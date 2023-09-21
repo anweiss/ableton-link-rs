@@ -2,8 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use tokio::{
     select,
-    sync::oneshot::{self, Receiver},
+    sync::mpsc::{self, Receiver},
 };
+use tracing::info;
 
 use crate::{
     discovery::{
@@ -42,7 +43,7 @@ impl PeerGateway<GatewayObserver> {
     pub async fn new(node_state: NodeState, ghost_xform: GhostXForm) -> Self {
         let node_state = Arc::new(Mutex::new(node_state));
 
-        let (tx, rx) = oneshot::channel::<OnEvent>();
+        let (tx, rx) = mpsc::channel::<OnEvent>(1);
 
         PeerGateway {
             observer: GatewayObserver::default(),
@@ -63,7 +64,7 @@ impl PeerGateway<GatewayObserver> {
     }
 
     pub async fn listen(&mut self) {
-        println!(
+        info!(
             "initializing peer gateway on interface {}",
             self.messenger
                 .interface
@@ -80,7 +81,7 @@ impl PeerGateway<GatewayObserver> {
 
         loop {
             select! {
-                val = &mut self.rx => {
+                val = self.rx.recv() => {
                     match val.unwrap() {
                         OnEvent::PeerState(peer) => self.on_peer_state(&peer.node_state, peer.ttl).await,
                         OnEvent::Byebye(node_id) => self.on_byebye(&node_id).await,
@@ -104,7 +105,7 @@ impl PeerGateway<GatewayObserver> {
         }
     }
 
-    pub async fn on_peer_state(&self, node_state: &NodeState, ttl: i32) {
+    pub async fn on_peer_state(&self, node_state: &NodeState, ttl: u8) {
         todo!()
     }
 
@@ -132,27 +133,32 @@ mod tests {
     use crate::discovery::{
         messages::{MessageHeader, ALIVE, PROTOCOL_HEADER},
         messenger::new_udp_reuseport,
-        ENCODING_CONFIG, LINK_PORT, MULTICAST_ADDR,
+        ENCODING_CONFIG, IP_ANY, LINK_PORT, MULTICAST_ADDR,
     };
 
     use super::*;
 
+    fn init_tracing() {
+        let subscriber = tracing_subscriber::FmtSubscriber::new();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    }
+
     #[tokio::test]
 
     async fn test_gateway() {
-        let mut gw = PeerGateway::new(NodeState::default(), GhostXForm::default()).await;
+        init_tracing();
 
-        let s = new_udp_reuseport("0.0.0.0:20808".parse().unwrap());
+        let node_state = NodeState::default();
+        let mut gw = PeerGateway::new(node_state, GhostXForm::default()).await;
+
+        let s = new_udp_reuseport(IP_ANY);
         s.set_broadcast(true).unwrap();
         s.set_multicast_ttl_v4(2).unwrap();
-
-        let rng = rand::thread_rng();
-        let node_id = NodeId::random(rng);
 
         tokio::spawn(async move {
             let header = MessageHeader {
                 ttl: 10,
-                ident: node_id,
+                ident: node_state.node_id,
                 message_type: ALIVE,
                 ..Default::default()
             };
@@ -164,7 +170,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            println!("bytes sent");
+            info!("test bytes sent");
         });
 
         gw.listen().await;

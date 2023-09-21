@@ -3,10 +3,7 @@ use std::mem;
 use bincode::{Decode, Encode};
 
 use crate::{
-    discovery::{
-        payload::{self, PayloadEntryHeader},
-        ENCODING_CONFIG,
-    },
+    discovery::{payload, ENCODING_CONFIG},
     link::node::NodeId,
 };
 
@@ -24,8 +21,15 @@ pub const ALIVE: MessageType = 1;
 pub const RESPONSE: MessageType = 2;
 pub const BYEBYE: MessageType = 3;
 
+pub const MESSAGE_TYPES: [&'static str; 4] = ["INVALID", "ALIVE", "RESPONSE", "BYEBYE"];
+
 pub const PROTOCOL_HEADER: ProtocolHeader = [b'_', b'a', b's', b'd', b'p', b'_', b'v', b'1'];
 pub const PROTOCOL_HEADER_SIZE: usize = PROTOCOL_HEADER.len();
+
+pub const MESSAGE_HEADER_SIZE: usize = mem::size_of::<MessageType>()
+    + mem::size_of::<u8>()
+    + mem::size_of::<SessionGroupId>()
+    + mem::size_of::<NodeId>();
 
 #[derive(Debug, Clone, Copy, Default, Encode, Decode, PartialEq, Eq)]
 pub struct MessageHeader {
@@ -35,12 +39,7 @@ pub struct MessageHeader {
     pub ident: NodeId,
 }
 
-impl MessageHeader {
-    pub const SIZE: usize = mem::size_of::<MessageType>()
-        + mem::size_of::<u8>()
-        + mem::size_of::<SessionGroupId>()
-        + mem::size_of::<NodeId>();
-}
+impl MessageHeader {}
 
 pub fn encode_message(
     from: NodeId,
@@ -55,7 +54,7 @@ pub fn encode_message(
         ident: from,
     };
 
-    let message_size = PROTOCOL_HEADER.len() + MessageHeader::SIZE + payload.size() as usize;
+    let message_size = PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE + payload.size() as usize;
 
     if message_size > MAX_MESSAGE_SIZE {
         panic!("exceeded maximum message size");
@@ -81,7 +80,7 @@ pub fn byebye_message(from: NodeId) -> Result<Vec<u8>> {
 }
 
 pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
-    let min_message_size = PROTOCOL_HEADER_SIZE + MessageHeader::SIZE;
+    let min_message_size = PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE;
 
     if data.len() < min_message_size {
         panic!("invalid message size");
@@ -94,26 +93,20 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
     Ok(bincode::decode_from_slice(
         &data[PROTOCOL_HEADER_SIZE..min_message_size],
         ENCODING_CONFIG,
-    )?)
+    )
+    .map(|header| (header.0, PROTOCOL_HEADER_SIZE + header.1))?)
 }
 
 pub fn parse_payload(data: &[u8]) -> Result<Payload> {
-    let payload = Payload::default();
-    payload::decode(payload, data).unwrap();
+    let mut payload = Payload::default();
+    payload::decode(&mut payload, data).unwrap();
 
-    todo!()
+    Ok(payload)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_alive_mesage() {
-        let payload = Payload::default();
-        let out = alive_message(NodeId::default(), 10, &payload);
-        println!("{:?}", out);
-    }
 
     #[test]
     fn test_parse_message_header() {

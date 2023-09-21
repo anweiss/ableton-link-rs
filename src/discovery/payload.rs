@@ -1,6 +1,7 @@
 use std::{mem, time::Duration};
 
 use bincode::{Decode, Encode};
+use tracing::{info, warn};
 
 use crate::link::{
     node::NodeState,
@@ -53,7 +54,8 @@ impl Payload {
         let mut encoded = Vec::new();
 
         for entry in &self.entries {
-            encoded.append(&mut entry.encode()?);
+            let mut encoded_entry = entry.encode()?;
+            encoded.append(&mut encoded_entry);
         }
 
         Ok(encoded)
@@ -72,7 +74,7 @@ impl From<NodeState> for Payload {
     }
 }
 
-pub fn decode(mut payload: Payload, data: &[u8]) -> Result<()> {
+pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
     if PAYLOAD_ENTRY_HEADER_SIZE > data.len() {
         return Ok(());
     }
@@ -83,24 +85,6 @@ pub fn decode(mut payload: Payload, data: &[u8]) -> Result<()> {
     )
     .unwrap();
 
-    println!("payload entry header {:?}", payload_entry_header);
-    println!(
-        "payload entry header key {:?}",
-        payload_entry_header.key.to_be_bytes()
-    );
-    println!(
-        "timeline entry header key {:?}",
-        TIMELINE_HEADER_KEY.to_be_bytes()
-    );
-    println!(
-        "session membership entry header key {:?}",
-        SESSION_MEMBERSHIP_HEADER_KEY.to_be_bytes()
-    );
-    println!(
-        "start stop state entry header key {:?}",
-        START_STOP_STATE_HEADER_KEY.to_be_bytes()
-    );
-
     match payload_entry_header.key {
         HOST_TIME_HEADER_KEY => {
             let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + HOST_TIME_SIZE as usize;
@@ -109,7 +93,7 @@ pub fn decode(mut payload: Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            println!("payload entry {:?}", entry);
+            info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::HostTime(entry));
             decode(payload, &data[decode_len..])?;
@@ -117,11 +101,12 @@ pub fn decode(mut payload: Payload, data: &[u8]) -> Result<()> {
         TIMELINE_HEADER_KEY => {
             let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + TIMELINE_SIZE as usize;
             let (entry, _) = bincode::decode_from_slice::<Timeline, _>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..TIMELINE_SIZE as usize],
+                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len as usize],
                 ENCODING_CONFIG,
-            )?;
+            )
+            .unwrap();
 
-            println!("payload entry {:?}", entry);
+            info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::Timeline(entry));
             decode(payload, &data[decode_len..])?;
@@ -133,7 +118,7 @@ pub fn decode(mut payload: Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            println!("payload entry {:?}", entry);
+            info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::SessionMembership(entry));
             decode(payload, &data[decode_len..])?;
@@ -145,13 +130,13 @@ pub fn decode(mut payload: Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            println!("payload entry {:?}", entry);
+            info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::StartStopState(entry));
             decode(payload, &data[decode_len..])?;
         }
         _ => {
-            println!("unknown payload entry key {:x}", payload_entry_header.key);
+            warn!("unknown payload entry key {:x}", payload_entry_header.key);
             todo!()
         }
     }
@@ -172,6 +157,7 @@ impl PayloadEntryHeader {
     }
 }
 
+#[derive(Debug)]
 pub enum PayloadEntry {
     HostTime(HostTime),
     GhostTime(GhostTime),

@@ -1,4 +1,7 @@
-use std::mem;
+use std::{
+    fmt::{self, Display},
+    mem,
+};
 
 use bincode::{Decode, Encode};
 
@@ -15,7 +18,14 @@ pub const SESSION_MEMBERSHIP_HEADER: PayloadEntryHeader = PayloadEntryHeader {
 
 pub struct ControllerSessions;
 
-pub type SessionId = NodeId;
+#[derive(Clone, Copy, Debug, Encode, Decode, Default)]
+pub struct SessionId(pub NodeId);
+
+impl Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 pub struct ControllerClientState;
 

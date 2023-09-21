@@ -11,6 +11,6 @@ tokio = { version = "1", features = ["full"] }
 bincode = { version = "2.0.0-rc.3", features = ["derive", "serde"] }
 thiserror = "1.0.48"
 socket2 = "0.5.3"
-
-[dev-dependencies]
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
 hex = "0.4.3"

@@ -1,21 +1,13 @@
 use std::{
-    borrow::BorrowMut,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
 };
 
-use bincode::enc;
-use tokio::{
-    net::UdpSocket,
-    runtime::Runtime,
-    sync::{
-        oneshot::{Receiver, Sender},
-        Notify,
-    },
-};
+use tokio::{net::UdpSocket, sync::mpsc::Sender};
+use tracing::info;
 
 use crate::{
-    discovery::messages::PROTOCOL_HEADER_SIZE,
+    discovery::{messages::MESSAGE_TYPES, peers::PeerState},
     link::node::{NodeId, NodeState},
 };
 
@@ -26,7 +18,6 @@ use super::{
         BYEBYE, RESPONSE,
     },
     payload::Payload,
-    peers::PeerState,
     IP_ANY, LINK_PORT, MULTICAST_ADDR,
 };
 
@@ -79,18 +70,21 @@ impl Messenger {
         let socket = self.interface.as_ref().unwrap().clone();
         let node_state = self.node_state.lock().unwrap().clone();
         let ttl = self.ttl;
+        let tx = self.tx.clone();
 
         tokio::spawn(async move {
             loop {
+                let tx = tx.clone();
+
                 let mut buf = [0; 1024];
                 let socket = socket.clone();
                 let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
 
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
 
-                println!(
-                    "received message type {} from peer {:?}",
-                    header.message_type, header.ident
+                info!(
+                    "received message type {} from peer {}",
+                    MESSAGE_TYPES[header.message_type as usize], header.ident
                 );
 
                 match header.message_type {
@@ -100,11 +94,14 @@ impl Messenger {
                         });
 
                         // empty payload
-                        if PROTOCOL_HEADER_SIZE + header_len == amt {
+                        if header_len == amt {
                             continue;
                         }
 
-                        receive_peer_state(&header, &buf[header_len..amt]).await;
+                        receive_peer_state(tx, header, &buf[header_len..amt]).await;
+                    }
+                    RESPONSE => {
+                        receive_peer_state(tx, header, &buf[header_len..amt]).await;
                     }
                     _ => todo!(),
                 }
@@ -139,7 +136,6 @@ pub async fn send_message(
     let message = encode_message(from, ttl, message_type, payload).unwrap();
 
     let sent_bytes = socket.send_to(&message, to).await.unwrap();
-    println!("sent {} bytes", sent_bytes)
 }
 
 pub async fn send_peer_state(
@@ -149,7 +145,7 @@ pub async fn send_peer_state(
     message_type: MessageType,
     to: SocketAddr,
 ) {
-    println!("sending peer state");
+    info!("sending peer state");
 
     send_message(
         socket,
@@ -162,11 +158,19 @@ pub async fn send_peer_state(
     .await
 }
 
-pub async fn receive_peer_state(header: &MessageHeader, buf: &[u8]) {
-    println!("receiving peer state");
+pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf: &[u8]) {
+    info!("receiving peer state");
     let payload = parse_payload(buf).unwrap();
+    let node_state: NodeState = NodeState::from_payload(header.ident, &payload);
+    let tx = tx.clone();
 
-    todo!()
+    tokio::spawn(async move {
+        tx.send(OnEvent::PeerState(PeerState {
+            node_state,
+            ttl: header.ttl,
+        }))
+        .await
+    });
 }
 
 pub fn send_byebye(node_state: NodeId) {

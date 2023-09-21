@@ -8,7 +8,7 @@ use super::{beats::Beats, ghostxform::GhostXForm, timeline::Timeline, Result};
 
 pub const START_STOP_STATE_HEADER_KEY: u32 = u32::from_be_bytes(*b"stst");
 pub const START_STOP_STATE_SIZE: u32 =
-    (mem::size_of::<bool>() + mem::size_of::<Beats>() + mem::size_of::<Duration>()) as u32;
+    (mem::size_of::<bool>() + mem::size_of::<Beats>() + mem::size_of::<u64>()) as u32;
 pub const START_STOP_STATE_HEADER: PayloadEntryHeader = PayloadEntryHeader {
     key: START_STOP_STATE_HEADER_KEY,
     size: START_STOP_STATE_SIZE,
@@ -39,11 +39,40 @@ impl ApiStartStopState {
     }
 }
 
-#[derive(Default, Debug, Clone, Copy, Encode, Decode)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct StartStopState {
     pub is_playing: bool,
     pub beats: Beats,
     pub timestamp: Duration,
+}
+
+impl bincode::enc::Encode for StartStopState {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> std::result::Result<(), bincode::error::EncodeError> {
+        bincode::Encode::encode(
+            &(
+                self.is_playing,
+                self.beats,
+                self.timestamp.as_micros() as u64,
+            ),
+            encoder,
+        )
+    }
+}
+
+impl bincode::de::Decode for StartStopState {
+    fn decode<D: bincode::de::Decoder>(
+        decoder: &mut D,
+    ) -> std::result::Result<Self, bincode::error::DecodeError> {
+        let (is_playing, beats, timestamp) = bincode::Decode::decode(decoder)?;
+        Ok(Self {
+            is_playing,
+            beats,
+            timestamp: Duration::from_micros(timestamp),
+        })
+    }
 }
 
 impl StartStopState {

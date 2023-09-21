@@ -11,7 +11,7 @@ pub trait PeerObserver {
 #[derive(Clone, Copy)]
 pub struct PeerState {
     pub node_state: NodeState,
-    pub ttl: i32,
+    pub ttl: u8,
 }
 
 #[derive(Default)]

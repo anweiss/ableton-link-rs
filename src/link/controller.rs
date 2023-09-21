@@ -47,7 +47,7 @@ impl Controller {
     ) -> Self {
         let mut rng = rand::thread_rng();
         let node_id = NodeId::random(&mut rng);
-        let session_id = node_id;
+        let session_id = SessionId(node_id);
         let session_state = Arc::new(Mutex::new(init_session_state(tempo, clock)));
         let timeline = session_state.lock().unwrap().timeline;
 
