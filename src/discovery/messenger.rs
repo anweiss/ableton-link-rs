@@ -76,8 +76,9 @@ impl Messenger {
             loop {
                 let tx = tx.clone();
 
-                let mut buf = [0; 1024];
+                let mut buf = [0; 20];
                 let socket = socket.clone();
+
                 let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
 
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
@@ -94,11 +95,9 @@ impl Messenger {
                         });
 
                         // empty payload
-                        if header_len == amt {
-                            continue;
+                        if header_len != amt {
+                            receive_peer_state(tx, header, &buf[header_len..amt]).await;
                         }
-
-                        receive_peer_state(tx, header, &buf[header_len..amt]).await;
                     }
                     RESPONSE => {
                         receive_peer_state(tx, header, &buf[header_len..amt]).await;
@@ -162,7 +161,6 @@ pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf:
     info!("receiving peer state");
     let payload = parse_payload(buf).unwrap();
     let node_state: NodeState = NodeState::from_payload(header.ident, &payload);
-    let tx = tx.clone();
 
     tokio::spawn(async move {
         tx.send(OnEvent::PeerState(PeerState {

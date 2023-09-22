@@ -1,7 +1,9 @@
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize},
-    Arc, Mutex,
+    Arc,
 };
+
+use tokio::sync::Mutex;
 
 use crate::{
     clock::Clock,
@@ -34,7 +36,7 @@ pub struct Controller {
     rt_client_state_setter: RtClientStateSetter,
     peers: ControllerPeers,
     sessions: ControllerSessions,
-    discovery: PeerGateway<GatewayObserver>,
+    discovery: PeerGateway,
 }
 
 impl Controller {
@@ -49,7 +51,7 @@ impl Controller {
         let node_id = NodeId::random(&mut rng);
         let session_id = SessionId(node_id);
         let session_state = Arc::new(Mutex::new(init_session_state(tempo, clock)));
-        let timeline = session_state.lock().unwrap().timeline;
+        let timeline = session_state.lock().await.timeline;
 
         Self {
             tempo_callback,

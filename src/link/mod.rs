@@ -9,11 +9,9 @@ pub mod state;
 pub mod tempo;
 pub mod timeline;
 
-use std::{
-    result,
-    sync::{atomic::AtomicBool, Arc, Mutex},
-    time::Duration,
-};
+use std::{result, sync::Arc, time::Duration};
+
+use tokio::sync::Mutex;
 
 use crate::clock::Clock;
 
