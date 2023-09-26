@@ -1,4 +1,5 @@
 use std::{
+    ops::DerefMut,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -72,7 +73,7 @@ impl PeerGateway {
         }
     }
 
-    pub async fn update_node_state(&mut self, node_state: NodeState, _ghost_xform: GhostXForm) {
+    pub async fn update_node_state(&mut self, node_state: NodeState, ghost_xform: GhostXForm) {
         // TODO: measure update node state
         self.messenger
             .update_state(PeerState {
@@ -82,7 +83,7 @@ impl PeerGateway {
             .await
     }
 
-    pub async fn measure_peer(&mut self, _peer: &PeerStateMessageType) {
+    pub async fn measure_peer(&mut self, peer: &PeerStateMessageType) {
         todo!()
     }
 
@@ -129,30 +130,29 @@ impl PeerGateway {
     }
 
     pub async fn on_peer_state(&mut self, node_state: NodeState, ttl: u8) {
-        let peer_id = node_state.ident();
-        let existing = self.find_peer(&peer_id).await;
+        {
+            let peer_id = node_state.ident();
+            let existing = self.find_peer(&peer_id).await;
+            if existing {
+                self.peer_timeouts
+                    .lock()
+                    .unwrap()
+                    .retain(|(_, id)| id != &peer_id);
+            }
 
-        if existing {
-            self.peer_timeouts
-                .lock()
-                .unwrap()
-                .retain(|(_, id)| id != &peer_id);
+            let new_to = (Instant::now() + Duration::from_secs(ttl as u64), peer_id);
+
+            info!("updating peer timeout status");
+            let mut peer_timeouts = self.peer_timeouts.lock().unwrap();
+            let i = peer_timeouts
+                .iter()
+                .position(|(timeout, _)| timeout >= &new_to.0)
+                .unwrap_or(peer_timeouts.len());
+            peer_timeouts.insert(i, new_to);
+
+            let peer_event = self.tx_peer_event.clone();
+            tokio::spawn(async move { peer_event.send(PeerEvent::SawPeer(node_state)).await });
         }
-
-        let new_to = (Instant::now() + Duration::from_secs(ttl as u64), peer_id);
-
-        info!("updating peer timeout status");
-        let i = self
-            .peer_timeouts
-            .lock()
-            .unwrap()
-            .iter()
-            .position(|(timeout, _)| timeout >= &new_to.0)
-            .unwrap_or(self.peer_timeouts.lock().unwrap().len());
-        self.peer_timeouts.lock().unwrap().insert(i, new_to);
-
-        let peer_event = self.tx_peer_event.clone();
-        tokio::spawn(async move { peer_event.send(PeerEvent::SawPeer(node_state)).await });
 
         schedule_next_pruning(
             self.peer_timeouts.clone(),
