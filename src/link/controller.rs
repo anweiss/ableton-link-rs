@@ -9,7 +9,7 @@ use crate::{
     clock::Clock,
     discovery::{
         gateway::PeerGateway,
-        peers::{ControllerPeer, GatewayObserver},
+        peers::{ControllerPeer},
     },
 };
 
@@ -101,7 +101,7 @@ impl Controller {
     }
 }
 
-fn init_session_state(tempo: tempo::Tempo, clock: Clock) -> SessionState {
+fn init_session_state(_tempo: tempo::Tempo, _clock: Clock) -> SessionState {
     // todo!()
     SessionState::default()
 }

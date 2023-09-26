@@ -80,7 +80,7 @@ impl PeerState {
     }
 }
 
-async fn session_timeline_exists(session_id: SessionId, timeline: Timeline) -> bool {
+async fn session_timeline_exists(_session_id: SessionId, _timeline: Timeline) -> bool {
     todo!()
 }
 
@@ -98,11 +98,11 @@ async fn saw_peer(node_state: NodeState, peers: Arc<Mutex<Vec<ControllerPeer>>>)
 
     let mut peers = peers.lock().unwrap();
 
-    let is_new_session_timeline = !peers.iter().any(|p| {
+    let _is_new_session_timeline = !peers.iter().any(|p| {
         p.peer_state.session_id() == peer_session && p.peer_state.timeline() == peer_timeline
     });
 
-    let is_new_session_start_stop_state = !peers
+    let _is_new_session_start_stop_state = !peers
         .iter()
         .any(|p| p.peer_state.start_stop_state() == peer_start_stop_state);
 
@@ -136,7 +136,7 @@ async fn peer_left(node_id: NodeId, peers: Arc<Mutex<Vec<ControllerPeer>>>) {
     })
 }
 
-async fn peer_timed_out(peer_id: SocketAddr, new_state: PeerStateMessageType) {
+async fn peer_timed_out(_peer_id: SocketAddr, _new_state: PeerStateMessageType) {
     todo!()
 }
 

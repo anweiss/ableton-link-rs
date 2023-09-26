@@ -59,7 +59,7 @@ impl BasicLink {
         todo!()
     }
 
-    pub fn enable_start_stop_sync(&mut self, enable: bool) {
+    pub fn enable_start_stop_sync(&mut self, _enable: bool) {
         todo!()
     }
 
@@ -67,21 +67,21 @@ impl BasicLink {
         todo!()
     }
 
-    pub fn set_num_peers_callback<F>(&mut self, callback: F)
+    pub fn set_num_peers_callback<F>(&mut self, _callback: F)
     where
         F: FnMut(usize) + Send + 'static,
     {
         todo!()
     }
 
-    pub fn set_tempo_callback<F>(&mut self, callback: F)
+    pub fn set_tempo_callback<F>(&mut self, _callback: F)
     where
         F: FnMut(f64) + Send + 'static,
     {
         todo!()
     }
 
-    pub fn set_start_stop_callback<F>(&mut self, callback: F)
+    pub fn set_start_stop_callback<F>(&mut self, _callback: F)
     where
         F: FnMut(bool) + Send + 'static,
     {
@@ -96,7 +96,7 @@ impl BasicLink {
         todo!()
     }
 
-    pub fn commit_audio_session_state(&mut self, state: SessionState) {
+    pub fn commit_audio_session_state(&mut self, _state: SessionState) {
         todo!()
     }
 
@@ -104,7 +104,7 @@ impl BasicLink {
         todo!()
     }
 
-    pub fn commit_app_session_state(&mut self, state: SessionState) {
+    pub fn commit_app_session_state(&mut self, _state: SessionState) {
         todo!()
     }
 }
@@ -117,7 +117,7 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn new(state: ApiState, respect_quantum: bool) -> Self {
+    pub fn new(_state: ApiState, _respect_quantum: bool) -> Self {
         todo!()
     }
 
@@ -125,31 +125,31 @@ impl SessionState {
         todo!()
     }
 
-    pub fn set_tempo(&mut self, bpm: f64, at_time: Duration) {
+    pub fn set_tempo(&mut self, _bpm: f64, _at_time: Duration) {
         todo!()
     }
 
-    pub fn beat_at_time(&self, time: Duration, quantum: f64) -> f64 {
+    pub fn beat_at_time(&self, _time: Duration, _quantum: f64) -> f64 {
         todo!()
     }
 
-    pub fn phase_at_time(&self, time: Duration, quantum: f64) -> f64 {
+    pub fn phase_at_time(&self, _time: Duration, _quantum: f64) -> f64 {
         todo!()
     }
 
-    pub fn time_at_beat(&self, beat: f64, quantum: f64) -> Duration {
+    pub fn time_at_beat(&self, _beat: f64, _quantum: f64) -> Duration {
         todo!()
     }
 
-    pub fn request_beat_at_time(&mut self, beat: f64, time: Duration, quantum: f64) {
+    pub fn request_beat_at_time(&mut self, _beat: f64, _time: Duration, _quantum: f64) {
         todo!()
     }
 
-    pub fn force_beat_at_time(&mut self, beat: f64, time: Duration, quantum: f64) {
+    pub fn force_beat_at_time(&mut self, _beat: f64, _time: Duration, _quantum: f64) {
         todo!()
     }
 
-    pub fn set_is_playing(&mut self, is_playing: bool, time: Duration) {
+    pub fn set_is_playing(&mut self, _is_playing: bool, _time: Duration) {
         todo!()
     }
 
@@ -161,16 +161,16 @@ impl SessionState {
         todo!()
     }
 
-    pub fn request_beat_at_start_playing_time(&mut self, beat: f64, quantum: f64) {
+    pub fn request_beat_at_start_playing_time(&mut self, _beat: f64, _quantum: f64) {
         todo!()
     }
 
     pub fn set_is_playing_and_request_beat_at_time(
         &mut self,
-        is_playing: bool,
-        time: Duration,
-        beat: f64,
-        quantum: f64,
+        _is_playing: bool,
+        _time: Duration,
+        _beat: f64,
+        _quantum: f64,
     ) {
         todo!()
     }

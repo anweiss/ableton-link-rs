@@ -41,7 +41,7 @@ impl Beats {
         }
     }
 
-    pub fn size_in_byte_stream(self, beats: Beats) -> u32 {
+    pub fn size_in_byte_stream(self, _beats: Beats) -> u32 {
         todo!()
     }
 }

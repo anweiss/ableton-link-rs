@@ -201,7 +201,7 @@ pub async fn send_message(
 
     let message = encode_message(from, ttl, message_type, payload).unwrap();
 
-    let sent_bytes = socket.send_to(&message, to).await.unwrap();
+    let _sent_bytes = socket.send_to(&message, to).await.unwrap();
 }
 
 pub async fn send_peer_state(

@@ -21,7 +21,7 @@ pub const ALIVE: MessageType = 1;
 pub const RESPONSE: MessageType = 2;
 pub const BYEBYE: MessageType = 3;
 
-pub const MESSAGE_TYPES: [&'static str; 4] = ["INVALID", "ALIVE", "RESPONSE", "BYEBYE"];
+pub const MESSAGE_TYPES: [&str; 4] = ["INVALID", "ALIVE", "RESPONSE", "BYEBYE"];
 
 pub const PROTOCOL_HEADER: ProtocolHeader = [b'_', b'a', b's', b'd', b'p', b'_', b'v', b'1'];
 pub const PROTOCOL_HEADER_SIZE: usize = PROTOCOL_HEADER.len();

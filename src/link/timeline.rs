@@ -1,6 +1,6 @@
 use std::{mem, time::Duration};
 
-use bincode::{Decode, Encode};
+use bincode::{Encode};
 
 use crate::discovery::{payload::PayloadEntryHeader, ENCODING_CONFIG};
 
@@ -25,11 +25,11 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    fn to_beats(&self, time: Duration) -> Beats {
+    fn to_beats(&self, _time: Duration) -> Beats {
         todo!()
     }
 
-    fn from_beats(&self, beats: Beats) -> Duration {
+    fn from_beats(&self, _beats: Beats) -> Duration {
         todo!()
     }
 

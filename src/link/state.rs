@@ -1,7 +1,7 @@
-use std::{mem, sync::Arc, time::Duration};
+use std::{mem, time::Duration};
 
-use bincode::{Decode, Encode};
-use tokio::sync::Mutex;
+use bincode::{Encode};
+
 
 use crate::discovery::{payload::PayloadEntryHeader, ENCODING_CONFIG};
 
