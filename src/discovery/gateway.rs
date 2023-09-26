@@ -1,12 +1,13 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    ops::DerefMut,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_recursion::async_recursion;
 use tokio::{
     select,
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        Mutex,
-    },
+    sync::mpsc::{self, Receiver, Sender},
     time::Instant,
 };
 use tracing::info;
@@ -135,14 +136,14 @@ impl PeerGateway {
             if existing {
                 self.peer_timeouts
                     .lock()
-                    .await
+                    .unwrap()
                     .retain(|(_, id)| id != &peer_id);
             }
 
             let new_to = (Instant::now() + Duration::from_secs(ttl as u64), peer_id);
 
             info!("updating peer timeout status");
-            let mut peer_timeouts = self.peer_timeouts.lock().await;
+            let mut peer_timeouts = self.peer_timeouts.lock().unwrap();
             let i = peer_timeouts
                 .iter()
                 .position(|(timeout, _)| timeout >= &new_to.0)
@@ -168,7 +169,7 @@ impl PeerGateway {
 
             self.peer_timeouts
                 .lock()
-                .await
+                .unwrap()
                 .retain(|(_, id)| id != &peer_id);
         }
     }
@@ -176,7 +177,7 @@ impl PeerGateway {
     pub async fn find_peer(&self, peer_id: &NodeId) -> bool {
         self.peer_timeouts
             .lock()
-            .await
+            .unwrap()
             .iter()
             .any(|(_, id)| id == peer_id)
     }
@@ -186,15 +187,13 @@ impl PeerGateway {
 pub async fn schedule_next_pruning(
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
     epoch: Instant,
-    peer_event: Sender<PeerEvent>,
+    tx_peer_event: Sender<PeerEvent>,
 ) {
-    let peer_timeouts = peer_timeouts.clone();
-
-    if peer_timeouts.lock().await.is_empty() {
+    if peer_timeouts.lock().unwrap().is_empty() {
         return;
     }
 
-    let pt = peer_timeouts.lock().await;
+    let pt = peer_timeouts.lock().unwrap();
     let (timeout, peer_id) = pt
         .first()
         .map(|(timeout, peer_id)| {
@@ -211,42 +210,43 @@ pub async fn schedule_next_pruning(
         peer_id
     );
 
+    let tx_peer_event = tx_peer_event.clone();
     let peer_timeouts = peer_timeouts.clone();
 
     tokio::spawn(async move {
         tokio::time::sleep(timeout).await;
 
-        prune_expired_peers(peer_timeouts, epoch, peer_event).await;
+        let expired_peers = prune_expired_peers(peer_timeouts.clone(), epoch);
+        for peer in expired_peers.iter() {
+            info!("pruning peer {}", peer.1);
+            tx_peer_event
+                .send(PeerEvent::PeerTimedOut(peer.1))
+                .await
+                .unwrap();
+        }
+
+        schedule_next_pruning(peer_timeouts, epoch, tx_peer_event).await;
     });
 }
 
-async fn prune_expired_peers(
+fn prune_expired_peers(
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
     epoch: Instant,
-    peer_event: Sender<PeerEvent>,
-) {
+) -> Vec<(Instant, NodeId)> {
     info!(
         "pruning peers @ {}ms since gateway initialization epoch",
         Instant::now().duration_since(epoch).as_millis(),
     );
 
-    let mut pt = peer_timeouts.lock().await;
+    let mut peer_timeouts = peer_timeouts.lock().unwrap();
 
     // find the first element in pt whose timeout value is not less than Instant::now()
-    let i = pt
+    let i = peer_timeouts
         .iter()
         .position(|(timeout, _)| timeout >= &Instant::now())
-        .unwrap_or(pt.len());
+        .unwrap_or(peer_timeouts.len());
 
-    for peer in pt.drain(0..i) {
-        info!("pruning peer {}", peer.1);
-        peer_event
-            .send(PeerEvent::PeerTimedOut(peer.1))
-            .await
-            .unwrap();
-    }
-
-    schedule_next_pruning(peer_timeouts.clone(), epoch, peer_event).await;
+    peer_timeouts.drain(0..i).collect::<Vec<_>>()
 }
 
 impl Drop for PeerGateway {

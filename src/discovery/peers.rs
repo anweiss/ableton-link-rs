@@ -1,7 +1,10 @@
-use std::{net::SocketAddr, sync::Arc, vec};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    vec,
+};
 
-use futures::stream::StreamExt;
-use tokio::sync::{mpsc::Receiver, Mutex};
+use tokio::sync::mpsc::Receiver;
 use tracing::info;
 
 use crate::link::{
@@ -93,7 +96,7 @@ async fn saw_peer(node_state: NodeState, peers: Arc<Mutex<Vec<ControllerPeer>>>)
     let peer_timeline = ps.timeline();
     let peer_start_stop_state = ps.start_stop_state();
 
-    let mut peers = peers.lock().await;
+    let mut peers = peers.lock().unwrap();
 
     let is_new_session_timeline = !peers.iter().any(|p| {
         p.peer_state.session_id() == peer_session && p.peer_state.timeline() == peer_timeline
@@ -123,7 +126,7 @@ async fn peer_left(node_id: NodeId, peers: Arc<Mutex<Vec<ControllerPeer>>>) {
     info!("peer {} left", node_id);
 
     let mut did_session_membership_change = false;
-    peers.lock().await.retain(|peer| {
+    peers.lock().unwrap().retain(|peer| {
         if peer.peer_state.ident() == node_id {
             did_session_membership_change = true;
             false

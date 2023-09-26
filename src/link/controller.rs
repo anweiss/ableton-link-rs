@@ -58,7 +58,7 @@ impl Controller {
             tempo_callback,
             start_stop_callback,
             clock,
-            node_id: node_id.clone(),
+            node_id,
             session_id,
             session_state: session_state.clone(),
             client_state: Arc::new(Mutex::new(ControllerClientState)),
