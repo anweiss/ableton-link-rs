@@ -23,7 +23,7 @@ pub const BYEBYE: MessageType = 3;
 
 pub const MESSAGE_TYPES: [&str; 4] = ["INVALID", "ALIVE", "RESPONSE", "BYEBYE"];
 
-pub const PROTOCOL_HEADER: ProtocolHeader = [b'_', b'a', b's', b'd', b'p', b'_', b'v', b'1'];
+pub const PROTOCOL_HEADER: ProtocolHeader = [b'_', b'a', b's', b'd', b'p', b'_', b'v', 1];
 pub const PROTOCOL_HEADER_SIZE: usize = PROTOCOL_HEADER.len();
 
 pub const MESSAGE_HEADER_SIZE: usize = mem::size_of::<MessageType>()
@@ -86,6 +86,7 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
         panic!("invalid message size");
     }
 
+    println!("{:?}", data);
     if !data.starts_with(&PROTOCOL_HEADER) {
         panic!("invalid protocol header");
     }
