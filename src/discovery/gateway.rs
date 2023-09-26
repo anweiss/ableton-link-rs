@@ -10,7 +10,7 @@ use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     time::Instant,
 };
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     discovery::{
@@ -52,9 +52,10 @@ impl PeerGateway {
     pub async fn new(node_state: NodeState, ghost_xform: GhostXForm) -> Self {
         let (tx_event, rx_event) = mpsc::channel::<OnEvent>(1);
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
+        let epoch = Instant::now();
 
         PeerGateway {
-            epoch: Instant::now(),
+            epoch,
             observer: GatewayObserver::new(rx_peer_event).await,
             messenger: Messenger::new(
                 PeerState {
@@ -62,6 +63,7 @@ impl PeerGateway {
                     endpoint: None,
                 },
                 tx_event.clone(),
+                epoch,
             )
             .await,
             measurement: MeasurementService::default(),
@@ -107,7 +109,7 @@ impl PeerGateway {
             select! {
                 val = self.rx_event.as_mut().unwrap().recv() => {
                     match val.unwrap() {
-                        OnEvent::PeerState(peer) => self.on_peer_state(peer.node_state, peer.ttl).await,
+                        OnEvent::PeerState(msg) => self.on_peer_state(msg).await,
                         OnEvent::Byebye(node_id) => self.on_byebye(node_id).await,
                     }
                 }
@@ -129,30 +131,34 @@ impl PeerGateway {
         }
     }
 
-    pub async fn on_peer_state(&mut self, node_state: NodeState, ttl: u8) {
-        {
-            let peer_id = node_state.ident();
-            let existing = self.find_peer(&peer_id).await;
-            if existing {
-                self.peer_timeouts
-                    .lock()
-                    .unwrap()
-                    .retain(|(_, id)| id != &peer_id);
-            }
+    pub async fn on_peer_state(&mut self, msg: PeerStateMessageType) {
+        let peer_id = msg.node_state.ident();
+        self.peer_timeouts
+            .lock()
+            .unwrap()
+            .retain(|(_, id)| id != &peer_id);
 
-            let new_to = (Instant::now() + Duration::from_secs(ttl as u64), peer_id);
+        let new_to = (
+            Instant::now() + Duration::from_secs(msg.ttl as u64),
+            peer_id,
+        );
 
-            info!("updating peer timeout status");
-            let mut peer_timeouts = self.peer_timeouts.lock().unwrap();
-            let i = peer_timeouts
-                .iter()
-                .position(|(timeout, _)| timeout >= &new_to.0)
-                .unwrap_or(peer_timeouts.len());
-            peer_timeouts.insert(i, new_to);
+        debug!("updating peer timeout status for peer {}", peer_id);
 
-            let peer_event = self.tx_peer_event.clone();
-            tokio::spawn(async move { peer_event.send(PeerEvent::SawPeer(node_state)).await });
+        let i = self
+            .peer_timeouts
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|(timeout, _)| timeout >= &new_to.0);
+        if let Some(i) = i {
+            self.peer_timeouts.lock().unwrap().insert(i, new_to);
+        } else {
+            self.peer_timeouts.lock().unwrap().push(new_to);
         }
+
+        let peer_event = self.tx_peer_event.clone();
+        tokio::spawn(async move { peer_event.send(PeerEvent::SawPeer(msg.node_state)).await });
 
         schedule_next_pruning(
             self.peer_timeouts.clone(),
@@ -194,17 +200,10 @@ pub async fn schedule_next_pruning(
     }
 
     let pt = peer_timeouts.lock().unwrap();
-    let (timeout, peer_id) = pt
-        .first()
-        .map(|(timeout, peer_id)| {
-            (
-                timeout.duration_since(epoch) + Duration::from_secs(1),
-                peer_id,
-            )
-        })
-        .unwrap();
+    let (timeout, peer_id) = pt.first().unwrap();
+    let timeout = timeout.duration_since(epoch) + Duration::from_secs(1);
 
-    info!(
+    debug!(
         "scheduling next pruning for {}ms because of peer {}",
         timeout.as_millis(),
         peer_id
@@ -232,20 +231,28 @@ fn prune_expired_peers(
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
     epoch: Instant,
 ) -> Vec<(Instant, NodeId)> {
-    info!(
+    debug!(
         "pruning peers @ {}ms since gateway initialization epoch",
         Instant::now().duration_since(epoch).as_millis(),
     );
 
-    let mut peer_timeouts = peer_timeouts.lock().unwrap();
-
     // find the first element in pt whose timeout value is not less than Instant::now()
-    let i = peer_timeouts
-        .iter()
-        .position(|(timeout, _)| timeout >= &Instant::now())
-        .unwrap_or(peer_timeouts.len());
 
-    peer_timeouts.drain(0..i).collect::<Vec<_>>()
+    let i = peer_timeouts
+        .lock()
+        .unwrap()
+        .iter()
+        .position(|(timeout, _)| timeout >= &Instant::now());
+
+    if let Some(i) = i {
+        peer_timeouts
+            .lock()
+            .unwrap()
+            .drain(0..i)
+            .collect::<Vec<_>>()
+    } else {
+        peer_timeouts.lock().unwrap().drain(..).collect::<Vec<_>>()
+    }
 }
 
 impl Drop for PeerGateway {
@@ -283,7 +290,7 @@ mod tests {
         s.set_multicast_loop_v4(false).unwrap();
 
         let header = MessageHeader {
-            ttl: 10,
+            ttl: 5,
             ident: NodeState::default().ident(),
             message_type: ALIVE,
             ..Default::default()

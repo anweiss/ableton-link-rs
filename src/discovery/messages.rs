@@ -1,6 +1,7 @@
 use std::mem;
 
 use bincode::{Decode, Encode};
+use tracing::info;
 
 use crate::{
     discovery::{payload, ENCODING_CONFIG},
@@ -86,7 +87,6 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
         panic!("invalid message size");
     }
 
-    println!("{:?}", data);
     if !data.starts_with(&PROTOCOL_HEADER) {
         panic!("invalid protocol header");
     }

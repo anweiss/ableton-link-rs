@@ -6,7 +6,7 @@ use std::{
 
 use async_recursion::async_recursion;
 use tokio::{net::UdpSocket, sync::mpsc::Sender, time::Instant};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     discovery::{messages::MESSAGE_TYPES, peers::PeerStateMessageType},
@@ -17,7 +17,7 @@ use super::{
     gateway::OnEvent,
     messages::{
         encode_message, parse_message_header, parse_payload, MessageHeader, MessageType, ALIVE,
-        BYEBYE, RESPONSE,
+        BYEBYE, MAX_MESSAGE_SIZE, RESPONSE,
     },
     payload::Payload,
     peers::PeerState,
@@ -49,12 +49,12 @@ pub struct Messenger {
     pub peer_state: Arc<std::sync::Mutex<PeerState>>,
     pub ttl: u8,
     pub ttl_ratio: u8,
-    pub last_broadcast_time: Arc<Mutex<Option<Instant>>>,
+    pub last_broadcast_time: Arc<Mutex<Instant>>,
     pub tx_event: Sender<OnEvent>,
 }
 
 impl Messenger {
-    pub async fn new(peer_state: PeerState, tx_event: Sender<OnEvent>) -> Self {
+    pub async fn new(peer_state: PeerState, tx_event: Sender<OnEvent>, epoch: Instant) -> Self {
         let socket = new_udp_reuseport(IP_ANY);
         socket
             .join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::new(0, 0, 0, 0))
@@ -66,7 +66,7 @@ impl Messenger {
             peer_state: Arc::new(std::sync::Mutex::new(peer_state)),
             ttl: 5,
             ttl_ratio: 20,
-            last_broadcast_time: Arc::new(Mutex::new(None)),
+            last_broadcast_time: Arc::new(Mutex::new(epoch)),
             tx_event,
         }
     }
@@ -85,17 +85,22 @@ impl Messenger {
 
                 let last_broadcast_time = last_broadcast_time.clone();
 
-                let mut buf = [0; 20];
+                let mut buf = [0; MAX_MESSAGE_SIZE];
                 let socket = socket.clone();
 
                 let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
 
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
 
-                info!(
-                    "received message type {} from peer {}",
-                    MESSAGE_TYPES[header.message_type as usize], header.ident
-                );
+                if header.ident == peer_state.lock().unwrap().ident() && header.group_id == 0 {
+                    debug!("ignoring messages from self (peer {})", header.ident);
+                    continue;
+                } else {
+                    info!(
+                        "received message type {} from peer {}",
+                        MESSAGE_TYPES[header.message_type as usize], header.ident
+                    );
+                }
 
                 match header.message_type {
                     ALIVE => {
@@ -110,10 +115,7 @@ impl Messenger {
                             .await;
                         });
 
-                        // empty payload
-                        if header_len != amt {
-                            receive_peer_state(tx, header, &buf[header_len..amt]).await;
-                        }
+                        receive_peer_state(tx, header, &buf[header_len..amt]).await;
                     }
                     RESPONSE => {
                         receive_peer_state(tx, header, &buf[header_len..amt]).await;
@@ -125,6 +127,16 @@ impl Messenger {
                 }
             }
         });
+
+        broadcast_state(
+            self.ttl,
+            self.ttl_ratio,
+            self.last_broadcast_time.clone(),
+            self.interface.as_ref().unwrap().clone(),
+            self.peer_state.clone(),
+            SocketAddr::new(MULTICAST_ADDR.into(), LINK_PORT),
+        )
+        .await;
     }
 
     pub async fn update_state(&mut self, state: PeerState) {
@@ -135,7 +147,7 @@ impl Messenger {
             self.ttl_ratio,
             self.last_broadcast_time.clone(),
             self.interface.as_ref().unwrap().clone(),
-            state,
+            self.peer_state.clone(),
             SocketAddr::new(MULTICAST_ADDR.into(), LINK_PORT),
         )
         .await;
@@ -146,19 +158,33 @@ impl Messenger {
 pub async fn broadcast_state(
     ttl: u8,
     ttl_ratio: u8,
-    last_broadcast_time: Arc<Mutex<Option<Instant>>>,
+    last_broadcast_time: Arc<Mutex<Instant>>,
     socket: Arc<UdpSocket>,
-    peer_state: PeerState,
+    peer_state: Arc<Mutex<PeerState>>,
     to: SocketAddr,
 ) {
     let min_broadcast_period = Duration::from_millis(50);
     let nominal_broadcast_period = Duration::from_millis(ttl as u64 * 1000 / ttl_ratio as u64);
-    let time_since_last_broadcast = Instant::now() - last_broadcast_time.lock().unwrap().unwrap();
 
-    let delay = min_broadcast_period - time_since_last_broadcast;
+    let time_since_last_broadcast = if *last_broadcast_time.lock().unwrap() > Instant::now() {
+        0
+    } else {
+        Instant::now()
+            .duration_since(*last_broadcast_time.lock().unwrap())
+            .as_millis()
+    };
+
+    let tslb = Duration::from_millis(time_since_last_broadcast as u64);
+    let delay = if tslb > min_broadcast_period {
+        Duration::default()
+    } else {
+        min_broadcast_period - tslb
+    };
 
     let lbt = last_broadcast_time.clone();
     let s = socket.clone();
+
+    let ps = peer_state.clone();
 
     tokio::spawn(async move {
         let sleep_time = if delay > Duration::from_millis(0) {
@@ -168,12 +194,20 @@ pub async fn broadcast_state(
         };
 
         tokio::time::sleep(sleep_time).await;
-        broadcast_state(ttl, ttl_ratio, lbt, s, peer_state, to).await;
+        broadcast_state(ttl, ttl_ratio, lbt, s, ps, to).await;
     });
 
-    if delay < Duration::from_millis(0) {
-        info!("broadcasting state");
-        send_peer_state(socket, peer_state, ttl, ALIVE, to, last_broadcast_time).await;
+    if delay < Duration::from_millis(1) {
+        debug!("broadcasting state");
+        send_peer_state(
+            socket,
+            peer_state.clone(),
+            ttl,
+            ALIVE,
+            to,
+            last_broadcast_time,
+        )
+        .await;
     }
 }
 
@@ -182,9 +216,8 @@ pub async fn send_response(
     peer_state: Arc<Mutex<PeerState>>,
     ttl: u8,
     to: SocketAddr,
-    last_broadcast_time: Arc<Mutex<Option<Instant>>>,
+    last_broadcast_time: Arc<Mutex<Instant>>,
 ) {
-    let peer_state = *peer_state.lock().unwrap();
     send_peer_state(socket, peer_state, ttl, RESPONSE, to, last_broadcast_time).await
 }
 
@@ -198,6 +231,7 @@ pub async fn send_message(
 ) {
     socket.set_broadcast(true).unwrap();
     socket.set_multicast_ttl_v4(2).unwrap();
+    socket.set_multicast_loop_v4(false).unwrap();
 
     let message = encode_message(from, ttl, message_type, payload).unwrap();
 
@@ -206,13 +240,13 @@ pub async fn send_message(
 
 pub async fn send_peer_state(
     socket: Arc<UdpSocket>,
-    peer_state: PeerState,
+    peer_state: Arc<Mutex<PeerState>>,
     ttl: u8,
     message_type: MessageType,
     to: SocketAddr,
-    last_broadcast_time: Arc<Mutex<Option<Instant>>>,
+    last_broadcast_time: Arc<Mutex<Instant>>,
 ) {
-    info!("sending peer state");
+    let peer_state = *peer_state.lock().unwrap();
 
     send_message(
         socket,
@@ -224,11 +258,11 @@ pub async fn send_peer_state(
     )
     .await;
 
-    last_broadcast_time.lock().unwrap().replace(Instant::now());
+    *last_broadcast_time.lock().unwrap() = Instant::now();
 }
 
 pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf: &[u8]) {
-    info!("receiving peer state");
+    debug!("receiving state from peer {}", header.ident);
     let payload = parse_payload(buf).unwrap();
     let node_state: NodeState = NodeState::from_payload(header.ident, &payload);
 
@@ -242,7 +276,7 @@ pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf:
 }
 
 pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
-    info!("receiving bye bye");
+    debug!("receiving bye bye from peer {}", node_id);
     tokio::spawn(async move { tx.send(OnEvent::Byebye(node_id)).await });
 }
 

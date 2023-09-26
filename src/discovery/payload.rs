@@ -35,7 +35,7 @@ pub const PREV_GHOST_TIME_HEADER: PayloadEntryHeader = PayloadEntryHeader {
     size: PREV_GHOST_TIME_SIZE,
 };
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Payload {
     pub entries: Vec<PayloadEntry>,
 }
@@ -125,15 +125,18 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
         }
         START_STOP_STATE_HEADER_KEY => {
             let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + START_STOP_STATE_SIZE as usize;
+            info!("{}", PAYLOAD_ENTRY_HEADER_SIZE);
+            info!("{:?}", &data[PAYLOAD_ENTRY_HEADER_SIZE..]);
+            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + START_STOP_STATE_SIZE as usize;
             let (entry, _) = bincode::decode_from_slice::<StartStopState, _>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
+                &data[PAYLOAD_ENTRY_HEADER_SIZE..],
                 ENCODING_CONFIG,
             )?;
 
             info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::StartStopState(entry));
-            decode(payload, &data[decode_len..])?;
+            // decode(payload, &data[decode_len..])?;
         }
         _ => {
             warn!("unknown payload entry key {:x}", payload_entry_header.key);
