@@ -101,7 +101,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
         TIMELINE_HEADER_KEY => {
             let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + TIMELINE_SIZE as usize;
             let (entry, _) = bincode::decode_from_slice::<Timeline, _>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len as usize],
+                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
                 ENCODING_CONFIG,
             )
             .unwrap();

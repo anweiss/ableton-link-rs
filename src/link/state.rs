@@ -1,6 +1,7 @@
-use std::{mem, time::Duration};
+use std::{mem, sync::Arc, time::Duration};
 
 use bincode::{Decode, Encode};
+use tokio::sync::Mutex;
 
 use crate::discovery::{payload::PayloadEntryHeader, ENCODING_CONFIG};
 
@@ -14,7 +15,7 @@ pub const START_STOP_STATE_HEADER: PayloadEntryHeader = PayloadEntryHeader {
     size: START_STOP_STATE_SIZE,
 };
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SessionState {
     pub timeline: Timeline,
     pub start_stop_state: StartStopState,
@@ -39,7 +40,7 @@ impl ApiStartStopState {
     }
 }
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartStopState {
     pub is_playing: bool,
     pub beats: Beats,
@@ -78,7 +79,7 @@ impl bincode::de::Decode for StartStopState {
 impl StartStopState {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = START_STOP_STATE_HEADER.encode()?;
-        encoded.append(&mut bincode::encode_to_vec(&self, ENCODING_CONFIG)?);
+        encoded.append(&mut bincode::encode_to_vec(self, ENCODING_CONFIG)?);
         Ok(encoded)
     }
 }

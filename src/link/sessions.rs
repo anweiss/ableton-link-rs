@@ -18,7 +18,7 @@ pub const SESSION_MEMBERSHIP_HEADER: PayloadEntryHeader = PayloadEntryHeader {
 
 pub struct ControllerSessions;
 
-#[derive(Clone, Copy, Debug, Encode, Decode, Default)]
+#[derive(Clone, Copy, Debug, Encode, Decode, Default, PartialEq, Eq)]
 pub struct SessionId(pub NodeId);
 
 impl Display for SessionId {

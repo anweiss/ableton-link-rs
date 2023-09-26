@@ -1,8 +1,9 @@
 use core::fmt;
-use std::fmt::Display;
+use std::{fmt::Display, sync::Arc};
 
 use bincode::{Decode, Encode};
 use rand::Rng;
+use tokio::sync::Mutex;
 
 use crate::discovery::payload::{Payload, PayloadEntry};
 
@@ -31,7 +32,7 @@ impl NodeId {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NodeState {
     pub node_id: NodeId,
     pub session_id: SessionId,

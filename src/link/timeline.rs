@@ -35,7 +35,7 @@ impl Timeline {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = TIMELINE_HEADER.encode()?;
-        encoded.append(&mut bincode::encode_to_vec(&self, ENCODING_CONFIG)?);
+        encoded.append(&mut bincode::encode_to_vec(self, ENCODING_CONFIG)?);
         Ok(encoded)
     }
 }
