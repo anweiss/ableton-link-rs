@@ -1,6 +1,8 @@
-use std::{mem, time::Duration};
-
-
+use std::{
+    fmt::{self, Display},
+    mem,
+    time::Duration,
+};
 
 use super::beats::Beats;
 
@@ -9,6 +11,12 @@ pub const TEMPO_SIZE: u32 = mem::size_of::<f64>() as u32;
 #[derive(Default, Debug, PartialEq, Clone, Copy)]
 pub struct Tempo {
     pub value: f64,
+}
+
+impl Display for Tempo {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:.1}", self.value)
+    }
 }
 
 impl From<Duration> for Tempo {

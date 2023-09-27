@@ -96,7 +96,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            info!("decoded payload entry {:?}", entry);
+            // info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::HostTime(entry));
             decode(payload, &data[decode_len..])?;
@@ -109,7 +109,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             )
             .unwrap();
 
-            info!("decoded payload entry {:?}", entry);
+            info!("bpm: {}", entry.tempo);
 
             payload.entries.push(PayloadEntry::Timeline(entry));
             decode(payload, &data[decode_len..])?;
@@ -121,7 +121,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            info!("decoded payload entry {:?}", entry);
+            // info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::SessionMembership(entry));
             decode(payload, &data[decode_len..])?;
@@ -133,7 +133,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            info!("decoded payload entry {:?}", entry);
+            // info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::StartStopState(entry));
             decode(payload, &data[decode_len..])?;
@@ -145,7 +145,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            info!("decoded payload entry {:?}", entry);
+            // info!("decoded payload entry {:?}", entry);
 
             payload
                 .entries

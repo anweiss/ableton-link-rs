@@ -49,7 +49,7 @@ impl Controller {
 
         let timeline = session_state.lock().unwrap().timeline;
 
-        let (tx_measure_peer, _rx_measure_peer) = tokio::sync::mpsc::channel(1);
+        let (tx_measure_peer, mut rx_measure_peer) = tokio::sync::mpsc::channel(1);
 
         Self {
             tempo_callback,
@@ -82,6 +82,7 @@ impl Controller {
                     start_stop_state: StartStopState::default(),
                 },
                 GhostXForm::default(),
+                rx_measure_peer,
             )
             .await,
         }

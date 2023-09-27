@@ -9,7 +9,11 @@ use bincode::{Decode, Encode};
 use tokio::sync::mpsc::Sender;
 use tracing::debug;
 
-use crate::discovery::{payload::PayloadEntryHeader, peers::ControllerPeer, ENCODING_CONFIG};
+use crate::discovery::{
+    payload::PayloadEntryHeader,
+    peers::{ControllerPeer, PeerState},
+    ENCODING_CONFIG,
+};
 
 use super::{ghostxform::GhostXForm, node::NodeId, timeline::Timeline, Result};
 
@@ -69,7 +73,7 @@ pub struct Session {
 pub struct Sessions {
     pub sessions: Arc<Mutex<Vec<Session>>>,
     pub current: Option<SessionId>,
-    pub tx_measure_peer: Sender<()>,
+    pub tx_measure_peer: Sender<PeerState>,
     pub peers: Arc<Mutex<Vec<ControllerPeer>>>,
 }
 
@@ -77,7 +81,7 @@ impl Sessions {
     pub fn new(
         init: Session,
         peers: Arc<Mutex<Vec<ControllerPeer>>>,
-        tx_measure_peer: Sender<()>,
+        tx_measure_peer: Sender<PeerState>,
     ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(vec![init])),

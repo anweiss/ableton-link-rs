@@ -37,6 +37,7 @@ pub struct PeerGateway {
     node_state: NodeState,
     ghost_xform: Arc<Mutex<GhostXForm>>,
     rx_event: Option<Receiver<OnEvent>>,
+    rx_measure_beer: Option<Receiver<PeerState>>,
     tx_peer_event: Sender<PeerEvent>,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
 }
@@ -48,7 +49,11 @@ pub enum OnEvent {
 }
 
 impl PeerGateway {
-    pub async fn new(node_state: NodeState, ghost_xform: GhostXForm) -> Self {
+    pub async fn new(
+        node_state: NodeState,
+        ghost_xform: GhostXForm,
+        rx_measure_peer: Receiver<PeerState>,
+    ) -> Self {
         let (tx_event, rx_event) = mpsc::channel::<OnEvent>(1);
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
@@ -69,6 +74,7 @@ impl PeerGateway {
             node_state,
             ghost_xform: Arc::new(Mutex::new(ghost_xform)),
             rx_event: Some(rx_event),
+            rx_measure_beer: Some(rx_measure_peer),
             tx_peer_event,
             peer_timeouts: Arc::new(Mutex::new(vec![])),
         }
@@ -281,12 +287,13 @@ mod tests {
         init_tracing();
 
         let node_1 = NodeState::default();
-        let mut gw = PeerGateway::new(node_1, GhostXForm::default()).await;
+        let (_, rx) = mpsc::channel::<PeerState>(1);
+        let mut gw = PeerGateway::new(node_1, GhostXForm::default(), rx).await;
 
         let s = new_udp_reuseport(IP_ANY);
         s.set_broadcast(true).unwrap();
         s.set_multicast_ttl_v4(2).unwrap();
-        s.set_multicast_loop_v4(false).unwrap();
+        // s.set_multicast_loop_v4(false).unwrap();
 
         let header = MessageHeader {
             ttl: 5,
@@ -303,6 +310,12 @@ mod tests {
             .unwrap();
 
         info!("test bytes sent");
+
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            std::process::exit(0);
+        });
 
         gw.listen().await;
     }
