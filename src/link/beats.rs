@@ -44,6 +44,10 @@ impl Beats {
     pub fn size_in_byte_stream(self, _beats: Beats) -> u32 {
         todo!()
     }
+
+    pub fn floating(self) -> f64 {
+        self.value as f64 / 1e6
+    }
 }
 
 impl From<Beats> for f64 {

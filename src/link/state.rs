@@ -1,7 +1,6 @@
 use std::{mem, time::Duration};
 
-use bincode::{Encode};
-
+use bincode::Encode;
 
 use crate::discovery::{payload::PayloadEntryHeader, ENCODING_CONFIG};
 

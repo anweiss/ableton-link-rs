@@ -1,22 +1,17 @@
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize},
-    Arc,
+    Arc, Mutex,
 };
-
-use tokio::sync::Mutex;
 
 use crate::{
     clock::Clock,
-    discovery::{
-        gateway::PeerGateway,
-        peers::{ControllerPeer},
-    },
+    discovery::{gateway::PeerGateway, peers::ControllerPeer},
 };
 
 use super::{
     ghostxform::GhostXForm,
     node::{NodeId, NodeState},
-    sessions::{ControllerClientState, ControllerSessions, SessionId},
+    sessions::{ControllerClientState, Session, SessionId, SessionMeasurement, Sessions},
     state::{SessionState, StartStopState},
     tempo, PeerCountCallback, StartStopCallback, TempoCallback,
 };
@@ -35,7 +30,7 @@ pub struct Controller {
     start_stop_sync_enabled: Arc<AtomicBool>,
     rt_client_state_setter: RtClientStateSetter,
     peers: ControllerPeer,
-    sessions: ControllerSessions,
+    sessions: Sessions,
     discovery: PeerGateway,
 }
 
@@ -52,7 +47,9 @@ impl Controller {
         let session_id = SessionId(node_id);
         let session_state = Arc::new(Mutex::new(init_session_state(tempo, clock)));
 
-        let timeline = session_state.lock().await.timeline;
+        let timeline = session_state.lock().unwrap().timeline;
+
+        let (tx_measure_peer, rx_measure_peer) = tokio::sync::mpsc::channel(1);
 
         Self {
             tempo_callback,
@@ -68,7 +65,15 @@ impl Controller {
             start_stop_sync_enabled: Arc::new(AtomicBool::new(false)),
             rt_client_state_setter: RtClientStateSetter,
             peers: ControllerPeer::default(),
-            sessions: ControllerSessions,
+            sessions: Sessions::new(
+                Session {
+                    session_id,
+                    timeline,
+                    measurement: SessionMeasurement::default(),
+                },
+                Arc::new(Mutex::new(Vec::new())),
+                tx_measure_peer,
+            ),
             discovery: PeerGateway::new(
                 NodeState {
                     node_id,
@@ -87,15 +92,19 @@ impl Controller {
     }
 
     pub async fn update_discovery(&mut self) {
+        let timeline = self.session_state.lock().unwrap().timeline;
+        let start_stop_state = self.session_state.lock().unwrap().start_stop_state;
+        let ghost_xform = self.session_state.lock().unwrap().ghost_xform;
+
         self.discovery
             .update_node_state(
                 NodeState {
                     node_id: self.node_id,
                     session_id: self.session_id,
-                    timeline: self.session_state.lock().await.timeline,
-                    start_stop_state: self.session_state.lock().await.start_stop_state,
+                    timeline,
+                    start_stop_state,
                 },
-                self.session_state.lock().await.ghost_xform,
+                ghost_xform,
             )
             .await;
     }

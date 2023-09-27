@@ -4,6 +4,9 @@ use bincode::{Decode, Encode};
 use tracing::{info, warn};
 
 use crate::link::{
+    measurement::{
+        MeasurementEndpointV4, MEASUREMENT_ENDPOINT_V4_HEADER_KEY, MEASUREMENT_ENDPOINT_V4_SIZE,
+    },
     node::NodeState,
     sessions::{SessionMembership, SESSION_MEMBERSHIP_HEADER_KEY, SESSION_MEMBERSHIP_SIZE},
     state::{StartStopState, START_STOP_STATE_HEADER_KEY, START_STOP_STATE_SIZE},
@@ -125,18 +128,29 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
         }
         START_STOP_STATE_HEADER_KEY => {
             let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + START_STOP_STATE_SIZE as usize;
-            info!("{}", PAYLOAD_ENTRY_HEADER_SIZE);
-            info!("{:?}", &data[PAYLOAD_ENTRY_HEADER_SIZE..]);
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + START_STOP_STATE_SIZE as usize;
             let (entry, _) = bincode::decode_from_slice::<StartStopState, _>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..],
+                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
                 ENCODING_CONFIG,
             )?;
 
             info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::StartStopState(entry));
-            // decode(payload, &data[decode_len..])?;
+            decode(payload, &data[decode_len..])?;
+        }
+        MEASUREMENT_ENDPOINT_V4_HEADER_KEY => {
+            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + MEASUREMENT_ENDPOINT_V4_SIZE as usize;
+            let (entry, _) = bincode::decode_from_slice::<MeasurementEndpointV4, _>(
+                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
+                ENCODING_CONFIG,
+            )?;
+
+            info!("decoded payload entry {:?}", entry);
+
+            payload
+                .entries
+                .push(PayloadEntry::MeasurementEndpointV4(entry));
+            decode(payload, &data[decode_len..])?;
         }
         _ => {
             warn!("unknown payload entry key {:x}", payload_entry_header.key);
@@ -168,6 +182,7 @@ pub enum PayloadEntry {
     Timeline(Timeline),
     SessionMembership(SessionMembership),
     StartStopState(StartStopState),
+    MeasurementEndpointV4(MeasurementEndpointV4),
 }
 
 impl PayloadEntry {
@@ -179,6 +194,7 @@ impl PayloadEntry {
             PayloadEntry::Timeline(_) => TIMELINE_SIZE,
             PayloadEntry::SessionMembership(_) => SESSION_MEMBERSHIP_SIZE,
             PayloadEntry::StartStopState(_) => START_STOP_STATE_SIZE,
+            PayloadEntry::MeasurementEndpointV4(_) => MEASUREMENT_ENDPOINT_V4_SIZE,
         }
     }
 
@@ -190,6 +206,9 @@ impl PayloadEntry {
             PayloadEntry::Timeline(timeline) => timeline.encode(),
             PayloadEntry::SessionMembership(session_membership) => session_membership.encode(),
             PayloadEntry::StartStopState(start_stop_state) => start_stop_state.encode(),
+            PayloadEntry::MeasurementEndpointV4(measurement_endpoint_v4) => {
+                measurement_endpoint_v4.encode()
+            }
         }
     }
 }

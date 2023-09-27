@@ -1,6 +1,6 @@
 use std::{mem, time::Duration};
 
-use bincode::{Encode};
+use bincode::Encode;
 
 use crate::discovery::{payload::PayloadEntryHeader, ENCODING_CONFIG};
 
@@ -19,9 +19,9 @@ pub const TIMELINE_HEADER: PayloadEntryHeader = PayloadEntryHeader {
 
 #[derive(PartialEq, Clone, Default, Debug, Copy)]
 pub struct Timeline {
-    tempo: Tempo,
-    beat_origin: Beats,
-    time_origin: Duration,
+    pub tempo: Tempo,
+    pub beat_origin: Beats,
+    pub time_origin: Duration,
 }
 
 impl Timeline {

@@ -54,6 +54,53 @@ impl GatewayObserver {
 
         gwo
     }
+
+    pub fn session_peers(&self, session_id: &SessionId) -> Vec<ControllerPeer> {
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.peer_state.session_id() == *session_id)
+            .copied()
+            .collect::<Vec<_>>();
+        peers.sort_by(|a, b| a.peer_state.ident().cmp(&b.peer_state.ident()));
+
+        peers
+    }
+
+    pub fn unique_session_peer_count(&self, session_id: &SessionId) -> usize {
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.peer_state.session_id() == *session_id)
+            .copied()
+            .collect::<Vec<_>>();
+        peers.dedup_by(|a, b| a.peer_state.ident() == b.peer_state.ident());
+
+        peers.len()
+    }
+
+    pub fn set_session_timeline(&mut self, session_id: &SessionId, timeline: Timeline) {
+        self.peers.lock().unwrap().iter_mut().for_each(|peer| {
+            if peer.peer_state.session_id() == *session_id {
+                peer.peer_state.node_state.timeline = timeline;
+            }
+        });
+    }
+
+    pub fn forget_session(&mut self, session_id: &SessionId) {
+        self.peers
+            .lock()
+            .unwrap()
+            .retain(|peer| peer.peer_state.session_id() != *session_id);
+    }
+
+    pub fn reset_peers(&mut self) {
+        self.peers.lock().unwrap().clear();
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -140,7 +187,7 @@ async fn peer_timed_out(_peer_id: SocketAddr, _new_state: PeerStateMessageType) 
     todo!()
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct ControllerPeer {
     pub peer_state: PeerState,
 }

@@ -1,9 +1,8 @@
 use core::fmt;
-use std::{fmt::Display};
+use std::fmt::Display;
 
 use bincode::{Decode, Encode};
 use rand::Rng;
-
 
 use crate::discovery::payload::{Payload, PayloadEntry};
 
@@ -11,7 +10,7 @@ use super::{sessions::SessionId, state::StartStopState, timeline::Timeline};
 
 pub type NodeIdArray = [u8; 8];
 
-#[derive(Default, Clone, Copy, Debug, Encode, Decode, Eq, PartialEq)]
+#[derive(Default, Clone, Copy, Debug, Encode, Decode, Eq, PartialEq, PartialOrd, Ord)]
 pub struct NodeId(NodeIdArray);
 
 impl Display for NodeId {
