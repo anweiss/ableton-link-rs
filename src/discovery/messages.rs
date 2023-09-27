@@ -1,7 +1,7 @@
 use std::mem;
 
 use bincode::{Decode, Encode};
-use tracing::info;
+
 
 use crate::{
     discovery::{payload, ENCODING_CONFIG},

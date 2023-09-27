@@ -1,5 +1,4 @@
 use std::{
-    ops::DerefMut,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -75,7 +74,7 @@ impl PeerGateway {
         }
     }
 
-    pub async fn update_node_state(&mut self, node_state: NodeState, ghost_xform: GhostXForm) {
+    pub async fn update_node_state(&mut self, node_state: NodeState, _ghost_xform: GhostXForm) {
         // TODO: measure update node state
         self.messenger
             .update_state(PeerState {
@@ -85,7 +84,7 @@ impl PeerGateway {
             .await
     }
 
-    pub async fn measure_peer(&mut self, peer: &PeerStateMessageType) {
+    pub async fn measure_peer(&mut self, _peer: &PeerStateMessageType) {
         todo!()
     }
 

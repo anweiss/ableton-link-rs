@@ -173,7 +173,7 @@ impl Sessions {
         }
     }
 
-    pub fn launch_session_measurement(&mut self, session: &Session) {
+    pub fn launch_session_measurement(&mut self, _session: &Session) {
         todo!()
     }
 }
