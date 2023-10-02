@@ -76,16 +76,16 @@ impl Default for SessionMeasurement {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Session {
-    pub session_id: SessionId,
+    pub session_id: Arc<Mutex<SessionId>>,
     pub timeline: Timeline,
     pub measurement: SessionMeasurement,
 }
 
 pub struct Sessions {
     pub sessions: Arc<Mutex<Vec<Session>>>,
-    pub current: Option<SessionId>,
+    pub current: Option<Arc<Mutex<SessionId>>>,
     pub tx_measure_peer: Sender<PeerState>,
     pub peers: Arc<Mutex<Vec<ControllerPeer>>>,
 }
@@ -97,8 +97,8 @@ impl Sessions {
         tx_measure_peer: Sender<PeerState>,
     ) -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(vec![init])),
-            current: Some(init.session_id),
+            sessions: Arc::new(Mutex::new(vec![init.clone()])),
+            current: Some(init.session_id.clone()),
             tx_measure_peer,
             peers,
         }
@@ -109,14 +109,14 @@ impl Sessions {
         self.sessions.lock().unwrap().clear()
     }
 
-    pub fn reset_timeline(&mut self, timeline: Timeline) {
-        if let Some(current) = self.current {
+    pub fn reset_timeline(&self, timeline: Timeline) {
+        if let Some(current) = &self.current {
             if let Some(session) = self
                 .sessions
                 .lock()
                 .unwrap()
                 .iter_mut()
-                .find(|s| s.session_id == current)
+                .find(|s| *s.session_id.lock().unwrap() == *current.lock().unwrap())
             {
                 session.timeline = timeline;
             }
@@ -124,16 +124,16 @@ impl Sessions {
     }
 
     pub fn saw_session_timeline(
-        &mut self,
-        session_id: SessionId,
+        &self,
+        session_id: Arc<Mutex<SessionId>>,
         timeline: Timeline,
     ) -> Option<Timeline> {
-        if let Some(current) = self.current {
-            if current == session_id {
-                self.update_timeline(current, timeline);
+        if let Some(current) = &self.current {
+            if *current.lock().unwrap() == *session_id.lock().unwrap() {
+                self.update_timeline(current.clone(), timeline);
             } else {
                 let session = Session {
-                    session_id,
+                    session_id: session_id.clone(),
                     timeline,
                     measurement: SessionMeasurement {
                         x_form: GhostXForm::default(),
@@ -146,9 +146,9 @@ impl Sessions {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|s| s.session_id == session_id)
+                    .any(|s| *s.session_id.lock().unwrap() == *session_id.lock().unwrap())
                 {
-                    self.update_timeline(session.session_id, timeline);
+                    self.update_timeline(session.session_id.clone(), timeline);
                 } else {
                     self.launch_session_measurement(&session);
                     self.sessions.lock().unwrap().push(session);
@@ -160,20 +160,20 @@ impl Sessions {
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|s| s.session_id == session_id)
+                .find(|s| *s.session_id.lock().unwrap() == *session_id.lock().unwrap())
                 .map(|s| s.timeline);
         }
 
         None
     }
 
-    pub fn update_timeline(&mut self, session_id: SessionId, timeline: Timeline) {
+    pub fn update_timeline(&self, session_id: Arc<Mutex<SessionId>>, timeline: Timeline) {
         if let Some(session) = self
             .sessions
             .lock()
             .unwrap()
             .iter_mut()
-            .find(|s| s.session_id == session_id)
+            .find(|s| *s.session_id.lock().unwrap() == *session_id.lock().unwrap())
         {
             if timeline.beat_origin > session.timeline.beat_origin {
                 debug!(
@@ -193,7 +193,7 @@ impl Sessions {
         }
     }
 
-    pub fn launch_session_measurement(&mut self, _session: &Session) {
+    pub fn launch_session_measurement(&self, _session: &Session) {
         todo!()
     }
 }

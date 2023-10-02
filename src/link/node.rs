@@ -1,5 +1,8 @@
 use core::fmt;
-use std::fmt::Display;
+use std::{
+    fmt::Display,
+    sync::{Arc, Mutex},
+};
 
 use bincode::{Decode, Encode};
 use rand::Rng;
@@ -34,19 +37,18 @@ impl NodeId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct NodeState {
     pub node_id: NodeId,
-    pub session_id: SessionId,
+    pub session_id: Arc<Mutex<SessionId>>,
     pub timeline: Timeline,
     pub start_stop_state: StartStopState,
 }
 
-impl Default for NodeState {
-    fn default() -> Self {
+impl NodeState {
+    pub fn new(session_id: Arc<Mutex<SessionId>>) -> Self {
         let mut rng = rand::thread_rng();
         let node_id = NodeId::random(&mut rng);
-        let session_id = SessionId(node_id);
 
         NodeState {
             node_id,
@@ -55,9 +57,7 @@ impl Default for NodeState {
             start_stop_state: StartStopState::default(),
         }
     }
-}
 
-impl NodeState {
     pub fn ident(&self) -> NodeId {
         self.node_id
     }
@@ -65,7 +65,9 @@ impl NodeState {
     pub fn from_payload(node_id: NodeId, payload: &Payload) -> Self {
         let mut node_state = NodeState {
             node_id,
-            ..Default::default()
+            session_id: Arc::new(Mutex::new(SessionId::default())),
+            timeline: Timeline::default(),
+            start_stop_state: StartStopState::default(),
         };
 
         for entry in &payload.entries {
@@ -74,7 +76,7 @@ impl NodeState {
                     node_state.timeline = *tl;
                 }
                 PayloadEntry::SessionMembership(sm) => {
-                    node_state.session_id = sm.session_id;
+                    node_state.session_id = Arc::new(Mutex::new(sm.session_id));
                 }
                 PayloadEntry::StartStopState(ststst) => {
                     node_state.start_stop_state = *ststst;

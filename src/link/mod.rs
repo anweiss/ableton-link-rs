@@ -27,9 +27,9 @@ pub type TempoCallback = Arc<Mutex<Box<dyn Fn(tempo::Tempo) + Send>>>;
 pub type StartStopCallback = Arc<Mutex<Box<dyn Fn(bool) + Send>>>;
 
 pub struct BasicLink {
-    peer_count_callback: Option<PeerCountCallback>,
-    tempo_callback: Option<TempoCallback>,
-    start_stop_callback: Option<StartStopCallback>,
+    // peer_count_callback: Option<PeerCountCallback>,
+    // tempo_callback: Option<TempoCallback>,
+    // start_stop_callback: Option<StartStopCallback>,
     controller: Controller,
 }
 
@@ -38,13 +38,12 @@ impl BasicLink {
         let subscriber = tracing_subscriber::FmtSubscriber::new();
         tracing::subscriber::set_global_default(subscriber).unwrap();
 
-        let controller =
-            Controller::new(tempo::Tempo::new(bpm), None, None, None, Clock::new()).await;
+        let controller = Controller::new(tempo::Tempo::new(bpm), Clock::new()).await;
 
         Self {
-            peer_count_callback: None,
-            tempo_callback: None,
-            start_stop_callback: None,
+            // peer_count_callback: None,
+            // tempo_callback: None,
+            // start_stop_callback: None,
             controller,
         }
     }

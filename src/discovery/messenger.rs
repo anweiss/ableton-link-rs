@@ -248,17 +248,10 @@ pub async fn send_peer_state(
     to: SocketAddr,
     last_broadcast_time: Arc<Mutex<Instant>>,
 ) {
-    let peer_state = *peer_state.lock().unwrap();
+    let ident = peer_state.lock().unwrap().ident();
+    let node_state = peer_state.lock().unwrap().node_state.clone();
 
-    send_message(
-        socket,
-        peer_state.ident(),
-        ttl,
-        message_type,
-        &peer_state.node_state.into(),
-        to,
-    )
-    .await;
+    send_message(socket, ident, ttl, message_type, &node_state.into(), to).await;
 
     *last_broadcast_time.lock().unwrap() = Instant::now();
 }

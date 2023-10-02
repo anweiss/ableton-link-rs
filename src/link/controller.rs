@@ -13,25 +13,28 @@ use super::{
     ghostxform::GhostXForm,
     node::{NodeId, NodeState},
     sessions::{Session, SessionId, SessionMeasurement, Sessions},
-    state::{ControllerClientState, SessionState, StartStopState},
+    state::{
+        ClientStartStopState, ClientState, ControllerClientState, SessionState, StartStopState,
+    },
     tempo,
     timeline::{clamp_tempo, Timeline},
-    PeerCountCallback, StartStopCallback, TempoCallback,
 };
 
+pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
+
 pub struct Controller {
-    tempo_callback: Option<TempoCallback>,
-    start_stop_callback: Option<StartStopCallback>,
+    // tempo_callback: Option<TempoCallback>,
+    // start_stop_callback: Option<StartStopCallback>,
     node_id: NodeId,
-    session_id: SessionId,
+    session_id: Arc<Mutex<SessionId>>,
     session_state: Arc<Mutex<SessionState>>,
-    client_state: Arc<Mutex<ControllerClientState>>,
+    client_state: Arc<Mutex<ClientState>>,
     // last_is_playing_for_start_stop_state_callback: bool,
-    has_pending_rt_client_states: Arc<AtomicBool>,
-    session_peer_counter: SessionPeerCounter,
+    // has_pending_rt_client_states: Arc<AtomicBool>,
+    session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
     start_stop_sync_enabled: Arc<AtomicBool>,
-    rt_client_state_setter: RtClientStateSetter,
-    peers: ControllerPeer,
+    // rt_client_state_setter: RtClientStateSetter,
+    // peers: ControllerPeer,
     sessions: Sessions,
     discovery: PeerGateway,
     clock: Clock,
@@ -40,36 +43,38 @@ pub struct Controller {
 impl Controller {
     pub async fn new(
         tempo: tempo::Tempo,
-        peer_count_callback: Option<PeerCountCallback>,
-        tempo_callback: Option<TempoCallback>,
-        start_stop_callback: Option<StartStopCallback>,
+        // peer_count_callback: Option<PeerCountCallback>,
+        // tempo_callback: Option<TempoCallback>,
+        // start_stop_callback: Option<StartStopCallback>,
         clock: Clock,
     ) -> Self {
         let mut rng = rand::thread_rng();
         let node_id = NodeId::random(&mut rng);
-        let session_id = SessionId(node_id);
-        let session_state = Arc::new(Mutex::new(init_session_state(tempo, clock)));
+        let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
+        let session_id = Arc::new(Mutex::new(SessionId(node_id)));
+        let session_state = init_session_state(tempo, clock);
+        let client_state = Arc::new(Mutex::new(init_client_state(session_state)));
 
-        let timeline = session_state.lock().unwrap().timeline;
+        let timeline = session_state.timeline;
 
         let (tx_measure_peer, rx_measure_peer) = tokio::sync::mpsc::channel(1);
 
         Self {
-            tempo_callback,
-            start_stop_callback,
+            // tempo_callback,
+            // start_stop_callback,
             node_id,
-            session_id,
-            session_state: session_state.clone(),
-            client_state: Arc::new(Mutex::new(ControllerClientState::default())),
+            session_id: session_id.clone(),
+            session_state: Arc::new(Mutex::new(session_state)),
+            client_state,
             // last_is_playing_for_start_stop_state_callback: false,
-            has_pending_rt_client_states: Arc::new(AtomicBool::new(false)),
-            session_peer_counter: SessionPeerCounter::new(peer_count_callback),
+            // has_pending_rt_client_states: Arc::new(AtomicBool::new(false)),
+            session_peer_counter: session_peer_counter.clone(),
             start_stop_sync_enabled: Arc::new(AtomicBool::new(false)),
-            rt_client_state_setter: RtClientStateSetter,
-            peers: ControllerPeer::default(),
+            // rt_client_state_setter: RtClientStateSetter,
+            // peers: ControllerPeer::default(),
             sessions: Sessions::new(
                 Session {
-                    session_id,
+                    session_id: session_id.clone(),
                     timeline,
                     measurement: SessionMeasurement::default(),
                 },
@@ -79,13 +84,14 @@ impl Controller {
             discovery: PeerGateway::new(
                 NodeState {
                     node_id,
-                    session_id,
+                    session_id: session_id.clone(),
                     timeline,
                     start_stop_state: StartStopState::default(),
                 },
                 GhostXForm::default(),
                 rx_measure_peer,
                 clock,
+                session_peer_counter,
             )
             .await,
             clock,
@@ -105,7 +111,7 @@ impl Controller {
             .update_node_state(
                 NodeState {
                     node_id: self.node_id,
-                    session_id: self.session_id,
+                    session_id: self.session_id.clone(),
                     timeline,
                     start_stop_state,
                 },
@@ -138,18 +144,67 @@ fn init_session_state(tempo: tempo::Tempo, clock: Clock) -> SessionState {
     }
 }
 
-pub struct SessionPeerCounter {
-    callback: Option<PeerCountCallback>,
-    session_peer_count: AtomicUsize,
-}
+fn init_client_state(session_state: SessionState) -> ClientState {
+    let host_time = session_state
+        .ghost_x_form
+        .ghost_to_host(Duration::microseconds(0));
 
-impl SessionPeerCounter {
-    pub fn new(callback: Option<PeerCountCallback>) -> Self {
-        Self {
-            callback,
-            session_peer_count: AtomicUsize::new(0),
-        }
+    ClientState {
+        timeline: Timeline {
+            tempo: session_state.timeline.tempo,
+            beat_origin: session_state.timeline.beat_origin,
+            time_origin: host_time,
+        },
+        start_stop_state: ClientStartStopState {
+            is_playing: session_state.start_stop_state.is_playing,
+            time: host_time,
+            timestamp: host_time,
+        },
     }
 }
 
-pub struct RtClientStateSetter;
+fn select_preferred_start_stop_state(
+    current_start_stop_state: ClientStartStopState,
+    start_stop_state: ClientStartStopState,
+) -> ClientStartStopState {
+    if start_stop_state.timestamp > current_start_stop_state.timestamp {
+        return start_stop_state;
+    }
+
+    current_start_stop_state
+}
+
+fn map_start_stop_state_form_session_to_client(
+    session_start_stop_state: StartStopState,
+    session_timeline: Timeline,
+    x_form: GhostXForm,
+) -> ClientStartStopState {
+    let time = x_form.ghost_to_host(session_timeline.from_beats(session_start_stop_state.beats));
+    let timestamp = x_form.ghost_to_host(session_start_stop_state.timestamp);
+    ClientStartStopState {
+        is_playing: session_start_stop_state.is_playing,
+        time,
+        timestamp,
+    }
+}
+
+fn map_start_stop_state_from_client_to_session(
+    client_start_stop_state: ClientStartStopState,
+    session_timeline: Timeline,
+    x_form: GhostXForm,
+) -> StartStopState {
+    let session_beats =
+        session_timeline.to_beats(x_form.host_to_ghost(client_start_stop_state.time));
+    let timestamp = x_form.host_to_ghost(client_start_stop_state.timestamp);
+    StartStopState {
+        is_playing: client_start_stop_state.is_playing,
+        beats: session_beats,
+        timestamp,
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SessionPeerCounter {
+    // callback: Option<PeerCountCallback>,
+    session_peer_count: usize,
+}

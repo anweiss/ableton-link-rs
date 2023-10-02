@@ -74,7 +74,7 @@ impl From<NodeState> for Payload {
         Payload {
             entries: vec![
                 PayloadEntry::Timeline(value.timeline),
-                PayloadEntry::SessionMembership(value.session_id.into()),
+                PayloadEntry::SessionMembership((*value.session_id.lock().unwrap()).into()),
                 PayloadEntry::StartStopState(value.start_stop_state),
             ],
         }

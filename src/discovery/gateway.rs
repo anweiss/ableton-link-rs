@@ -17,9 +17,10 @@ use crate::{
     },
     link::{
         clock::Clock,
+        controller::SessionPeerCounter,
         ghostxform::GhostXForm,
         measurement::MeasurementService,
-        node::{NodeId, NodeState},
+        node::{self, NodeId, NodeState},
         payload::Payload,
     },
 };
@@ -40,6 +41,7 @@ pub struct PeerGateway {
     rx_measure_peer: Option<Receiver<PeerState>>,
     tx_peer_event: Sender<PeerEvent>,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
+    session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
 }
 
 #[derive(Clone)]
@@ -54,13 +56,14 @@ impl PeerGateway {
         ghost_xform: GhostXForm,
         rx_measure_peer: Receiver<PeerState>,
         clock: Clock,
+        session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
     ) -> Self {
         let (tx_event, rx_event) = mpsc::channel::<OnEvent>(1);
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
         let messenger = Messenger::new(
             PeerState {
-                node_state,
+                node_state: node_state.clone(),
                 endpoint: None,
             },
             tx_event.clone(),
@@ -81,7 +84,7 @@ impl PeerGateway {
             messenger,
             measurement: MeasurementService::new(
                 unicast_socket,
-                node_state.session_id,
+                node_state.session_id.clone(),
                 ghost_xform,
                 clock,
             )
@@ -92,12 +95,13 @@ impl PeerGateway {
             rx_measure_peer: Some(rx_measure_peer),
             tx_peer_event,
             peer_timeouts: Arc::new(Mutex::new(vec![])),
+            session_peer_counter,
         }
     }
 
-    pub async fn update_node_state(&self, node_state: NodeState, _ghost_xform: GhostXForm) {
+    pub async fn update_node_state(&mut self, node_state: NodeState, _ghost_xform: GhostXForm) {
         self.measurement
-            .update_node_state(node_state.session_id, _ghost_xform)
+            .update_node_state(node_state.session_id.clone(), _ghost_xform)
             .await;
         self.messenger
             .update_state(PeerState {
@@ -113,7 +117,7 @@ impl PeerGateway {
 
     pub async fn listen(&mut self) {
         let ctrl_socket = self.messenger.interface.as_ref().unwrap().clone();
-        let node_state = self.node_state;
+        let node_state = self.node_state.clone();
 
         self.messenger.listen().await;
 
@@ -278,10 +282,13 @@ impl Drop for PeerGateway {
 
 #[cfg(test)]
 mod tests {
-    use crate::discovery::{
-        messages::{MessageHeader, ALIVE, PROTOCOL_HEADER},
-        messenger::new_udp_reuseport,
-        ENCODING_CONFIG, IP_ANY, LINK_PORT, MULTICAST_ADDR,
+    use crate::{
+        discovery::{
+            messages::{MessageHeader, ALIVE, PROTOCOL_HEADER},
+            messenger::new_udp_reuseport,
+            ENCODING_CONFIG, IP_ANY, LINK_PORT, MULTICAST_ADDR,
+        },
+        link::sessions::SessionId,
     };
 
     use super::*;
@@ -296,9 +303,17 @@ mod tests {
     async fn test_gateway() {
         init_tracing();
 
-        let node_1 = NodeState::default();
+        let session_id = Arc::new(Mutex::new(SessionId::default()));
+        let node_1 = NodeState::new(session_id.clone());
         let (_, rx) = mpsc::channel::<PeerState>(1);
-        let mut gw = PeerGateway::new(node_1, GhostXForm::default(), rx, Clock::new()).await;
+        let mut gw = PeerGateway::new(
+            node_1,
+            GhostXForm::default(),
+            rx,
+            Clock::new(),
+            Arc::new(Mutex::new(SessionPeerCounter::default())),
+        )
+        .await;
 
         let s = new_udp_reuseport(IP_ANY);
         s.set_broadcast(true).unwrap();
@@ -307,7 +322,7 @@ mod tests {
 
         let header = MessageHeader {
             ttl: 5,
-            ident: NodeState::default().ident(),
+            ident: NodeState::new(session_id.clone()).ident(),
             message_type: ALIVE,
             ..Default::default()
         };

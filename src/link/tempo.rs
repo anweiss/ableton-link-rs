@@ -1,8 +1,9 @@
 use std::{
     fmt::{self, Display},
     mem,
-    time::Duration,
 };
+
+use chrono::Duration;
 
 use super::beats::Beats;
 
@@ -22,7 +23,7 @@ impl Display for Tempo {
 impl From<Duration> for Tempo {
     fn from(value: Duration) -> Self {
         Tempo {
-            value: 60.0 * 1e6 / value.as_micros() as f64,
+            value: 60.0 * 1e6 / value.num_microseconds().unwrap() as f64,
         }
     }
 }
@@ -37,16 +38,20 @@ impl Tempo {
     }
 
     pub fn micros_per_beat(&self) -> Duration {
-        Duration::from_micros((60.0 * 1e6 / self.bpm()).round() as u64)
+        Duration::microseconds((60.0 * 1e6 / self.bpm()).round() as i64)
     }
 
-    pub fn micros_to_beats(&self, micros: u64) -> Beats {
-        Beats::new(micros as f64 / self.micros_per_beat().as_micros() as f64)
+    pub fn micros_to_beats(&self, micros: Duration) -> Beats {
+        Beats::new(
+            micros.num_microseconds().unwrap() as f64
+                / self.micros_per_beat().num_microseconds().unwrap() as f64,
+        )
     }
 
     pub fn beats_to_micros(&self, beats: Beats) -> Duration {
-        Duration::from_micros(
-            (beats.floating() * self.micros_per_beat().as_micros() as f64).round() as u64,
+        Duration::microseconds(
+            (beats.floating() * self.micros_per_beat().num_microseconds().unwrap() as f64).round()
+                as i64,
         )
     }
 }
@@ -56,7 +61,7 @@ impl bincode::Encode for Tempo {
         &self,
         encoder: &mut E,
     ) -> std::result::Result<(), bincode::error::EncodeError> {
-        bincode::Encode::encode(&self.micros_per_beat().as_micros(), encoder)
+        bincode::Encode::encode(&self.micros_per_beat().num_microseconds().unwrap(), encoder)
     }
 }
 
@@ -64,7 +69,7 @@ impl bincode::Decode for Tempo {
     fn decode<D: bincode::de::Decoder>(
         decoder: &mut D,
     ) -> std::result::Result<Self, bincode::error::DecodeError> {
-        Ok(Self::from(Duration::from_micros(bincode::Decode::decode(
+        Ok(Self::from(Duration::microseconds(bincode::Decode::decode(
             decoder,
         )?)))
     }

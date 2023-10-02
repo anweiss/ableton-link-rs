@@ -85,7 +85,7 @@ pub struct MeasurementService {
 impl MeasurementService {
     pub async fn new(
         unicast_socket: Arc<UdpSocket>,
-        session_id: SessionId,
+        session_id: Arc<Mutex<SessionId>>,
         ghost_x_form: GhostXForm,
         clock: Clock,
     ) -> MeasurementService {
@@ -97,7 +97,11 @@ impl MeasurementService {
         }
     }
 
-    pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
+    pub async fn update_node_state(
+        &mut self,
+        session_id: Arc<Mutex<SessionId>>,
+        x_form: GhostXForm,
+    ) {
         self.ping_responder
             .update_node_state(session_id, x_form)
             .await;
@@ -115,7 +119,7 @@ enum TimerStatus {
 #[derive(Debug)]
 pub struct Measurement {
     pub socket: Option<Arc<UdpSocket>>,
-    pub session_id: SessionId,
+    pub session_id: Arc<Mutex<SessionId>>,
     pub endpoint: Option<SocketAddrV4>,
     pub data: Arc<Mutex<Vec<f64>>>,
     pub clock: Clock,
@@ -131,7 +135,7 @@ impl Measurement {
 
         let mut measurement = Measurement {
             socket: Some(socket.clone()),
-            session_id: state.node_state.session_id,
+            session_id: state.node_state.session_id.clone(),
             endpoint: state.endpoint,
             data: Arc::new(Mutex::new(vec![])),
             clock,
@@ -202,7 +206,7 @@ impl Measurement {
     pub async fn listen(&mut self) {
         let socket = self.socket.as_ref().unwrap().clone();
         let clock = self.clock;
-        let s_id = self.session_id;
+        let s_id = self.session_id.clone();
         let data = self.data.clone();
         let tx_timer = self.tx_timer.clone();
 
@@ -238,7 +242,7 @@ impl Measurement {
                         }
                     }
 
-                    if s_id == session_id {
+                    if *s_id.lock().unwrap() == session_id {
                         let host_time = clock.micros();
                         let payload = Payload {
                             entries: vec![

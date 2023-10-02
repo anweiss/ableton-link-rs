@@ -27,12 +27,12 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    fn to_beats(&self, _time: Duration) -> Beats {
-        todo!()
+    pub fn to_beats(&self, time: Duration) -> Beats {
+        self.beat_origin + self.tempo.micros_to_beats(time - self.time_origin)
     }
 
-    fn from_beats(&self, _beats: Beats) -> Duration {
-        todo!()
+    pub fn from_beats(&self, beats: Beats) -> Duration {
+        self.time_origin + self.tempo.beats_to_micros(beats - self.beat_origin)
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {

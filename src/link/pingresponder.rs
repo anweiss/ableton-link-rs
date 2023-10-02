@@ -55,13 +55,13 @@ pub struct PingResponder {
 impl PingResponder {
     pub async fn new(
         unicast_socket: Arc<UdpSocket>,
-        session_id: SessionId,
+        session_id: Arc<Mutex<SessionId>>,
         ghost_x_form: GhostXForm,
         clock: Clock,
     ) -> Self {
         let pr = PingResponder {
             unicast_socket: Some(unicast_socket),
-            session_id: Arc::new(Mutex::new(session_id)),
+            session_id,
             ghost_x_form: Arc::new(Mutex::new(ghost_x_form)),
             clock,
         };
@@ -118,8 +118,12 @@ impl PingResponder {
         });
     }
 
-    pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
-        *self.session_id.lock().unwrap() = session_id;
+    pub async fn update_node_state(
+        &mut self,
+        session_id: Arc<Mutex<SessionId>>,
+        x_form: GhostXForm,
+    ) {
+        self.session_id = session_id;
         *self.ghost_x_form.lock().unwrap() = x_form;
     }
 }
