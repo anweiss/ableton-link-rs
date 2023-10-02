@@ -1,9 +1,7 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::sync::{Arc, Mutex};
 
 use async_recursion::async_recursion;
+use chrono::Duration;
 use tokio::{
     select,
     sync::mpsc::{self, Receiver, Sender},
@@ -14,13 +12,15 @@ use tracing::{debug, info};
 use crate::{
     discovery::{
         messages::{encode_message, BYEBYE},
-        payload::Payload,
-        LINK_PORT, MULTICAST_ADDR,
+        messenger::new_udp_reuseport,
+        IP_ANY, LINK_PORT, MULTICAST_ADDR,
     },
     link::{
+        clock::Clock,
         ghostxform::GhostXForm,
         measurement::MeasurementService,
         node::{NodeId, NodeState},
+        payload::Payload,
     },
 };
 
@@ -37,7 +37,7 @@ pub struct PeerGateway {
     node_state: NodeState,
     ghost_xform: Arc<Mutex<GhostXForm>>,
     rx_event: Option<Receiver<OnEvent>>,
-    rx_measure_beer: Option<Receiver<PeerState>>,
+    rx_measure_peer: Option<Receiver<PeerState>>,
     tx_peer_event: Sender<PeerEvent>,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
 }
@@ -53,35 +53,52 @@ impl PeerGateway {
         node_state: NodeState,
         ghost_xform: GhostXForm,
         rx_measure_peer: Receiver<PeerState>,
+        clock: Clock,
     ) -> Self {
         let (tx_event, rx_event) = mpsc::channel::<OnEvent>(1);
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
+        let messenger = Messenger::new(
+            PeerState {
+                node_state,
+                endpoint: None,
+            },
+            tx_event.clone(),
+            epoch,
+        )
+        .await;
+
+        info!(
+            "initializing peer gateway on interface {}",
+            messenger.interface.as_ref().unwrap().local_addr().unwrap()
+        );
+
+        let unicast_socket = Arc::new(new_udp_reuseport(IP_ANY));
 
         PeerGateway {
             epoch,
             observer: GatewayObserver::new(rx_peer_event).await,
-            messenger: Messenger::new(
-                PeerState {
-                    node_state,
-                    endpoint: None,
-                },
-                tx_event.clone(),
-                epoch,
+            messenger,
+            measurement: MeasurementService::new(
+                unicast_socket,
+                node_state.session_id,
+                ghost_xform,
+                clock,
             )
             .await,
-            measurement: MeasurementService::default(),
             node_state,
             ghost_xform: Arc::new(Mutex::new(ghost_xform)),
             rx_event: Some(rx_event),
-            rx_measure_beer: Some(rx_measure_peer),
+            rx_measure_peer: Some(rx_measure_peer),
             tx_peer_event,
             peer_timeouts: Arc::new(Mutex::new(vec![])),
         }
     }
 
-    pub async fn update_node_state(&mut self, node_state: NodeState, _ghost_xform: GhostXForm) {
-        // TODO: measure update node state
+    pub async fn update_node_state(&self, node_state: NodeState, _ghost_xform: GhostXForm) {
+        self.measurement
+            .update_node_state(node_state.session_id, _ghost_xform)
+            .await;
         self.messenger
             .update_state(PeerState {
                 node_state,
@@ -95,16 +112,6 @@ impl PeerGateway {
     }
 
     pub async fn listen(&mut self) {
-        info!(
-            "initializing peer gateway on interface {}",
-            self.messenger
-                .interface
-                .as_ref()
-                .unwrap()
-                .local_addr()
-                .unwrap()
-        );
-
         let ctrl_socket = self.messenger.interface.as_ref().unwrap().clone();
         let node_state = self.node_state;
 
@@ -118,6 +125,9 @@ impl PeerGateway {
                         OnEvent::Byebye(node_id) => self.on_byebye(node_id).await,
                     }
                 }
+                // peer = self.rx_measure_peer.as_mut().unwrap().recv() => {
+                //     todo!()
+                // }
                 // byebye upon program termination
                 _ = tokio::signal::ctrl_c() => {
                     ctrl_socket.set_broadcast(true).unwrap();
@@ -144,7 +154,7 @@ impl PeerGateway {
             .retain(|(_, id)| id != &peer_id);
 
         let new_to = (
-            Instant::now() + Duration::from_secs(msg.ttl as u64),
+            Instant::now() + Duration::seconds(msg.ttl as i64).to_std().unwrap(),
             peer_id,
         );
 
@@ -206,7 +216,7 @@ pub async fn schedule_next_pruning(
 
     let pt = peer_timeouts.lock().unwrap();
     let (timeout, peer_id) = pt.first().unwrap();
-    let timeout = timeout.duration_since(epoch) + Duration::from_secs(1);
+    let timeout = timeout.duration_since(epoch) + Duration::seconds(1).to_std().unwrap();
 
     debug!(
         "scheduling next pruning for {}ms because of peer {}",
@@ -288,12 +298,12 @@ mod tests {
 
         let node_1 = NodeState::default();
         let (_, rx) = mpsc::channel::<PeerState>(1);
-        let mut gw = PeerGateway::new(node_1, GhostXForm::default(), rx).await;
+        let mut gw = PeerGateway::new(node_1, GhostXForm::default(), rx, Clock::new()).await;
 
         let s = new_udp_reuseport(IP_ANY);
         s.set_broadcast(true).unwrap();
         s.set_multicast_ttl_v4(2).unwrap();
-        // s.set_multicast_loop_v4(false).unwrap();
+        s.set_multicast_loop_v4(false).unwrap();
 
         let header = MessageHeader {
             ttl: 5,
@@ -312,7 +322,7 @@ mod tests {
         info!("test bytes sent");
 
         tokio::spawn(async {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::seconds(10).to_std().unwrap()).await;
 
             std::process::exit(0);
         });

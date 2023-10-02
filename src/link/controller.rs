@@ -3,23 +3,25 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use crate::{
-    clock::Clock,
-    discovery::{gateway::PeerGateway, peers::ControllerPeer},
-};
+use chrono::Duration;
+
+use crate::discovery::{gateway::PeerGateway, peers::ControllerPeer};
 
 use super::{
+    beats::Beats,
+    clock::Clock,
     ghostxform::GhostXForm,
     node::{NodeId, NodeState},
-    sessions::{ControllerClientState, Session, SessionId, SessionMeasurement, Sessions},
-    state::{SessionState, StartStopState},
-    tempo, PeerCountCallback, StartStopCallback, TempoCallback,
+    sessions::{Session, SessionId, SessionMeasurement, Sessions},
+    state::{ControllerClientState, SessionState, StartStopState},
+    tempo,
+    timeline::{clamp_tempo, Timeline},
+    PeerCountCallback, StartStopCallback, TempoCallback,
 };
 
 pub struct Controller {
     tempo_callback: Option<TempoCallback>,
     start_stop_callback: Option<StartStopCallback>,
-    clock: Clock,
     node_id: NodeId,
     session_id: SessionId,
     session_state: Arc<Mutex<SessionState>>,
@@ -32,6 +34,7 @@ pub struct Controller {
     peers: ControllerPeer,
     sessions: Sessions,
     discovery: PeerGateway,
+    clock: Clock,
 }
 
 impl Controller {
@@ -49,16 +52,15 @@ impl Controller {
 
         let timeline = session_state.lock().unwrap().timeline;
 
-        let (tx_measure_peer, mut rx_measure_peer) = tokio::sync::mpsc::channel(1);
+        let (tx_measure_peer, rx_measure_peer) = tokio::sync::mpsc::channel(1);
 
         Self {
             tempo_callback,
             start_stop_callback,
-            clock,
             node_id,
             session_id,
             session_state: session_state.clone(),
-            client_state: Arc::new(Mutex::new(ControllerClientState)),
+            client_state: Arc::new(Mutex::new(ControllerClientState::default())),
             // last_is_playing_for_start_stop_state_callback: false,
             has_pending_rt_client_states: Arc::new(AtomicBool::new(false)),
             session_peer_counter: SessionPeerCounter::new(peer_count_callback),
@@ -83,8 +85,10 @@ impl Controller {
                 },
                 GhostXForm::default(),
                 rx_measure_peer,
+                clock,
             )
             .await,
+            clock,
         }
     }
 
@@ -95,7 +99,7 @@ impl Controller {
     pub async fn update_discovery(&mut self) {
         let timeline = self.session_state.lock().unwrap().timeline;
         let start_stop_state = self.session_state.lock().unwrap().start_stop_state;
-        let ghost_xform = self.session_state.lock().unwrap().ghost_xform;
+        let ghost_xform = self.session_state.lock().unwrap().ghost_x_form;
 
         self.discovery
             .update_node_state(
@@ -111,9 +115,27 @@ impl Controller {
     }
 }
 
-fn init_session_state(_tempo: tempo::Tempo, _clock: Clock) -> SessionState {
-    // todo!()
-    SessionState::default()
+fn init_x_form(clock: Clock) -> GhostXForm {
+    GhostXForm {
+        slope: 1.0,
+        intercept: clock.micros(),
+    }
+}
+
+fn init_session_state(tempo: tempo::Tempo, clock: Clock) -> SessionState {
+    SessionState {
+        timeline: clamp_tempo(Timeline {
+            tempo,
+            beat_origin: Beats::new(0f64),
+            time_origin: Duration::microseconds(0),
+        }),
+        start_stop_state: StartStopState {
+            is_playing: false,
+            beats: Beats::new(0f64),
+            timestamp: Duration::microseconds(0),
+        },
+        ghost_x_form: init_x_form(clock),
+    }
 }
 
 pub struct SessionPeerCounter {

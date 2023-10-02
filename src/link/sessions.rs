@@ -2,20 +2,26 @@ use std::{
     fmt::{self, Display},
     mem,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use bincode::{Decode, Encode};
+use chrono::Duration;
 use tokio::sync::mpsc::Sender;
 use tracing::debug;
 
 use crate::discovery::{
-    payload::PayloadEntryHeader,
     peers::{ControllerPeer, PeerState},
     ENCODING_CONFIG,
 };
 
-use super::{ghostxform::GhostXForm, node::NodeId, timeline::Timeline, Result};
+use super::{
+    ghostxform::GhostXForm,
+    node::NodeId,
+    payload::PayloadEntryHeader,
+    state::{ClientStartStopState, StartStopState},
+    timeline::Timeline,
+    Result,
+};
 
 pub const SESSION_MEMBERSHIP_HEADER_KEY: u32 = u32::from_be_bytes(*b"sess");
 pub const SESSION_MEMBERSHIP_SIZE: u32 = mem::size_of::<SessionId>() as u32;
@@ -32,8 +38,6 @@ impl Display for SessionId {
         write!(f, "{}", self.0)
     }
 }
-
-pub struct ControllerClientState;
 
 #[derive(Clone, Copy, Debug, Default, Encode, Decode)]
 pub struct SessionMembership {
@@ -57,13 +61,22 @@ impl SessionMembership {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct SessionMeasurement {
     pub x_form: GhostXForm,
     pub timestamp: Duration,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+impl Default for SessionMeasurement {
+    fn default() -> Self {
+        Self {
+            x_form: GhostXForm::default(),
+            timestamp: Duration::zero(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct Session {
     pub session_id: SessionId,
     pub timeline: Timeline,
@@ -122,7 +135,10 @@ impl Sessions {
                 let session = Session {
                     session_id,
                     timeline,
-                    ..Default::default()
+                    measurement: SessionMeasurement {
+                        x_form: GhostXForm::default(),
+                        timestamp: Duration::zero(),
+                    },
                 };
 
                 if self
@@ -164,7 +180,7 @@ impl Sessions {
                     "adopting peer timeline ({}, {}, {})",
                     timeline.tempo.bpm(),
                     timeline.beat_origin.floating(),
-                    timeline.time_origin.as_micros(),
+                    timeline.time_origin.num_microseconds().unwrap(),
                 );
 
                 session.timeline = timeline;

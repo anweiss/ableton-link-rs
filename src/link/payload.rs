@@ -1,19 +1,23 @@
-use std::{mem, time::Duration};
+use std::mem;
 
 use bincode::{Decode, Encode};
+use chrono::Duration;
 use tracing::{info, warn};
 
-use crate::link::{
-    measurement::{
-        MeasurementEndpointV4, MEASUREMENT_ENDPOINT_V4_HEADER_KEY, MEASUREMENT_ENDPOINT_V4_SIZE,
+use crate::{
+    discovery::{peers::PeerState, ENCODING_CONFIG},
+    link::{
+        measurement::{
+            MeasurementEndpointV4, MEASUREMENT_ENDPOINT_V4_HEADER_KEY, MEASUREMENT_ENDPOINT_V4_SIZE,
+        },
+        node::NodeState,
+        sessions::{SessionMembership, SESSION_MEMBERSHIP_HEADER_KEY, SESSION_MEMBERSHIP_SIZE},
+        state::{StartStopState, START_STOP_STATE_HEADER_KEY, START_STOP_STATE_SIZE},
+        timeline::{Timeline, TIMELINE_HEADER_KEY, TIMELINE_SIZE},
     },
-    node::NodeState,
-    sessions::{SessionMembership, SESSION_MEMBERSHIP_HEADER_KEY, SESSION_MEMBERSHIP_SIZE},
-    state::{StartStopState, START_STOP_STATE_HEADER_KEY, START_STOP_STATE_SIZE},
-    timeline::{Timeline, TIMELINE_HEADER_KEY, TIMELINE_SIZE},
 };
 
-use super::{Result, ENCODING_CONFIG};
+use super::Result;
 
 pub const PAYLOAD_ENTRY_HEADER_SIZE: usize = mem::size_of::<u32>() + mem::size_of::<u32>();
 
@@ -77,6 +81,16 @@ impl From<NodeState> for Payload {
     }
 }
 
+impl From<PeerState> for Payload {
+    fn from(value: PeerState) -> Self {
+        Payload {
+            entries: vec![PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
+                endpoint: value.endpoint,
+            })],
+        }
+    }
+}
+
 pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
     if PAYLOAD_ENTRY_HEADER_SIZE > data.len() {
         return Ok(());
@@ -96,7 +110,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            // info!("decoded payload entry {:?}", entry);
+            info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::HostTime(entry));
             decode(payload, &data[decode_len..])?;
@@ -121,7 +135,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            // info!("decoded payload entry {:?}", entry);
+            info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::SessionMembership(entry));
             decode(payload, &data[decode_len..])?;
@@ -133,7 +147,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            // info!("decoded payload entry {:?}", entry);
+            info!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::StartStopState(entry));
             decode(payload, &data[decode_len..])?;
@@ -145,7 +159,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            // info!("decoded payload entry {:?}", entry);
+            info!("decoded payload entry {:?}", entry);
 
             payload
                 .entries
@@ -213,7 +227,7 @@ impl PayloadEntry {
     }
 }
 
-#[derive(Debug, Clone, Decode, Default)]
+#[derive(Debug, Clone)]
 pub struct HostTime {
     pub time: Duration,
 }
@@ -226,14 +240,25 @@ impl HostTime {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = HOST_TIME_HEADER.encode()?;
         encoded.append(&mut bincode::encode_to_vec(
-            self.time.as_micros() as u64,
+            self.time.num_microseconds().unwrap(),
             ENCODING_CONFIG,
         )?);
         Ok(encoded)
     }
 }
 
-#[derive(Debug, Clone, Decode, Default)]
+impl bincode::Decode for HostTime {
+    fn decode<D: bincode::de::Decoder>(
+        decoder: &mut D,
+    ) -> std::result::Result<Self, bincode::error::DecodeError> {
+        let time: i64 = bincode::Decode::decode(decoder)?;
+        Ok(Self {
+            time: Duration::microseconds(time),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct GhostTime {
     pub time: Duration,
 }
@@ -246,14 +271,25 @@ impl GhostTime {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = GHOST_TIME_HEADER.encode()?;
         encoded.append(&mut bincode::encode_to_vec(
-            self.time.as_micros() as u64,
+            self.time.num_microseconds().unwrap(),
             ENCODING_CONFIG,
         )?);
         Ok(encoded)
     }
 }
 
-#[derive(Debug, Clone, Decode, Default)]
+impl bincode::Decode for GhostTime {
+    fn decode<D: bincode::de::Decoder>(
+        decoder: &mut D,
+    ) -> std::result::Result<Self, bincode::error::DecodeError> {
+        let time: i64 = bincode::Decode::decode(decoder)?;
+        Ok(Self {
+            time: Duration::microseconds(time),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PrevGhostTime {
     pub time: Duration,
 }
@@ -266,10 +302,21 @@ impl PrevGhostTime {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = PREV_GHOST_TIME_HEADER.encode()?;
         encoded.append(&mut bincode::encode_to_vec(
-            self.time.as_micros() as u64,
+            self.time.num_microseconds().unwrap(),
             ENCODING_CONFIG,
         )?);
         Ok(encoded)
+    }
+}
+
+impl bincode::Decode for PrevGhostTime {
+    fn decode<D: bincode::de::Decoder>(
+        decoder: &mut D,
+    ) -> std::result::Result<Self, bincode::error::DecodeError> {
+        let time: i64 = bincode::Decode::decode(decoder)?;
+        Ok(Self {
+            time: Duration::microseconds(time),
+        })
     }
 }
 

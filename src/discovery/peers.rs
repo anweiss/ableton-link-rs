@@ -1,5 +1,5 @@
 use std::{
-    net::SocketAddr,
+    net::{SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
     vec,
 };
@@ -106,7 +106,7 @@ impl GatewayObserver {
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct PeerState {
     pub node_state: NodeState,
-    pub endpoint: Option<SocketAddr>,
+    pub endpoint: Option<SocketAddrV4>,
 }
 
 impl PeerState {

@@ -10,7 +10,10 @@ use tracing::{debug, info};
 
 use crate::{
     discovery::{messages::MESSAGE_TYPES, peers::PeerStateMessageType},
-    link::node::{NodeId, NodeState},
+    link::{
+        node::{NodeId, NodeState},
+        payload::Payload,
+    },
 };
 
 use super::{
@@ -19,7 +22,6 @@ use super::{
         encode_message, parse_message_header, parse_payload, MessageHeader, MessageType, ALIVE,
         BYEBYE, MAX_MESSAGE_SIZE, RESPONSE,
     },
-    payload::Payload,
     peers::PeerState,
     IP_ANY, LINK_PORT, MULTICAST_ADDR,
 };
@@ -139,7 +141,7 @@ impl Messenger {
         .await;
     }
 
-    pub async fn update_state(&mut self, state: PeerState) {
+    pub async fn update_state(&self, state: PeerState) {
         *self.peer_state.lock().unwrap() = state;
 
         broadcast_state(
@@ -262,7 +264,6 @@ pub async fn send_peer_state(
 }
 
 pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf: &[u8]) {
-    debug!("receiving state from peer {}", header.ident);
     let payload = parse_payload(buf).unwrap();
     let node_state: NodeState = NodeState::from_payload(header.ident, &payload);
 

@@ -4,9 +4,12 @@ use std::fmt::Display;
 use bincode::{Decode, Encode};
 use rand::Rng;
 
-use crate::discovery::payload::{Payload, PayloadEntry};
-
-use super::{sessions::SessionId, state::StartStopState, timeline::Timeline};
+use super::{
+    payload::{Payload, PayloadEntry},
+    sessions::SessionId,
+    state::StartStopState,
+    timeline::Timeline,
+};
 
 pub type NodeIdArray = [u8; 8];
 

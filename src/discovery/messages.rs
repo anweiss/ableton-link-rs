@@ -2,20 +2,22 @@ use std::mem;
 
 use bincode::{Decode, Encode};
 
-
 use crate::{
-    discovery::{payload, ENCODING_CONFIG},
-    link::node::NodeId,
+    discovery::ENCODING_CONFIG,
+    link::{
+        node::NodeId,
+        payload::{self, Payload},
+        Result,
+    },
 };
 
-use super::{payload::Payload, Result};
-
 pub const MAX_MESSAGE_SIZE: usize = 512;
+pub const PROTOCOL_HEADER_SIZE: usize = 8;
 
 pub type MessageType = u8;
 pub type SessionGroupId = u16;
 
-pub type ProtocolHeader = [u8; 8];
+pub type ProtocolHeader = [u8; PROTOCOL_HEADER_SIZE];
 
 pub const INVALID: MessageType = 0;
 pub const ALIVE: MessageType = 1;
@@ -25,7 +27,6 @@ pub const BYEBYE: MessageType = 3;
 pub const MESSAGE_TYPES: [&str; 4] = ["INVALID", "ALIVE", "RESPONSE", "BYEBYE"];
 
 pub const PROTOCOL_HEADER: ProtocolHeader = [b'_', b'a', b's', b'd', b'p', b'_', b'v', 1];
-pub const PROTOCOL_HEADER_SIZE: usize = PROTOCOL_HEADER.len();
 
 pub const MESSAGE_HEADER_SIZE: usize = mem::size_of::<MessageType>()
     + mem::size_of::<u8>()

@@ -1,21 +1,24 @@
 pub mod beats;
+pub mod clock;
 pub mod controller;
 pub mod error;
 pub mod ghostxform;
 pub mod measurement;
 pub mod node;
+pub mod payload;
+pub mod pingresponder;
 pub mod sessions;
 pub mod state;
 pub mod tempo;
 pub mod timeline;
 
-use std::{result, sync::Arc, time::Duration};
+use std::{
+    result,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use tokio::sync::Mutex;
-
-use crate::clock::Clock;
-
-use self::{controller::Controller, state::ApiState};
+use self::{clock::Clock, controller::Controller, state::ApiState};
 
 pub type Result<T> = result::Result<T, error::Error>;
 
@@ -27,7 +30,6 @@ pub struct BasicLink {
     peer_count_callback: Option<PeerCountCallback>,
     tempo_callback: Option<TempoCallback>,
     start_stop_callback: Option<StartStopCallback>,
-    clock: Clock,
     controller: Controller,
 }
 
@@ -36,16 +38,14 @@ impl BasicLink {
         let subscriber = tracing_subscriber::FmtSubscriber::new();
         tracing::subscriber::set_global_default(subscriber).unwrap();
 
-        let clock = Clock::default();
-
-        let controller = Controller::new(tempo::Tempo::new(bpm), None, None, None, clock).await;
+        let controller =
+            Controller::new(tempo::Tempo::new(bpm), None, None, None, Clock::new()).await;
 
         Self {
             peer_count_callback: None,
             tempo_callback: None,
             start_stop_callback: None,
             controller,
-            clock,
         }
     }
 }
@@ -85,10 +85,6 @@ impl BasicLink {
     where
         F: FnMut(bool) + Send + 'static,
     {
-        todo!()
-    }
-
-    pub fn clock(&self) -> Clock {
         todo!()
     }
 

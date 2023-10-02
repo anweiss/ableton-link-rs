@@ -1,19 +1,11 @@
 pub mod gateway;
 pub mod messages;
 pub mod messenger;
-pub mod payload;
 pub mod peers;
 
-use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    result,
-};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use bincode::config::{BigEndian, Configuration, Fixint};
-
-use crate::link::error::Error;
-
-pub type Result<T> = result::Result<T, Error>;
 
 pub const ENCODING_CONFIG: Configuration<BigEndian, Fixint> = bincode::config::standard()
     .with_big_endian()
