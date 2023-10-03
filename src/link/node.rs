@@ -26,6 +26,11 @@ impl Display for NodeId {
 }
 
 impl NodeId {
+    pub fn new() -> Self {
+        let mut rng = rand::thread_rng();
+        NodeId::random(&mut rng)
+    }
+
     pub fn from_array(rhs: NodeIdArray) -> Self {
         NodeId(rhs)
     }
@@ -47,8 +52,7 @@ pub struct NodeState {
 
 impl NodeState {
     pub fn new(session_id: Arc<Mutex<SessionId>>) -> Self {
-        let mut rng = rand::thread_rng();
-        let node_id = NodeId::random(&mut rng);
+        let node_id = NodeId::new();
 
         NodeState {
             node_id,

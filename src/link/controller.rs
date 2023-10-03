@@ -4,8 +4,12 @@ use std::sync::{
 };
 
 use chrono::Duration;
+use tokio::sync::mpsc::{self, Receiver};
 
-use crate::discovery::{gateway::PeerGateway, peers::ControllerPeer};
+use crate::discovery::{
+    gateway::{OnEvent, PeerGateway},
+    peers::{ControllerPeer, PeerStateChange},
+};
 
 use super::{
     beats::Beats,
@@ -25,7 +29,7 @@ pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 pub struct Controller {
     // tempo_callback: Option<TempoCallback>,
     // start_stop_callback: Option<StartStopCallback>,
-    node_id: NodeId,
+    node_id: Arc<Mutex<NodeId>>,
     session_id: Arc<Mutex<SessionId>>,
     session_state: Arc<Mutex<SessionState>>,
     client_state: Arc<Mutex<ClientState>>,
@@ -35,9 +39,10 @@ pub struct Controller {
     start_stop_sync_enabled: Arc<AtomicBool>,
     // rt_client_state_setter: RtClientStateSetter,
     // peers: ControllerPeer,
-    sessions: Sessions,
-    discovery: PeerGateway,
+    sessions: Arc<Mutex<Sessions>>,
+    discovery: Arc<PeerGateway>,
     clock: Clock,
+    rx_event: Option<Receiver<OnEvent>>,
 }
 
 impl Controller {
@@ -48,42 +53,25 @@ impl Controller {
         // start_stop_callback: Option<StartStopCallback>,
         clock: Clock,
     ) -> Self {
-        let mut rng = rand::thread_rng();
-        let node_id = NodeId::random(&mut rng);
+        let n_id = NodeId::new();
+        let node_id = Arc::new(Mutex::new(n_id));
         let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
-        let session_id = Arc::new(Mutex::new(SessionId(node_id)));
-        let session_state = init_session_state(tempo, clock);
-        let client_state = Arc::new(Mutex::new(init_client_state(session_state)));
+        let session_id = Arc::new(Mutex::new(SessionId(n_id)));
+        let s_state = init_session_state(tempo, clock);
+        let client_state = Arc::new(Mutex::new(init_client_state(s_state)));
 
-        let timeline = session_state.timeline;
+        let timeline = s_state.timeline;
+
+        let session_state = Arc::new(Mutex::new(s_state));
 
         let (tx_measure_peer, rx_measure_peer) = tokio::sync::mpsc::channel(1);
+        let (tx_peer_state_change, mut rx_peer_state_change) = tokio::sync::mpsc::channel(1);
+        let (tx_event, rx_event) = tokio::sync::mpsc::channel::<OnEvent>(1);
 
-        Self {
-            // tempo_callback,
-            // start_stop_callback,
-            node_id,
-            session_id: session_id.clone(),
-            session_state: Arc::new(Mutex::new(session_state)),
-            client_state,
-            // last_is_playing_for_start_stop_state_callback: false,
-            // has_pending_rt_client_states: Arc::new(AtomicBool::new(false)),
-            session_peer_counter: session_peer_counter.clone(),
-            start_stop_sync_enabled: Arc::new(AtomicBool::new(false)),
-            // rt_client_state_setter: RtClientStateSetter,
-            // peers: ControllerPeer::default(),
-            sessions: Sessions::new(
-                Session {
-                    session_id: session_id.clone(),
-                    timeline,
-                    measurement: SessionMeasurement::default(),
-                },
-                Arc::new(Mutex::new(Vec::new())),
-                tx_measure_peer,
-            ),
-            discovery: PeerGateway::new(
+        let discovery = Arc::new(
+            PeerGateway::new(
                 NodeState {
-                    node_id,
+                    node_id: n_id,
                     session_id: session_id.clone(),
                     timeline,
                     start_stop_state: StartStopState::default(),
@@ -91,34 +79,142 @@ impl Controller {
                 GhostXForm::default(),
                 rx_measure_peer,
                 clock,
-                session_peer_counter,
+                session_peer_counter.clone(),
+                tx_peer_state_change,
+                tx_event,
             )
             .await,
+        );
+
+        let sessions = Arc::new(Mutex::new(Sessions::new(
+            Session {
+                session_id: session_id.clone(),
+                timeline,
+                measurement: SessionMeasurement::default(),
+            },
+            Arc::new(Mutex::new(Vec::new())),
+            tx_measure_peer,
+        )));
+
+        let n_id_loop = node_id.clone();
+        let discovery_loop = discovery.clone();
+        let s_id_loop = session_id.clone();
+        let s_state_loop = session_state.clone();
+        let sessions_loop = sessions.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match rx_peer_state_change.recv().await {
+                    Some(PeerStateChange::SessionMembership) => {
+                        let n_id = NodeId::new();
+                        *n_id_loop.lock().unwrap() = n_id;
+                        *s_id_loop.lock().unwrap() = SessionId(n_id);
+
+                        let x_form = init_x_form(clock);
+                        let host_time = -x_form.intercept;
+
+                        let new_tl = Timeline {
+                            tempo: s_state_loop.lock().unwrap().timeline.tempo,
+                            beat_origin: s_state_loop.lock().unwrap().timeline.to_beats(
+                                s_state_loop
+                                    .lock()
+                                    .unwrap()
+                                    .ghost_x_form
+                                    .host_to_ghost(host_time),
+                            ),
+                            time_origin: x_form.host_to_ghost(host_time),
+                        };
+
+                        reset_session_start_stop_state(s_state_loop.clone());
+
+                        update_session_timing(s_state_loop.clone(), new_tl, x_form);
+                        update_discovery(
+                            s_state_loop.clone(),
+                            n_id_loop.clone(),
+                            s_id_loop.clone(),
+                            discovery_loop.clone(),
+                        )
+                        .await;
+
+                        sessions_loop.lock().unwrap().reset_session(Session {
+                            session_id: s_id_loop.clone(),
+                            timeline: new_tl,
+                            measurement: SessionMeasurement {
+                                x_form,
+                                timestamp: host_time,
+                            },
+                        });
+
+                        discovery_loop.observer.reset_peers();
+                    }
+                    Some(PeerStateChange::SessionTimeline) => {}
+                    _ => todo!(),
+                }
+            }
+        });
+
+        Self {
+            // tempo_callback,
+            // start_stop_callback,
+            node_id,
+            session_id: session_id.clone(),
+            session_state,
+            client_state,
+            // last_is_playing_for_start_stop_state_callback: false,
+            // has_pending_rt_client_states: Arc::new(AtomicBool::new(false)),
+            session_peer_counter: session_peer_counter.clone(),
+            start_stop_sync_enabled: Arc::new(AtomicBool::new(false)),
+            // rt_client_state_setter: RtClientStateSetter,
+            // peers: ControllerPeer::default(),
+            sessions,
+            discovery,
             clock,
+            rx_event: Some(rx_event),
         }
     }
 
+    pub async fn reset_state(&mut self) {}
+
     pub async fn enable(&mut self) {
-        self.discovery.listen().await;
+        self.discovery.listen(self.rx_event.as_mut().unwrap()).await;
     }
+}
 
-    pub async fn update_discovery(&mut self) {
-        let timeline = self.session_state.lock().unwrap().timeline;
-        let start_stop_state = self.session_state.lock().unwrap().start_stop_state;
-        let ghost_xform = self.session_state.lock().unwrap().ghost_x_form;
+pub async fn update_discovery(
+    session_state: Arc<Mutex<SessionState>>,
+    node_id: Arc<Mutex<NodeId>>,
+    session_id: Arc<Mutex<SessionId>>,
+    discovery: Arc<PeerGateway>,
+) {
+    let timeline = session_state.lock().unwrap().timeline;
+    let start_stop_state = session_state.lock().unwrap().start_stop_state;
+    let ghost_xform = session_state.lock().unwrap().ghost_x_form;
 
-        self.discovery
-            .update_node_state(
-                NodeState {
-                    node_id: self.node_id,
-                    session_id: self.session_id.clone(),
-                    timeline,
-                    start_stop_state,
-                },
-                ghost_xform,
-            )
-            .await;
-    }
+    let node_id = *node_id.lock().unwrap();
+
+    discovery
+        .update_node_state(
+            NodeState {
+                node_id,
+                session_id,
+                timeline,
+                start_stop_state,
+            },
+            ghost_xform,
+        )
+        .await;
+}
+
+pub fn reset_session_start_stop_state(session_state: Arc<Mutex<SessionState>>) {
+    session_state.lock().unwrap().start_stop_state = StartStopState::default();
+}
+
+pub fn update_session_timing(
+    session_state: Arc<Mutex<SessionState>>,
+    new_timeline: Timeline,
+    new_x_form: GhostXForm,
+) {
+    todo!()
 }
 
 fn init_x_form(clock: Clock) -> GhostXForm {
@@ -206,5 +302,5 @@ fn map_start_stop_state_from_client_to_session(
 #[derive(Debug, Default)]
 pub struct SessionPeerCounter {
     // callback: Option<PeerCountCallback>,
-    session_peer_count: usize,
+    pub session_peer_count: usize,
 }

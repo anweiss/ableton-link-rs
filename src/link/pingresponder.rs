@@ -118,12 +118,8 @@ impl PingResponder {
         });
     }
 
-    pub async fn update_node_state(
-        &mut self,
-        session_id: Arc<Mutex<SessionId>>,
-        x_form: GhostXForm,
-    ) {
-        self.session_id = session_id;
+    pub async fn update_node_state(&self, session_id: Arc<Mutex<SessionId>>, x_form: GhostXForm) {
+        *self.session_id.lock().unwrap() = *session_id.lock().unwrap();
         *self.ghost_x_form.lock().unwrap() = x_form;
     }
 }

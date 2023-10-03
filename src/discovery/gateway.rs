@@ -27,17 +27,16 @@ use crate::{
 
 use super::{
     messenger::{send_byebye, Messenger},
-    peers::{GatewayObserver, PeerEvent, PeerState, PeerStateMessageType},
+    peers::{GatewayObserver, PeerEvent, PeerState, PeerStateChange, PeerStateMessageType},
 };
 
 pub struct PeerGateway {
+    pub observer: GatewayObserver,
     epoch: Instant,
-    observer: GatewayObserver,
     messenger: Messenger,
     measurement: MeasurementService,
     node_state: NodeState,
     ghost_xform: Arc<Mutex<GhostXForm>>,
-    rx_event: Option<Receiver<OnEvent>>,
     rx_measure_peer: Option<Receiver<PeerState>>,
     tx_peer_event: Sender<PeerEvent>,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
@@ -57,8 +56,9 @@ impl PeerGateway {
         rx_measure_peer: Receiver<PeerState>,
         clock: Clock,
         session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
+        tx_peer_state_change: Sender<PeerStateChange>,
+        tx_event: Sender<OnEvent>,
     ) -> Self {
-        let (tx_event, rx_event) = mpsc::channel::<OnEvent>(1);
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
         let messenger = Messenger::new(
@@ -80,7 +80,13 @@ impl PeerGateway {
 
         PeerGateway {
             epoch,
-            observer: GatewayObserver::new(rx_peer_event).await,
+            observer: GatewayObserver::new(
+                rx_peer_event,
+                node_state.session_id.clone(),
+                session_peer_counter.clone(),
+                tx_peer_state_change,
+            )
+            .await,
             messenger,
             measurement: MeasurementService::new(
                 unicast_socket,
@@ -91,7 +97,6 @@ impl PeerGateway {
             .await,
             node_state,
             ghost_xform: Arc::new(Mutex::new(ghost_xform)),
-            rx_event: Some(rx_event),
             rx_measure_peer: Some(rx_measure_peer),
             tx_peer_event,
             peer_timeouts: Arc::new(Mutex::new(vec![])),
@@ -99,7 +104,7 @@ impl PeerGateway {
         }
     }
 
-    pub async fn update_node_state(&mut self, node_state: NodeState, _ghost_xform: GhostXForm) {
+    pub async fn update_node_state(&self, node_state: NodeState, _ghost_xform: GhostXForm) {
         self.measurement
             .update_node_state(node_state.session_id.clone(), _ghost_xform)
             .await;
@@ -115,7 +120,7 @@ impl PeerGateway {
         todo!()
     }
 
-    pub async fn listen(&mut self) {
+    pub async fn listen(&self, rx_event: &mut Receiver<OnEvent>) {
         let ctrl_socket = self.messenger.interface.as_ref().unwrap().clone();
         let node_state = self.node_state.clone();
 
@@ -123,7 +128,7 @@ impl PeerGateway {
 
         loop {
             select! {
-                val = self.rx_event.as_mut().unwrap().recv() => {
+                val = rx_event.recv() => {
                     match val.unwrap() {
                         OnEvent::PeerState(msg) => self.on_peer_state(msg).await,
                         OnEvent::Byebye(node_id) => self.on_byebye(node_id).await,
@@ -150,7 +155,7 @@ impl PeerGateway {
         }
     }
 
-    pub async fn on_peer_state(&mut self, msg: PeerStateMessageType) {
+    pub async fn on_peer_state(&self, msg: PeerStateMessageType) {
         let peer_id = msg.node_state.ident();
         self.peer_timeouts
             .lock()
@@ -306,12 +311,17 @@ mod tests {
         let session_id = Arc::new(Mutex::new(SessionId::default()));
         let node_1 = NodeState::new(session_id.clone());
         let (_, rx) = mpsc::channel::<PeerState>(1);
-        let mut gw = PeerGateway::new(
+        let (tx_event, mut rx_event) = mpsc::channel::<OnEvent>(1);
+        let (tx_peer_state_change, _) = mpsc::channel::<PeerStateChange>(1);
+
+        let gw = PeerGateway::new(
             node_1,
             GhostXForm::default(),
             rx,
             Clock::new(),
             Arc::new(Mutex::new(SessionPeerCounter::default())),
+            tx_peer_state_change,
+            tx_event,
         )
         .await;
 
@@ -342,6 +352,6 @@ mod tests {
             std::process::exit(0);
         });
 
-        gw.listen().await;
+        gw.listen(&mut rx_event).await;
     }
 }

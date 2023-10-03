@@ -97,11 +97,7 @@ impl MeasurementService {
         }
     }
 
-    pub async fn update_node_state(
-        &mut self,
-        session_id: Arc<Mutex<SessionId>>,
-        x_form: GhostXForm,
-    ) {
+    pub async fn update_node_state(&self, session_id: Arc<Mutex<SessionId>>, x_form: GhostXForm) {
         self.ping_responder
             .update_node_state(session_id, x_form)
             .await;

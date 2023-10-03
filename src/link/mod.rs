@@ -18,6 +18,10 @@ use std::{
     time::Duration,
 };
 
+use tokio::sync::mpsc::Receiver;
+
+use crate::discovery::gateway::OnEvent;
+
 use self::{clock::Clock, controller::Controller, state::ApiState};
 
 pub type Result<T> = result::Result<T, error::Error>;
