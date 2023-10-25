@@ -15,7 +15,7 @@ use crate::{
     discovery::{
         messages::{encode_message, BYEBYE},
         messenger::new_udp_reuseport,
-        IP_ANY, LINK_PORT, MULTICAST_ADDR,
+        LINK_PORT, MULTICAST_ADDR, MULTICAST_IP_ANY, UNICAST_IP_ANY,
     },
     link::{
         clock::Clock,
@@ -72,7 +72,7 @@ impl PeerGateway {
         let messenger = Messenger::new(
             PeerState {
                 node_state: node_state.clone(),
-                endpoint: None,
+                measurement_endpoint: None,
             },
             tx_event.clone(),
             epoch,
@@ -85,7 +85,7 @@ impl PeerGateway {
             messenger.interface.as_ref().unwrap().local_addr().unwrap()
         );
 
-        let unicast_socket = Arc::new(new_udp_reuseport(IP_ANY));
+        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(UNICAST_IP_ANY));
 
         PeerGateway {
             epoch,
@@ -100,7 +100,7 @@ impl PeerGateway {
             .await,
             messenger,
             measurement: MeasurementService::new(
-                unicast_socket,
+                ping_responder_unicast_socket,
                 node_state.session_id.clone(),
                 ghost_xform,
                 clock,
@@ -124,7 +124,7 @@ impl PeerGateway {
         self.messenger
             .update_state(PeerState {
                 node_state,
-                endpoint: None,
+                measurement_endpoint: None,
             })
             .await
     }
@@ -213,7 +213,7 @@ pub async fn on_peer_state(
     tx_peer_event
         .send(PeerEvent::SawPeer(PeerState {
             node_state: msg.node_state,
-            endpoint: Some(msg.endpoint),
+            measurement_endpoint: msg.measurement_endpoint,
         }))
         .await
         .unwrap();
@@ -330,7 +330,7 @@ mod tests {
         discovery::{
             messages::{MessageHeader, ALIVE, PROTOCOL_HEADER},
             messenger::new_udp_reuseport,
-            ENCODING_CONFIG, IP_ANY, LINK_PORT, MULTICAST_ADDR,
+            ENCODING_CONFIG, LINK_PORT, MULTICAST_ADDR, MULTICAST_IP_ANY,
         },
         link::sessions::SessionId,
     };

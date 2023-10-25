@@ -17,7 +17,10 @@ use tokio::{
 use tracing::info;
 
 use crate::{
-    discovery::{messages::parse_payload, peers::PeerState, ENCODING_CONFIG},
+    discovery::{
+        messages::parse_payload, messenger::new_udp_reuseport, peers::PeerState, ENCODING_CONFIG,
+        UNICAST_IP_ANY,
+    },
     link::{
         payload::PrevGhostTime,
         pingresponder::{parse_message_header, MAX_MESSAGE_SIZE, PONG},
@@ -97,7 +100,7 @@ pub struct MeasurementService {
 
 impl MeasurementService {
     pub async fn new(
-        unicast_socket: Arc<UdpSocket>,
+        ping_responder_unicast_socket: Arc<UdpSocket>,
         session_id: SessionId,
         ghost_x_form: GhostXForm,
         clock: Clock,
@@ -107,7 +110,6 @@ impl MeasurementService {
         let mut rx_measure_peer = tx_measure_peer.subscribe();
         let measurement_map = Arc::new(Mutex::new(HashMap::new()));
 
-        let u_socket = unicast_socket.clone();
         let m_map = measurement_map.clone();
         let t_peer = tx_measure_peer.clone();
 
@@ -119,7 +121,6 @@ impl MeasurementService {
                     Ok(peer) = rx_measure_peer.recv() => {
                         if let MeasurePeerEvent::PeerState(session_id, peer) = peer {
                             measure_peer(
-                                Some(u_socket.clone()),
                                 clock,
                                 m_map.clone(),
                                 t_peer.clone(),
@@ -140,7 +141,7 @@ impl MeasurementService {
             measurement_map,
             clock,
             ping_responder: PingResponder::new(
-                unicast_socket,
+                ping_responder_unicast_socket,
                 session_id,
                 ghost_x_form,
                 clock,
@@ -159,7 +160,6 @@ impl MeasurementService {
 }
 
 pub async fn measure_peer(
-    unicast_socket: Option<Arc<UdpSocket>>,
     clock: Clock,
     measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
     tx_measure_peer: tokio::sync::broadcast::Sender<MeasurePeerEvent>,
@@ -175,7 +175,7 @@ pub async fn measure_peer(
 
     let (tx_measurement, mut rx_measurement) = mpsc::channel(1);
 
-    let measurement = Measurement::new(unicast_socket, state, clock, tx_measurement).await;
+    let measurement = Measurement::new(state, clock, tx_measurement).await;
 
     measurement_map.lock().unwrap().insert(node_id, measurement);
 
@@ -220,56 +220,72 @@ enum TimerStatus {
 pub struct Measurement {
     pub unicast_socket: Option<Arc<UdpSocket>>,
     pub session_id: SessionId,
-    pub endpoint: Option<SocketAddrV4>,
+    pub measurement_endpoint: Option<SocketAddrV4>,
     pub data: Arc<Mutex<Vec<f64>>>,
     pub clock: Clock,
     pub measurements_started: Arc<Mutex<usize>>,
-    pub success: bool,
-    rx_timer: Option<Receiver<TimerStatus>>,
+    pub success: Arc<Mutex<bool>>,
     tx_timer: Sender<TimerStatus>,
     tx_measurement: Sender<Vec<f64>>,
 }
 
 impl Measurement {
-    pub async fn new(
-        socket: Option<Arc<UdpSocket>>,
-        state: PeerState,
-        clock: Clock,
-        tx_measurement: Sender<Vec<f64>>,
-    ) -> Self {
-        let (tx_timer, rx_timer) = mpsc::channel(1);
+    pub async fn new(state: PeerState, clock: Clock, tx_measurement: Sender<Vec<f64>>) -> Self {
+        let (tx_timer, mut rx_timer) = mpsc::channel(1);
 
         info!("peer state: {:?}", state);
 
+        let unicast_socket = Arc::new(new_udp_reuseport(UNICAST_IP_ANY));
+
+        let success = Arc::new(Mutex::new(false));
+        let data = Arc::new(Mutex::new(vec![]));
+
         let mut measurement = Measurement {
-            unicast_socket: socket.clone(),
+            unicast_socket: Some(unicast_socket.clone()),
             session_id: state.node_state.session_id.clone(),
-            endpoint: state.endpoint,
-            data: Arc::new(Mutex::new(vec![])),
+            measurement_endpoint: state.measurement_endpoint,
+            data: data.clone(),
             clock,
             measurements_started: Arc::new(Mutex::new(0)),
-            success: false,
+            success: success.clone(),
             tx_timer,
-            rx_timer: Some(rx_timer),
-            tx_measurement,
+            tx_measurement: tx_measurement.clone(),
         };
 
         info!("measurement on gateway");
 
         let ht = HostTime::new(clock.micros());
 
+        let s = success.clone();
+        let s_me = state.measurement_endpoint.clone();
+        let d = data.clone();
+        let t = tx_measurement.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if let Some(timer_status) = rx_timer.recv().await {
+                    match timer_status {
+                        TimerStatus::Finish => {
+                            finish(s.clone(), s_me.unwrap(), d.clone(), t.clone()).await;
+                        }
+                        TimerStatus::Reset => {
+                            todo!();
+                        }
+                    }
+                }
+            }
+        });
+
         measurement.listen().await;
 
-        if let Some(socket) = socket {
-            send_ping(
-                socket,
-                state.endpoint.as_ref().unwrap().clone(),
-                &Payload {
-                    entries: vec![PayloadEntry::HostTime(ht)],
-                },
-            )
-            .await;
-        }
+        send_ping(
+            unicast_socket,
+            state.measurement_endpoint.as_ref().unwrap().clone(),
+            &Payload {
+                entries: vec![PayloadEntry::HostTime(ht)],
+            },
+        )
+        .await;
 
         measurement.reset_timer().await;
 
@@ -288,7 +304,7 @@ impl Measurement {
 
                         send_ping(
                             self.unicast_socket.as_ref().unwrap().clone(),
-                            self.endpoint.as_ref().unwrap().clone(),
+                            self.measurement_endpoint.as_ref().unwrap().clone(),
                             &Payload {
                                 entries: vec![PayloadEntry::HostTime(ht)],
                             },
@@ -298,16 +314,10 @@ impl Measurement {
                         *self.measurements_started.lock().unwrap() += 1;
                     } else {
                         self.data.lock().unwrap().clear();
-                        info!("measuring {} failed", self.endpoint.unwrap());
+                        info!("measuring {} failed", self.measurement_endpoint.unwrap());
 
                         let data = self.data.lock().unwrap().clone();
                         self.tx_measurement.send(data).await.unwrap();
-                        break;
-                    }
-                }
-                Some(timer_status) = self.rx_timer.as_mut().unwrap().recv() => {
-                    if let TimerStatus::Finish = timer_status {
-                        self.finish().await;
                         break;
                     }
                 }
@@ -315,17 +325,9 @@ impl Measurement {
         }
     }
 
-    async fn finish(&mut self) {
-        self.success = true;
-        info!("measuring {} done", self.endpoint.unwrap());
-
-        let data = self.data.lock().unwrap().clone();
-        self.tx_measurement.send(data).await.unwrap();
-    }
-
     pub async fn listen(&mut self) {
         let socket = self.unicast_socket.as_ref().unwrap().clone();
-        let endpoint = self.endpoint.as_ref().unwrap().clone();
+        let endpoint = self.measurement_endpoint.as_ref().unwrap().clone();
         socket.connect(endpoint).await.unwrap();
         let clock = self.clock;
         let s_id = self.session_id.clone();
@@ -397,9 +399,13 @@ impl Measurement {
                             }
                         }
 
+                        info!("data {:?}", data.lock().unwrap());
+
                         if data.lock().unwrap().len() > NUMBER_DATA_POINTS {
+                            info!("finishing measurement");
                             tx_timer.send(TimerStatus::Finish).await.unwrap();
                         } else {
+                            info!("resetting measurement");
                             tx_timer.send(TimerStatus::Reset).await.unwrap();
                         }
                     }
@@ -409,9 +415,29 @@ impl Measurement {
     }
 }
 
-pub async fn send_ping(socket: Arc<UdpSocket>, endpoint: SocketAddrV4, payload: &Payload) {
+async fn finish(
+    success: Arc<Mutex<bool>>,
+    measurement_endpoint: SocketAddrV4,
+    data: Arc<Mutex<Vec<f64>>>,
+    tx_measurement: Sender<Vec<f64>>,
+) {
+    *success.lock().unwrap() = true;
+    info!("measuring {} done", measurement_endpoint);
+
+    let data = data.lock().unwrap().clone();
+    tx_measurement.send(data).await.unwrap();
+}
+
+pub async fn send_ping(
+    socket: Arc<UdpSocket>,
+    measurement_endpoint: SocketAddrV4,
+    payload: &Payload,
+) {
     let message = encode_message(PING, payload).unwrap();
-    info!("sending ping message to {}", endpoint);
+    info!(
+        "sending ping message to measurement endpoint {}",
+        measurement_endpoint
+    );
     let _ = socket.send(&message).await.unwrap();
 }
 

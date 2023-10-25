@@ -25,7 +25,7 @@ use crate::link::{
 pub struct PeerStateMessageType {
     pub node_state: NodeState,
     pub ttl: u8,
-    pub endpoint: SocketAddrV4,
+    pub measurement_endpoint: Option<SocketAddrV4>,
 }
 
 pub enum PeerEvent {
@@ -60,7 +60,7 @@ impl GatewayObserver {
                             Some(PeerEvent::SawPeer(peer_state)) => {
                                 saw_peer(
                                     peer_state.node_state,
-                                    peer_state.endpoint,
+                                    peer_state.measurement_endpoint,
                                     peers.clone(),
                                     session_id.clone(),
                                     session_peer_counter.clone(),
@@ -108,7 +108,7 @@ impl GatewayObserver {
 #[derive(Debug, Clone)]
 pub struct PeerState {
     pub node_state: NodeState,
-    pub endpoint: Option<SocketAddrV4>,
+    pub measurement_endpoint: Option<SocketAddrV4>,
 }
 
 impl PeerState {
@@ -168,7 +168,7 @@ async fn saw_peer(
 
     let ps = PeerState {
         node_state,
-        endpoint,
+        measurement_endpoint: endpoint,
     };
 
     let peer_session = ps.session_id();

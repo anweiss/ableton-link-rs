@@ -9,7 +9,7 @@ use tokio::{net::UdpSocket, select, sync::Notify, time::Instant};
 use tracing::info;
 
 use crate::{
-    discovery::{messenger::new_udp_reuseport, ENCODING_CONFIG, IP_ANY},
+    discovery::{messenger::new_udp_reuseport, ENCODING_CONFIG, MULTICAST_IP_ANY},
     link::{
         payload::{GhostTime, PayloadEntry},
         sessions::SessionMembership,
@@ -84,40 +84,43 @@ impl PingResponder {
         );
 
         tokio::spawn(async move {
-            let mut buf = [0; MAX_MESSAGE_SIZE];
             loop {
-                select! {
-                    Ok((amt, src)) = unicast_socket.recv_from(&mut buf) => {
-                        let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
-                        let payload_size = buf[header_len..amt].len();
-                        let max_payload_size = HOST_TIME_SIZE + PREV_GHOST_TIME_SIZE;
+                let mut buf = [0; MAX_MESSAGE_SIZE];
 
-                        if header.message_type == PING && payload_size <= max_payload_size as usize {
-                            info!("received ping message from {}", src);
-
-                            let id = SessionMembership {
-                                session_id: *session_id.lock().unwrap(),
-                            };
-                            let current_gt = GhostTime {
-                                time: ghost_x_form.lock().unwrap().host_to_ghost(clock.micros()),
-                            };
-                            let pong_payload = Payload {
-                                entries: vec![
-                                    PayloadEntry::SessionMembership(id),
-                                    PayloadEntry::GhostTime(current_gt),
-                                ],
-                            };
-
-                            let pong_message = encode_message(PONG, &pong_payload).unwrap();
-                            unicast_socket.send_to(&pong_message, src).await.unwrap();
-                            info!("sent pong message to {}", src);
-                        } else {
-                            info!("received invalid message from {}", src);
-                        }
+                if let Ok((amt, src)) = unicast_socket.recv_from(&mut buf).await {
+                    if !buf.starts_with(&PROTOCOL_HEADER) {
+                        info!("protocol header mismatch");
+                        continue;
                     }
-                    // _ = notifier.notified() => {
-                    //     break;
-                    // }
+
+                    let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
+                    let payload_size = buf[header_len..amt].len();
+                    let max_payload_size = HOST_TIME_SIZE + PREV_GHOST_TIME_SIZE;
+
+                    info!("header message type {}", header.message_type);
+
+                    if header.message_type == PING && payload_size <= max_payload_size as usize {
+                        info!("received ping message from {}", src);
+
+                        let id = SessionMembership {
+                            session_id: *session_id.lock().unwrap(),
+                        };
+                        let current_gt = GhostTime {
+                            time: ghost_x_form.lock().unwrap().host_to_ghost(clock.micros()),
+                        };
+                        let pong_payload = Payload {
+                            entries: vec![
+                                PayloadEntry::SessionMembership(id),
+                                PayloadEntry::GhostTime(current_gt),
+                            ],
+                        };
+
+                        let pong_message = encode_message(PONG, &pong_payload).unwrap();
+                        unicast_socket.send_to(&pong_message, src).await.unwrap();
+                        info!("sent pong message to {}", src);
+                    } else {
+                        info!("received invalid message from {}", src);
+                    }
                 }
             }
         });
@@ -161,4 +164,31 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
         ENCODING_CONFIG,
     )
     .map(|header| (header.0, PROTOCOL_HEADER_SIZE + header.1))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::link::payload::HostTime;
+
+    use super::*;
+
+    fn init_tracing() {
+        let subscriber = tracing_subscriber::FmtSubscriber::new();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    }
+
+    #[test]
+    fn roundtrip() {
+        init_tracing();
+
+        let payload = Payload {
+            entries: vec![PayloadEntry::HostTime(HostTime::default())],
+        };
+
+        let message = encode_message(PING, &payload).unwrap();
+        info!("message: {:?}", message);
+
+        let header = parse_message_header(&message).unwrap();
+        info!("header: {:?}", header);
+    }
 }

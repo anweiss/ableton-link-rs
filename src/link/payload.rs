@@ -22,21 +22,21 @@ use super::Result;
 pub const PAYLOAD_ENTRY_HEADER_SIZE: usize = mem::size_of::<u32>() + mem::size_of::<u32>();
 
 pub const HOST_TIME_HEADER_KEY: u32 = u32::from_be_bytes(*b"__ht");
-pub const HOST_TIME_SIZE: u32 = mem::size_of::<Duration>() as u32;
+pub const HOST_TIME_SIZE: u32 = mem::size_of::<u64>() as u32;
 pub const HOST_TIME_HEADER: PayloadEntryHeader = PayloadEntryHeader {
     key: HOST_TIME_HEADER_KEY,
     size: HOST_TIME_SIZE,
 };
 
 pub const GHOST_TIME_HEADER_KEY: u32 = u32::from_be_bytes(*b"__gt");
-pub const GHOST_TIME_SIZE: u32 = mem::size_of::<Duration>() as u32;
+pub const GHOST_TIME_SIZE: u32 = mem::size_of::<u64>() as u32;
 pub const GHOST_TIME_HEADER: PayloadEntryHeader = PayloadEntryHeader {
     key: GHOST_TIME_HEADER_KEY,
     size: GHOST_TIME_SIZE,
 };
 
 pub const PREV_GHOST_TIME_HEADER_KEY: u32 = u32::from_be_bytes(*b"_pgt");
-pub const PREV_GHOST_TIME_SIZE: u32 = mem::size_of::<Duration>() as u32;
+pub const PREV_GHOST_TIME_SIZE: u32 = mem::size_of::<u64>() as u32;
 pub const PREV_GHOST_TIME_HEADER: PayloadEntryHeader = PayloadEntryHeader {
     key: PREV_GHOST_TIME_HEADER_KEY,
     size: PREV_GHOST_TIME_SIZE,
@@ -81,15 +81,15 @@ impl From<NodeState> for Payload {
     }
 }
 
-impl From<PeerState> for Payload {
-    fn from(value: PeerState) -> Self {
-        Payload {
-            entries: vec![PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
-                endpoint: value.endpoint,
-            })],
-        }
-    }
-}
+// impl From<PeerState> for Payload {
+//     fn from(value: PeerState) -> Self {
+//         Payload {
+//             entries: vec![PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
+//                 endpoint: value.endpoint,
+//             })],
+//         }
+//     }
+// }
 
 pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
     if PAYLOAD_ENTRY_HEADER_SIZE > data.len() {
@@ -110,7 +110,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            info!("decoded payload entry {:?}", entry);
+            debug!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::HostTime(entry));
             decode(payload, &data[decode_len..])?;
@@ -164,6 +164,30 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             payload
                 .entries
                 .push(PayloadEntry::MeasurementEndpointV4(entry));
+            decode(payload, &data[decode_len..])?;
+        }
+        GHOST_TIME_HEADER_KEY => {
+            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + GHOST_TIME_SIZE as usize;
+            let (entry, _) = bincode::decode_from_slice::<GhostTime, _>(
+                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
+                ENCODING_CONFIG,
+            )?;
+
+            debug!("decoded payload entry {:?}", entry);
+
+            payload.entries.push(PayloadEntry::GhostTime(entry));
+            decode(payload, &data[decode_len..])?;
+        }
+        PREV_GHOST_TIME_HEADER_KEY => {
+            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + PREV_GHOST_TIME_SIZE as usize;
+            let (entry, _) = bincode::decode_from_slice::<PrevGhostTime, _>(
+                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
+                ENCODING_CONFIG,
+            )?;
+
+            debug!("decoded payload entry {:?}", entry);
+
+            payload.entries.push(PayloadEntry::PrevGhostTime(entry));
             decode(payload, &data[decode_len..])?;
         }
         _ => {
@@ -230,6 +254,14 @@ impl PayloadEntry {
 #[derive(Debug, Clone)]
 pub struct HostTime {
     pub time: Duration,
+}
+
+impl Default for HostTime {
+    fn default() -> Self {
+        Self {
+            time: Duration::zero(),
+        }
+    }
 }
 
 impl HostTime {

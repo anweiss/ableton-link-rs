@@ -16,7 +16,7 @@ use crate::{
     discovery::{messages::MESSAGE_TYPES, peers::PeerStateMessageType},
     link::{
         node::{NodeId, NodeState},
-        payload::Payload,
+        payload::{Payload, PayloadEntry},
     },
 };
 
@@ -27,7 +27,7 @@ use super::{
         BYEBYE, MAX_MESSAGE_SIZE, RESPONSE,
     },
     peers::PeerState,
-    IP_ANY, LINK_PORT, MULTICAST_ADDR,
+    LINK_PORT, MULTICAST_ADDR, MULTICAST_IP_ANY,
 };
 
 pub fn new_udp_reuseport(addr: SocketAddr) -> UdpSocket {
@@ -67,7 +67,7 @@ impl Messenger {
         epoch: Instant,
         notifier: Arc<Notify>,
     ) -> Self {
-        let socket = new_udp_reuseport(IP_ANY);
+        let socket = new_udp_reuseport(MULTICAST_IP_ANY);
         socket
             .join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::new(0, 0, 0, 0))
             .unwrap();
@@ -105,8 +105,8 @@ impl Messenger {
                     continue;
                 } else {
                     info!(
-                        "received message type {} from peer {}",
-                        MESSAGE_TYPES[header.message_type as usize], header.ident
+                        "received message type {} from peer {} at {}",
+                        MESSAGE_TYPES[header.message_type as usize], header.ident, src
                     );
                 }
 
@@ -122,22 +122,12 @@ impl Messenger {
                             )
                             .await;
 
-                            receive_peer_state(
-                                tx_event.clone(),
-                                header,
-                                &buf[header_len..amt],
-                                src,
-                            )
-                            .await;
+                            receive_peer_state(tx_event.clone(), header, &buf[header_len..amt])
+                                .await;
                         }
                         RESPONSE => {
-                            receive_peer_state(
-                                tx_event.clone(),
-                                header,
-                                &buf[header_len..amt],
-                                src,
-                            )
-                            .await;
+                            receive_peer_state(tx_event.clone(), header, &buf[header_len..amt])
+                                .await;
                         }
                         BYEBYE => {
                             receive_bye_bye(tx_event.clone(), header.ident).await;
@@ -278,13 +268,16 @@ pub async fn send_peer_state(
     *last_broadcast_time.lock().unwrap() = Instant::now();
 }
 
-pub async fn receive_peer_state(
-    tx: Sender<OnEvent>,
-    header: MessageHeader,
-    buf: &[u8],
-    endpoint: SocketAddrV4,
-) {
+pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf: &[u8]) {
     let payload = parse_payload(buf).unwrap();
+    let measurement_endpoint = payload.entries.iter().find_map(|e| {
+        if let PayloadEntry::MeasurementEndpointV4(me) = e {
+            me.endpoint
+        } else {
+            None
+        }
+    });
+
     let node_state: NodeState = NodeState::from_payload(header.ident, &payload);
 
     info!("sending peer state to gateway {}", node_state.ident());
@@ -292,7 +285,7 @@ pub async fn receive_peer_state(
         .send(OnEvent::PeerState(PeerStateMessageType {
             node_state,
             ttl: header.ttl,
-            endpoint,
+            measurement_endpoint,
         }))
         .await;
 
@@ -307,7 +300,7 @@ pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
 pub fn send_byebye(node_state: NodeId) {
     info!("sending bye bye");
 
-    let socket = new_udp_reuseport(IP_ANY);
+    let socket = new_udp_reuseport(MULTICAST_IP_ANY);
     socket.set_broadcast(true).unwrap();
     socket.set_multicast_ttl_v4(2).unwrap();
 
