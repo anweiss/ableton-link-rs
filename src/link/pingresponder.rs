@@ -5,7 +5,7 @@ use std::{
 };
 
 use bincode::{Decode, Encode};
-use tokio::{net::UdpSocket, time::Instant};
+use tokio::{net::UdpSocket, select, sync::Notify, time::Instant};
 use tracing::info;
 
 use crate::{
@@ -44,7 +44,7 @@ pub struct MessageHeader {
     pub message_type: MessageType,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PingResponder {
     pub session_id: Arc<Mutex<SessionId>>,
     pub ghost_x_form: Arc<Mutex<GhostXForm>>,
@@ -55,23 +55,24 @@ pub struct PingResponder {
 impl PingResponder {
     pub async fn new(
         unicast_socket: Arc<UdpSocket>,
-        session_id: Arc<Mutex<SessionId>>,
+        session_id: SessionId,
         ghost_x_form: GhostXForm,
         clock: Clock,
+        notifier: Arc<Notify>,
     ) -> Self {
         let pr = PingResponder {
             unicast_socket: Some(unicast_socket),
-            session_id,
+            session_id: Arc::new(Mutex::new(session_id)),
             ghost_x_form: Arc::new(Mutex::new(ghost_x_form)),
             clock,
         };
 
-        pr.listen().await;
+        pr.listen(notifier).await;
 
         pr
     }
 
-    pub async fn listen(&self) {
+    pub async fn listen(&self, notifier: Arc<Notify>) {
         let unicast_socket = self.unicast_socket.as_ref().unwrap().clone();
         let session_id = self.session_id.clone();
         let ghost_x_form = self.ghost_x_form.clone();
@@ -83,43 +84,47 @@ impl PingResponder {
         );
 
         tokio::spawn(async move {
+            let mut buf = [0; MAX_MESSAGE_SIZE];
             loop {
-                let mut buf = [0; MAX_MESSAGE_SIZE];
+                select! {
+                    Ok((amt, src)) = unicast_socket.recv_from(&mut buf) => {
+                        let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
+                        let payload_size = buf[header_len..amt].len();
+                        let max_payload_size = HOST_TIME_SIZE + PREV_GHOST_TIME_SIZE;
 
-                let (amt, src) = unicast_socket.recv_from(&mut buf).await.unwrap();
+                        if header.message_type == PING && payload_size <= max_payload_size as usize {
+                            info!("received ping message from {}", src);
 
-                let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
-                let payload_size = buf[header_len..amt].len();
-                let max_payload_size = HOST_TIME_SIZE + PREV_GHOST_TIME_SIZE;
+                            let id = SessionMembership {
+                                session_id: *session_id.lock().unwrap(),
+                            };
+                            let current_gt = GhostTime {
+                                time: ghost_x_form.lock().unwrap().host_to_ghost(clock.micros()),
+                            };
+                            let pong_payload = Payload {
+                                entries: vec![
+                                    PayloadEntry::SessionMembership(id),
+                                    PayloadEntry::GhostTime(current_gt),
+                                ],
+                            };
 
-                if header.message_type == PING && payload_size <= max_payload_size as usize {
-                    info!("received ping message from {}", src);
-
-                    let id = SessionMembership {
-                        session_id: *session_id.lock().unwrap(),
-                    };
-                    let current_gt = GhostTime {
-                        time: ghost_x_form.lock().unwrap().host_to_ghost(clock.micros()),
-                    };
-                    let pong_payload = Payload {
-                        entries: vec![
-                            PayloadEntry::SessionMembership(id),
-                            PayloadEntry::GhostTime(current_gt),
-                        ],
-                    };
-
-                    let pong_message = encode_message(PONG, &pong_payload).unwrap();
-                    unicast_socket.send_to(&pong_message, src).await.unwrap();
-                    info!("sent pong message to {}", src);
-                } else {
-                    info!("received invalid message from {}", src);
+                            let pong_message = encode_message(PONG, &pong_payload).unwrap();
+                            unicast_socket.send_to(&pong_message, src).await.unwrap();
+                            info!("sent pong message to {}", src);
+                        } else {
+                            info!("received invalid message from {}", src);
+                        }
+                    }
+                    // _ = notifier.notified() => {
+                    //     break;
+                    // }
                 }
             }
         });
     }
 
-    pub async fn update_node_state(&self, session_id: Arc<Mutex<SessionId>>, x_form: GhostXForm) {
-        *self.session_id.lock().unwrap() = *session_id.lock().unwrap();
+    pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
+        *self.session_id.lock().unwrap() = session_id;
         *self.ghost_x_form.lock().unwrap() = x_form;
     }
 }

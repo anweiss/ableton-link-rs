@@ -2,7 +2,7 @@ use std::mem;
 
 use bincode::{Decode, Encode};
 use chrono::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     discovery::{peers::PeerState, ENCODING_CONFIG},
@@ -74,7 +74,7 @@ impl From<NodeState> for Payload {
         Payload {
             entries: vec![
                 PayloadEntry::Timeline(value.timeline),
-                PayloadEntry::SessionMembership((*value.session_id.lock().unwrap()).into()),
+                PayloadEntry::SessionMembership((value.session_id).into()),
                 PayloadEntry::StartStopState(value.start_stop_state),
             ],
         }
@@ -123,7 +123,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             )
             .unwrap();
 
-            info!("bpm: {}", entry.tempo);
+            info!("received bpm: {}", entry.tempo);
 
             payload.entries.push(PayloadEntry::Timeline(entry));
             decode(payload, &data[decode_len..])?;
@@ -135,7 +135,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            info!("decoded payload entry {:?}", entry);
+            debug!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::SessionMembership(entry));
             decode(payload, &data[decode_len..])?;
@@ -147,7 +147,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            info!("decoded payload entry {:?}", entry);
+            debug!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::StartStopState(entry));
             decode(payload, &data[decode_len..])?;
@@ -159,7 +159,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 ENCODING_CONFIG,
             )?;
 
-            info!("decoded payload entry {:?}", entry);
+            debug!("decoded payload entry {:?}", entry);
 
             payload
                 .entries

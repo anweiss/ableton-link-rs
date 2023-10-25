@@ -1,11 +1,15 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use async_recursion::async_recursion;
-use tokio::{net::UdpSocket, sync::mpsc::Sender, time::Instant};
+use tokio::{
+    net::UdpSocket,
+    select,
+    sync::{mpsc::Sender, Notify},
+    time::Instant,
+};
 use tracing::{debug, info};
 
 use crate::{
@@ -53,10 +57,16 @@ pub struct Messenger {
     pub ttl_ratio: u8,
     pub last_broadcast_time: Arc<Mutex<Instant>>,
     pub tx_event: Sender<OnEvent>,
+    pub notifier: Arc<Notify>,
 }
 
 impl Messenger {
-    pub async fn new(peer_state: PeerState, tx_event: Sender<OnEvent>, epoch: Instant) -> Self {
+    pub async fn new(
+        peer_state: PeerState,
+        tx_event: Sender<OnEvent>,
+        epoch: Instant,
+        notifier: Arc<Notify>,
+    ) -> Self {
         let socket = new_udp_reuseport(IP_ANY);
         socket
             .join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::new(0, 0, 0, 0))
@@ -70,6 +80,7 @@ impl Messenger {
             ttl_ratio: 20,
             last_broadcast_time: Arc::new(Mutex::new(epoch)),
             tx_event,
+            notifier,
         }
     }
 
@@ -80,18 +91,13 @@ impl Messenger {
         let tx_event = self.tx_event.clone();
         let last_broadcast_time = self.last_broadcast_time.clone();
 
+        let n = self.notifier.clone();
+
         tokio::spawn(async move {
             loop {
-                let tx = tx_event.clone();
-                let peer_state = peer_state.clone();
-
-                let last_broadcast_time = last_broadcast_time.clone();
-
                 let mut buf = [0; MAX_MESSAGE_SIZE];
-                let socket = socket.clone();
 
                 let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
-
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
 
                 if header.ident == peer_state.lock().unwrap().ident() && header.group_id == 0 {
@@ -104,30 +110,45 @@ impl Messenger {
                     );
                 }
 
-                match header.message_type {
-                    ALIVE => {
-                        tokio::spawn(async move {
+                if let SocketAddr::V4(src) = src {
+                    match header.message_type {
+                        ALIVE => {
                             send_response(
-                                socket,
+                                socket.clone(),
                                 peer_state.clone(),
                                 ttl,
                                 src,
                                 last_broadcast_time.clone(),
                             )
                             .await;
-                        });
 
-                        receive_peer_state(tx, header, &buf[header_len..amt]).await;
+                            receive_peer_state(
+                                tx_event.clone(),
+                                header,
+                                &buf[header_len..amt],
+                                src,
+                            )
+                            .await;
+                        }
+                        RESPONSE => {
+                            receive_peer_state(
+                                tx_event.clone(),
+                                header,
+                                &buf[header_len..amt],
+                                src,
+                            )
+                            .await;
+                        }
+                        BYEBYE => {
+                            receive_bye_bye(tx_event.clone(), header.ident).await;
+                        }
+                        _ => todo!(),
                     }
-                    RESPONSE => {
-                        receive_peer_state(tx, header, &buf[header_len..amt]).await;
-                    }
-                    BYEBYE => {
-                        receive_bye_bye(tx, header.ident).await;
-                    }
-                    _ => todo!(),
                 }
             }
+            // _ = n.notified() => {
+            //     break;
+            // }
         });
 
         broadcast_state(
@@ -136,7 +157,8 @@ impl Messenger {
             self.last_broadcast_time.clone(),
             self.interface.as_ref().unwrap().clone(),
             self.peer_state.clone(),
-            SocketAddr::new(MULTICAST_ADDR.into(), LINK_PORT),
+            SocketAddrV4::new(MULTICAST_ADDR.into(), LINK_PORT),
+            self.notifier.clone(),
         )
         .await;
     }
@@ -144,72 +166,72 @@ impl Messenger {
     pub async fn update_state(&self, state: PeerState) {
         *self.peer_state.lock().unwrap() = state;
 
-        broadcast_state(
-            self.ttl,
-            self.ttl_ratio,
-            self.last_broadcast_time.clone(),
-            self.interface.as_ref().unwrap().clone(),
-            self.peer_state.clone(),
-            SocketAddr::new(MULTICAST_ADDR.into(), LINK_PORT),
-        )
-        .await;
+        // broadcast_state(
+        //     self.ttl,
+        //     self.ttl_ratio,
+        //     self.last_broadcast_time.clone(),
+        //     self.interface.as_ref().unwrap().clone(),
+        //     self.peer_state.clone(),
+        //     SocketAddr::new(MULTICAST_ADDR.into(), LINK_PORT),
+        //     self.notifier.clone(),
+        // )
+        // .await;
     }
 }
 
-#[async_recursion]
 pub async fn broadcast_state(
     ttl: u8,
     ttl_ratio: u8,
     last_broadcast_time: Arc<Mutex<Instant>>,
     socket: Arc<UdpSocket>,
     peer_state: Arc<Mutex<PeerState>>,
-    to: SocketAddr,
+    to: SocketAddrV4,
+    n: Arc<Notify>,
 ) {
-    let min_broadcast_period = Duration::from_millis(50);
-    let nominal_broadcast_period = Duration::from_millis(ttl as u64 * 1000 / ttl_ratio as u64);
-
-    let time_since_last_broadcast = if *last_broadcast_time.lock().unwrap() > Instant::now() {
-        0
-    } else {
-        Instant::now()
-            .duration_since(*last_broadcast_time.lock().unwrap())
-            .as_millis()
-    };
-
-    let tslb = Duration::from_millis(time_since_last_broadcast as u64);
-    let delay = if tslb > min_broadcast_period {
-        Duration::default()
-    } else {
-        min_broadcast_period - tslb
-    };
-
     let lbt = last_broadcast_time.clone();
     let s = socket.clone();
 
-    let ps = peer_state.clone();
+    let mut sleep_time = Duration::default();
 
-    tokio::spawn(async move {
-        let sleep_time = if delay > Duration::from_millis(0) {
-            delay
-        } else {
-            nominal_broadcast_period
-        };
+    loop {
+        select! {
+            _ = tokio::time::sleep(sleep_time) => {
+                let min_broadcast_period = Duration::from_millis(50);
+                let nominal_broadcast_period =
+                    Duration::from_millis(ttl as u64 * 1000 / ttl_ratio as u64);
 
-        tokio::time::sleep(sleep_time).await;
-        broadcast_state(ttl, ttl_ratio, lbt, s, ps, to).await;
-    });
+                let lbt = lbt.clone();
 
-    if delay < Duration::from_millis(1) {
-        debug!("broadcasting state");
-        send_peer_state(
-            socket,
-            peer_state.clone(),
-            ttl,
-            ALIVE,
-            to,
-            last_broadcast_time,
-        )
-        .await;
+                let time_since_last_broadcast = if *lbt.lock().unwrap() > Instant::now() {
+                    0
+                } else {
+                    Instant::now()
+                        .duration_since(*lbt.lock().unwrap())
+                        .as_millis()
+                };
+
+                let tslb = Duration::from_millis(time_since_last_broadcast as u64);
+                let delay = if tslb > min_broadcast_period {
+                    Duration::default()
+                } else {
+                    min_broadcast_period - tslb
+                };
+
+                sleep_time = if delay > Duration::from_millis(0) {
+                    delay
+                } else {
+                    nominal_broadcast_period
+                };
+
+                if delay < Duration::from_millis(1) {
+                    debug!("broadcasting state");
+                    send_peer_state(s.clone(), peer_state.clone(), ttl, ALIVE, to, lbt).await;
+                }
+            }
+            _ = n.notified() => {
+                break;
+            }
+        }
     }
 }
 
@@ -217,7 +239,7 @@ pub async fn send_response(
     socket: Arc<UdpSocket>,
     peer_state: Arc<Mutex<PeerState>>,
     ttl: u8,
-    to: SocketAddr,
+    to: SocketAddrV4,
     last_broadcast_time: Arc<Mutex<Instant>>,
 ) {
     send_peer_state(socket, peer_state, ttl, RESPONSE, to, last_broadcast_time).await
@@ -229,11 +251,11 @@ pub async fn send_message(
     ttl: u8,
     message_type: MessageType,
     payload: &Payload,
-    to: SocketAddr,
+    to: SocketAddrV4,
 ) {
     socket.set_broadcast(true).unwrap();
     socket.set_multicast_ttl_v4(2).unwrap();
-    socket.set_multicast_loop_v4(false).unwrap();
+    socket.set_multicast_loop_v4(true).unwrap();
 
     let message = encode_message(from, ttl, message_type, payload).unwrap();
 
@@ -245,7 +267,7 @@ pub async fn send_peer_state(
     peer_state: Arc<Mutex<PeerState>>,
     ttl: u8,
     message_type: MessageType,
-    to: SocketAddr,
+    to: SocketAddrV4,
     last_broadcast_time: Arc<Mutex<Instant>>,
 ) {
     let ident = peer_state.lock().unwrap().ident();
@@ -256,17 +278,25 @@ pub async fn send_peer_state(
     *last_broadcast_time.lock().unwrap() = Instant::now();
 }
 
-pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf: &[u8]) {
+pub async fn receive_peer_state(
+    tx: Sender<OnEvent>,
+    header: MessageHeader,
+    buf: &[u8],
+    endpoint: SocketAddrV4,
+) {
     let payload = parse_payload(buf).unwrap();
     let node_state: NodeState = NodeState::from_payload(header.ident, &payload);
 
-    tokio::spawn(async move {
-        tx.send(OnEvent::PeerState(PeerStateMessageType {
+    info!("sending peer state to gateway {}", node_state.ident());
+    let _ = tx
+        .send(OnEvent::PeerState(PeerStateMessageType {
             node_state,
             ttl: header.ttl,
+            endpoint,
         }))
-        .await
-    });
+        .await;
+
+    // info!("peer state sent")
 }
 
 pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {

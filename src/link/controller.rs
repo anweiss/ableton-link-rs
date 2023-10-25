@@ -4,24 +4,30 @@ use std::sync::{
 };
 
 use chrono::Duration;
-use tokio::sync::mpsc::{self, Receiver};
+use tokio::{
+    select,
+    sync::{
+        mpsc::{self, Receiver},
+        Notify,
+    },
+};
+use tracing::info;
 
 use crate::discovery::{
     gateway::{OnEvent, PeerGateway},
-    peers::{ControllerPeer, PeerStateChange},
+    peers::{ControllerPeer, PeerState, PeerStateChange},
 };
 
 use super::{
     beats::Beats,
     clock::Clock,
     ghostxform::GhostXForm,
+    measurement::MeasurePeerEvent,
     node::{NodeId, NodeState},
     sessions::{Session, SessionId, SessionMeasurement, Sessions},
-    state::{
-        ClientStartStopState, ClientState, ControllerClientState, SessionState, StartStopState,
-    },
+    state::{ClientStartStopState, ClientState, SessionState, StartStopState},
     tempo,
-    timeline::{clamp_tempo, Timeline},
+    timeline::{clamp_tempo, update_client_timeline_from_session, Timeline},
 };
 
 pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
@@ -36,13 +42,15 @@ pub struct Controller {
     // last_is_playing_for_start_stop_state_callback: bool,
     // has_pending_rt_client_states: Arc<AtomicBool>,
     session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
-    start_stop_sync_enabled: Arc<AtomicBool>,
+    start_stop_sync_enabled: Arc<Mutex<bool>>,
     // rt_client_state_setter: RtClientStateSetter,
     // peers: ControllerPeer,
-    sessions: Arc<Mutex<Sessions>>,
+    sessions: Sessions,
     discovery: Arc<PeerGateway>,
     clock: Clock,
     rx_event: Option<Receiver<OnEvent>>,
+    rx_measure_peer: Option<tokio::sync::broadcast::Receiver<MeasurePeerEvent>>,
+    notifier: Arc<Notify>,
 }
 
 impl Controller {
@@ -64,91 +72,152 @@ impl Controller {
 
         let session_state = Arc::new(Mutex::new(s_state));
 
-        let (tx_measure_peer, rx_measure_peer) = tokio::sync::mpsc::channel(1);
+        let (tx_measure_peer, rx_measure_peer) = tokio::sync::broadcast::channel(1);
         let (tx_peer_state_change, mut rx_peer_state_change) = tokio::sync::mpsc::channel(1);
         let (tx_event, rx_event) = tokio::sync::mpsc::channel::<OnEvent>(1);
+
+        let peers = Arc::new(Mutex::new(vec![]));
+
+        let notifier = Arc::new(Notify::new());
 
         let discovery = Arc::new(
             PeerGateway::new(
                 NodeState {
                     node_id: n_id,
-                    session_id: session_id.clone(),
+                    session_id: *session_id.lock().unwrap(),
                     timeline,
                     start_stop_state: StartStopState::default(),
                 },
                 GhostXForm::default(),
-                rx_measure_peer,
                 clock,
                 session_peer_counter.clone(),
                 tx_peer_state_change,
                 tx_event,
+                tx_measure_peer.clone(),
+                peers.clone(),
+                notifier.clone(),
             )
             .await,
         );
 
-        let sessions = Arc::new(Mutex::new(Sessions::new(
+        let sessions = Sessions::new(
             Session {
-                session_id: session_id.clone(),
+                session_id: *session_id.lock().unwrap(),
                 timeline,
                 measurement: SessionMeasurement::default(),
             },
-            Arc::new(Mutex::new(Vec::new())),
             tx_measure_peer,
-        )));
+            peers,
+            notifier.clone(),
+        );
 
         let n_id_loop = node_id.clone();
         let discovery_loop = discovery.clone();
         let s_id_loop = session_id.clone();
         let s_state_loop = session_state.clone();
+        let c_state_loop = client_state.clone();
         let sessions_loop = sessions.clone();
+
+        let start_stop_sync_enabled = Arc::new(Mutex::new(false));
+        let s_stop_sync_enabled = start_stop_sync_enabled.clone();
+
+        let n = notifier.clone();
 
         tokio::spawn(async move {
             loop {
-                match rx_peer_state_change.recv().await {
-                    Some(PeerStateChange::SessionMembership) => {
-                        let n_id = NodeId::new();
-                        *n_id_loop.lock().unwrap() = n_id;
-                        *s_id_loop.lock().unwrap() = SessionId(n_id);
+                select! {
+                    Some(peer_state_changes) = rx_peer_state_change.recv() => {
+                        info!("received peer state changes");
+                        for peer_state_change in peer_state_changes.iter() {
+                            match peer_state_change {
+                                PeerStateChange::SessionMembership => {
+                                    reset_state(
+                                        n_id_loop.clone(),
+                                        s_id_loop.clone(),
+                                        s_state_loop.clone(),
+                                        c_state_loop.clone(),
+                                        discovery_loop.clone(),
+                                        sessions_loop.clone(),
+                                        clock,
+                                        s_stop_sync_enabled.clone(),
+                                    )
+                                    .await
+                                }
+                                PeerStateChange::SessionTimeline(peer_session, timeline) => {
+                                    // handle_timeline_from_session
 
-                        let x_form = init_x_form(clock);
-                        let host_time = -x_form.intercept;
+                                    info!(
+                                        "received timeline with tempo: {} for session: {}",
+                                        timeline.tempo.bpm(),
+                                        peer_session
+                                    );
 
-                        let new_tl = Timeline {
-                            tempo: s_state_loop.lock().unwrap().timeline.tempo,
-                            beat_origin: s_state_loop.lock().unwrap().timeline.to_beats(
-                                s_state_loop
-                                    .lock()
-                                    .unwrap()
-                                    .ghost_x_form
-                                    .host_to_ghost(host_time),
-                            ),
-                            time_origin: x_form.host_to_ghost(host_time),
-                        };
+                                    let new_timeline = sessions_loop
+                                        .saw_session_timeline(*peer_session, *timeline)
+                                        .unwrap();
 
-                        reset_session_start_stop_state(s_state_loop.clone());
+                                    update_session_timing(
+                                        s_state_loop.clone(),
+                                        c_state_loop.clone(),
+                                        new_timeline,
+                                        None,
+                                        clock,
+                                        s_stop_sync_enabled.clone(),
+                                    );
 
-                        update_session_timing(s_state_loop.clone(), new_tl, x_form);
-                        update_discovery(
-                            s_state_loop.clone(),
-                            n_id_loop.clone(),
-                            s_id_loop.clone(),
-                            discovery_loop.clone(),
-                        )
-                        .await;
+                                    update_discovery(
+                                        s_state_loop.clone(),
+                                        n_id_loop.clone(),
+                                        s_id_loop.clone(),
+                                        discovery_loop.clone(),
+                                    )
+                                    .await;
+                                }
+                                PeerStateChange::SessionStartStopState(
+                                    peer_session,
+                                    peer_start_stop_state,
+                                ) => {
+                                    // handle_start_stop_state_from_session
 
-                        sessions_loop.lock().unwrap().reset_session(Session {
-                            session_id: s_id_loop.clone(),
-                            timeline: new_tl,
-                            measurement: SessionMeasurement {
-                                x_form,
-                                timestamp: host_time,
-                            },
-                        });
+                                    info!(
+                                        "received start stop state. isPlaying: {}, beats: {}, time: {} for session: {}",
+                                        peer_start_stop_state.is_playing,
+                                        peer_start_stop_state.beats.floating(),
+                                        peer_start_stop_state.timestamp.num_microseconds().unwrap(),
+                                        peer_session,
+                                    );
 
-                        discovery_loop.observer.reset_peers();
+                                    if *peer_session == *s_id_loop.lock().unwrap()
+                                        && peer_start_stop_state.timestamp
+                                            > s_state_loop.lock().unwrap().start_stop_state.timestamp
+                                    {
+                                        s_state_loop.lock().unwrap().start_stop_state =
+                                            *peer_start_stop_state;
+
+                                        update_discovery(
+                                            s_state_loop.clone(),
+                                            n_id_loop.clone(),
+                                            s_id_loop.clone(),
+                                            discovery_loop.clone(),
+                                        )
+                                        .await;
+
+                                        if *s_stop_sync_enabled.lock().unwrap() {
+                                            c_state_loop.lock().unwrap().start_stop_state =
+                                                map_start_stop_state_from_session_to_client(
+                                                    *peer_start_stop_state,
+                                                    s_state_loop.lock().unwrap().timeline,
+                                                    s_state_loop.lock().unwrap().ghost_x_form,
+                                                )
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                    Some(PeerStateChange::SessionTimeline) => {}
-                    _ => todo!(),
+                    // _ = n.notified() => {
+                    //     break;
+                    // }
                 }
             }
         });
@@ -163,21 +232,83 @@ impl Controller {
             // last_is_playing_for_start_stop_state_callback: false,
             // has_pending_rt_client_states: Arc::new(AtomicBool::new(false)),
             session_peer_counter: session_peer_counter.clone(),
-            start_stop_sync_enabled: Arc::new(AtomicBool::new(false)),
+            start_stop_sync_enabled,
             // rt_client_state_setter: RtClientStateSetter,
             // peers: ControllerPeer::default(),
             sessions,
             discovery,
             clock,
             rx_event: Some(rx_event),
+            rx_measure_peer: Some(rx_measure_peer),
+            notifier,
         }
     }
 
-    pub async fn reset_state(&mut self) {}
-
     pub async fn enable(&mut self) {
-        self.discovery.listen(self.rx_event.as_mut().unwrap()).await;
+        self.discovery
+            .listen(self.rx_event.take().unwrap(), self.notifier.clone())
+            .await;
     }
+}
+
+pub async fn reset_state(
+    node_id: Arc<Mutex<NodeId>>,
+    session_id: Arc<Mutex<SessionId>>,
+    session_state: Arc<Mutex<SessionState>>,
+    client_state: Arc<Mutex<ClientState>>,
+    discovery: Arc<PeerGateway>,
+    mut sessions: Sessions,
+    clock: Clock,
+    start_stop_sync_enabled: Arc<Mutex<bool>>,
+) {
+    let n_id = NodeId::new();
+    *node_id.lock().unwrap() = n_id;
+    *session_id.lock().unwrap() = SessionId(n_id);
+
+    let x_form = init_x_form(clock);
+    let host_time = -x_form.intercept;
+
+    let new_tl = Timeline {
+        tempo: session_state.lock().unwrap().timeline.tempo,
+        beat_origin: session_state.lock().unwrap().timeline.to_beats(
+            session_state
+                .lock()
+                .unwrap()
+                .ghost_x_form
+                .host_to_ghost(host_time),
+        ),
+        time_origin: x_form.host_to_ghost(host_time),
+    };
+
+    reset_session_start_stop_state(session_state.clone());
+
+    update_session_timing(
+        session_state.clone(),
+        client_state.clone(),
+        new_tl,
+        Some(x_form),
+        clock,
+        start_stop_sync_enabled,
+    );
+
+    update_discovery(
+        session_state.clone(),
+        node_id.clone(),
+        session_id.clone(),
+        discovery.clone(),
+    )
+    .await;
+
+    sessions.reset_session(Session {
+        session_id: *session_id.lock().unwrap(),
+        timeline: new_tl,
+        measurement: SessionMeasurement {
+            x_form,
+            timestamp: host_time,
+        },
+    });
+
+    discovery.observer.reset_peers();
 }
 
 pub async fn update_discovery(
@@ -191,6 +322,7 @@ pub async fn update_discovery(
     let ghost_xform = session_state.lock().unwrap().ghost_x_form;
 
     let node_id = *node_id.lock().unwrap();
+    let session_id = *session_id.lock().unwrap();
 
     discovery
         .update_node_state(
@@ -211,10 +343,43 @@ pub fn reset_session_start_stop_state(session_state: Arc<Mutex<SessionState>>) {
 
 pub fn update_session_timing(
     session_state: Arc<Mutex<SessionState>>,
+    client_state: Arc<Mutex<ClientState>>,
     new_timeline: Timeline,
-    new_x_form: GhostXForm,
+    new_x_form: Option<GhostXForm>,
+    clock: Clock,
+    start_stop_sync_enabled: Arc<Mutex<bool>>,
 ) {
-    todo!()
+    let new_timeline = clamp_tempo(new_timeline);
+    let old_timeline = session_state.try_lock().unwrap().timeline;
+    let old_x_form = session_state.try_lock().unwrap().ghost_x_form;
+
+    let new_x_form = new_x_form.unwrap_or(old_x_form);
+
+    if old_timeline != new_timeline || old_x_form != new_x_form {
+        session_state.lock().unwrap().timeline = new_timeline;
+        session_state.lock().unwrap().ghost_x_form = new_x_form;
+
+        let old_client_timeline = client_state.lock().unwrap().timeline;
+        client_state.lock().unwrap().timeline = update_client_timeline_from_session(
+            new_timeline,
+            old_client_timeline,
+            clock.micros(),
+            new_x_form,
+        );
+
+        if *start_stop_sync_enabled.lock().unwrap()
+            && session_state.lock().unwrap().start_stop_state != StartStopState::default()
+        {
+            client_state.lock().unwrap().start_stop_state =
+                map_start_stop_state_from_session_to_client(
+                    session_state.lock().unwrap().start_stop_state,
+                    session_state.lock().unwrap().timeline,
+                    session_state.lock().unwrap().ghost_x_form,
+                );
+        }
+
+        if old_timeline.tempo != new_timeline.tempo {}
+    }
 }
 
 fn init_x_form(clock: Clock) -> GhostXForm {
@@ -270,7 +435,7 @@ fn select_preferred_start_stop_state(
     current_start_stop_state
 }
 
-fn map_start_stop_state_form_session_to_client(
+fn map_start_stop_state_from_session_to_client(
     session_start_stop_state: StartStopState,
     session_timeline: Timeline,
     x_form: GhostXForm,

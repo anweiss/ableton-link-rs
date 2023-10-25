@@ -177,11 +177,16 @@ impl SessionState {
 
 #[cfg(test)]
 mod tests {
+    use tracing::info;
+
     use super::*;
 
     #[tokio::test]
     async fn test_basic_link() {
+        // console_subscriber::init();
+
         let mut link = BasicLink::new(120.0).await;
+        info!("initializing basic link at 120 bpm");
         link.enable().await;
     }
 }

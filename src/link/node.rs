@@ -16,7 +16,7 @@ use super::{
 
 pub type NodeIdArray = [u8; 8];
 
-#[derive(Default, Clone, Copy, Debug, Encode, Decode, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Default, Clone, Copy, Debug, Encode, Decode, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct NodeId(NodeIdArray);
 
 impl Display for NodeId {
@@ -45,13 +45,13 @@ impl NodeId {
 #[derive(Debug, Clone)]
 pub struct NodeState {
     pub node_id: NodeId,
-    pub session_id: Arc<Mutex<SessionId>>,
+    pub session_id: SessionId,
     pub timeline: Timeline,
     pub start_stop_state: StartStopState,
 }
 
 impl NodeState {
-    pub fn new(session_id: Arc<Mutex<SessionId>>) -> Self {
+    pub fn new(session_id: SessionId) -> Self {
         let node_id = NodeId::new();
 
         NodeState {
@@ -69,7 +69,7 @@ impl NodeState {
     pub fn from_payload(node_id: NodeId, payload: &Payload) -> Self {
         let mut node_state = NodeState {
             node_id,
-            session_id: Arc::new(Mutex::new(SessionId::default())),
+            session_id: SessionId::default(),
             timeline: Timeline::default(),
             start_stop_state: StartStopState::default(),
         };
@@ -80,7 +80,7 @@ impl NodeState {
                     node_state.timeline = *tl;
                 }
                 PayloadEntry::SessionMembership(sm) => {
-                    node_state.session_id = Arc::new(Mutex::new(sm.session_id));
+                    node_state.session_id = sm.session_id;
                 }
                 PayloadEntry::StartStopState(ststst) => {
                     node_state.start_stop_state = *ststst;

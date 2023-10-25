@@ -147,4 +147,20 @@ mod tests {
         assert_eq!(START_STOP_STATE_HEADER_KEY, 0x73747374);
         println!("size: {}", START_STOP_STATE_SIZE);
     }
+
+    #[test]
+    fn roundtrip() {
+        let start_stop_state = StartStopState {
+            beats: Beats { value: 123 },
+            is_playing: true,
+            timestamp: Duration::zero(),
+        };
+
+        let encoded = bincode::encode_to_vec(start_stop_state, ENCODING_CONFIG).unwrap();
+
+        let (decoded, _) =
+            bincode::decode_from_slice::<StartStopState, _>(&encoded[..], ENCODING_CONFIG).unwrap();
+
+        assert_eq!(decoded, start_stop_state);
+    }
 }
