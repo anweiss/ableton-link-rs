@@ -91,7 +91,7 @@ impl Messenger {
         let tx_event = self.tx_event.clone();
         let last_broadcast_time = self.last_broadcast_time.clone();
 
-        let n = self.notifier.clone();
+        let _n = self.notifier.clone();
 
         tokio::spawn(async move {
             loop {
@@ -147,7 +147,7 @@ impl Messenger {
             self.last_broadcast_time.clone(),
             self.interface.as_ref().unwrap().clone(),
             self.peer_state.clone(),
-            SocketAddrV4::new(MULTICAST_ADDR.into(), LINK_PORT),
+            SocketAddrV4::new(MULTICAST_ADDR, LINK_PORT),
             self.notifier.clone(),
         )
         .await;

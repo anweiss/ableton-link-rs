@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     mem,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
 
@@ -10,7 +10,7 @@ use tokio::{
     net::UdpSocket,
     select,
     sync::{
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Sender},
         Notify,
     },
 };
@@ -218,8 +218,6 @@ impl Measurement {
     pub async fn new(state: PeerState, clock: Clock, tx_measurement: Sender<Vec<f64>>) -> Self {
         let (tx_timer, mut rx_timer) = mpsc::channel(1);
 
-        info!("peer state: {:?}", state);
-
         let unicast_socket = Arc::new(new_udp_reuseport(UNICAST_IP_ANY));
 
         let success = Arc::new(Mutex::new(false));
@@ -227,7 +225,7 @@ impl Measurement {
 
         let mut measurement = Measurement {
             unicast_socket: Some(unicast_socket.clone()),
-            session_id: state.node_state.session_id.clone(),
+            session_id: state.node_state.session_id,
             measurement_endpoint: state.measurement_endpoint,
             data: data.clone(),
             clock,
@@ -309,10 +307,10 @@ impl Measurement {
 
     pub async fn listen(&mut self) {
         let socket = self.unicast_socket.as_ref().unwrap().clone();
-        let endpoint = self.measurement_endpoint.as_ref().unwrap().clone();
+        let endpoint = *self.measurement_endpoint.as_ref().unwrap();
         socket.connect(endpoint).await.unwrap();
         let clock = self.clock;
-        let s_id = self.session_id.clone();
+        let s_id = self.session_id;
         let data = self.data.clone();
         let tx_timer = self.tx_timer.clone();
 
@@ -322,6 +320,7 @@ impl Measurement {
         );
 
         tokio::spawn(async move {
+            let mut pong_received = false;
             loop {
                 let mut buf = [0; MAX_MESSAGE_SIZE];
 
@@ -330,7 +329,10 @@ impl Measurement {
 
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
                 if header.message_type == PONG {
-                    debug!("received pong message from {}", src);
+                    if !pong_received {
+                        info!("received pong message from {}", src);
+                        pong_received = true;
+                    }
 
                     let payload = parse_payload(&buf[header_len..amt]).unwrap();
 
@@ -382,15 +384,10 @@ impl Measurement {
                             }
                         }
 
-                        // info!("data {:?}", data.lock().unwrap());
-
-                        debug!("data len: {}", data.lock().unwrap().len());
-
                         if data.lock().unwrap().len() > NUMBER_DATA_POINTS {
-                            debug!("finishing measurement");
+                            info!("finishing measurement");
                             tx_timer.send(TimerStatus::Finish).await.unwrap();
-                        } else {
-                            debug!("resetting measurement");
+                            break;
                         }
                     }
                 }
@@ -411,7 +408,7 @@ async fn reset_timer(
     loop {
         select! {
             _  = tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()) => {
-                debug!(
+                info!(
                     "measurements_start {}",
                     measurements_started.lock().unwrap()
                 );
@@ -432,7 +429,7 @@ async fn reset_timer(
                     *measurements_started.lock().unwrap() += 1;
                 } else {
                     data.lock().unwrap().clear();
-                    debug!("measuring {} failed", measurement_endpoint);
+                    info!("measuring {} failed", measurement_endpoint);
 
                     let data = data.lock().unwrap().clone();
                     tx_measurement.send(data).await.unwrap();
@@ -485,9 +482,8 @@ pub fn median(values: Vec<f64>) -> f64 {
     if n % 2 == 0 {
         let mid1 = n / 2;
         let mid2 = (n - 1) / 2;
-        let median = (sorted_values[mid1] + sorted_values[mid2]) / 2.0;
 
-        median
+        (sorted_values[mid1] + sorted_values[mid2]) / 2.0
     } else {
         let mid = n / 2;
 

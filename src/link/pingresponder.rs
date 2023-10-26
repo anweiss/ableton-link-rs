@@ -1,15 +1,13 @@
 use std::{
-    net::{SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use bincode::{Decode, Encode};
-use tokio::{net::UdpSocket, select, sync::Notify, time::Instant};
+use tokio::{net::UdpSocket, sync::Notify};
 use tracing::info;
 
 use crate::{
-    discovery::{messenger::new_udp_reuseport, ENCODING_CONFIG, MULTICAST_IP_ANY},
+    discovery::{ENCODING_CONFIG},
     link::{
         payload::{GhostTime, PayloadEntry},
         sessions::SessionMembership,
@@ -72,7 +70,7 @@ impl PingResponder {
         pr
     }
 
-    pub async fn listen(&self, notifier: Arc<Notify>) {
+    pub async fn listen(&self, _notifier: Arc<Notify>) {
         let unicast_socket = self.unicast_socket.as_ref().unwrap().clone();
         let session_id = self.session_id.clone();
         let ghost_x_form = self.ghost_x_form.clone();

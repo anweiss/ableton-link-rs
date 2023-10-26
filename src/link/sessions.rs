@@ -6,28 +6,13 @@ use std::{
 
 use bincode::{Decode, Encode};
 use chrono::Duration;
-use tokio::{
-    select,
-    sync::{
-        mpsc::{Receiver, Sender},
-        Notify,
-    },
-};
 use tracing::{debug, info};
 
-use crate::discovery::{
-    peers::{ControllerPeer, PeerState},
-    ENCODING_CONFIG,
-};
+use crate::discovery::{peers::ControllerPeer, ENCODING_CONFIG};
 
 use super::{
-    ghostxform::GhostXForm,
-    measurement::MeasurePeerEvent,
-    node::NodeId,
-    payload::PayloadEntryHeader,
-    state::{ClientStartStopState, StartStopState},
-    timeline::Timeline,
-    Result,
+    clock::Clock, ghostxform::GhostXForm, measurement::MeasurePeerEvent, node::NodeId,
+    payload::PayloadEntryHeader, timeline::Timeline, Result,
 };
 
 pub const SESSION_MEMBERSHIP_HEADER_KEY: u32 = u32::from_be_bytes(*b"sess");
@@ -37,7 +22,7 @@ pub const SESSION_MEMBERSHIP_HEADER: PayloadEntryHeader = PayloadEntryHeader {
     size: SESSION_MEMBERSHIP_SIZE,
 };
 
-#[derive(Clone, Copy, Debug, Encode, Decode, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Encode, Decode, Default, PartialEq, Eq, PartialOrd)]
 pub struct SessionId(pub NodeId);
 
 impl Display for SessionId {
@@ -92,10 +77,11 @@ pub struct Session {
 
 #[derive(Clone)]
 pub struct Sessions {
-    pub sessions: Arc<Mutex<Vec<Session>>>,
-    pub current: Option<Arc<Mutex<SessionId>>>,
+    pub other_sessions: Arc<Mutex<Vec<Session>>>,
+    pub current: Option<Arc<Mutex<Session>>>,
     pub tx_measure_peer: tokio::sync::broadcast::Sender<MeasurePeerEvent>,
     pub peers: Arc<Mutex<Vec<ControllerPeer>>>,
+    pub clock: Clock,
 }
 
 impl Sessions {
@@ -103,49 +89,57 @@ impl Sessions {
         init: Session,
         tx_measure_peer: tokio::sync::broadcast::Sender<MeasurePeerEvent>,
         peers: Arc<Mutex<Vec<ControllerPeer>>>,
-        notifier: Arc<Notify>,
+        clock: Clock,
+        tx_join_session: tokio::sync::mpsc::Sender<Session>,
     ) -> Self {
         let mut rx_measure_peer = tx_measure_peer.subscribe();
-        let sessions = Arc::new(Mutex::new(vec![init.clone()]));
+        let other_sessions = Arc::new(Mutex::new(vec![init.clone()]));
+        let current = Some(Arc::new(Mutex::new(init)));
 
-        let sessions_loop = sessions.clone();
+        let other_sessions_loop = other_sessions.clone();
+        let current_loop = current.clone();
+        let tx_join_session_loop = tx_join_session.clone();
 
         tokio::spawn(async move {
             loop {
-                select! {
-                    Ok(measure_peer_event) = rx_measure_peer.recv() => {
-                        if let MeasurePeerEvent::XForm(session_id, x_form) = measure_peer_event {
-                            todo!();
-                        }
+                if let Ok(measure_peer_event) = rx_measure_peer.recv().await {
+                    if let MeasurePeerEvent::XForm(session_id, x_form) = measure_peer_event {
+                        handle_successful_measurement(
+                            session_id,
+                            x_form,
+                            other_sessions_loop.clone(),
+                            current_loop.clone(),
+                            clock,
+                            tx_join_session_loop.clone(),
+                        )
+                        .await;
                     }
-                    // _ = notifier.notified() => {
-                    //     break;
-                    // }
                 }
             }
         });
 
         Self {
-            sessions,
-            current: Some(Arc::new(Mutex::new(init.session_id.clone()))),
+            other_sessions,
+            current,
             tx_measure_peer,
             peers,
+            clock,
         }
     }
 
     pub fn reset_session(&mut self, session: Session) {
-        self.current = Some(Arc::new(Mutex::new(session.session_id)));
-        self.sessions.lock().unwrap().clear()
+        self.current = Some(Arc::new(Mutex::new(session)));
+        self.other_sessions.lock().unwrap().clear()
     }
 
     pub fn reset_timeline(&self, timeline: Timeline) {
         if let Some(current) = &self.current {
             if let Some(session) = self
-                .sessions
+                .other_sessions
                 .lock()
                 .unwrap()
                 .iter_mut()
-                .find(|s| s.session_id == *current.lock().unwrap())
+                .find(|s| s.session_id == current.lock().unwrap().session_id)
             {
                 session.timeline = timeline;
             }
@@ -163,11 +157,11 @@ impl Sessions {
         );
 
         if let Some(current) = &self.current {
-            if *current.lock().unwrap() == session_id {
-                self.update_timeline(*current.lock().unwrap(), timeline);
+            if current.lock().unwrap().session_id == session_id {
+                self.update_timeline(current.lock().unwrap().session_id, timeline);
             } else {
                 let mut session = Session {
-                    session_id: session_id.clone(),
+                    session_id,
                     timeline,
                     measurement: SessionMeasurement {
                         x_form: GhostXForm::default(),
@@ -176,21 +170,21 @@ impl Sessions {
                 };
 
                 if self
-                    .sessions
+                    .other_sessions
                     .lock()
                     .unwrap()
                     .iter()
                     .any(|s| s.session_id == session_id)
                 {
-                    self.update_timeline(session.session_id.clone(), timeline);
+                    self.update_timeline(session.session_id, timeline);
                 } else {
                     self.launch_session_measurement(&mut session);
-                    self.sessions.lock().unwrap().push(session);
+                    self.other_sessions.lock().unwrap().push(session);
                 }
             }
 
             return self
-                .sessions
+                .other_sessions
                 .lock()
                 .unwrap()
                 .iter()
@@ -203,7 +197,7 @@ impl Sessions {
 
     pub fn update_timeline(&self, session_id: SessionId, timeline: Timeline) {
         if let Some(session) = self
-            .sessions
+            .other_sessions
             .lock()
             .unwrap()
             .iter_mut()
@@ -230,7 +224,7 @@ impl Sessions {
     pub fn launch_session_measurement(&self, session: &mut Session) {
         info!("launching session measurement");
 
-        let peers = session_peers(self.peers.clone(), session.session_id.clone());
+        let peers = session_peers(self.peers.clone(), session.session_id);
 
         if let Some(p) = peers
             .iter()
@@ -253,6 +247,77 @@ impl Sessions {
                 .unwrap();
         }
     }
+}
+
+pub async fn handle_successful_measurement(
+    session_id: SessionId,
+    x_form: GhostXForm,
+    other_sessions: Arc<Mutex<Vec<Session>>>,
+    current: Option<Arc<Mutex<Session>>>,
+    clock: Clock,
+    tx_join_session: tokio::sync::mpsc::Sender<Session>,
+) {
+    info!(
+        "session {} measurement completed with result ({}, {})",
+        session_id,
+        x_form.slope,
+        x_form.intercept.num_microseconds().unwrap(),
+    );
+
+    let measurement = SessionMeasurement {
+        x_form,
+        timestamp: clock.micros(),
+    };
+
+    if let Some(current) = current {
+        if current.lock().unwrap().session_id == session_id {
+            current.lock().unwrap().measurement = measurement;
+            let session = current.lock().unwrap().clone();
+            tx_join_session.send(session).await.unwrap();
+        } else {
+            let s = other_sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .enumerate()
+                .find(|(_, s)| s.session_id == session_id);
+
+            if let Some((idx, s)) = s {
+                const SESSION_EPS: Duration = Duration::microseconds(500000);
+
+                let host_time = clock.micros();
+                let cur_ghost = current
+                    .lock()
+                    .unwrap()
+                    .measurement
+                    .x_form
+                    .host_to_ghost(host_time);
+                let new_ghost = measurement.x_form.host_to_ghost(host_time);
+
+                let mut s = s.clone();
+                s.measurement = measurement;
+
+                let ghost_diff = new_ghost - cur_ghost;
+                if ghost_diff > SESSION_EPS
+                    || (ghost_diff.num_microseconds().unwrap().abs()
+                        < SESSION_EPS.num_microseconds().unwrap()
+                        && session_id < current.lock().unwrap().session_id)
+                {
+                    // new session wins
+                    let c = current.lock().unwrap().clone();
+                    *current.lock().unwrap() = s.clone();
+                    other_sessions.lock().unwrap().remove(idx);
+                    other_sessions.lock().unwrap().push(c);
+
+                    tx_join_session.send(s).await.unwrap();
+                    todo!("schedule remeasurement");
+                }
+            }
+        }
+    }
+
+    // todo!();
 }
 
 pub fn session_peers(

@@ -5,7 +5,7 @@ use chrono::Duration;
 use tracing::{debug, info, warn};
 
 use crate::{
-    discovery::{peers::PeerState, ENCODING_CONFIG},
+    discovery::{ENCODING_CONFIG},
     link::{
         measurement::{
             MeasurementEndpointV4, MEASUREMENT_ENDPOINT_V4_HEADER_KEY, MEASUREMENT_ENDPOINT_V4_SIZE,

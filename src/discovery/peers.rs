@@ -45,12 +45,12 @@ impl GatewayObserver {
         session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
         tx_peer_state_change: Sender<Vec<PeerStateChange>>,
         peers: Arc<Mutex<Vec<ControllerPeer>>>,
-        notifier: Arc<Notify>,
+        _notifier: Arc<Notify>,
     ) -> Self {
         let gwo = GatewayObserver { peers };
 
         let peers = gwo.peers.clone();
-        let session_id = session_id.clone();
+        let session_id = session_id;
 
         tokio::spawn(async move {
             loop {
@@ -62,7 +62,7 @@ impl GatewayObserver {
                                     peer_state.node_state,
                                     peer_state.measurement_endpoint,
                                     peers.clone(),
-                                    session_id.clone(),
+                                    session_id,
                                     session_peer_counter.clone(),
                                     tx_peer_state_change.clone(),
                                 )
@@ -117,7 +117,7 @@ impl PeerState {
     }
 
     pub fn session_id(&self) -> SessionId {
-        self.node_state.session_id.clone()
+        self.node_state.session_id
     }
 
     pub fn timeline(&self) -> Timeline {
@@ -208,7 +208,7 @@ async fn saw_peer(
     if is_new_session_timeline {
         info!("session timeline changed");
         peer_state_changes.push(PeerStateChange::SessionTimeline(
-            peer_session.clone(),
+            peer_session,
             peer_timeline,
         ));
     }
@@ -225,15 +225,13 @@ async fn saw_peer(
         info!("session membership changed");
         let count = unique_session_peer_count(session_id, peers.clone());
         let old_count = session_peer_counter.lock().unwrap().session_peer_count;
-        if old_count != count {
-            if count == 0 {
-                peer_state_changes.push(PeerStateChange::SessionMembership);
-            }
+        if old_count != count && count == 0 {
+            peer_state_changes.push(PeerStateChange::SessionMembership);
         }
     }
 
     info!("sending peer state changes to controller");
-    let _ = tx_peer_state_change.send(peer_state_changes).await.unwrap();
+    tx_peer_state_change.send(peer_state_changes).await.unwrap();
 }
 
 async fn peer_left(node_id: NodeId, peers: Arc<Mutex<Vec<ControllerPeer>>>) {

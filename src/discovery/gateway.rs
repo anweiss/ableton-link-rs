@@ -15,7 +15,7 @@ use crate::{
     discovery::{
         messages::{encode_message, BYEBYE},
         messenger::new_udp_reuseport,
-        LINK_PORT, MULTICAST_ADDR, MULTICAST_IP_ANY, UNICAST_IP_ANY,
+        LINK_PORT, MULTICAST_ADDR, UNICAST_IP_ANY,
     },
     link::{
         clock::Clock,
@@ -24,7 +24,6 @@ use crate::{
         measurement::{MeasurePeerEvent, MeasurementService},
         node::{NodeId, NodeState},
         payload::Payload,
-        sessions::SessionId,
     },
 };
 
@@ -91,7 +90,7 @@ impl PeerGateway {
             epoch,
             observer: GatewayObserver::new(
                 rx_peer_event,
-                node_state.session_id.clone(),
+                node_state.session_id,
                 session_peer_counter.clone(),
                 tx_peer_state_change,
                 peers,
@@ -101,7 +100,7 @@ impl PeerGateway {
             messenger,
             measurement: MeasurementService::new(
                 ping_responder_unicast_socket,
-                node_state.session_id.clone(),
+                node_state.session_id,
                 ghost_xform,
                 clock,
                 tx_measure_peer.clone(),
@@ -119,7 +118,7 @@ impl PeerGateway {
 
     pub async fn update_node_state(&self, node_state: NodeState, _ghost_xform: GhostXForm) {
         self.measurement
-            .update_node_state(node_state.session_id.clone(), _ghost_xform)
+            .update_node_state(node_state.session_id, _ghost_xform)
             .await;
         self.messenger
             .update_state(PeerState {

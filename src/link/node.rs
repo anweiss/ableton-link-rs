@@ -1,7 +1,6 @@
 use core::fmt;
 use std::{
     fmt::Display,
-    sync::{Arc, Mutex},
 };
 
 use bincode::{Decode, Encode};
