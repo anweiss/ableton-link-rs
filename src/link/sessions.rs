@@ -232,8 +232,6 @@ impl Sessions {
 
         let peers = session_peers(self.peers.clone(), session.session_id.clone());
 
-        info!("peers {:?}", peers);
-
         if let Some(p) = peers
             .iter()
             .find(|p| p.peer_state.ident() == session.session_id.0)

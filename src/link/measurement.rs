@@ -14,7 +14,7 @@ use tokio::{
         Notify,
     },
 };
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     discovery::{
@@ -113,26 +113,12 @@ impl MeasurementService {
         let m_map = measurement_map.clone();
         let t_peer = tx_measure_peer.clone();
 
-        let n = notifier.clone();
-
         tokio::spawn(async move {
             loop {
-                select! {
-                    Ok(peer) = rx_measure_peer.recv() => {
-                        if let MeasurePeerEvent::PeerState(session_id, peer) = peer {
-                            measure_peer(
-                                clock,
-                                m_map.clone(),
-                                t_peer.clone(),
-                                session_id,
-                                peer,
-                            )
-                            .await;
-                        }
+                if let Ok(peer) = rx_measure_peer.recv().await {
+                    if let MeasurePeerEvent::PeerState(session_id, peer) = peer {
+                        measure_peer(clock, m_map.clone(), t_peer.clone(), session_id, peer).await;
                     }
-                    // _ = n.notified() => {
-                    //     break;
-                    // }
                 }
             }
         });
@@ -226,7 +212,6 @@ pub struct Measurement {
     pub measurements_started: Arc<Mutex<usize>>,
     pub success: Arc<Mutex<bool>>,
     tx_timer: Sender<TimerStatus>,
-    tx_measurement: Sender<Vec<f64>>,
 }
 
 impl Measurement {
@@ -249,7 +234,6 @@ impl Measurement {
             measurements_started: Arc::new(Mutex::new(0)),
             success: success.clone(),
             tx_timer,
-            tx_measurement: tx_measurement.clone(),
         };
 
         info!("measurement on gateway");
@@ -257,19 +241,41 @@ impl Measurement {
         let ht = HostTime::new(clock.micros());
 
         let s = success.clone();
-        let s_me = state.measurement_endpoint.clone();
         let d = data.clone();
         let t = tx_measurement.clone();
+        let ms = measurement.measurements_started.clone();
+        let us = unicast_socket.clone();
+
+        let finished_notifier = Arc::new(Notify::new());
+
+        let fn_loop = finished_notifier.clone();
 
         tokio::spawn(async move {
             loop {
                 if let Some(timer_status) = rx_timer.recv().await {
                     match timer_status {
                         TimerStatus::Finish => {
-                            finish(s.clone(), s_me.unwrap(), d.clone(), t.clone()).await;
+                            fn_loop.notify_one();
+
+                            finish(
+                                s.clone(),
+                                state.measurement_endpoint.unwrap(),
+                                d.clone(),
+                                t.clone(),
+                            )
+                            .await;
                         }
                         TimerStatus::Reset => {
-                            todo!();
+                            reset_timer(
+                                ms.clone(),
+                                clock,
+                                Some(us.clone()),
+                                state.measurement_endpoint.unwrap(),
+                                d.clone(),
+                                t.clone(),
+                                fn_loop.clone(),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -279,50 +285,26 @@ impl Measurement {
         measurement.listen().await;
 
         send_ping(
-            unicast_socket,
-            state.measurement_endpoint.as_ref().unwrap().clone(),
+            unicast_socket.clone(),
+            *state.measurement_endpoint.as_ref().unwrap(),
             &Payload {
                 entries: vec![PayloadEntry::HostTime(ht)],
             },
         )
         .await;
 
-        measurement.reset_timer().await;
+        reset_timer(
+            measurement.measurements_started.clone(),
+            clock,
+            Some(unicast_socket.clone()),
+            state.measurement_endpoint.unwrap(),
+            data.clone(),
+            tx_measurement.clone(),
+            finished_notifier.clone(),
+        )
+        .await;
 
         measurement
-    }
-
-    pub async fn reset_timer(&mut self) {
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()) => {
-                    info!("measurements_start {}", self.measurements_started.lock().unwrap());
-                    if *self.measurements_started.lock().unwrap() < NUMBER_MEASUREMENTS {
-                        let ht = HostTime {
-                            time: self.clock.micros(),
-                        };
-
-                        send_ping(
-                            self.unicast_socket.as_ref().unwrap().clone(),
-                            self.measurement_endpoint.as_ref().unwrap().clone(),
-                            &Payload {
-                                entries: vec![PayloadEntry::HostTime(ht)],
-                            },
-                        )
-                        .await;
-
-                        *self.measurements_started.lock().unwrap() += 1;
-                    } else {
-                        self.data.lock().unwrap().clear();
-                        info!("measuring {} failed", self.measurement_endpoint.unwrap());
-
-                        let data = self.data.lock().unwrap().clone();
-                        self.tx_measurement.send(data).await.unwrap();
-                        break;
-                    }
-                }
-            }
-        }
     }
 
     pub async fn listen(&mut self) {
@@ -343,11 +325,12 @@ impl Measurement {
             loop {
                 let mut buf = [0; MAX_MESSAGE_SIZE];
 
+                // TODO: check to see if peer has left before receiving pong
                 let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
 
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
                 if header.message_type == PONG {
-                    info!("received pong message from {}", src);
+                    debug!("received pong message from {}", src);
 
                     let payload = parse_payload(&buf[header_len..amt]).unwrap();
 
@@ -399,19 +382,66 @@ impl Measurement {
                             }
                         }
 
-                        info!("data {:?}", data.lock().unwrap());
+                        // info!("data {:?}", data.lock().unwrap());
+
+                        debug!("data len: {}", data.lock().unwrap().len());
 
                         if data.lock().unwrap().len() > NUMBER_DATA_POINTS {
-                            info!("finishing measurement");
+                            debug!("finishing measurement");
                             tx_timer.send(TimerStatus::Finish).await.unwrap();
                         } else {
-                            info!("resetting measurement");
-                            tx_timer.send(TimerStatus::Reset).await.unwrap();
+                            debug!("resetting measurement");
                         }
                     }
                 }
             }
         });
+    }
+}
+
+async fn reset_timer(
+    measurements_started: Arc<Mutex<usize>>,
+    clock: Clock,
+    unicast_socket: Option<Arc<UdpSocket>>,
+    measurement_endpoint: SocketAddrV4,
+    data: Arc<Mutex<Vec<f64>>>,
+    tx_measurement: Sender<Vec<f64>>,
+    finished_notifier: Arc<Notify>,
+) {
+    loop {
+        select! {
+            _  = tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()) => {
+                debug!(
+                    "measurements_start {}",
+                    measurements_started.lock().unwrap()
+                );
+                if *measurements_started.lock().unwrap() < NUMBER_MEASUREMENTS {
+                    let ht = HostTime {
+                        time: clock.micros(),
+                    };
+
+                    send_ping(
+                        unicast_socket.as_ref().unwrap().clone(),
+                        measurement_endpoint,
+                        &Payload {
+                            entries: vec![PayloadEntry::HostTime(ht)],
+                        },
+                    )
+                    .await;
+
+                    *measurements_started.lock().unwrap() += 1;
+                } else {
+                    data.lock().unwrap().clear();
+                    debug!("measuring {} failed", measurement_endpoint);
+
+                    let data = data.lock().unwrap().clone();
+                    tx_measurement.send(data).await.unwrap();
+                }
+            }
+            _ = finished_notifier.notified() => {
+                break;
+            }
+        }
     }
 }
 
@@ -422,10 +452,11 @@ async fn finish(
     tx_measurement: Sender<Vec<f64>>,
 ) {
     *success.lock().unwrap() = true;
-    info!("measuring {} done", measurement_endpoint);
+    debug!("measuring {} done", measurement_endpoint);
 
-    let data = data.lock().unwrap().clone();
-    tx_measurement.send(data).await.unwrap();
+    let d = data.lock().unwrap().clone();
+    tx_measurement.send(d).await.unwrap();
+    data.lock().unwrap().clear();
 }
 
 pub async fn send_ping(
@@ -434,7 +465,7 @@ pub async fn send_ping(
     payload: &Payload,
 ) {
     let message = encode_message(PING, payload).unwrap();
-    info!(
+    debug!(
         "sending ping message to measurement endpoint {}",
         measurement_endpoint
     );
