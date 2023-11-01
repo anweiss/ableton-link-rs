@@ -18,10 +18,6 @@ use std::{
     time::Duration,
 };
 
-
-
-
-
 use self::{clock::Clock, controller::Controller, state::ApiState};
 
 pub type Result<T> = result::Result<T, error::Error>;

@@ -95,7 +95,7 @@ pub struct MeasurementService {
     pub measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
     pub clock: Clock,
     pub ping_responder: PingResponder,
-    pub tx_measure_peer: tokio::sync::broadcast::Sender<MeasurePeerEvent>,
+    pub tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
 }
 
 impl MeasurementService {
@@ -104,21 +104,20 @@ impl MeasurementService {
         session_id: SessionId,
         ghost_x_form: GhostXForm,
         clock: Clock,
-        tx_measure_peer: tokio::sync::broadcast::Sender<MeasurePeerEvent>,
+        tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
         notifier: Arc<Notify>,
+        mut rx_measure_peer_state: tokio::sync::mpsc::Receiver<MeasurePeerEvent>,
     ) -> MeasurementService {
-        let mut rx_measure_peer = tx_measure_peer.subscribe();
         let measurement_map = Arc::new(Mutex::new(HashMap::new()));
 
         let m_map = measurement_map.clone();
-        let t_peer = tx_measure_peer.clone();
+        let t_peer = tx_measure_peer_result.clone();
 
         tokio::spawn(async move {
             loop {
-                if let Ok(peer) = rx_measure_peer.recv().await {
-                    if let MeasurePeerEvent::PeerState(session_id, peer) = peer {
-                        measure_peer(clock, m_map.clone(), t_peer.clone(), session_id, peer).await;
-                    }
+                let event = rx_measure_peer_state.recv().await;
+                if let Some(MeasurePeerEvent::PeerState(session_id, peer)) = event {
+                    measure_peer(clock, m_map.clone(), t_peer.clone(), session_id, peer).await;
                 }
             }
         });
@@ -134,7 +133,7 @@ impl MeasurementService {
                 notifier,
             )
             .await,
-            tx_measure_peer,
+            tx_measure_peer: tx_measure_peer_result,
         }
     }
 
@@ -148,7 +147,7 @@ impl MeasurementService {
 pub async fn measure_peer(
     clock: Clock,
     measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
-    tx_measure_peer: tokio::sync::broadcast::Sender<MeasurePeerEvent>,
+    tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     session_id: SessionId,
     state: PeerState,
 ) {
@@ -163,9 +162,12 @@ pub async fn measure_peer(
 
     let measurement = Measurement::new(state, clock, tx_measurement).await;
 
-    measurement_map.lock().unwrap().insert(node_id, measurement);
+    measurement_map
+        .try_lock()
+        .unwrap()
+        .insert(node_id, measurement);
 
-    let tx_measure_peer = tx_measure_peer.clone();
+    let tx_measure_peer_result_loop = tx_measure_peer_result.clone();
 
     let measurement_map = measurement_map.clone();
 
@@ -173,11 +175,12 @@ pub async fn measure_peer(
         loop {
             if let Some(data) = rx_measurement.recv().await {
                 if data.is_empty() {
-                    let _ = tx_measure_peer
+                    let _ = tx_measure_peer_result_loop
                         .send(MeasurePeerEvent::XForm(session_id, GhostXForm::default()))
+                        .await
                         .unwrap();
                 } else {
-                    let _ = tx_measure_peer
+                    let _ = tx_measure_peer_result_loop
                         .send(MeasurePeerEvent::XForm(
                             session_id,
                             GhostXForm {
@@ -185,10 +188,15 @@ pub async fn measure_peer(
                                 intercept: Duration::microseconds(median(data).round() as i64),
                             },
                         ))
+                        .await
                         .unwrap();
                 }
 
-                measurement_map.lock().unwrap().remove(&node_id);
+                measurement_map
+                    .try_lock()
+                    .unwrap()
+                    .remove(&node_id)
+                    .unwrap();
             }
         }
     });
@@ -197,6 +205,7 @@ pub async fn measure_peer(
 pub const NUMBER_DATA_POINTS: usize = 100;
 pub const NUMBER_MEASUREMENTS: usize = 5;
 
+#[derive(Debug)]
 enum TimerStatus {
     Finish,
     Reset,
@@ -251,6 +260,7 @@ impl Measurement {
         tokio::spawn(async move {
             loop {
                 if let Some(timer_status) = rx_timer.recv().await {
+                    debug!("timer status {:?}", timer_status);
                     match timer_status {
                         TimerStatus::Finish => {
                             fn_loop.notify_one();
@@ -367,7 +377,7 @@ impl Measurement {
                         if ghost_time != Duration::microseconds(0)
                             && prev_host_time != Duration::microseconds(0)
                         {
-                            data.lock().unwrap().push(
+                            data.try_lock().unwrap().push(
                                 ghost_time.num_microseconds().unwrap() as f64
                                     - ((host_time + prev_host_time).num_microseconds().unwrap()
                                         as f64
@@ -375,17 +385,16 @@ impl Measurement {
                             );
 
                             if prev_ghost_time != Duration::microseconds(0) {
-                                data.lock().unwrap().push(
+                                data.try_lock().unwrap().push(
                                     ((ghost_time + prev_ghost_time).num_microseconds().unwrap()
                                         as f64
                                         * 0.5)
-                                        - prev_ghost_time.num_microseconds().unwrap() as f64,
+                                        - prev_host_time.num_microseconds().unwrap() as f64,
                                 );
                             }
                         }
 
-                        if data.lock().unwrap().len() > NUMBER_DATA_POINTS {
-                            info!("finishing measurement");
+                        if data.try_lock().unwrap().len() > NUMBER_DATA_POINTS {
                             tx_timer.send(TimerStatus::Finish).await.unwrap();
                             break;
                         }
@@ -410,9 +419,9 @@ async fn reset_timer(
             _  = tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()) => {
                 info!(
                     "measurements_start {}",
-                    measurements_started.lock().unwrap()
+                    measurements_started.try_lock().unwrap()
                 );
-                if *measurements_started.lock().unwrap() < NUMBER_MEASUREMENTS {
+                if *measurements_started.try_lock().unwrap() < NUMBER_MEASUREMENTS {
                     let ht = HostTime {
                         time: clock.micros(),
                     };
@@ -426,12 +435,12 @@ async fn reset_timer(
                     )
                     .await;
 
-                    *measurements_started.lock().unwrap() += 1;
+                    *measurements_started.try_lock().unwrap() += 1;
                 } else {
-                    data.lock().unwrap().clear();
+                    data.try_lock().unwrap().clear();
                     info!("measuring {} failed", measurement_endpoint);
 
-                    let data = data.lock().unwrap().clone();
+                    let data = data.try_lock().unwrap().clone();
                     tx_measurement.send(data).await.unwrap();
                 }
             }
@@ -448,12 +457,12 @@ async fn finish(
     data: Arc<Mutex<Vec<f64>>>,
     tx_measurement: Sender<Vec<f64>>,
 ) {
-    *success.lock().unwrap() = true;
+    *success.try_lock().unwrap() = true;
     debug!("measuring {} done", measurement_endpoint);
 
-    let d = data.lock().unwrap().clone();
+    let d = data.try_lock().unwrap().clone();
     tx_measurement.send(d).await.unwrap();
-    data.lock().unwrap().clear();
+    data.try_lock().unwrap().clear();
 }
 
 pub async fn send_ping(

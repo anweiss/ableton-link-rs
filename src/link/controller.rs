@@ -1,15 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use chrono::Duration;
-use tokio::{
-    select,
-    sync::{mpsc::Receiver, Notify},
-};
+use tokio::sync::{mpsc::Receiver, Notify};
 use tracing::info;
 
 use crate::discovery::{
     gateway::{OnEvent, PeerGateway},
-    peers::PeerStateChange,
+    peers::{unique_session_peer_count, ControllerPeer, PeerStateChange},
 };
 
 use super::{
@@ -34,16 +31,13 @@ pub struct Controller {
     session_state: Arc<Mutex<SessionState>>,
     client_state: Arc<Mutex<ClientState>>,
     // last_is_playing_for_start_stop_state_callback: bool,
-    // has_pending_rt_client_states: Arc<AtomicBool>,
     session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
-    // rt_client_state_setter: RtClientStateSetter,
-    // peers: ControllerPeer,
+    peers: Arc<Mutex<Vec<ControllerPeer>>>,
     sessions: Sessions,
     discovery: Arc<PeerGateway>,
     clock: Clock,
     rx_event: Option<Receiver<OnEvent>>,
-    rx_measure_peer: Option<tokio::sync::broadcast::Receiver<MeasurePeerEvent>>,
     notifier: Arc<Notify>,
 }
 
@@ -67,7 +61,8 @@ impl Controller {
 
         let session_state = Arc::new(Mutex::new(s_state));
 
-        let (tx_measure_peer, rx_measure_peer) = tokio::sync::broadcast::channel(1);
+        let (tx_measure_peer_state, rx_measure_peer_state) = tokio::sync::mpsc::channel(1);
+        let (tx_measure_peer_result, rx_measure_peer_result) = tokio::sync::mpsc::channel(1);
         let (tx_peer_state_change, mut rx_peer_state_change) = tokio::sync::mpsc::channel(1);
         let (tx_event, rx_event) = tokio::sync::mpsc::channel::<OnEvent>(1);
         let (tx_join_session, mut rx_join_session) = tokio::sync::mpsc::channel::<Session>(1);
@@ -75,11 +70,13 @@ impl Controller {
         let peers = Arc::new(Mutex::new(vec![]));
         let notifier = Arc::new(Notify::new());
 
+        let s_id = *session_id.try_lock().unwrap();
+
         let discovery = Arc::new(
             PeerGateway::new(
                 NodeState {
                     node_id: n_id,
-                    session_id: *session_id.lock().unwrap(),
+                    session_id: s_id,
                     timeline,
                     start_stop_state: StartStopState::default(),
                 },
@@ -88,11 +85,26 @@ impl Controller {
                 session_peer_counter.clone(),
                 tx_peer_state_change,
                 tx_event,
-                tx_measure_peer.clone(),
+                tx_measure_peer_result.clone(),
                 peers.clone(),
                 notifier.clone(),
+                rx_measure_peer_state,
             )
             .await,
+        );
+
+        let sessions = Sessions::new(
+            Session {
+                session_id: *session_id.try_lock().unwrap(),
+                timeline,
+                measurement: SessionMeasurement::default(),
+            },
+            tx_measure_peer_state,
+            peers.clone(),
+            clock,
+            tx_join_session,
+            notifier.clone(),
+            rx_measure_peer_result,
         );
 
         let s_id_loop = session_id.clone();
@@ -101,6 +113,9 @@ impl Controller {
         let s_stop_sync_enabled_loop = start_stop_sync_enabled.clone();
         let n_id_loop = node_id.clone();
         let discovery_loop = discovery.clone();
+        let peers_loop = peers.clone();
+        let s_peer_counter_loop = session_peer_counter.clone();
+        let s_loop = sessions.clone();
 
         tokio::spawn(async move {
             loop {
@@ -114,31 +129,24 @@ impl Controller {
                         s_stop_sync_enabled_loop.clone(),
                         n_id_loop.clone(),
                         discovery_loop.clone(),
+                        peers_loop.clone(),
+                        s_peer_counter_loop.clone(),
+                        s_loop.clone(),
                     )
                     .await;
                 }
             }
         });
 
-        let sessions = Sessions::new(
-            Session {
-                session_id: *session_id.lock().unwrap(),
-                timeline,
-                measurement: SessionMeasurement::default(),
-            },
-            tx_measure_peer,
-            peers,
-            clock,
-            tx_join_session,
-        );
-
         let n_id_loop = node_id.clone();
         let discovery_loop = discovery.clone();
         let s_id_loop = session_id.clone();
         let s_state_loop = session_state.clone();
         let c_state_loop = client_state.clone();
-        let sessions_loop = sessions.clone();
         let s_stop_sync_enabled_loop = start_stop_sync_enabled.clone();
+        let sessions_loop = sessions.clone();
+        let p_loop = peers.clone();
+        let s_peer_counter_loop = session_peer_counter.clone();
 
         tokio::spawn(async move {
             loop {
@@ -164,13 +172,12 @@ impl Controller {
 
                                 info!(
                                     "received timeline with tempo: {} for session: {}",
-                                    timeline.tempo.bpm(),
-                                    peer_session
+                                    timeline.tempo, peer_session
                                 );
 
                                 let new_timeline = sessions_loop
                                     .saw_session_timeline(*peer_session, *timeline)
-                                    .unwrap();
+                                    .await;
 
                                 update_session_timing(
                                     s_state_loop.clone(),
@@ -203,11 +210,15 @@ impl Controller {
                                     peer_session,
                                 );
 
-                                if *peer_session == *s_id_loop.lock().unwrap()
+                                if *peer_session == *s_id_loop.try_lock().unwrap()
                                     && peer_start_stop_state.timestamp
-                                        > s_state_loop.lock().unwrap().start_stop_state.timestamp
+                                        > s_state_loop
+                                            .try_lock()
+                                            .unwrap()
+                                            .start_stop_state
+                                            .timestamp
                                 {
-                                    s_state_loop.lock().unwrap().start_stop_state =
+                                    s_state_loop.try_lock().unwrap().start_stop_state =
                                         *peer_start_stop_state;
 
                                     update_discovery(
@@ -218,14 +229,34 @@ impl Controller {
                                     )
                                     .await;
 
-                                    if *s_stop_sync_enabled_loop.lock().unwrap() {
-                                        c_state_loop.lock().unwrap().start_stop_state =
+                                    if *s_stop_sync_enabled_loop.try_lock().unwrap() {
+                                        c_state_loop.try_lock().unwrap().start_stop_state =
                                             map_start_stop_state_from_session_to_client(
                                                 *peer_start_stop_state,
-                                                s_state_loop.lock().unwrap().timeline,
-                                                s_state_loop.lock().unwrap().ghost_x_form,
+                                                s_state_loop.try_lock().unwrap().timeline,
+                                                s_state_loop.try_lock().unwrap().ghost_x_form,
                                             )
                                     }
+                                }
+                            }
+                            PeerStateChange::PeerLeft => {
+                                let s_id = *s_id_loop.try_lock().unwrap();
+                                let count = unique_session_peer_count(s_id, p_loop.clone());
+                                let old_count =
+                                    s_peer_counter_loop.try_lock().unwrap().session_peer_count;
+                                s_peer_counter_loop.try_lock().unwrap().session_peer_count = count;
+                                if old_count != count && count == 0 {
+                                    reset_state(
+                                        n_id_loop.clone(),
+                                        s_id_loop.clone(),
+                                        s_state_loop.clone(),
+                                        c_state_loop.clone(),
+                                        discovery_loop.clone(),
+                                        sessions_loop.clone(),
+                                        clock,
+                                        s_stop_sync_enabled_loop.clone(),
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -242,16 +273,13 @@ impl Controller {
             session_state,
             client_state,
             // last_is_playing_for_start_stop_state_callback: false,
-            // has_pending_rt_client_states: Arc::new(AtomicBool::new(false)),
             session_peer_counter: session_peer_counter.clone(),
             start_stop_sync_enabled,
-            // rt_client_state_setter: RtClientStateSetter,
-            // peers: ControllerPeer::default(),
+            peers: peers.clone(),
             sessions,
             discovery,
             clock,
             rx_event: Some(rx_event),
-            rx_measure_peer: Some(rx_measure_peer),
             notifier,
         }
     }
@@ -272,24 +300,37 @@ pub async fn join_session(
     start_stop_sync_enabled: Arc<Mutex<bool>>,
     node_id: Arc<Mutex<NodeId>>,
     discovery: Arc<PeerGateway>,
+    peers: Arc<Mutex<Vec<ControllerPeer>>>,
+    session_peer_count: Arc<Mutex<SessionPeerCounter>>,
+    sessions: Sessions,
 ) {
-    let session_id_changed = *session_id.lock().unwrap() != session.session_id;
-    *session_id.lock().unwrap() = session.session_id;
+    let session_id_changed = *session_id.try_lock().unwrap() != session.session_id;
+    *session_id.try_lock().unwrap() = session.session_id;
 
     if session_id_changed {
         reset_session_start_stop_state(session_state.clone())
     }
 
+    if session_id_changed {
+        reset_session_start_stop_state(session_state.clone());
+    }
+
     update_session_timing(
         session_state.clone(),
-        client_state,
+        client_state.clone(),
         session.timeline,
         Some(session.measurement.x_form),
         clock,
-        start_stop_sync_enabled,
+        start_stop_sync_enabled.clone(),
     );
 
-    update_discovery(session_state, node_id, session_id, discovery).await;
+    update_discovery(
+        session_state.clone(),
+        node_id.clone(),
+        session_id.clone(),
+        discovery.clone(),
+    )
+    .await;
 
     if session_id_changed {
         info!(
@@ -297,6 +338,26 @@ pub async fn join_session(
             session.session_id,
             session.timeline.tempo.bpm()
         );
+
+        // session_peer_counter(session_id, peers, session_peer_count);
+
+        let s_id = *session_id.try_lock().unwrap();
+        let count = unique_session_peer_count(s_id, peers);
+        let old_count = session_peer_count.try_lock().unwrap().session_peer_count;
+        session_peer_count.try_lock().unwrap().session_peer_count = count;
+        if old_count != count && count == 0 {
+            reset_state(
+                node_id,
+                session_id,
+                session_state,
+                client_state,
+                discovery,
+                sessions,
+                clock,
+                start_stop_sync_enabled,
+            )
+            .await;
+        }
     }
 }
 
@@ -311,17 +372,19 @@ pub async fn reset_state(
     start_stop_sync_enabled: Arc<Mutex<bool>>,
 ) {
     let n_id = NodeId::new();
-    *node_id.lock().unwrap() = n_id;
-    *session_id.lock().unwrap() = SessionId(n_id);
+    *node_id.try_lock().unwrap() = n_id;
+    *session_id.try_lock().unwrap() = SessionId(n_id);
 
     let x_form = init_x_form(clock);
     let host_time = -x_form.intercept;
 
+    let timeline = session_state.try_lock().unwrap().timeline;
+
     let new_tl = Timeline {
-        tempo: session_state.lock().unwrap().timeline.tempo,
-        beat_origin: session_state.lock().unwrap().timeline.to_beats(
+        tempo: timeline.tempo,
+        beat_origin: timeline.to_beats(
             session_state
-                .lock()
+                .try_lock()
                 .unwrap()
                 .ghost_x_form
                 .host_to_ghost(host_time),
@@ -349,7 +412,7 @@ pub async fn reset_state(
     .await;
 
     sessions.reset_session(Session {
-        session_id: *session_id.lock().unwrap(),
+        session_id: *session_id.try_lock().unwrap(),
         timeline: new_tl,
         measurement: SessionMeasurement {
             x_form,
@@ -366,12 +429,12 @@ pub async fn update_discovery(
     session_id: Arc<Mutex<SessionId>>,
     discovery: Arc<PeerGateway>,
 ) {
-    let timeline = session_state.lock().unwrap().timeline;
-    let start_stop_state = session_state.lock().unwrap().start_stop_state;
-    let ghost_xform = session_state.lock().unwrap().ghost_x_form;
+    let timeline = session_state.try_lock().unwrap().timeline;
+    let start_stop_state = session_state.try_lock().unwrap().start_stop_state;
+    let ghost_xform = session_state.try_lock().unwrap().ghost_x_form;
 
-    let node_id = *node_id.lock().unwrap();
-    let session_id = *session_id.lock().unwrap();
+    let node_id = *node_id.try_lock().unwrap();
+    let session_id = *session_id.try_lock().unwrap();
 
     discovery
         .update_node_state(
@@ -387,7 +450,7 @@ pub async fn update_discovery(
 }
 
 pub fn reset_session_start_stop_state(session_state: Arc<Mutex<SessionState>>) {
-    session_state.lock().unwrap().start_stop_state = StartStopState::default();
+    session_state.try_lock().unwrap().start_stop_state = StartStopState::default();
 }
 
 pub fn update_session_timing(
@@ -405,25 +468,25 @@ pub fn update_session_timing(
     let new_x_form = new_x_form.unwrap_or(old_x_form);
 
     if old_timeline != new_timeline || old_x_form != new_x_form {
-        session_state.lock().unwrap().timeline = new_timeline;
-        session_state.lock().unwrap().ghost_x_form = new_x_form;
+        session_state.try_lock().unwrap().timeline = new_timeline;
+        session_state.try_lock().unwrap().ghost_x_form = new_x_form;
 
-        let old_client_timeline = client_state.lock().unwrap().timeline;
-        client_state.lock().unwrap().timeline = update_client_timeline_from_session(
+        let old_client_timeline = client_state.try_lock().unwrap().timeline;
+        client_state.try_lock().unwrap().timeline = update_client_timeline_from_session(
             new_timeline,
             old_client_timeline,
             clock.micros(),
             new_x_form,
         );
 
-        if *start_stop_sync_enabled.lock().unwrap()
-            && session_state.lock().unwrap().start_stop_state != StartStopState::default()
+        if *start_stop_sync_enabled.try_lock().unwrap()
+            && session_state.try_lock().unwrap().start_stop_state != StartStopState::default()
         {
-            client_state.lock().unwrap().start_stop_state =
+            client_state.try_lock().unwrap().start_stop_state =
                 map_start_stop_state_from_session_to_client(
-                    session_state.lock().unwrap().start_stop_state,
-                    session_state.lock().unwrap().timeline,
-                    session_state.lock().unwrap().ghost_x_form,
+                    session_state.try_lock().unwrap().start_stop_state,
+                    session_state.try_lock().unwrap().timeline,
+                    session_state.try_lock().unwrap().ghost_x_form,
                 );
         }
 

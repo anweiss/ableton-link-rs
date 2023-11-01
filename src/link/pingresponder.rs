@@ -1,13 +1,11 @@
-use std::{
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use bincode::{Decode, Encode};
 use tokio::{net::UdpSocket, sync::Notify};
 use tracing::info;
 
 use crate::{
-    discovery::{ENCODING_CONFIG},
+    discovery::ENCODING_CONFIG,
     link::{
         payload::{GhostTime, PayloadEntry},
         sessions::SessionMembership,
@@ -101,10 +99,13 @@ impl PingResponder {
                         info!("received ping message from {}", src);
 
                         let id = SessionMembership {
-                            session_id: *session_id.lock().unwrap(),
+                            session_id: *session_id.try_lock().unwrap(),
                         };
                         let current_gt = GhostTime {
-                            time: ghost_x_form.lock().unwrap().host_to_ghost(clock.micros()),
+                            time: ghost_x_form
+                                .try_lock()
+                                .unwrap()
+                                .host_to_ghost(clock.micros()),
                         };
                         let pong_payload = Payload {
                             entries: vec![
@@ -125,8 +126,8 @@ impl PingResponder {
     }
 
     pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
-        *self.session_id.lock().unwrap() = session_id;
-        *self.ghost_x_form.lock().unwrap() = x_form;
+        *self.session_id.try_lock().unwrap() = session_id;
+        *self.ghost_x_form.try_lock().unwrap() = x_form;
     }
 }
 

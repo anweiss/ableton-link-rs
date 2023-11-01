@@ -26,3 +26,9 @@ impl Clock {
         self.elapsed()
     }
 }
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -100,7 +100,7 @@ impl Messenger {
                 let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
 
-                if header.ident == peer_state.lock().unwrap().ident() && header.group_id == 0 {
+                if header.ident == peer_state.try_lock().unwrap().ident() && header.group_id == 0 {
                     debug!("ignoring messages from self (peer {})", header.ident);
                     continue;
                 } else {
@@ -154,7 +154,7 @@ impl Messenger {
     }
 
     pub async fn update_state(&self, state: PeerState) {
-        *self.peer_state.lock().unwrap() = state;
+        *self.peer_state.try_lock().unwrap() = state;
 
         // broadcast_state(
         //     self.ttl,
@@ -192,11 +192,11 @@ pub async fn broadcast_state(
 
                 let lbt = lbt.clone();
 
-                let time_since_last_broadcast = if *lbt.lock().unwrap() > Instant::now() {
+                let time_since_last_broadcast = if *lbt.try_lock().unwrap() > Instant::now() {
                     0
                 } else {
                     Instant::now()
-                        .duration_since(*lbt.lock().unwrap())
+                        .duration_since(*lbt.try_lock().unwrap())
                         .as_millis()
                 };
 
@@ -260,12 +260,12 @@ pub async fn send_peer_state(
     to: SocketAddrV4,
     last_broadcast_time: Arc<Mutex<Instant>>,
 ) {
-    let ident = peer_state.lock().unwrap().ident();
-    let node_state = peer_state.lock().unwrap().node_state.clone();
+    let ident = peer_state.try_lock().unwrap().ident();
+    let node_state = peer_state.try_lock().unwrap().node_state.clone();
 
     send_message(socket, ident, ttl, message_type, &node_state.into(), to).await;
 
-    *last_broadcast_time.lock().unwrap() = Instant::now();
+    *last_broadcast_time.try_lock().unwrap() = Instant::now();
 }
 
 pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf: &[u8]) {
@@ -280,7 +280,7 @@ pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf:
 
     let node_state: NodeState = NodeState::from_payload(header.ident, &payload);
 
-    info!("sending peer state to gateway {}", node_state.ident());
+    debug!("sending peer state to gateway {}", node_state.ident());
     let _ = tx
         .send(OnEvent::PeerState(PeerStateMessageType {
             node_state,

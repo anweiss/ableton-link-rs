@@ -5,7 +5,7 @@ use chrono::Duration;
 use tracing::{debug, info, warn};
 
 use crate::{
-    discovery::{ENCODING_CONFIG},
+    discovery::ENCODING_CONFIG,
     link::{
         measurement::{
             MeasurementEndpointV4, MEASUREMENT_ENDPOINT_V4_HEADER_KEY, MEASUREMENT_ENDPOINT_V4_SIZE,
@@ -123,7 +123,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             )
             .unwrap();
 
-            info!("received bpm: {}", entry.tempo);
+            debug!("received bpm: {}", entry.tempo);
 
             payload.entries.push(PayloadEntry::Timeline(entry));
             decode(payload, &data[decode_len..])?;

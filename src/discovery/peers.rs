@@ -1,5 +1,5 @@
 use std::{
-    net::{SocketAddr, SocketAddrV4},
+    net::SocketAddrV4,
     sync::{Arc, Mutex},
     vec,
 };
@@ -11,7 +11,7 @@ use tokio::{
         Notify,
     },
 };
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::link::{
     controller::SessionPeerCounter,
@@ -68,9 +68,9 @@ impl GatewayObserver {
                                 )
                                 .await
                             }
-                            Some(PeerEvent::PeerLeft(node_id)) => peer_left(node_id, peers.clone()).await,
+                            Some(PeerEvent::PeerLeft(node_id)) => peer_left(node_id, peers.clone(), tx_peer_state_change.clone()).await,
                             Some(PeerEvent::PeerTimedOut(node_id)) => {
-                                peer_left(node_id, peers.clone()).await
+                                peer_left(node_id, peers.clone(), tx_peer_state_change.clone()).await
                             }
                             None => continue,
                         }
@@ -86,7 +86,7 @@ impl GatewayObserver {
     }
 
     pub fn set_session_timeline(&mut self, session_id: SessionId, timeline: Timeline) {
-        self.peers.lock().unwrap().iter_mut().for_each(|peer| {
+        self.peers.try_lock().unwrap().iter_mut().for_each(|peer| {
             if peer.peer_state.session_id() == session_id {
                 peer.peer_state.node_state.timeline = timeline;
             }
@@ -95,13 +95,13 @@ impl GatewayObserver {
 
     pub fn forget_session(&mut self, session_id: Arc<Mutex<SessionId>>) {
         self.peers
-            .lock()
+            .try_lock()
             .unwrap()
-            .retain(|peer| peer.peer_state.session_id() != *session_id.lock().unwrap());
+            .retain(|peer| peer.peer_state.session_id() != *session_id.try_lock().unwrap());
     }
 
     pub fn reset_peers(&self) {
-        self.peers.lock().unwrap().clear();
+        self.peers.try_lock().unwrap().clear();
     }
 }
 
@@ -129,16 +129,12 @@ impl PeerState {
     }
 }
 
-async fn session_timeline_exists(_session_id: SessionId, _timeline: Timeline) -> bool {
-    todo!()
-}
-
 pub fn unique_session_peer_count(
     session_id: SessionId,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
 ) -> usize {
     let mut peers = peers
-        .lock()
+        .try_lock()
         .unwrap()
         .iter()
         .filter(|p| p.peer_state.session_id() == session_id)
@@ -154,6 +150,7 @@ pub enum PeerStateChange {
     SessionMembership,
     SessionTimeline(SessionId, Timeline),
     SessionStartStopState(SessionId, StartStopState),
+    PeerLeft,
 }
 
 async fn saw_peer(
@@ -175,12 +172,12 @@ async fn saw_peer(
     let peer_timeline = ps.timeline();
     let peer_start_stop_state = ps.start_stop_state();
 
-    let is_new_session_timeline = !peers.lock().unwrap().iter().any(|p| {
+    let is_new_session_timeline = !peers.try_lock().unwrap().iter().any(|p| {
         p.peer_state.session_id() == peer_session && p.peer_state.timeline() == peer_timeline
     });
 
     let is_new_session_start_stop_state = !peers
-        .lock()
+        .try_lock()
         .unwrap()
         .iter()
         .any(|p| p.peer_state.start_stop_state() == peer_start_stop_state);
@@ -188,16 +185,16 @@ async fn saw_peer(
     let peer = ControllerPeer { peer_state: ps };
 
     let did_session_membership_change = if !peers
-        .lock()
+        .try_lock()
         .unwrap()
         .iter()
         .any(|p| p.peer_state.ident() == peer.peer_state.ident())
     {
-        peers.lock().unwrap().push(peer);
+        peers.try_lock().unwrap().push(peer);
         true
     } else {
         peers
-            .lock()
+            .try_lock()
             .unwrap()
             .iter()
             .any(|p| p.peer_state.session_id() != peer_session)
@@ -206,7 +203,7 @@ async fn saw_peer(
     let mut peer_state_changes = vec![];
 
     if is_new_session_timeline {
-        info!("session timeline changed");
+        debug!("session timeline changed");
         peer_state_changes.push(PeerStateChange::SessionTimeline(
             peer_session,
             peer_timeline,
@@ -214,7 +211,7 @@ async fn saw_peer(
     }
 
     if is_new_session_start_stop_state {
-        info!("session start stop changed");
+        debug!("session start stop changed");
         peer_state_changes.push(PeerStateChange::SessionStartStopState(
             peer_session,
             peer_start_stop_state,
@@ -222,34 +219,41 @@ async fn saw_peer(
     }
 
     if did_session_membership_change {
-        info!("session membership changed");
+        debug!("session membership changed");
         let count = unique_session_peer_count(session_id, peers.clone());
-        let old_count = session_peer_counter.lock().unwrap().session_peer_count;
+        let old_count = session_peer_counter.try_lock().unwrap().session_peer_count;
         if old_count != count && count == 0 {
             peer_state_changes.push(PeerStateChange::SessionMembership);
         }
     }
 
-    info!("sending peer state changes to controller");
+    debug!("sending peer state changes to controller");
     tx_peer_state_change.send(peer_state_changes).await.unwrap();
 }
 
-async fn peer_left(node_id: NodeId, peers: Arc<Mutex<Vec<ControllerPeer>>>) {
+async fn peer_left(
+    node_id: NodeId,
+    peers: Arc<Mutex<Vec<ControllerPeer>>>,
+    tx_peer_state_change: Sender<Vec<PeerStateChange>>,
+) {
     info!("peer {} left", node_id);
 
     let mut did_session_membership_change = false;
-    peers.lock().unwrap().retain(|peer| {
+    peers.try_lock().unwrap().retain(|peer| {
         if peer.peer_state.ident() == node_id {
             did_session_membership_change = true;
             false
         } else {
             true
         }
-    })
-}
+    });
 
-async fn peer_timed_out(_peer_id: SocketAddr, _new_state: PeerStateMessageType) {
-    todo!()
+    if did_session_membership_change {
+        tx_peer_state_change
+            .send(vec![PeerStateChange::PeerLeft])
+            .await
+            .unwrap();
+    }
 }
 
 #[derive(Debug, Clone)]
