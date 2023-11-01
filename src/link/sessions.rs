@@ -211,7 +211,7 @@ impl Sessions {
             }
         }
 
-        self.current.try_lock().unwrap().timeline.clone()
+        self.current.try_lock().unwrap().timeline
     }
 
     pub fn update_timeline(&self, session_id: SessionId, timeline: Timeline) {
@@ -237,22 +237,20 @@ impl Sessions {
                     session.timeline.beat_origin.floating(),
                 );
             }
-        } else {
-            if timeline.beat_origin >= self.current.try_lock().unwrap().timeline.beat_origin {
-                info!(
-                    "adopting peer timeline (bpm: {}, beat origin: {}, time_origin: {})",
-                    timeline.tempo,
-                    timeline.beat_origin.floating(),
-                    timeline.time_origin.num_microseconds().unwrap(),
-                );
+        } else if timeline.beat_origin >= self.current.try_lock().unwrap().timeline.beat_origin {
+            info!(
+                "adopting peer timeline (bpm: {}, beat origin: {}, time_origin: {})",
+                timeline.tempo,
+                timeline.beat_origin.floating(),
+                timeline.time_origin.num_microseconds().unwrap(),
+            );
 
-                self.current.try_lock().unwrap().timeline = timeline;
-            } else {
-                info!("rejecting peer timeline with beat origin: {}. current timeline beat origin: {}",
-                    timeline.beat_origin.floating(),
-                    self.current.try_lock().unwrap().timeline.beat_origin.floating(),
-                );
-            }
+            self.current.try_lock().unwrap().timeline = timeline;
+        } else {
+            info!("rejecting peer timeline with beat origin: {}. current timeline beat origin: {}",
+                timeline.beat_origin.floating(),
+                self.current.try_lock().unwrap().timeline.beat_origin.floating(),
+            );
         }
     }
 }

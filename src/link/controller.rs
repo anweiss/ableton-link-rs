@@ -13,7 +13,6 @@ use super::{
     beats::Beats,
     clock::Clock,
     ghostxform::GhostXForm,
-    measurement::MeasurePeerEvent,
     node::{NodeId, NodeState},
     sessions::{Session, SessionId, SessionMeasurement, Sessions},
     state::{ClientStartStopState, ClientState, SessionState, StartStopState},

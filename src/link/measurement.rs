@@ -175,12 +175,12 @@ pub async fn measure_peer(
         loop {
             if let Some(data) = rx_measurement.recv().await {
                 if data.is_empty() {
-                    let _ = tx_measure_peer_result_loop
+                    tx_measure_peer_result_loop
                         .send(MeasurePeerEvent::XForm(session_id, GhostXForm::default()))
                         .await
                         .unwrap();
                 } else {
-                    let _ = tx_measure_peer_result_loop
+                    tx_measure_peer_result_loop
                         .send(MeasurePeerEvent::XForm(
                             session_id,
                             GhostXForm {
