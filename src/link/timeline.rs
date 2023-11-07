@@ -1,7 +1,7 @@
 use std::mem;
 
 use chrono::Duration;
-
+use tracing::info;
 
 use crate::discovery::ENCODING_CONFIG;
 
@@ -27,6 +27,16 @@ pub struct Timeline {
     pub time_origin: Duration,
 }
 
+impl Default for Timeline {
+    fn default() -> Self {
+        Self {
+            tempo: Default::default(),
+            beat_origin: Default::default(),
+            time_origin: Duration::zero(),
+        }
+    }
+}
+
 impl Timeline {
     pub fn to_beats(&self, time: Duration) -> Beats {
         self.beat_origin + self.tempo.micros_to_beats(time - self.time_origin)
@@ -40,16 +50,6 @@ impl Timeline {
         let mut encoded = TIMELINE_HEADER.encode()?;
         encoded.append(&mut bincode::encode_to_vec(self, ENCODING_CONFIG)?);
         Ok(encoded)
-    }
-}
-
-impl Default for Timeline {
-    fn default() -> Self {
-        Self {
-            tempo: Tempo::default(),
-            beat_origin: Beats { value: 0i64 },
-            time_origin: Duration::zero(),
-        }
     }
 }
 
@@ -152,5 +152,62 @@ pub fn update_session_timeline_from_client(
 pub fn shift_client_timeline(mut client: Timeline, shift: Beats) -> Timeline {
     let time_delta = client.from_beats(shift) - client.from_beats(Beats { value: 0i64 });
     client.time_origin = client.time_origin - time_delta;
+
     client
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_to_client_updates_tempo() {
+        let b0 = Beats::new(-1.0);
+        let t0 = Duration::microseconds(-1);
+        let x_form = GhostXForm {
+            slope: 1.0,
+            intercept: Duration::microseconds(-1000000),
+        };
+
+        let cur_client = Timeline {
+            tempo: Tempo { value: 60.0 },
+            beat_origin: b0,
+            time_origin: t0,
+        };
+        let session = Timeline {
+            tempo: Tempo { value: 90.0 },
+            beat_origin: b0,
+            time_origin: x_form.host_to_ghost(t0),
+        };
+        let new_client = update_client_timeline_from_session(cur_client, session, t0, x_form);
+        assert_eq!(new_client.tempo, Tempo { value: 90.0 });
+    }
+
+    #[test]
+    fn time_to_beats() {
+        let t160 = Timeline {
+            tempo: Tempo::new(60.0),
+            beat_origin: Beats::new(-1.0),
+            time_origin: Duration::microseconds(1000000),
+        };
+
+        assert_eq!(
+            t160.to_beats(Duration::microseconds(4500000)),
+            Beats::new(2.5)
+        );
+    }
+
+    #[test]
+    fn beats_to_time() {
+        let t160 = Timeline {
+            tempo: Tempo::new(60.0),
+            beat_origin: Beats::new(-1.0),
+            time_origin: Duration::microseconds(1000000),
+        };
+
+        assert_eq!(
+            t160.from_beats(Beats::new(3.2)),
+            Duration::microseconds(5200000)
+        );
+    }
 }

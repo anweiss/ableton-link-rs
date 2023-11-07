@@ -4,6 +4,7 @@ use std::{
 };
 
 use chrono::Duration;
+use tracing::info;
 
 use super::beats::Beats;
 
@@ -72,5 +73,34 @@ impl bincode::Decode for Tempo {
         Ok(Self::from(Duration::microseconds(bincode::Decode::decode(
             decoder,
         )?)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn construct_from_bpm() {
+        let tempo = Tempo::new(120.0);
+        assert_eq!(tempo.micros_per_beat(), Duration::microseconds(500000));
+    }
+
+    #[test]
+    fn micros_to_beats() {
+        let tempo = Tempo::new(120.0);
+        assert_eq!(
+            tempo.micros_to_beats(Duration::microseconds(1000000)),
+            Beats::new(2.0)
+        );
+    }
+
+    #[test]
+    fn beats_to_micros() {
+        let tempo = Tempo::new(120.0);
+        assert_eq!(
+            tempo.beats_to_micros(Beats::new(2.0)),
+            Duration::microseconds(1000000)
+        );
     }
 }

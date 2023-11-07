@@ -41,7 +41,7 @@ pub struct GatewayObserver {
 impl GatewayObserver {
     pub async fn new(
         mut on_peer_event: Receiver<PeerEvent>,
-        session_id: SessionId,
+        peer_state: Arc<Mutex<PeerState>>,
         session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
         tx_peer_state_change: Sender<Vec<PeerStateChange>>,
         peers: Arc<Mutex<Vec<ControllerPeer>>>,
@@ -50,7 +50,7 @@ impl GatewayObserver {
         let gwo = GatewayObserver { peers };
 
         let peers = gwo.peers.clone();
-        let session_id = session_id;
+        let peer_state_loop = peer_state.clone();
 
         tokio::spawn(async move {
             loop {
@@ -59,10 +59,9 @@ impl GatewayObserver {
                         match peer_event {
                             Some(PeerEvent::SawPeer(peer_state)) => {
                                 saw_peer(
-                                    peer_state.node_state,
-                                    peer_state.measurement_endpoint,
+                                    peer_state,
                                     peers.clone(),
-                                    session_id,
+                                    peer_state_loop.clone(),
                                     session_peer_counter.clone(),
                                     tx_peer_state_change.clone(),
                                 )
@@ -105,7 +104,7 @@ impl GatewayObserver {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct PeerState {
     pub node_state: NodeState,
     pub measurement_endpoint: Option<SocketAddrV4>,
@@ -154,18 +153,15 @@ pub enum PeerStateChange {
 }
 
 async fn saw_peer(
-    node_state: NodeState,
-    endpoint: Option<SocketAddrV4>,
+    peer_seen_peer_state: PeerState,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
-    session_id: SessionId,
-    session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
+    self_peer_state: Arc<Mutex<PeerState>>,
+    _session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
     tx_peer_state_change: Sender<Vec<PeerStateChange>>,
 ) {
-    info!("saw peer {}", node_state.ident());
-
     let ps = PeerState {
-        node_state,
-        measurement_endpoint: endpoint,
+        node_state: peer_seen_peer_state.node_state,
+        measurement_endpoint: peer_seen_peer_state.measurement_endpoint,
     };
 
     let peer_session = ps.session_id();
@@ -184,6 +180,12 @@ async fn saw_peer(
 
     let peer = ControllerPeer { peer_state: ps };
 
+    if !peers.try_lock().unwrap().contains(&peer)
+        && peer.peer_state.ident() != self_peer_state.lock().unwrap().ident()
+    {
+        info!("saw peer {}", peer.peer_state.ident());
+    }
+
     let did_session_membership_change = if !peers
         .try_lock()
         .unwrap()
@@ -197,7 +199,7 @@ async fn saw_peer(
             .try_lock()
             .unwrap()
             .iter()
-            .any(|p| p.peer_state.session_id() != peer_session)
+            .all(|p| p.peer_state.session_id() != peer_session)
     };
 
     let mut peer_state_changes = vec![];
@@ -220,15 +222,13 @@ async fn saw_peer(
 
     if did_session_membership_change {
         debug!("session membership changed");
-        let count = unique_session_peer_count(session_id, peers.clone());
-        let old_count = session_peer_counter.try_lock().unwrap().session_peer_count;
-        if old_count != count && count == 0 {
-            peer_state_changes.push(PeerStateChange::SessionMembership);
-        }
+        peer_state_changes.push(PeerStateChange::SessionMembership);
     }
 
-    debug!("sending peer state changes to controller");
-    tx_peer_state_change.send(peer_state_changes).await.unwrap();
+    if !peer_state_changes.is_empty() {
+        debug!("sending peer state changes to controller");
+        tx_peer_state_change.send(peer_state_changes).await.unwrap();
+    }
 }
 
 async fn peer_left(
@@ -256,7 +256,218 @@ async fn peer_left(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ControllerPeer {
     pub peer_state: PeerState,
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+    use tokio::sync::mpsc;
+
+    use crate::{
+        discovery::gateway::{OnEvent, PeerGateway},
+        link::{
+            beats::Beats, clock::Clock, ghostxform::GhostXForm, measurement::MeasurePeerEvent,
+            sessions::session_peers, state::SessionState, tempo::Tempo,
+        },
+    };
+
+    use super::*;
+
+    // fn init_tracing() {
+    //     let subscriber = tracing_subscriber::FmtSubscriber::new();
+    //     tracing::subscriber::set_global_default(subscriber).unwrap();
+    // }
+
+    fn init_peers() -> (PeerState, PeerState, PeerState) {
+        (
+            PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::new(),
+                    session_id: SessionId(NodeId::new()),
+                    timeline: Timeline {
+                        tempo: Tempo::new(60.0),
+                        beat_origin: Beats::new(1.0),
+                        time_origin: Duration::microseconds(1234),
+                    },
+                    start_stop_state: StartStopState {
+                        is_playing: false,
+                        beats: Beats::new(0.0),
+                        timestamp: Duration::microseconds(2345),
+                    },
+                },
+                measurement_endpoint: None,
+            },
+            PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::new(),
+                    session_id: SessionId(NodeId::new()),
+                    timeline: Timeline {
+                        tempo: Tempo::new(120.0),
+                        beat_origin: Beats::new(10.0),
+                        time_origin: Duration::microseconds(500),
+                    },
+                    start_stop_state: StartStopState::default(),
+                },
+                measurement_endpoint: None,
+            },
+            PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::new(),
+                    session_id: SessionId(NodeId::new()),
+                    timeline: Timeline {
+                        tempo: Tempo::new(100.0),
+                        beat_origin: Beats::new(4.0),
+                        time_origin: Duration::microseconds(100),
+                    },
+                    start_stop_state: StartStopState::default(),
+                },
+                measurement_endpoint: None,
+            },
+        )
+    }
+
+    async fn init_gateway() -> (
+        PeerGateway,
+        mpsc::Sender<Vec<PeerStateChange>>,
+        Arc<Mutex<u8>>,
+    ) {
+        let session_id = SessionId::default();
+        let node_1 = NodeState::new(session_id.clone());
+        let (tx_measure_peer_result, _) = mpsc::channel::<MeasurePeerEvent>(1);
+        let (_, rx_measure_peer_state) = mpsc::channel::<MeasurePeerEvent>(1);
+        let (tx_event, _) = mpsc::channel::<OnEvent>(1);
+        let (tx_peer_state_change, mut rx_peer_state_change) =
+            mpsc::channel::<Vec<PeerStateChange>>(1);
+
+        let notifier = Arc::new(Notify::new());
+
+        let calls = Arc::new(Mutex::new(0));
+        let c = calls.clone();
+
+        tokio::spawn(async move {
+            while let Some(_) = rx_peer_state_change.recv().await {
+                *c.try_lock().unwrap() += 1;
+            }
+        });
+
+        (
+            PeerGateway::new(
+                Arc::new(Mutex::new(PeerState {
+                    node_state: node_1,
+                    measurement_endpoint: None,
+                })),
+                Arc::new(Mutex::new(SessionState::default())),
+                Clock::new(),
+                Arc::new(Mutex::new(SessionPeerCounter::default())),
+                tx_peer_state_change.clone(),
+                tx_event,
+                tx_measure_peer_result,
+                Arc::new(Mutex::new(vec![])),
+                notifier.clone(),
+                rx_measure_peer_state,
+            )
+            .await,
+            tx_peer_state_change,
+            calls,
+        )
+    }
+
+    #[tokio::test]
+    async fn add_find_peer() {
+        // init_tracing();
+
+        let (foo_peer, _, _) = init_peers();
+
+        let (gw, tx_peer_state_change, calls) = init_gateway().await;
+
+        saw_peer(
+            foo_peer.clone(),
+            gw.observer.peers.clone(),
+            gw.peer_state.clone(),
+            gw.session_peer_counter.clone(),
+            tx_peer_state_change.clone(),
+        )
+        .await;
+
+        tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()).await;
+
+        assert_eq!(
+            session_peers(gw.observer.peers.clone(), foo_peer.session_id()),
+            vec![ControllerPeer {
+                peer_state: foo_peer
+            }]
+        );
+        assert!(*calls.try_lock().unwrap() == 1);
+    }
+
+    #[tokio::test]
+    async fn add_remove_peer() {
+        // init_tracing();
+
+        let (foo_peer, _, _) = init_peers();
+
+        let (gw, tx_peer_state_change, calls) = init_gateway().await;
+
+        saw_peer(
+            foo_peer.clone(),
+            gw.observer.peers.clone(),
+            gw.peer_state.clone(),
+            gw.session_peer_counter.clone(),
+            tx_peer_state_change.clone(),
+        )
+        .await;
+
+        peer_left(
+            foo_peer.ident(),
+            gw.observer.peers.clone(),
+            tx_peer_state_change.clone(),
+        )
+        .await;
+
+        tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()).await;
+
+        assert!(gw.observer.peers.try_lock().unwrap().is_empty());
+        assert!(*calls.try_lock().unwrap() == 2);
+    }
+
+    #[tokio::test]
+    async fn add_two_peers_remove_one_peer() {
+        // init_tracing();
+
+        let (foo_peer, bar_peer, _) = init_peers();
+
+        let (gw, tx_peer_state_change, _) = init_gateway().await;
+
+        for peer in [foo_peer.clone(), bar_peer.clone()].iter() {
+            saw_peer(
+                peer.clone(),
+                gw.observer.peers.clone(),
+                gw.peer_state.clone(),
+                gw.session_peer_counter.clone(),
+                tx_peer_state_change.clone(),
+            )
+            .await;
+        }
+
+        peer_left(
+            foo_peer.ident(),
+            gw.observer.peers.clone(),
+            tx_peer_state_change.clone(),
+        )
+        .await;
+
+        tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()).await;
+
+        assert!(session_peers(gw.observer.peers.clone(), foo_peer.session_id()).is_empty());
+
+        assert_eq!(
+            session_peers(gw.observer.peers.clone(), bar_peer.clone().session_id()),
+            vec![ControllerPeer {
+                peer_state: bar_peer,
+            }]
+        );
+    }
 }

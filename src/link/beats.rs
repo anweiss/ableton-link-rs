@@ -41,10 +41,6 @@ impl Beats {
         }
     }
 
-    pub fn size_in_byte_stream(self, _beats: Beats) -> u32 {
-        todo!()
-    }
-
     pub fn floating(self) -> f64 {
         self.value as f64 / 1e6
     }
@@ -81,5 +77,29 @@ impl Sub for Beats {
         Self {
             value: self.value - rhs.value,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_floating() {
+        let beats = Beats::new(0.5);
+        assert_eq!(beats.micro_beats(), 500000);
+        assert!((0.5 - beats.floating()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn from_micros() {
+        let beats = Beats::from_microbeats(100000);
+        assert_eq!(beats.micro_beats(), 100000);
+        assert!((0.1 - beats.floating()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn size_bytes() {
+        assert_eq!(BEATS_SIZE, 8);
     }
 }

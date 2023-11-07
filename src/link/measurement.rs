@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    mem,
+    io, mem,
     net::{Ipv4Addr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
@@ -35,6 +35,7 @@ use super::{
     payload::{HostTime, Payload, PayloadEntry, PayloadEntryHeader},
     pingresponder::{encode_message, PingResponder, PING},
     sessions::SessionId,
+    state::SessionState,
 };
 
 pub const MEASUREMENT_ENDPOINT_V4_HEADER_KEY: u32 = u32::from_be_bytes(*b"mep4");
@@ -79,7 +80,7 @@ impl bincode::Decode for MeasurementEndpointV4 {
 impl MeasurementEndpointV4 {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = MEASUREMENT_ENDPOINT_V4_HEADER.encode()?;
-        encoded.append(&mut bincode::encode_to_vec(self.endpoint, ENCODING_CONFIG)?);
+        encoded.append(&mut bincode::encode_to_vec(self, ENCODING_CONFIG)?);
         Ok(encoded)
     }
 }
@@ -101,8 +102,8 @@ pub struct MeasurementService {
 impl MeasurementService {
     pub async fn new(
         ping_responder_unicast_socket: Arc<UdpSocket>,
-        session_id: SessionId,
-        ghost_x_form: GhostXForm,
+        peer_state: Arc<Mutex<PeerState>>,
+        session_state: Arc<Mutex<SessionState>>,
         clock: Clock,
         tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
         notifier: Arc<Notify>,
@@ -112,12 +113,21 @@ impl MeasurementService {
 
         let m_map = measurement_map.clone();
         let t_peer = tx_measure_peer_result.clone();
+        let n_loop = notifier.clone();
 
         tokio::spawn(async move {
             loop {
                 let event = rx_measure_peer_state.recv().await;
                 if let Some(MeasurePeerEvent::PeerState(session_id, peer)) = event {
-                    measure_peer(clock, m_map.clone(), t_peer.clone(), session_id, peer).await;
+                    measure_peer(
+                        clock,
+                        m_map.clone(),
+                        t_peer.clone(),
+                        session_id,
+                        peer,
+                        n_loop.clone(),
+                    )
+                    .await;
                 }
             }
         });
@@ -127,12 +137,10 @@ impl MeasurementService {
             clock,
             ping_responder: PingResponder::new(
                 ping_responder_unicast_socket,
-                session_id,
-                ghost_x_form,
+                peer_state.clone(),
+                session_state,
                 clock,
-                notifier,
-            )
-            .await,
+            ),
             tx_measure_peer: tx_measure_peer_result,
         }
     }
@@ -150,6 +158,7 @@ pub async fn measure_peer(
     tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     session_id: SessionId,
     state: PeerState,
+    notifier: Arc<Notify>,
 ) {
     info!(
         "measuring peer {} for session {}",
@@ -160,8 +169,7 @@ pub async fn measure_peer(
 
     let (tx_measurement, mut rx_measurement) = mpsc::channel(1);
 
-    let measurement = Measurement::new(state, clock, tx_measurement).await;
-
+    let measurement = Measurement::new(state, clock, tx_measurement, notifier).await;
     measurement_map
         .try_lock()
         .unwrap()
@@ -192,11 +200,7 @@ pub async fn measure_peer(
                         .unwrap();
                 }
 
-                measurement_map
-                    .try_lock()
-                    .unwrap()
-                    .remove(&node_id)
-                    .unwrap();
+                measurement_map.try_lock().unwrap().remove(&node_id);
             }
         }
     });
@@ -220,14 +224,25 @@ pub struct Measurement {
     pub clock: Clock,
     pub measurements_started: Arc<Mutex<usize>>,
     pub success: Arc<Mutex<bool>>,
+    pub init_bytes_sent: usize,
     tx_timer: Sender<TimerStatus>,
 }
 
 impl Measurement {
-    pub async fn new(state: PeerState, clock: Clock, tx_measurement: Sender<Vec<f64>>) -> Self {
+    pub async fn new(
+        state: PeerState,
+        clock: Clock,
+        tx_measurement: Sender<Vec<f64>>,
+        notifier: Arc<Notify>,
+    ) -> Self {
         let (tx_timer, mut rx_timer) = mpsc::channel(1);
 
         let unicast_socket = Arc::new(new_udp_reuseport(UNICAST_IP_ANY));
+        info!(
+            "initiating new unicast socket {} for measurement_endpoint {:?}",
+            unicast_socket.local_addr().unwrap(),
+            state.measurement_endpoint
+        );
 
         let success = Arc::new(Mutex::new(false));
         let data = Arc::new(Mutex::new(vec![]));
@@ -241,6 +256,7 @@ impl Measurement {
             measurements_started: Arc::new(Mutex::new(0)),
             success: success.clone(),
             tx_timer,
+            init_bytes_sent: 0,
         };
 
         info!("measurement on gateway");
@@ -259,32 +275,36 @@ impl Measurement {
 
         tokio::spawn(async move {
             loop {
-                if let Some(timer_status) = rx_timer.recv().await {
-                    debug!("timer status {:?}", timer_status);
-                    match timer_status {
-                        TimerStatus::Finish => {
-                            fn_loop.notify_one();
+                select! {
+                    Some(timer_status) = rx_timer.recv() => {
+                        match timer_status {
+                            TimerStatus::Finish => {
+                                fn_loop.notify_one();
 
-                            finish(
-                                s.clone(),
-                                state.measurement_endpoint.unwrap(),
-                                d.clone(),
-                                t.clone(),
-                            )
-                            .await;
+                                finish(
+                                    s.clone(),
+                                    state.measurement_endpoint.unwrap(),
+                                    d.clone(),
+                                    t.clone(),
+                                )
+                                .await;
+                            }
+                            TimerStatus::Reset => {
+                                reset_timer(
+                                    ms.clone(),
+                                    clock,
+                                    Some(us.clone()),
+                                    state.measurement_endpoint.unwrap(),
+                                    d.clone(),
+                                    t.clone(),
+                                    fn_loop.clone(),
+                                )
+                                .await;
+                            }
                         }
-                        TimerStatus::Reset => {
-                            reset_timer(
-                                ms.clone(),
-                                clock,
-                                Some(us.clone()),
-                                state.measurement_endpoint.unwrap(),
-                                d.clone(),
-                                t.clone(),
-                                fn_loop.clone(),
-                            )
-                            .await;
-                        }
+                    }
+                    _ = notifier.notified() => {
+                        break;
                     }
                 }
             }
@@ -292,14 +312,17 @@ impl Measurement {
 
         measurement.listen().await;
 
-        send_ping(
+        let init_bytes_sent = send_ping(
             unicast_socket.clone(),
             *state.measurement_endpoint.as_ref().unwrap(),
             &Payload {
                 entries: vec![PayloadEntry::HostTime(ht)],
             },
         )
-        .await;
+        .await
+        .unwrap();
+
+        measurement.init_bytes_sent = init_bytes_sent;
 
         reset_timer(
             measurement.measurements_started.clone(),
@@ -372,7 +395,7 @@ impl Measurement {
                             ],
                         };
 
-                        send_ping(socket.clone(), endpoint, &payload).await;
+                        let _ = send_ping(socket.clone(), endpoint, &payload).await.unwrap();
 
                         if ghost_time != Duration::microseconds(0)
                             && prev_host_time != Duration::microseconds(0)
@@ -426,14 +449,14 @@ async fn reset_timer(
                         time: clock.micros(),
                     };
 
-                    send_ping(
+                    let _ = send_ping(
                         unicast_socket.as_ref().unwrap().clone(),
                         measurement_endpoint,
                         &Payload {
                             entries: vec![PayloadEntry::HostTime(ht)],
                         },
                     )
-                    .await;
+                    .await.unwrap();
 
                     *measurements_started.try_lock().unwrap() += 1;
                 } else {
@@ -442,6 +465,7 @@ async fn reset_timer(
 
                     let data = data.try_lock().unwrap().clone();
                     tx_measurement.send(data).await.unwrap();
+                    break;
                 }
             }
             _ = finished_notifier.notified() => {
@@ -469,13 +493,14 @@ pub async fn send_ping(
     socket: Arc<UdpSocket>,
     measurement_endpoint: SocketAddrV4,
     payload: &Payload,
-) {
+) -> io::Result<usize> {
     let message = encode_message(PING, payload).unwrap();
     debug!(
         "sending ping message to measurement endpoint {}",
         measurement_endpoint
     );
-    let _ = socket.send(&message).await.unwrap();
+
+    socket.send(&message).await
 }
 
 pub fn median(values: Vec<f64>) -> f64 {
@@ -497,5 +522,95 @@ pub fn median(values: Vec<f64>) -> f64 {
         let mid = n / 2;
 
         sorted_values[mid]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc::Receiver;
+
+    use crate::{
+        discovery::{
+            gateway::{OnEvent, PeerGateway},
+            peers::PeerStateChange,
+        },
+        link::{controller::SessionPeerCounter, node::NodeState},
+    };
+
+    use super::*;
+
+    fn init_tracing() {
+        let subscriber = tracing_subscriber::FmtSubscriber::new();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    }
+
+    async fn init_gateway() -> (PeerGateway, Receiver<OnEvent>, Arc<Notify>) {
+        let session_id = SessionId::default();
+        let node_1 = NodeState::new(session_id.clone());
+        let (tx_measure_peer_result, _) = mpsc::channel::<MeasurePeerEvent>(1);
+        let (_, rx_measure_peer_state) = mpsc::channel::<MeasurePeerEvent>(1);
+        let (tx_event, rx_event) = mpsc::channel::<OnEvent>(1);
+        let (tx_peer_state_change, mut rx_peer_state_change) =
+            mpsc::channel::<Vec<PeerStateChange>>(1);
+
+        let notifier = Arc::new(Notify::new());
+
+        let calls = Arc::new(Mutex::new(0));
+        let c = calls.clone();
+
+        tokio::spawn(async move {
+            while let Some(_) = rx_peer_state_change.recv().await {
+                *c.try_lock().unwrap() += 1;
+            }
+        });
+
+        let s = new_udp_reuseport(UNICAST_IP_ANY);
+
+        (
+            PeerGateway::new(
+                Arc::new(Mutex::new(PeerState {
+                    node_state: node_1,
+                    measurement_endpoint: None,
+                })),
+                Arc::new(Mutex::new(SessionState::default())),
+                Clock::new(),
+                Arc::new(Mutex::new(SessionPeerCounter::default())),
+                tx_peer_state_change.clone(),
+                tx_event,
+                tx_measure_peer_result,
+                Arc::new(Mutex::new(vec![])),
+                notifier.clone(),
+                rx_measure_peer_state,
+            )
+            .await,
+            rx_event,
+            notifier,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_send_ping_on_new() {
+        init_tracing();
+
+        let (gw, rx_event, notifier) = init_gateway().await;
+        let n = notifier.clone();
+        tokio::spawn(async move {
+            gw.listen(rx_event, n).await;
+        });
+
+        let (tx_measurement, _) = mpsc::channel::<Vec<f64>>(1);
+
+        let s = new_udp_reuseport(UNICAST_IP_ANY);
+
+        Measurement::new(
+            PeerState {
+                measurement_endpoint: Some(s.local_addr().unwrap().to_string().parse().unwrap()),
+                ..Default::default()
+            },
+            Clock::new(),
+            tx_measurement,
+            notifier,
+        )
+        .await;
     }
 }

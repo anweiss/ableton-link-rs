@@ -2,10 +2,10 @@ use std::mem;
 
 use bincode::{Decode, Encode};
 use chrono::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
-    discovery::ENCODING_CONFIG,
+    discovery::{peers::PeerState, ENCODING_CONFIG},
     link::{
         measurement::{
             MeasurementEndpointV4, MEASUREMENT_ENDPOINT_V4_HEADER_KEY, MEASUREMENT_ENDPOINT_V4_SIZE,
@@ -81,15 +81,17 @@ impl From<NodeState> for Payload {
     }
 }
 
-// impl From<PeerState> for Payload {
-//     fn from(value: PeerState) -> Self {
-//         Payload {
-//             entries: vec![PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
-//                 endpoint: value.endpoint,
-//             })],
-//         }
-//     }
-// }
+impl From<PeerState> for Payload {
+    fn from(value: PeerState) -> Self {
+        let mut payload = Payload::from(value.node_state);
+        payload
+            .entries
+            .push(PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
+                endpoint: value.measurement_endpoint,
+            }));
+        payload
+    }
+}
 
 pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
     if PAYLOAD_ENTRY_HEADER_SIZE > data.len() {

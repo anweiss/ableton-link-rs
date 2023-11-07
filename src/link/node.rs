@@ -1,10 +1,11 @@
 use core::fmt;
-use std::{
-    fmt::Display,
-};
+use std::fmt::Display;
 
 use bincode::{Decode, Encode};
-use rand::Rng;
+use rand::{
+    distributions::{Distribution, Uniform},
+    Rng,
+};
 
 use super::{
     payload::{Payload, PayloadEntry},
@@ -16,7 +17,7 @@ use super::{
 pub type NodeIdArray = [u8; 8];
 
 #[derive(Default, Clone, Copy, Debug, Encode, Decode, Eq, PartialEq, PartialOrd, Ord, Hash)]
-pub struct NodeId(NodeIdArray);
+pub struct NodeId(pub NodeIdArray);
 
 impl Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
@@ -35,13 +36,18 @@ impl NodeId {
     }
 
     pub fn random<R: Rng>(mut rng: R) -> Self {
-        let mut node_id = [0; 8];
-        rng.fill(&mut node_id);
-        NodeId(node_id)
+        let dist = Uniform::from(33..127);
+        NodeId(
+            (0..8)
+                .map(|_| dist.sample(&mut rng))
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        )
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct NodeState {
     pub node_id: NodeId,
     pub session_id: SessionId,

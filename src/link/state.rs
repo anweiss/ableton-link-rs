@@ -110,7 +110,7 @@ pub struct ControllerClientState {
     pub state: ClientState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SessionState {
     pub timeline: Timeline,
     pub start_stop_state: StartStopState,

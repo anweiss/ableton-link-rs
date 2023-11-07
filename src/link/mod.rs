@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 pub mod beats;
 pub mod clock;
 pub mod controller;
@@ -181,8 +183,10 @@ mod tests {
     async fn test_basic_link() {
         // console_subscriber::init();
 
-        let mut link = BasicLink::new(120.0).await;
-        info!("initializing basic link at 120 bpm");
+        let bpm = 140.0;
+
+        let mut link = BasicLink::new(bpm).await;
+        info!("initializing basic link at {} bpm", bpm);
         link.enable().await;
     }
 }

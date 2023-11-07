@@ -191,23 +191,29 @@ impl Sessions {
                 },
             };
 
-            if self
+            let s = self
                 .other_sessions
                 .try_lock()
                 .unwrap()
                 .iter()
-                .any(|s| s.session_id == session_id)
-            {
-                self.update_timeline(session.session_id, timeline);
+                .cloned()
+                .find(|s| s.session_id == session_id);
+
+            if let Some(s) = s {
+                self.update_timeline(s.session_id, timeline);
             } else {
+                info!("adding session {} to other sessions", session_id);
+                self.other_sessions
+                    .try_lock()
+                    .unwrap()
+                    .push(session.clone());
+
                 launch_session_measurement(
                     self.peers.clone(),
                     self.tx_measure_peer_state.clone(),
-                    session.clone(),
+                    session,
                 )
                 .await;
-                info!("adding session {} to other sessions", session_id);
-                self.other_sessions.try_lock().unwrap().push(session);
             }
         }
 
@@ -215,7 +221,19 @@ impl Sessions {
     }
 
     pub fn update_timeline(&self, session_id: SessionId, timeline: Timeline) {
-        if let Some(session) = self
+        if self.current.try_lock().unwrap().session_id == session_id {
+            if timeline.beat_origin >= self.current.try_lock().unwrap().timeline.beat_origin {
+                info!(
+                    "adopting peer timeline ({}, {}, {})",
+                    timeline.tempo.bpm(),
+                    timeline.beat_origin.floating(),
+                    timeline.time_origin,
+                );
+                self.current.try_lock().unwrap().timeline = timeline;
+            } else {
+                info!("rejecting peer timeline with beat origin: {}. current timeline beat origin: {}", timeline.beat_origin.floating(), self.current.try_lock().unwrap().timeline.beat_origin.floating());
+            }
+        } else if let Some(session) = self
             .other_sessions
             .try_lock()
             .unwrap()
@@ -224,33 +242,15 @@ impl Sessions {
         {
             if timeline.beat_origin > session.timeline.beat_origin {
                 info!(
-                    "adopting peer timeline (bpm: {}, beat origin: {}, time_origin: {})",
-                    timeline.tempo,
+                    "adopting peer timeline ({}, {}, {})",
+                    timeline.tempo.bpm(),
                     timeline.beat_origin.floating(),
-                    timeline.time_origin.num_microseconds().unwrap(),
+                    timeline.time_origin,
                 );
-
                 session.timeline = timeline;
             } else {
-                info!("rejecting peer timeline with beat origin: {}. current timeline beat origin: {}",
-                    timeline.beat_origin.floating(),
-                    session.timeline.beat_origin.floating(),
-                );
+                info!("rejecting peer timeline with beat origin: {}. current timeline beat origin: {}", timeline.beat_origin.floating(), session.timeline.beat_origin.floating());
             }
-        } else if timeline.beat_origin >= self.current.try_lock().unwrap().timeline.beat_origin {
-            info!(
-                "adopting peer timeline (bpm: {}, beat origin: {}, time_origin: {})",
-                timeline.tempo,
-                timeline.beat_origin.floating(),
-                timeline.time_origin.num_microseconds().unwrap(),
-            );
-
-            self.current.try_lock().unwrap().timeline = timeline;
-        } else {
-            info!("rejecting peer timeline with beat origin: {}. current timeline beat origin: {}",
-                timeline.beat_origin.floating(),
-                self.current.try_lock().unwrap().timeline.beat_origin.floating(),
-            );
         }
     }
 }
@@ -340,14 +340,18 @@ pub async fn handle_successful_measurement(
 
             let ghost_diff = new_ghost - cur_ghost;
 
-            if ghost_diff > SESSION_EPS
-                || ghost_diff.num_microseconds().unwrap().abs()
+            info!("ghost_diff {:?}", ghost_diff);
+            info!("session EPS {:?}", SESSION_EPS);
+
+            if ghost_diff.abs() > SESSION_EPS
+                || (ghost_diff.abs().num_microseconds().unwrap()
                     < SESSION_EPS.num_microseconds().unwrap()
+                    && session_id != current.try_lock().unwrap().session_id)
             {
                 let c = current.try_lock().unwrap().clone();
                 *current.try_lock().unwrap() = s.clone();
                 other_sessions.try_lock().unwrap().remove(idx);
-                other_sessions.try_lock().unwrap().push(c);
+                other_sessions.try_lock().unwrap().insert(idx, c);
 
                 tx_join_session.send(s.clone()).await.unwrap();
 
@@ -376,7 +380,7 @@ pub async fn handle_failed_measurement(
             .iter()
             .cloned()
             .enumerate()
-            .find(|(_, s)| s.session_id == session_id);
+            .find(|(_, s)| s.session_id != session_id);
 
         if let Some((idx, _)) = s {
             other_sessions.try_lock().unwrap().remove(idx);
@@ -387,9 +391,10 @@ pub async fn handle_failed_measurement(
                 .iter()
                 .cloned()
                 .enumerate()
-                .find(|(_, p)| p.peer_state.session_id() == session_id);
+                .filter(|(_, p)| p.peer_state.session_id() == session_id)
+                .collect::<Vec<_>>();
 
-            if let Some((idx, _)) = p {
+            for (idx, _) in p {
                 peers.try_lock().unwrap().remove(idx);
             }
         }

@@ -2,10 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use bincode::{Decode, Encode};
 use tokio::{net::UdpSocket, sync::Notify};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
-    discovery::ENCODING_CONFIG,
+    discovery::{peers::PeerState, ENCODING_CONFIG},
     link::{
         payload::{GhostTime, PayloadEntry},
         sessions::SessionMembership,
@@ -17,6 +17,7 @@ use super::{
     ghostxform::GhostXForm,
     payload::{Payload, HOST_TIME_SIZE, PREV_GHOST_TIME_SIZE},
     sessions::SessionId,
+    state::SessionState,
     Result,
 };
 
@@ -42,36 +43,31 @@ pub struct MessageHeader {
 
 #[derive(Debug, Clone)]
 pub struct PingResponder {
-    pub session_id: Arc<Mutex<SessionId>>,
-    pub ghost_x_form: Arc<Mutex<GhostXForm>>,
+    pub peer_state: Arc<Mutex<PeerState>>,
+    pub session_state: Arc<Mutex<SessionState>>,
     pub clock: Clock,
     pub unicast_socket: Option<Arc<UdpSocket>>,
 }
 
 impl PingResponder {
-    pub async fn new(
+    pub fn new(
         unicast_socket: Arc<UdpSocket>,
-        session_id: SessionId,
-        ghost_x_form: GhostXForm,
+        peer_state: Arc<Mutex<PeerState>>,
+        session_state: Arc<Mutex<SessionState>>,
         clock: Clock,
-        notifier: Arc<Notify>,
     ) -> Self {
-        let pr = PingResponder {
+        PingResponder {
             unicast_socket: Some(unicast_socket),
-            session_id: Arc::new(Mutex::new(session_id)),
-            ghost_x_form: Arc::new(Mutex::new(ghost_x_form)),
+            peer_state,
+            session_state,
             clock,
-        };
-
-        pr.listen(notifier).await;
-
-        pr
+        }
     }
 
     pub async fn listen(&self, _notifier: Arc<Notify>) {
         let unicast_socket = self.unicast_socket.as_ref().unwrap().clone();
-        let session_id = self.session_id.clone();
-        let ghost_x_form = self.ghost_x_form.clone();
+        let peer_state = self.peer_state.clone();
+        let ghost_x_form = self.session_state.try_lock().unwrap().ghost_x_form;
         let clock = self.clock;
 
         info!(
@@ -91,21 +87,16 @@ impl PingResponder {
 
                     let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
                     let payload_size = buf[header_len..amt].len();
-                    let max_payload_size = HOST_TIME_SIZE + PREV_GHOST_TIME_SIZE;
-
-                    info!("header message type {}", header.message_type);
+                    let max_payload_size = 40;
 
                     if header.message_type == PING && payload_size <= max_payload_size as usize {
-                        info!("received ping message from {}", src);
+                        debug!("received ping message from {}", src);
 
                         let id = SessionMembership {
-                            session_id: *session_id.try_lock().unwrap(),
+                            session_id: peer_state.try_lock().unwrap().session_id(),
                         };
                         let current_gt = GhostTime {
-                            time: ghost_x_form
-                                .try_lock()
-                                .unwrap()
-                                .host_to_ghost(clock.micros()),
+                            time: ghost_x_form.host_to_ghost(clock.micros()),
                         };
                         let pong_payload = Payload {
                             entries: vec![
@@ -116,7 +107,7 @@ impl PingResponder {
 
                         let pong_message = encode_message(PONG, &pong_payload).unwrap();
                         unicast_socket.send_to(&pong_message, src).await.unwrap();
-                        info!("sent pong message to {}", src);
+                        debug!("sent pong message to {}", src);
                     } else {
                         info!("received invalid message from {}", src);
                     }
@@ -126,8 +117,8 @@ impl PingResponder {
     }
 
     pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
-        *self.session_id.try_lock().unwrap() = session_id;
-        *self.ghost_x_form.try_lock().unwrap() = x_form;
+        self.peer_state.try_lock().unwrap().node_state.session_id = session_id;
+        self.session_state.try_lock().unwrap().ghost_x_form = x_form;
     }
 }
 

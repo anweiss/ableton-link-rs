@@ -30,13 +30,14 @@ use super::{
     LINK_PORT, MULTICAST_ADDR, MULTICAST_IP_ANY,
 };
 
-pub fn new_udp_reuseport(addr: SocketAddr) -> UdpSocket {
+pub fn new_udp_reuseport(addr: SocketAddrV4) -> UdpSocket {
     let udp_sock = socket2::Socket::new(
-        if addr.is_ipv4() {
-            socket2::Domain::IPV4
-        } else {
-            socket2::Domain::IPV6
-        },
+        // if addr.is_ipv4() {
+        //     socket2::Domain::IPV4
+        // } else {
+        //     socket2::Domain::IPV6
+        // },
+        socket2::Domain::IPV4,
         socket2::Type::DGRAM,
         None,
     )
@@ -52,7 +53,7 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> UdpSocket {
 
 pub struct Messenger {
     pub interface: Option<Arc<UdpSocket>>,
-    pub peer_state: Arc<std::sync::Mutex<PeerState>>,
+    pub peer_state: Arc<Mutex<PeerState>>,
     pub ttl: u8,
     pub ttl_ratio: u8,
     pub last_broadcast_time: Arc<Mutex<Instant>>,
@@ -61,8 +62,8 @@ pub struct Messenger {
 }
 
 impl Messenger {
-    pub async fn new(
-        peer_state: PeerState,
+    pub fn new(
+        peer_state: Arc<Mutex<PeerState>>,
         tx_event: Sender<OnEvent>,
         epoch: Instant,
         notifier: Arc<Notify>,
@@ -75,7 +76,7 @@ impl Messenger {
 
         Messenger {
             interface: Some(Arc::new(socket)),
-            peer_state: Arc::new(std::sync::Mutex::new(peer_state)),
+            peer_state,
             ttl: 5,
             ttl_ratio: 20,
             last_broadcast_time: Arc::new(Mutex::new(epoch)),
@@ -100,11 +101,11 @@ impl Messenger {
                 let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
 
-                if header.ident == peer_state.try_lock().unwrap().ident() && header.group_id == 0 {
+                if header.ident == peer_state.try_lock().unwrap().ident() && header.group_id != 0 {
                     debug!("ignoring messages from self (peer {})", header.ident);
                     continue;
                 } else {
-                    info!(
+                    debug!(
                         "received message type {} from peer {} at {}",
                         MESSAGE_TYPES[header.message_type as usize], header.ident, src
                     );
@@ -162,7 +163,7 @@ impl Messenger {
         //     self.last_broadcast_time.clone(),
         //     self.interface.as_ref().unwrap().clone(),
         //     self.peer_state.clone(),
-        //     SocketAddr::new(MULTICAST_ADDR.into(), LINK_PORT),
+        //     SocketAddrV4::new(MULTICAST_ADDR.into(), LINK_PORT),
         //     self.notifier.clone(),
         // )
         // .await;
@@ -214,7 +215,6 @@ pub async fn broadcast_state(
                 };
 
                 if delay < Duration::from_millis(1) {
-                    debug!("broadcasting state");
                     send_peer_state(s.clone(), peer_state.clone(), ttl, ALIVE, to, lbt).await;
                 }
             }
@@ -261,9 +261,9 @@ pub async fn send_peer_state(
     last_broadcast_time: Arc<Mutex<Instant>>,
 ) {
     let ident = peer_state.try_lock().unwrap().ident();
-    let node_state = peer_state.try_lock().unwrap().node_state.clone();
+    let peer_state = peer_state.try_lock().unwrap().clone();
 
-    send_message(socket, ident, ttl, message_type, &node_state.into(), to).await;
+    send_message(socket, ident, ttl, message_type, &peer_state.into(), to).await;
 
     *last_broadcast_time.try_lock().unwrap() = Instant::now();
 }
