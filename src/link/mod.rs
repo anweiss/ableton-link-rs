@@ -17,10 +17,17 @@ pub mod timeline;
 use std::{
     result,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
-use self::{clock::Clock, controller::Controller, state::ApiState};
+use chrono::Duration;
+
+use self::{
+    clock::Clock,
+    controller::Controller,
+    state::{ClientStartStopState, ClientState},
+    tempo::Tempo,
+    timeline::{clamp_tempo, Timeline},
+};
 
 pub type Result<T> = result::Result<T, error::Error>;
 
@@ -33,6 +40,7 @@ pub struct BasicLink {
     // tempo_callback: Option<TempoCallback>,
     // start_stop_callback: Option<StartStopCallback>,
     controller: Controller,
+    clock: Clock,
 }
 
 impl BasicLink {
@@ -40,13 +48,16 @@ impl BasicLink {
         let subscriber = tracing_subscriber::FmtSubscriber::new();
         tracing::subscriber::set_global_default(subscriber).unwrap();
 
-        let controller = Controller::new(tempo::Tempo::new(bpm), Clock::new()).await;
+        let clock = Clock::new();
+
+        let controller = Controller::new(tempo::Tempo::new(bpm), clock).await;
 
         Self {
             // peer_count_callback: None,
             // tempo_callback: None,
             // start_stop_callback: None,
             controller,
+            clock,
         }
     }
 }
@@ -65,7 +76,7 @@ impl BasicLink {
     }
 
     pub fn num_peers(&self) -> usize {
-        todo!()
+        self.controller.num_peers()
     }
 
     pub fn set_num_peers_callback<F>(&mut self, _callback: F)
@@ -98,15 +109,99 @@ impl BasicLink {
     }
 
     pub fn capture_app_session_state(&self) -> SessionState {
-        todo!()
+        to_session_state(
+            &self.controller.client_state.try_lock().unwrap(),
+            self.num_peers() > 0,
+        )
     }
 
-    pub fn commit_app_session_state(&mut self, _state: SessionState) {
-        todo!()
+    pub async fn commit_app_session_state(&self, state: SessionState) {
+        self.controller
+            .set_state(to_incoming_client_state(
+                &state.state,
+                &state.original_state,
+                self.clock.micros(),
+            ))
+            .await
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+pub fn to_session_state(state: &ClientState, is_connected: bool) -> SessionState {
+    SessionState::new(
+        ApiState {
+            timeline: state.timeline,
+            start_stop_state: ApiStartStopState {
+                is_playing: state.start_stop_state.is_playing,
+                time: state.start_stop_state.time,
+            },
+        },
+        is_connected,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IncomingClientState {
+    pub timeline: Option<Timeline>,
+    pub start_stop_state: Option<ClientStartStopState>,
+    pub timeline_timestamp: Duration,
+}
+
+pub fn to_incoming_client_state(
+    state: &ApiState,
+    original_state: &ApiState,
+    timestamp: Duration,
+) -> IncomingClientState {
+    let timeline = if original_state.timeline != state.timeline {
+        Some(state.timeline)
+    } else {
+        None
+    };
+
+    let start_stop_state = if original_state.start_stop_state != state.start_stop_state {
+        Some(ClientStartStopState {
+            is_playing: state.start_stop_state.is_playing,
+            time: state.start_stop_state.time,
+            timestamp,
+        })
+    } else {
+        None
+    };
+
+    IncomingClientState {
+        timeline,
+        start_stop_state,
+        timeline_timestamp: timestamp,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ApiState {
+    timeline: Timeline,
+    start_stop_state: ApiStartStopState,
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+struct ApiStartStopState {
+    is_playing: bool,
+    time: Duration,
+}
+
+impl Default for ApiStartStopState {
+    fn default() -> Self {
+        Self {
+            is_playing: false,
+            time: Duration::zero(),
+        }
+    }
+}
+
+impl ApiStartStopState {
+    fn new(is_playing: bool, time: Duration) -> Self {
+        Self { is_playing, time }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SessionState {
     original_state: ApiState,
     state: ApiState,
@@ -114,16 +209,26 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn new(_state: ApiState, _respect_quantum: bool) -> Self {
-        todo!()
+    pub fn new(state: ApiState, respect_quantum: bool) -> Self {
+        Self {
+            original_state: state,
+            state,
+            respect_quantum,
+        }
     }
 
     pub fn tempo(&self) -> f64 {
         todo!()
     }
 
-    pub fn set_tempo(&mut self, _bpm: f64, _at_time: Duration) {
-        todo!()
+    pub fn set_tempo(&mut self, bpm: f64, at_time: Duration) {
+        let desired_tl = clamp_tempo(Timeline {
+            tempo: Tempo::new(bpm),
+            beat_origin: self.state.timeline.to_beats(at_time),
+            time_origin: at_time,
+        });
+        self.state.timeline.tempo = desired_tl.tempo;
+        self.state.timeline.time_origin = desired_tl.from_beats(self.state.timeline.beat_origin);
     }
 
     pub fn beat_at_time(&self, _time: Duration, _quantum: f64) -> f64 {
@@ -186,7 +291,26 @@ mod tests {
         let bpm = 140.0;
 
         let mut link = BasicLink::new(bpm).await;
+
         info!("initializing basic link at {} bpm", bpm);
         link.enable().await;
+
+        tokio::time::sleep(Duration::seconds(10).to_std().unwrap()).await;
+
+        let mut state = link.capture_app_session_state();
+
+        info!("captured app session state: {:?}", state);
+
+        tokio::time::sleep(Duration::seconds(10).to_std().unwrap()).await;
+
+        info!("changing tempo to {}", bpm);
+
+        state.set_tempo(bpm, Duration::zero());
+
+        info!("commiting new app session state");
+
+        link.commit_app_session_state(state).await;
+
+        tokio::time::sleep(Duration::seconds(10).to_std().unwrap()).await;
     }
 }

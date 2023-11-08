@@ -17,7 +17,11 @@ use super::{
     sessions::{Session, SessionId, SessionMeasurement, Sessions},
     state::{ClientStartStopState, ClientState, SessionState, StartStopState},
     tempo,
-    timeline::{clamp_tempo, update_client_timeline_from_session, Timeline},
+    timeline::{
+        clamp_tempo, update_client_timeline_from_session, update_session_timeline_from_client,
+        Timeline,
+    },
+    IncomingClientState,
 };
 
 pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
@@ -25,9 +29,9 @@ pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 pub struct Controller {
     // tempo_callback: Option<TempoCallback>,
     // start_stop_callback: Option<StartStopCallback>,
-    peer_state: Arc<Mutex<PeerState>>,
-    session_state: Arc<Mutex<SessionState>>,
-    client_state: Arc<Mutex<ClientState>>,
+    pub peer_state: Arc<Mutex<PeerState>>,
+    pub session_state: Arc<Mutex<SessionState>>,
+    pub client_state: Arc<Mutex<ClientState>>,
     // last_is_playing_for_start_stop_state_callback: bool,
     session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
@@ -300,9 +304,115 @@ impl Controller {
             self.start_stop_sync_enabled.clone(),
         )
         .await;
-        self.discovery
-            .listen(self.rx_event.take().unwrap(), self.notifier.clone())
+
+        let discovery = self.discovery.clone();
+        let rx_event = self.rx_event.take().unwrap();
+        let notifier = self.notifier.clone();
+
+        tokio::spawn(async move {
+            discovery.listen(rx_event, notifier).await;
+        });
+    }
+
+    pub async fn set_state(&self, mut new_client_state: IncomingClientState) {
+        info!("setting state");
+        if let Some(timeline) = new_client_state.timeline.as_mut() {
+            *timeline = clamp_tempo(*timeline);
+            self.client_state.try_lock().unwrap().timeline = *timeline;
+        }
+
+        if let Some(mut start_stop_state) = new_client_state.start_stop_state {
+            start_stop_state = select_preferred_start_stop_state(
+                self.client_state.try_lock().unwrap().start_stop_state,
+                start_stop_state,
+            );
+            self.client_state.try_lock().unwrap().start_stop_state = start_stop_state;
+        }
+
+        self.handle_client_state(new_client_state).await
+    }
+
+    pub async fn handle_client_state(&self, client_state: IncomingClientState) {
+        let mut must_update_discovery = false;
+
+        info!("client_state: {:?}", client_state);
+
+        if let Some(timeline) = client_state.timeline {
+            let session_timeline = update_session_timeline_from_client(
+                self.session_state.try_lock().unwrap().timeline,
+                timeline,
+                client_state.timeline_timestamp,
+                self.session_state.try_lock().unwrap().ghost_x_form,
+            );
+
+            self.sessions.reset_timeline(session_timeline);
+
+            // setSessionTimeline
+            for peer in self.peers.try_lock().unwrap().iter_mut().filter(|p| {
+                p.peer_state.session_id() == self.peer_state.try_lock().unwrap().session_id()
+            }) {
+                peer.peer_state.node_state.timeline = session_timeline;
+            }
+            update_session_timing(
+                self.session_state.clone(),
+                self.client_state.clone(),
+                session_timeline,
+                self.session_state.try_lock().unwrap().ghost_x_form,
+                self.clock,
+                self.start_stop_sync_enabled.clone(),
+            );
+
+            must_update_discovery = true;
+        }
+
+        if let Some(client_start_stop_state) = client_state.start_stop_state {
+            if *self.start_stop_sync_enabled.try_lock().unwrap() {
+                let new_ghost_time = self
+                    .session_state
+                    .try_lock()
+                    .unwrap()
+                    .ghost_x_form
+                    .host_to_ghost(client_start_stop_state.timestamp);
+
+                if new_ghost_time
+                    > self
+                        .session_state
+                        .try_lock()
+                        .unwrap()
+                        .start_stop_state
+                        .timestamp
+                {
+                    self.session_state.try_lock().unwrap().start_stop_state =
+                        map_start_stop_state_from_client_to_session(
+                            client_start_stop_state,
+                            self.session_state.try_lock().unwrap().timeline,
+                            self.session_state.try_lock().unwrap().ghost_x_form,
+                        );
+
+                    self.client_state.try_lock().unwrap().start_stop_state =
+                        client_start_stop_state;
+
+                    must_update_discovery = true;
+                }
+            }
+        }
+
+        if must_update_discovery {
+            info!("updating discovery");
+            update_discovery(
+                self.session_state.clone(),
+                self.peer_state.clone(),
+                self.discovery.clone(),
+            )
             .await;
+        }
+    }
+
+    pub fn num_peers(&self) -> usize {
+        self.session_peer_counter
+            .try_lock()
+            .unwrap()
+            .session_peer_count
     }
 }
 
@@ -338,7 +448,7 @@ pub async fn join_session(
 
     if session_id_changed {
         info!(
-            "joining session {} with tempo {}",
+            "joining session {:?} with tempo {}",
             session.session_id,
             session.timeline.tempo.bpm()
         );
@@ -361,6 +471,8 @@ pub async fn join_session(
             )
             .await;
         }
+
+        info!("session state {:?}", session_state.try_lock().unwrap());
     }
 }
 
@@ -391,7 +503,8 @@ pub async fn reset_state(
                 .ghost_x_form
                 .host_to_ghost(host_time),
         ),
-        time_origin: x_form.host_to_ghost(host_time),
+        // time_origin: x_form.host_to_ghost(host_time),
+        time_origin: Duration::zero(),
     };
 
     reset_session_start_stop_state(session_state.clone());
@@ -459,6 +572,7 @@ pub fn update_session_timing(
     start_stop_sync_enabled: Arc<Mutex<bool>>,
 ) {
     let new_timeline = clamp_tempo(new_timeline);
+
     if let Ok(mut session_state) = session_state.try_lock() {
         let old_timeline = session_state.timeline;
         let old_x_form = session_state.ghost_x_form;

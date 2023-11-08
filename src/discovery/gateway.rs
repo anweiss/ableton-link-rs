@@ -129,12 +129,8 @@ impl PeerGateway {
         self.measurement_service
             .update_node_state(node_state.session_id, ghost_xform)
             .await;
-        self.messenger
-            .update_state(PeerState {
-                node_state,
-                measurement_endpoint,
-            })
-            .await
+
+        self.peer_state.try_lock().unwrap().node_state = node_state;
     }
 
     pub async fn listen(&self, mut rx_event: Receiver<OnEvent>, notifier: Arc<Notify>) {

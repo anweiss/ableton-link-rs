@@ -9,7 +9,10 @@ use chrono::Duration;
 use tokio::sync::Notify;
 use tracing::{debug, info};
 
-use crate::discovery::{peers::ControllerPeer, ENCODING_CONFIG};
+use crate::{
+    discovery::{peers::ControllerPeer, ENCODING_CONFIG},
+    link::beats::Beats,
+};
 
 use super::{
     clock::Clock, ghostxform::GhostXForm, measurement::MeasurePeerEvent, node::NodeId,
@@ -80,6 +83,7 @@ pub struct Session {
 pub struct Sessions {
     pub other_sessions: Arc<Mutex<Vec<Session>>>,
     pub current: Arc<Mutex<Session>>,
+    pub is_founding: Arc<Mutex<bool>>,
     pub tx_measure_peer_state: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     pub peers: Arc<Mutex<Vec<ControllerPeer>>>,
     pub clock: Clock,
@@ -149,6 +153,7 @@ impl Sessions {
             tx_measure_peer_state,
             peers,
             clock,
+            is_founding: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -223,7 +228,7 @@ impl Sessions {
     pub fn update_timeline(&self, session_id: SessionId, timeline: Timeline) {
         if self.current.try_lock().unwrap().session_id == session_id {
             if timeline.beat_origin >= self.current.try_lock().unwrap().timeline.beat_origin {
-                info!(
+                debug!(
                     "adopting peer timeline ({}, {}, {})",
                     timeline.tempo.bpm(),
                     timeline.beat_origin.floating(),
@@ -344,11 +349,15 @@ pub async fn handle_successful_measurement(
             info!("session EPS {:?}", SESSION_EPS);
 
             if ghost_diff.abs() > SESSION_EPS
-                || (ghost_diff.abs().num_microseconds().unwrap()
+                || (ghost_diff.num_microseconds().unwrap()
                     < SESSION_EPS.num_microseconds().unwrap()
                     && session_id != current.try_lock().unwrap().session_id)
             {
                 let c = current.try_lock().unwrap().clone();
+                info!("beat origin {:?}", c.timeline.beat_origin);
+                info!("new session origin {:?}", s.timeline.beat_origin);
+                // s.timeline = c.timeline;
+
                 *current.try_lock().unwrap() = s.clone();
                 other_sessions.try_lock().unwrap().remove(idx);
                 other_sessions.try_lock().unwrap().insert(idx, c);

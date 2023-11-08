@@ -16,24 +16,6 @@ pub const START_STOP_STATE_HEADER: PayloadEntryHeader = PayloadEntryHeader {
     size: START_STOP_STATE_SIZE,
 };
 
-#[derive(Clone, Copy, Debug)]
-pub struct ApiState {
-    timline: Timeline,
-    start_stop_state: ApiStartStopState,
-}
-
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-struct ApiStartStopState {
-    is_playing: bool,
-    time: Duration,
-}
-
-impl ApiStartStopState {
-    fn new(is_playing: bool, time: Duration) -> Self {
-        Self { is_playing, time }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartStopState {
     pub is_playing: bool,
@@ -121,21 +103,6 @@ pub struct SessionState {
 pub struct ClientState {
     pub timeline: Timeline,
     pub start_stop_state: ClientStartStopState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RtClientState {
-    pub timeline: Timeline,
-    pub start_stop_state: ClientStartStopState,
-    pub timeline_timestamp: Duration,
-    pub start_stop_state_timestamp: Duration,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct IncomingClientState {
-    pub timeline: Option<Timeline>,
-    pub start_stop_state: Option<ClientStartStopState>,
-    pub timeline_timestamp: Duration,
 }
 
 #[cfg(test)]

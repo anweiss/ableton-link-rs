@@ -7,7 +7,7 @@ use bincode::{Decode, Encode};
 
 pub const BEATS_SIZE: u32 = mem::size_of::<i64>() as u32;
 
-#[derive(PartialEq, Eq, Copy, Clone, Default, PartialOrd, Encode, Decode, Debug)]
+#[derive(PartialEq, Eq, Copy, Clone, Default, PartialOrd, Ord, Encode, Decode, Debug)]
 pub struct Beats {
     pub value: i64,
 }

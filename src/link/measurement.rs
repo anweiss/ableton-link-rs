@@ -503,25 +503,19 @@ pub async fn send_ping(
     socket.send(&message).await
 }
 
-pub fn median(values: Vec<f64>) -> f64 {
-    let n = values.len();
+pub fn median(mut data: Vec<f64>) -> f64 {
+    let n = data.len();
+    assert!(n > 2);
 
-    if n <= 2 {
-        return 0.0;
-    }
-
-    let mut sorted_values = values;
-    sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    data.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     if n % 2 == 0 {
         let mid1 = n / 2;
-        let mid2 = (n - 1) / 2;
-
-        (sorted_values[mid1] + sorted_values[mid2]) / 2.0
+        let mid2 = mid1 - 1;
+        return (data[mid1] + data[mid2]) / 2.0;
     } else {
         let mid = n / 2;
-
-        sorted_values[mid]
+        return data[mid];
     }
 }
 

@@ -153,21 +153,6 @@ impl Messenger {
         )
         .await;
     }
-
-    pub async fn update_state(&self, state: PeerState) {
-        *self.peer_state.try_lock().unwrap() = state;
-
-        // broadcast_state(
-        //     self.ttl,
-        //     self.ttl_ratio,
-        //     self.last_broadcast_time.clone(),
-        //     self.interface.as_ref().unwrap().clone(),
-        //     self.peer_state.clone(),
-        //     SocketAddrV4::new(MULTICAST_ADDR.into(), LINK_PORT),
-        //     self.notifier.clone(),
-        // )
-        // .await;
-    }
 }
 
 pub async fn broadcast_state(

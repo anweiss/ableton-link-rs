@@ -180,19 +180,13 @@ async fn saw_peer(
 
     let peer = ControllerPeer { peer_state: ps };
 
-    if !peers.try_lock().unwrap().contains(&peer)
-        && peer.peer_state.ident() != self_peer_state.lock().unwrap().ident()
-    {
-        info!("saw peer {}", peer.peer_state.ident());
-    }
-
     let did_session_membership_change = if !peers
         .try_lock()
         .unwrap()
         .iter()
         .any(|p| p.peer_state.ident() == peer.peer_state.ident())
     {
-        peers.try_lock().unwrap().push(peer);
+        peers.try_lock().unwrap().push(peer.clone());
         true
     } else {
         peers
