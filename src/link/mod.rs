@@ -48,7 +48,7 @@ impl BasicLink {
         let subscriber = tracing_subscriber::FmtSubscriber::new();
         tracing::subscriber::set_global_default(subscriber).unwrap();
 
-        let clock = Clock::new();
+        let clock = Clock::default();
 
         let controller = Controller::new(tempo::Tempo::new(bpm), clock).await;
 

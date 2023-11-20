@@ -48,7 +48,6 @@ pub struct PeerGateway {
     messenger: Messenger,
     tx_peer_event: Sender<PeerEvent>,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
-    tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     cancel: Arc<Notify>,
 }
 
@@ -106,7 +105,7 @@ impl PeerGateway {
                 peer_state.clone(),
                 session_state,
                 clock,
-                tx_measure_peer_result.clone(),
+                tx_measure_peer_result,
                 notifier,
                 rx_measure_peer_state,
             )
@@ -115,7 +114,6 @@ impl PeerGateway {
             tx_peer_event,
             peer_timeouts: Arc::new(Mutex::new(vec![])),
             session_peer_counter,
-            tx_measure_peer: tx_measure_peer_result,
             cancel: Arc::new(Notify::new()),
         }
     }
@@ -406,7 +404,7 @@ mod tests {
                 measurement_endpoint: None,
             })),
             Arc::new(Mutex::new(SessionState::default())),
-            Clock::new(),
+            Clock::default(),
             Arc::new(Mutex::new(SessionPeerCounter::default())),
             tx_peer_state_change,
             tx_event,

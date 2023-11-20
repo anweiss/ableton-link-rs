@@ -354,7 +354,7 @@ mod tests {
                     measurement_endpoint: None,
                 })),
                 Arc::new(Mutex::new(SessionState::default())),
-                Clock::new(),
+                Clock::default(),
                 Arc::new(Mutex::new(SessionPeerCounter::default())),
                 tx_peer_state_change.clone(),
                 tx_event,

@@ -6,7 +6,7 @@ use std::{
 
 use bincode::{Decode, Encode};
 use chrono::Duration;
-use tokio::{sync::Notify, time::Instant};
+use tokio::{sync::Notify};
 use tracing::{debug, info};
 
 use crate::discovery::{peers::ControllerPeer, ENCODING_CONFIG};
@@ -186,7 +186,7 @@ impl Sessions {
         if self.current.try_lock().unwrap().session_id == session_id {
             let session = self.update_timeline(self.current.try_lock().unwrap().clone(), timeline);
             self.current.try_lock().unwrap().timeline = session.timeline;
-            if !self.has_joined.try_lock().unwrap().clone() {
+            if !*self.has_joined.try_lock().unwrap() {
                 debug!(
                     "updating current session {} with timeline {:?}",
                     session_id, session.timeline

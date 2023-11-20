@@ -212,12 +212,6 @@ pub const NUMBER_DATA_POINTS: usize = 20;
 pub const NUMBER_MEASUREMENTS: usize = 5;
 
 #[derive(Debug)]
-enum TimerStatus {
-    Finish,
-    Reset,
-}
-
-#[derive(Debug)]
 pub struct Measurement {
     pub unicast_socket: Option<Arc<UdpSocket>>,
     pub session_id: SessionId,
@@ -227,7 +221,7 @@ pub struct Measurement {
     pub measurements_started: Arc<Mutex<usize>>,
     pub success: Arc<Mutex<bool>>,
     pub init_bytes_sent: usize,
-    tx_timer: Sender<TimerStatus>,
+    tx_timer: Sender<()>,
 }
 
 impl Measurement {
@@ -266,8 +260,6 @@ impl Measurement {
         let s = success.clone();
         let d = data.clone();
         let t = tx_measurement.clone();
-        let ms = measurement.measurements_started.clone();
-        let us = unicast_socket.clone();
 
         let finished_notifier = Arc::new(Notify::new());
 
@@ -276,32 +268,15 @@ impl Measurement {
         tokio::spawn(async move {
             loop {
                 select! {
-                    Some(timer_status) = rx_timer.recv() => {
-                        match timer_status {
-                            TimerStatus::Finish => {
-                                fn_loop.notify_one();
-
-                                finish(
-                                    s.clone(),
-                                    state.measurement_endpoint.unwrap(),
-                                    d.clone(),
-                                    t.clone(),
-                                )
-                                .await;
-                            }
-                            TimerStatus::Reset => {
-                                reset_timer(
-                                    ms.clone(),
-                                    clock,
-                                    Some(us.clone()),
-                                    state.measurement_endpoint.unwrap(),
-                                    d.clone(),
-                                    t.clone(),
-                                    fn_loop.clone(),
-                                )
-                                .await;
-                            }
-                        }
+                    Some(_) = rx_timer.recv() => {
+                        fn_loop.notify_one();
+                        finish(
+                            s.clone(),
+                            state.measurement_endpoint.unwrap(),
+                            d.clone(),
+                            t.clone(),
+                        )
+                        .await;
                     }
                     _ = notifier.notified() => {
                         break;
@@ -421,7 +396,7 @@ impl Measurement {
                         }
 
                         if data.try_lock().unwrap().len() > NUMBER_DATA_POINTS {
-                            tx_timer.send(TimerStatus::Finish).await.unwrap();
+                            tx_timer.send(()).await.unwrap();
                             break;
                         }
                     }
@@ -515,9 +490,9 @@ pub fn median(mut numbers: Vec<f64>) -> f64 {
     assert!(length > 2);
     if length % 2 == 0 {
         let mid = length / 2;
-        (numbers[mid - 1] + numbers[mid]) as f64 / 2.0
+        (numbers[mid - 1] + numbers[mid]) / 2.0
     } else {
-        numbers[length / 2] as f64
+        numbers[length / 2]
     }
 }
 
@@ -569,7 +544,7 @@ mod tests {
                     measurement_endpoint: None,
                 })),
                 Arc::new(Mutex::new(SessionState::default())),
-                Clock::new(),
+                Clock::default(),
                 Arc::new(Mutex::new(SessionPeerCounter::default())),
                 tx_peer_state_change.clone(),
                 tx_event,
@@ -603,7 +578,7 @@ mod tests {
                 measurement_endpoint: Some(s.local_addr().unwrap().to_string().parse().unwrap()),
                 ..Default::default()
             },
-            Clock::new(),
+            Clock::default(),
             tx_measurement,
             notifier,
         )

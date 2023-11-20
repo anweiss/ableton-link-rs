@@ -1,12 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use bincode::{Decode, Encode};
-use chrono::Duration;
+
 use tokio::{net::UdpSocket, sync::Notify};
 use tracing::{debug, info};
 
 use crate::{
-    discovery::{messages::parse_payload, peers::PeerState, ENCODING_CONFIG},
+    discovery::{messages::parse_payload, ENCODING_CONFIG},
     link::{
         payload::{GhostTime, PayloadEntry},
         sessions::SessionMembership,
@@ -14,8 +14,7 @@ use crate::{
 };
 
 use super::{
-    clock::Clock, ghostxform::GhostXForm, payload::Payload, sessions::SessionId,
-    state::SessionState, Result,
+    clock::Clock, ghostxform::GhostXForm, payload::Payload, sessions::SessionId, Result,
 };
 
 pub const MAX_MESSAGE_SIZE: usize = 512;
@@ -97,9 +96,10 @@ impl PingResponder {
 
                         let mut payload_entries = vec![];
                         for entry in payload.entries.into_iter() {
-                            if matches!(entry, PayloadEntry::HostTime(_)) {
-                                payload_entries.push(entry);
-                            } else if matches!(entry, PayloadEntry::PrevGhostTime(_)) {
+                            if matches!(
+                                entry,
+                                PayloadEntry::HostTime(_) | PayloadEntry::PrevGhostTime(_)
+                            ) {
                                 payload_entries.push(entry);
                             }
                         }
