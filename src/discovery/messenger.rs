@@ -101,7 +101,8 @@ impl Messenger {
                 let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
 
-                if header.ident == peer_state.try_lock().unwrap().ident() && header.group_id != 0 {
+                // TODO figure out how to encode group ID
+                if header.ident == peer_state.try_lock().unwrap().ident() && header.group_id == 0 {
                     debug!("ignoring messages from self (peer {})", header.ident);
                     continue;
                 } else {

@@ -214,7 +214,7 @@ impl Controller {
                             ) => {
                                 // handle_start_stop_state_from_session
 
-                                debug!(
+                                info!(
                                     "controller received start stop state. isPlaying: {}, beats: {}, time: {} for session: {}",
                                     peer_start_stop_state.is_playing,
                                     peer_start_stop_state.beats.floating(),
@@ -309,9 +309,11 @@ impl Controller {
         let rx_event = self.rx_event.take().unwrap();
         let notifier = self.notifier.clone();
 
-        tokio::spawn(async move {
-            discovery.listen(rx_event, notifier).await;
-        });
+        discovery.listen(rx_event, notifier).await;
+
+        // tokio::spawn(async move {
+        //     discovery.listen(rx_event, notifier).await;
+        // });
     }
 
     pub async fn set_state(&self, mut new_client_state: IncomingClientState) {
@@ -448,9 +450,9 @@ pub async fn join_session(
 
     if session_id_changed {
         info!(
-            "joining session {:?} with tempo {}",
+            "joining session {} with tempo {}",
             session.session_id,
-            session.timeline.tempo.bpm()
+            session.timeline.tempo.bpm().round()
         );
 
         // session_peer_counter(session_id, peers, session_peer_count);
@@ -471,8 +473,6 @@ pub async fn join_session(
             )
             .await;
         }
-
-        info!("session state {:?}", session_state.try_lock().unwrap());
     }
 }
 
@@ -503,9 +503,15 @@ pub async fn reset_state(
                 .ghost_x_form
                 .host_to_ghost(host_time),
         ),
-        // time_origin: x_form.host_to_ghost(host_time),
-        time_origin: Duration::zero(),
+        time_origin: x_form.host_to_ghost(host_time),
+        // time_origin: Duration::zero(),
     };
+
+    info!(
+        "initializing new session {} with timeline {:?}",
+        peer_state.try_lock().unwrap().node_state.session_id,
+        new_tl,
+    );
 
     reset_session_start_stop_state(session_state.clone());
 
@@ -618,12 +624,12 @@ fn init_session_state(tempo: tempo::Tempo, clock: Clock) -> SessionState {
     SessionState {
         timeline: clamp_tempo(Timeline {
             tempo,
-            beat_origin: Beats::new(0f64),
+            beat_origin: Beats::new(0.0),
             time_origin: Duration::zero(),
         }),
         start_stop_state: StartStopState {
             is_playing: false,
-            beats: Beats::new(0f64),
+            beats: Beats::new(0.0),
             timestamp: Duration::microseconds(0),
         },
         ghost_x_form: init_x_form(clock),

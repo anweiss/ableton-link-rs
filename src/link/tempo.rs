@@ -4,7 +4,7 @@ use std::{
 };
 
 use chrono::Duration;
-use tracing::info;
+use tokio::time::Instant;
 
 use super::beats::Beats;
 

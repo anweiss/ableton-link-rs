@@ -1,4 +1,5 @@
 use chrono::Duration;
+use tokio::time::Instant;
 
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub struct GhostXForm {
@@ -9,7 +10,7 @@ pub struct GhostXForm {
 impl Default for GhostXForm {
     fn default() -> Self {
         Self {
-            slope: 0f64,
+            slope: 0.0,
             intercept: Duration::zero(),
         }
     }

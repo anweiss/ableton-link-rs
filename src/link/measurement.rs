@@ -137,8 +137,8 @@ impl MeasurementService {
             clock,
             ping_responder: PingResponder::new(
                 ping_responder_unicast_socket,
-                peer_state.clone(),
-                session_state,
+                peer_state.try_lock().unwrap().session_id(),
+                session_state.try_lock().unwrap().ghost_x_form,
                 clock,
             ),
             tx_measure_peer: tx_measure_peer_result,
@@ -161,8 +161,10 @@ pub async fn measure_peer(
     notifier: Arc<Notify>,
 ) {
     info!(
-        "measuring peer {} for session {}",
-        state.node_state.node_id, session_id
+        "measuring peer {} at {} for session {}",
+        state.node_state.node_id,
+        state.measurement_endpoint.unwrap(),
+        session_id
     );
 
     let node_id = state.node_state.node_id;
@@ -206,7 +208,7 @@ pub async fn measure_peer(
     });
 }
 
-pub const NUMBER_DATA_POINTS: usize = 100;
+pub const NUMBER_DATA_POINTS: usize = 20;
 pub const NUMBER_MEASUREMENTS: usize = 5;
 
 #[derive(Debug)]
@@ -259,8 +261,6 @@ impl Measurement {
             init_bytes_sent: 0,
         };
 
-        info!("measurement on gateway");
-
         let ht = HostTime::new(clock.micros());
 
         let s = success.clone();
@@ -311,6 +311,8 @@ impl Measurement {
         });
 
         measurement.listen().await;
+
+        info!("sending initial host time ping {:?}", ht);
 
         let init_bytes_sent = send_ping(
             unicast_socket.clone(),
@@ -386,6 +388,7 @@ impl Measurement {
 
                     if s_id == session_id {
                         let host_time = clock.micros();
+
                         let payload = Payload {
                             entries: vec![
                                 PayloadEntry::HostTime(HostTime { time: host_time }),
@@ -458,6 +461,8 @@ async fn reset_timer(
                     )
                     .await.unwrap();
 
+                    tokio::time::sleep(Duration::seconds(1).to_std().unwrap()).await;
+
                     *measurements_started.try_lock().unwrap() += 1;
                 } else {
                     data.try_lock().unwrap().clear();
@@ -503,19 +508,16 @@ pub async fn send_ping(
     socket.send(&message).await
 }
 
-pub fn median(mut data: Vec<f64>) -> f64 {
-    let n = data.len();
-    assert!(n > 2);
+pub fn median(mut numbers: Vec<f64>) -> f64 {
+    numbers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let length = numbers.len();
 
-    data.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    if n % 2 == 0 {
-        let mid1 = n / 2;
-        let mid2 = mid1 - 1;
-        return (data[mid1] + data[mid2]) / 2.0;
+    assert!(length > 2);
+    if length % 2 == 0 {
+        let mid = length / 2;
+        (numbers[mid - 1] + numbers[mid]) as f64 / 2.0
     } else {
-        let mid = n / 2;
-        return data[mid];
+        numbers[length / 2] as f64
     }
 }
 

@@ -3,13 +3,22 @@ use std::{
     ops::{Add, Neg, Sub},
 };
 
-use bincode::{Decode, Encode};
+use bincode::Decode;
 
 pub const BEATS_SIZE: u32 = mem::size_of::<i64>() as u32;
 
-#[derive(PartialEq, Eq, Copy, Clone, Default, PartialOrd, Ord, Encode, Decode, Debug)]
+#[derive(PartialEq, Eq, Copy, Clone, Default, PartialOrd, Ord, Decode, Debug)]
 pub struct Beats {
     pub value: i64,
+}
+
+impl bincode::Encode for Beats {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> std::result::Result<(), bincode::error::EncodeError> {
+        bincode::Encode::encode(&self.micro_beats(), encoder)
+    }
 }
 
 impl Beats {

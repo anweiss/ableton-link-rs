@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use bincode::{Decode, Encode};
+use chrono::Duration;
 use tokio::{net::UdpSocket, sync::Notify};
 use tracing::{debug, info};
 
 use crate::{
-    discovery::{peers::PeerState, ENCODING_CONFIG},
+    discovery::{messages::parse_payload, peers::PeerState, ENCODING_CONFIG},
     link::{
         payload::{GhostTime, PayloadEntry},
         sessions::SessionMembership,
@@ -13,12 +14,8 @@ use crate::{
 };
 
 use super::{
-    clock::Clock,
-    ghostxform::GhostXForm,
-    payload::{Payload, HOST_TIME_SIZE, PREV_GHOST_TIME_SIZE},
-    sessions::SessionId,
-    state::SessionState,
-    Result,
+    clock::Clock, ghostxform::GhostXForm, payload::Payload, sessions::SessionId,
+    state::SessionState, Result,
 };
 
 pub const MAX_MESSAGE_SIZE: usize = 512;
@@ -43,8 +40,8 @@ pub struct MessageHeader {
 
 #[derive(Debug, Clone)]
 pub struct PingResponder {
-    pub peer_state: Arc<Mutex<PeerState>>,
-    pub session_state: Arc<Mutex<SessionState>>,
+    pub session_id: Arc<Mutex<SessionId>>,
+    pub ghost_x_form: Arc<Mutex<GhostXForm>>,
     pub clock: Clock,
     pub unicast_socket: Option<Arc<UdpSocket>>,
 }
@@ -52,28 +49,30 @@ pub struct PingResponder {
 impl PingResponder {
     pub fn new(
         unicast_socket: Arc<UdpSocket>,
-        peer_state: Arc<Mutex<PeerState>>,
-        session_state: Arc<Mutex<SessionState>>,
+        session_id: SessionId,
+        ghost_x_form: GhostXForm,
         clock: Clock,
     ) -> Self {
         PingResponder {
             unicast_socket: Some(unicast_socket),
-            peer_state,
-            session_state,
+            session_id: Arc::new(Mutex::new(session_id)),
+            ghost_x_form: Arc::new(Mutex::new(ghost_x_form)),
             clock,
         }
     }
 
     pub async fn listen(&self, _notifier: Arc<Notify>) {
         let unicast_socket = self.unicast_socket.as_ref().unwrap().clone();
-        let peer_state = self.peer_state.clone();
-        let ghost_x_form = self.session_state.try_lock().unwrap().ghost_x_form;
+        let session_id = self.session_id.clone();
+        let ghost_x_form = self.ghost_x_form.clone();
         let clock = self.clock;
 
         info!(
             "listening for ping messages on {}",
             unicast_socket.local_addr().unwrap()
         );
+
+        let mut ping_message_received = false;
 
         tokio::spawn(async move {
             loop {
@@ -90,26 +89,51 @@ impl PingResponder {
                     let max_payload_size = 40;
 
                     if header.message_type == PING && payload_size <= max_payload_size as usize {
-                        debug!("received ping message from {}", src);
+                        if !ping_message_received {
+                            info!("received ping message from {}", src);
+                        }
+
+                        let payload = parse_payload(&buf[header_len..amt]).unwrap();
+
+                        let mut payload_entries = vec![];
+                        for entry in payload.entries.into_iter() {
+                            if matches!(entry, PayloadEntry::HostTime(_)) {
+                                payload_entries.push(entry);
+                            } else if matches!(entry, PayloadEntry::PrevGhostTime(_)) {
+                                payload_entries.push(entry);
+                            }
+                        }
 
                         let id = SessionMembership {
-                            session_id: peer_state.try_lock().unwrap().session_id(),
+                            session_id: *session_id.try_lock().unwrap(),
                         };
                         let current_gt = GhostTime {
-                            time: ghost_x_form.host_to_ghost(clock.micros()),
+                            time: ghost_x_form
+                                .try_lock()
+                                .unwrap()
+                                .host_to_ghost(clock.micros()),
                         };
+
+                        payload_entries.push(PayloadEntry::SessionMembership(id));
+                        payload_entries.push(PayloadEntry::GhostTime(current_gt));
+
                         let pong_payload = Payload {
-                            entries: vec![
-                                PayloadEntry::SessionMembership(id),
-                                PayloadEntry::GhostTime(current_gt),
-                            ],
+                            entries: payload_entries,
                         };
+
+                        if !ping_message_received {
+                            debug!("pong_payload {:?}", pong_payload);
+                        }
 
                         let pong_message = encode_message(PONG, &pong_payload).unwrap();
                         unicast_socket.send_to(&pong_message, src).await.unwrap();
-                        debug!("sent pong message to {}", src);
+                        if !ping_message_received {
+                            debug!("sent pong message to {}", src);
+                        }
+
+                        ping_message_received = true;
                     } else {
-                        info!("received invalid message from {}", src);
+                        debug!("received invalid message from {}", src);
                     }
                 }
             }
@@ -117,8 +141,8 @@ impl PingResponder {
     }
 
     pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
-        self.peer_state.try_lock().unwrap().node_state.session_id = session_id;
-        self.session_state.try_lock().unwrap().ghost_x_form = x_form;
+        *self.session_id.try_lock().unwrap() = session_id;
+        *self.ghost_x_form.try_lock().unwrap() = x_form;
     }
 }
 

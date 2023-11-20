@@ -125,7 +125,7 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             )
             .unwrap();
 
-            debug!("received bpm: {}", entry.tempo);
+            debug!("decoded payload entry {:?}", entry);
 
             payload.entries.push(PayloadEntry::Timeline(entry));
             decode(payload, &data[decode_len..])?;

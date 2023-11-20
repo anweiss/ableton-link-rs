@@ -1,6 +1,5 @@
-use std::time::Instant;
-
 use chrono::Duration;
+use tokio::time::Instant;
 
 #[derive(Copy, Clone, Debug)]
 pub struct Clock {
@@ -14,21 +13,7 @@ impl Clock {
         }
     }
 
-    pub fn reset(&mut self) {
-        self.start_time = Instant::now();
-    }
-
-    pub fn elapsed(&self) -> Duration {
-        Duration::from_std(self.start_time.elapsed()).unwrap()
-    }
-
     pub fn micros(&self) -> Duration {
-        self.elapsed()
-    }
-}
-
-impl Default for Clock {
-    fn default() -> Self {
-        Self::new()
+        Duration::from_std(self.start_time.elapsed()).unwrap()
     }
 }

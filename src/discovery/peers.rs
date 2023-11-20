@@ -155,7 +155,7 @@ pub enum PeerStateChange {
 async fn saw_peer(
     peer_seen_peer_state: PeerState,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
-    self_peer_state: Arc<Mutex<PeerState>>,
+    _self_peer_state: Arc<Mutex<PeerState>>,
     _session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
     tx_peer_state_change: Sender<Vec<PeerStateChange>>,
 ) {

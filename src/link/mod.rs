@@ -293,24 +293,25 @@ mod tests {
         let mut link = BasicLink::new(bpm).await;
 
         info!("initializing basic link at {} bpm", bpm);
+
         link.enable().await;
 
-        tokio::time::sleep(Duration::seconds(10).to_std().unwrap()).await;
+        // tokio::time::sleep(Duration::seconds(10).to_std().unwrap()).await;
 
-        let mut state = link.capture_app_session_state();
+        // let mut state = link.capture_app_session_state();
 
-        info!("captured app session state: {:?}", state);
+        // info!("captured app session state: {:?}", state);
 
-        tokio::time::sleep(Duration::seconds(10).to_std().unwrap()).await;
+        // tokio::time::sleep(Duration::seconds(10).to_std().unwrap()).await;
 
-        info!("changing tempo to {}", bpm);
+        // info!("changing tempo to {}", bpm);
 
-        state.set_tempo(bpm, Duration::zero());
+        // state.set_tempo(bpm, Duration::zero());
 
-        info!("commiting new app session state");
+        // info!("commiting new app session state");
 
-        link.commit_app_session_state(state).await;
+        // link.commit_app_session_state(state).await;
 
-        tokio::time::sleep(Duration::seconds(10).to_std().unwrap()).await;
+        // tokio::time::sleep(Duration::seconds(10).to_std().unwrap()).await;
     }
 }

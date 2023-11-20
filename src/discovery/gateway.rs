@@ -123,7 +123,7 @@ impl PeerGateway {
     pub async fn update_node_state(
         &self,
         node_state: NodeState,
-        measurement_endpoint: Option<SocketAddrV4>,
+        _measurement_endpoint: Option<SocketAddrV4>,
         ghost_xform: GhostXForm,
     ) {
         self.measurement_service
@@ -135,8 +135,8 @@ impl PeerGateway {
 
     pub async fn listen(&self, mut rx_event: Receiver<OnEvent>, notifier: Arc<Notify>) {
         info!(
-            "initializing peer gateway {} on interface {}",
-            &self.peer_state.try_lock().unwrap().ident(),
+            "initializing peer gateway {:?} on interface {}",
+            &self.peer_state.try_lock().unwrap().node_state.node_id,
             self.messenger
                 .interface
                 .as_ref()

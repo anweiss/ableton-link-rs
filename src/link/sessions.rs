@@ -6,13 +6,10 @@ use std::{
 
 use bincode::{Decode, Encode};
 use chrono::Duration;
-use tokio::sync::Notify;
+use tokio::{sync::Notify, time::Instant};
 use tracing::{debug, info};
 
-use crate::{
-    discovery::{peers::ControllerPeer, ENCODING_CONFIG},
-    link::beats::Beats,
-};
+use crate::discovery::{peers::ControllerPeer, ENCODING_CONFIG};
 
 use super::{
     clock::Clock, ghostxform::GhostXForm, measurement::MeasurePeerEvent, node::NodeId,
@@ -87,6 +84,7 @@ pub struct Sessions {
     pub tx_measure_peer_state: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     pub peers: Arc<Mutex<Vec<ControllerPeer>>>,
     pub clock: Clock,
+    pub has_joined: Arc<Mutex<bool>>,
 }
 
 impl Sessions {
@@ -154,6 +152,7 @@ impl Sessions {
             peers,
             clock,
             is_founding: Arc::new(Mutex::new(false)),
+            has_joined: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -185,7 +184,16 @@ impl Sessions {
         );
 
         if self.current.try_lock().unwrap().session_id == session_id {
-            self.update_timeline(session_id, timeline);
+            let session = self.update_timeline(self.current.try_lock().unwrap().clone(), timeline);
+            self.current.try_lock().unwrap().timeline = session.timeline;
+            if !self.has_joined.try_lock().unwrap().clone() {
+                debug!(
+                    "updating current session {} with timeline {:?}",
+                    session_id, session.timeline
+                );
+
+                *self.has_joined.try_lock().unwrap() = true;
+            }
         } else {
             let session = Session {
                 session_id,
@@ -202,10 +210,16 @@ impl Sessions {
                 .unwrap()
                 .iter()
                 .cloned()
-                .find(|s| s.session_id == session_id);
+                .enumerate()
+                .find(|(_, s)| s.session_id == session_id);
 
-            if let Some(s) = s {
-                self.update_timeline(s.session_id, timeline);
+            if let Some((idx, s)) = s {
+                let session = self.update_timeline(s, timeline);
+                info!(
+                    "updating already seen session {} with timeline {:?}",
+                    session_id, session.timeline
+                );
+                self.other_sessions.try_lock().unwrap()[idx].timeline = session.timeline;
             } else {
                 info!("adding session {} to other sessions", session_id);
                 self.other_sessions
@@ -225,38 +239,25 @@ impl Sessions {
         self.current.try_lock().unwrap().timeline
     }
 
-    pub fn update_timeline(&self, session_id: SessionId, timeline: Timeline) {
-        if self.current.try_lock().unwrap().session_id == session_id {
-            if timeline.beat_origin >= self.current.try_lock().unwrap().timeline.beat_origin {
-                debug!(
-                    "adopting peer timeline ({}, {}, {})",
-                    timeline.tempo.bpm(),
-                    timeline.beat_origin.floating(),
-                    timeline.time_origin,
-                );
-                self.current.try_lock().unwrap().timeline = timeline;
-            } else {
-                info!("rejecting peer timeline with beat origin: {}. current timeline beat origin: {}", timeline.beat_origin.floating(), self.current.try_lock().unwrap().timeline.beat_origin.floating());
-            }
-        } else if let Some(session) = self
-            .other_sessions
-            .try_lock()
-            .unwrap()
-            .iter_mut()
-            .find(|s| s.session_id == session_id)
-        {
-            if timeline.beat_origin > session.timeline.beat_origin {
-                info!(
-                    "adopting peer timeline ({}, {}, {})",
-                    timeline.tempo.bpm(),
-                    timeline.beat_origin.floating(),
-                    timeline.time_origin,
-                );
-                session.timeline = timeline;
-            } else {
-                info!("rejecting peer timeline with beat origin: {}. current timeline beat origin: {}", timeline.beat_origin.floating(), session.timeline.beat_origin.floating());
-            }
+    pub fn update_timeline(&self, mut session: Session, timeline: Timeline) -> Session {
+        if timeline.beat_origin > session.timeline.beat_origin {
+            info!(
+                "[adopting] updating peer timeline for session {} (bpm: {}, beat origin: {}, time: origin: {})",
+                session.session_id,
+                timeline.tempo.bpm().round(),
+                timeline.beat_origin.floating(),
+                timeline.time_origin,
+            );
+            session.timeline = timeline;
+        } else {
+            debug!(
+                "[rejecting] updating peer timeline with beat origin: {}. current timeline beat origin: {}",
+                timeline.beat_origin.floating(),
+                session.timeline.beat_origin.floating()
+            );
         }
+
+        session
     }
 }
 
@@ -265,7 +266,10 @@ pub async fn launch_session_measurement(
     tx_measure_peer_state: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     mut session: Session,
 ) {
-    info!("launching session measurement");
+    info!(
+        "launching session measurement for session {}",
+        session.session_id
+    );
 
     let peers = session_peers(peers.clone(), session.session_id);
 
@@ -345,18 +349,12 @@ pub async fn handle_successful_measurement(
 
             let ghost_diff = new_ghost - cur_ghost;
 
-            info!("ghost_diff {:?}", ghost_diff);
-            info!("session EPS {:?}", SESSION_EPS);
-
-            if ghost_diff.abs() > SESSION_EPS
-                || (ghost_diff.num_microseconds().unwrap()
+            if ghost_diff > SESSION_EPS
+                || (ghost_diff.num_microseconds().unwrap().abs()
                     < SESSION_EPS.num_microseconds().unwrap()
                     && session_id != current.try_lock().unwrap().session_id)
             {
                 let c = current.try_lock().unwrap().clone();
-                info!("beat origin {:?}", c.timeline.beat_origin);
-                info!("new session origin {:?}", s.timeline.beat_origin);
-                // s.timeline = c.timeline;
 
                 *current.try_lock().unwrap() = s.clone();
                 other_sessions.try_lock().unwrap().remove(idx);
