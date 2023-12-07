@@ -257,7 +257,10 @@ pub struct ControllerPeer {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use chrono::Duration;
+    use local_ip_address::list_afinet_netifas;
     use tokio::sync::mpsc;
 
     use crate::{
@@ -350,11 +353,11 @@ mod tests {
             }
         });
 
-        let ip = get_if_addrs::get_if_addrs()
+        let ip = list_afinet_netifas()
             .unwrap()
             .iter()
-            .find_map(|iface| match &iface.addr {
-                get_if_addrs::IfAddr::V4(ipv4) if !iface.is_loopback() => Some(ipv4.ip),
+            .find_map(|(_, ip)| match ip {
+                IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
                 _ => None,
             })
             .unwrap();

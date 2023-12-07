@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
     io, mem,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
 
 use chrono::Duration;
+use local_ip_address::list_afinet_netifas;
 use tokio::{
     net::UdpSocket,
     select,
@@ -231,11 +232,11 @@ impl Measurement {
     ) -> Self {
         let (tx_timer, mut rx_timer) = mpsc::channel(1);
 
-        let ip = get_if_addrs::get_if_addrs()
+        let ip = list_afinet_netifas()
             .unwrap()
             .iter()
-            .find_map(|iface| match &iface.addr {
-                get_if_addrs::IfAddr::V4(ipv4) if !iface.is_loopback() => Some(ipv4.ip),
+            .find_map(|(_, ip)| match ip {
+                IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
                 _ => None,
             })
             .unwrap();
@@ -505,6 +506,9 @@ pub fn median(mut numbers: Vec<f64>) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
+    use local_ip_address::list_afinet_netifas;
     use tokio::sync::mpsc::Receiver;
 
     use crate::{
@@ -542,11 +546,11 @@ mod tests {
             }
         });
 
-        let ip = get_if_addrs::get_if_addrs()
+        let ip = list_afinet_netifas()
             .unwrap()
             .iter()
-            .find_map(|iface| match &iface.addr {
-                get_if_addrs::IfAddr::V4(ipv4) if !iface.is_loopback() => Some(ipv4.ip),
+            .find_map(|(_, ip)| match ip {
+                IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
                 _ => None,
             })
             .unwrap();
@@ -588,11 +592,11 @@ mod tests {
 
         let (tx_measurement, _) = mpsc::channel::<Vec<f64>>(1);
 
-        let ip = get_if_addrs::get_if_addrs()
+        let ip = list_afinet_netifas()
             .unwrap()
             .iter()
-            .find_map(|iface| match &iface.addr {
-                get_if_addrs::IfAddr::V4(ipv4) if !iface.is_loopback() => Some(ipv4.ip),
+            .find_map(|(_, ip)| match ip {
+                IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
                 _ => None,
             })
             .unwrap();
