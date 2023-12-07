@@ -5,6 +5,7 @@ use std::{
 
 use chrono::Duration;
 use tokio::{
+    net::UdpSocket,
     select,
     sync::{
         mpsc::{self, Receiver, Sender},
@@ -17,8 +18,7 @@ use tracing::{debug, info};
 use crate::{
     discovery::{
         messages::{encode_message, BYEBYE},
-        messenger::new_udp_reuseport,
-        LINK_PORT, MULTICAST_ADDR, UNICAST_IP_ANY,
+        LINK_PORT, MULTICAST_ADDR,
     },
     link::{
         clock::Clock,
@@ -69,10 +69,11 @@ impl PeerGateway {
         peers: Arc<Mutex<Vec<ControllerPeer>>>,
         notifier: Arc<Notify>,
         rx_measure_peer_state: Receiver<MeasurePeerEvent>,
+        ping_responder_unicast_socket: Arc<UdpSocket>,
     ) -> Self {
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
-        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(UNICAST_IP_ANY));
+        // let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(UNICAST_IP_ANY));
         peer_state.try_lock().unwrap().measurement_endpoint = if let SocketAddr::V4(socket_addr) =
             ping_responder_unicast_socket.local_addr().unwrap()
         {
@@ -366,7 +367,7 @@ impl Drop for PeerGateway {
 
 #[cfg(test)]
 mod tests {
-    use crate::link::sessions::SessionId;
+    use crate::{discovery::messenger::new_udp_reuseport, link::sessions::SessionId};
 
     use super::*;
 
@@ -398,6 +399,17 @@ mod tests {
             }
         });
 
+        let ip = get_if_addrs::get_if_addrs()
+            .unwrap()
+            .iter()
+            .find_map(|iface| match &iface.addr {
+                get_if_addrs::IfAddr::V4(ipv4) if !iface.is_loopback() => Some(ipv4.ip),
+                _ => None,
+            })
+            .unwrap();
+
+        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0)));
+
         let gw = PeerGateway::new(
             Arc::new(Mutex::new(PeerState {
                 node_state: node_1,
@@ -412,6 +424,7 @@ mod tests {
             Arc::new(Mutex::new(vec![])),
             notifier.clone(),
             rx_measure_peer_state,
+            ping_responder_unicast_socket,
         )
         .await;
 

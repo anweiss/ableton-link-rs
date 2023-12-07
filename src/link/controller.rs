@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    net::SocketAddrV4,
+    sync::{Arc, Mutex},
+};
 
 use chrono::Duration;
 use tokio::sync::{mpsc::Receiver, Notify};
@@ -6,6 +9,7 @@ use tracing::{debug, info};
 
 use crate::discovery::{
     gateway::{OnEvent, PeerGateway},
+    messenger::new_udp_reuseport,
     peers::{unique_session_peer_count, ControllerPeer, PeerState, PeerStateChange},
 };
 
@@ -82,6 +86,17 @@ impl Controller {
             measurement_endpoint: None,
         }));
 
+        let ip = get_if_addrs::get_if_addrs()
+            .unwrap()
+            .iter()
+            .find_map(|iface| match &iface.addr {
+                get_if_addrs::IfAddr::V4(ipv4) if !iface.is_loopback() => Some(ipv4.ip),
+                _ => None,
+            })
+            .unwrap();
+
+        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0)));
+
         let discovery = Arc::new(
             PeerGateway::new(
                 peer_state.clone(),
@@ -94,6 +109,7 @@ impl Controller {
                 peers.clone(),
                 notifier.clone(),
                 rx_measure_peer_state,
+                ping_responder_unicast_socket,
             )
             .await,
         );

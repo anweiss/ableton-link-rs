@@ -19,7 +19,6 @@ use tracing::{debug, info};
 use crate::{
     discovery::{
         messages::parse_payload, messenger::new_udp_reuseport, peers::PeerState, ENCODING_CONFIG,
-        UNICAST_IP_ANY,
     },
     link::{
         payload::PrevGhostTime,
@@ -113,7 +112,6 @@ impl MeasurementService {
 
         let m_map = measurement_map.clone();
         let t_peer = tx_measure_peer_result.clone();
-        let n_loop = notifier.clone();
 
         tokio::spawn(async move {
             loop {
@@ -125,7 +123,7 @@ impl MeasurementService {
                         t_peer.clone(),
                         session_id,
                         peer,
-                        n_loop.clone(),
+                        notifier.clone(),
                     )
                     .await;
                 }
@@ -233,7 +231,16 @@ impl Measurement {
     ) -> Self {
         let (tx_timer, mut rx_timer) = mpsc::channel(1);
 
-        let unicast_socket = Arc::new(new_udp_reuseport(UNICAST_IP_ANY));
+        let ip = get_if_addrs::get_if_addrs()
+            .unwrap()
+            .iter()
+            .find_map(|iface| match &iface.addr {
+                get_if_addrs::IfAddr::V4(ipv4) if !iface.is_loopback() => Some(ipv4.ip),
+                _ => None,
+            })
+            .unwrap();
+
+        let unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0)));
         info!(
             "initiating new unicast socket {} for measurement_endpoint {:?}",
             unicast_socket.local_addr().unwrap(),
@@ -535,7 +542,16 @@ mod tests {
             }
         });
 
-        let s = new_udp_reuseport(UNICAST_IP_ANY);
+        let ip = get_if_addrs::get_if_addrs()
+            .unwrap()
+            .iter()
+            .find_map(|iface| match &iface.addr {
+                get_if_addrs::IfAddr::V4(ipv4) if !iface.is_loopback() => Some(ipv4.ip),
+                _ => None,
+            })
+            .unwrap();
+
+        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0)));
 
         (
             PeerGateway::new(
@@ -552,6 +568,7 @@ mod tests {
                 Arc::new(Mutex::new(vec![])),
                 notifier.clone(),
                 rx_measure_peer_state,
+                ping_responder_unicast_socket,
             )
             .await,
             rx_event,
@@ -571,7 +588,16 @@ mod tests {
 
         let (tx_measurement, _) = mpsc::channel::<Vec<f64>>(1);
 
-        let s = new_udp_reuseport(UNICAST_IP_ANY);
+        let ip = get_if_addrs::get_if_addrs()
+            .unwrap()
+            .iter()
+            .find_map(|iface| match &iface.addr {
+                get_if_addrs::IfAddr::V4(ipv4) if !iface.is_loopback() => Some(ipv4.ip),
+                _ => None,
+            })
+            .unwrap();
+
+        let s = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0)));
 
         Measurement::new(
             PeerState {

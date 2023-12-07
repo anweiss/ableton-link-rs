@@ -261,7 +261,10 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::{
-        discovery::gateway::{OnEvent, PeerGateway},
+        discovery::{
+            gateway::{OnEvent, PeerGateway},
+            messenger::new_udp_reuseport,
+        },
         link::{
             beats::Beats, clock::Clock, ghostxform::GhostXForm, measurement::MeasurePeerEvent,
             sessions::session_peers, state::SessionState, tempo::Tempo,
@@ -347,6 +350,17 @@ mod tests {
             }
         });
 
+        let ip = get_if_addrs::get_if_addrs()
+            .unwrap()
+            .iter()
+            .find_map(|iface| match &iface.addr {
+                get_if_addrs::IfAddr::V4(ipv4) if !iface.is_loopback() => Some(ipv4.ip),
+                _ => None,
+            })
+            .unwrap();
+
+        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0)));
+
         (
             PeerGateway::new(
                 Arc::new(Mutex::new(PeerState {
@@ -362,6 +376,7 @@ mod tests {
                 Arc::new(Mutex::new(vec![])),
                 notifier.clone(),
                 rx_measure_peer_state,
+                ping_responder_unicast_socket,
             )
             .await,
             tx_peer_state_change,
