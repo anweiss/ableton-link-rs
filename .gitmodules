@@ -1,3 +1,4 @@
 [submodule "vendor/ableton-link"]
 	path = vendor/ableton-link
 	url = https://github.com/Ableton/link.git
+	branch = master
