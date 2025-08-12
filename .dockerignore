@@ -1,0 +1,36 @@
+# Ignore build artifacts
+target/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Ignore git files
+.git/
+.gitignore
+
+# Ignore documentation
+README.md
+LICENSE
+*.md
+
+# Ignore test files
+test_interop.sh
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Keep only what we need for the build
+!Cargo.toml
+!Cargo.lock
+!src/
+!examples/
+!vendor/

@@ -70,9 +70,23 @@ cd ableton-link-rs
 # Build the project
 cargo build
 
-# Run the RustHut example
+# Run the RustHut example natively
 cargo run --example rusthut
 ```
+
+### Running RustHut in Docker
+
+For containerized deployment, you can run the rusthut example in Docker:
+
+```bash
+# Build the Docker image
+docker build -t rusthut-app .
+
+# Run the container with interactive mode and host networking
+docker run -it --network host rusthut-app
+```
+
+Host networking is recommended for optimal Ableton Link peer discovery across the network.
 
 ### RustHut Example
 
