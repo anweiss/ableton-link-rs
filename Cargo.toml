@@ -5,6 +5,19 @@ edition = "2021"
 description = "Native Rust implementation of the Ableton Link protocol"
 license = "GPL-3.0"
 repository = "https://github.com/anweiss/ableton-link-rs"
+exclude = [
+    "vendor/",
+    "target/",
+    ".vscode/",
+    ".idea/",
+    "Dockerfile",
+    ".dockerignore",
+    "test_interop.sh",
+    "*.tar",
+    "*.log",
+    ".DS_Store",
+    ".git/",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
