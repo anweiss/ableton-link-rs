@@ -187,8 +187,7 @@ mod tests {
     use super::*;
 
     fn init_tracing() {
-        let subscriber = tracing_subscriber::FmtSubscriber::new();
-        tracing::subscriber::set_global_default(subscriber).unwrap();
+        let _ = tracing_subscriber::fmt::try_init();
     }
 
     #[test]

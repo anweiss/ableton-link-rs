@@ -5,7 +5,6 @@ use std::{
 
 use chrono::Duration;
 
-
 use super::beats::Beats;
 
 pub const TEMPO_SIZE: u32 = mem::size_of::<f64>() as u32;
@@ -66,7 +65,7 @@ impl bincode::Encode for Tempo {
     }
 }
 
-impl bincode::Decode for Tempo {
+impl bincode::Decode<()> for Tempo {
     fn decode<D: bincode::de::Decoder>(
         decoder: &mut D,
     ) -> std::result::Result<Self, bincode::error::DecodeError> {

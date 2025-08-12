@@ -2,8 +2,6 @@ use std::mem;
 
 use chrono::Duration;
 
-
-
 use crate::discovery::ENCODING_CONFIG;
 
 use super::{
@@ -70,15 +68,21 @@ impl bincode::Encode for Timeline {
     }
 }
 
-impl bincode::Decode for Timeline {
+impl bincode::Decode<()> for Timeline {
     fn decode<D: bincode::de::Decoder>(
         decoder: &mut D,
     ) -> std::result::Result<Self, bincode::error::DecodeError> {
-        let (tempo, beat_origin, time_origin) = bincode::Decode::decode(decoder)?;
+        // Decode the raw i64 values as they are encoded
+        let tempo_micros: i64 = bincode::Decode::decode(decoder)?;
+        let beat_origin_micro_beats: i64 = bincode::Decode::decode(decoder)?;
+        let time_origin_micros: i64 = bincode::Decode::decode(decoder)?;
+
         Ok(Self {
-            tempo,
-            beat_origin,
-            time_origin: Duration::microseconds(time_origin),
+            tempo: Tempo::from(Duration::microseconds(tempo_micros)),
+            beat_origin: Beats {
+                value: beat_origin_micro_beats,
+            },
+            time_origin: Duration::microseconds(time_origin_micros),
         })
     }
 }
@@ -89,7 +93,7 @@ pub fn clamp_tempo(timeline: Timeline) -> Timeline {
 
     Timeline {
         tempo: Tempo {
-            value: f64::min(f64::max(timeline.tempo.bpm(), MIN_BPM), MAX_BPM),
+            value: timeline.tempo.bpm().clamp(MIN_BPM, MAX_BPM),
         },
         beat_origin: timeline.beat_origin,
         time_origin: timeline.time_origin,
@@ -150,11 +154,9 @@ pub fn update_session_timeline_from_client(
     }
 }
 
-pub fn shift_client_timeline(mut client: Timeline, shift: Beats) -> Timeline {
-    let time_delta = client.from_beats(shift) - client.from_beats(Beats { value: 0i64 });
-    client.time_origin = client.time_origin - time_delta;
-
-    client
+pub fn shift_client_timeline(client: Timeline, shift: Beats) -> Timeline {
+    use super::phase::shift_client_timeline;
+    shift_client_timeline(client, shift)
 }
 
 #[cfg(test)]

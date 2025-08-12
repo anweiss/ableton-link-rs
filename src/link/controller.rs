@@ -39,6 +39,7 @@ pub struct Controller {
     pub client_state: Arc<Mutex<ClientState>>,
     // last_is_playing_for_start_stop_state_callback: bool,
     session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
+    enabled: Arc<Mutex<bool>>,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     sessions: Sessions,
@@ -258,11 +259,15 @@ impl Controller {
                                     .await;
 
                                     if *s_stop_sync_enabled_loop.try_lock().unwrap() {
+                                        let (timeline, ghost_x_form) = {
+                                            let s_state = s_state_loop.try_lock().unwrap();
+                                            (s_state.timeline, s_state.ghost_x_form)
+                                        };
                                         c_state_loop.try_lock().unwrap().start_stop_state =
                                             map_start_stop_state_from_session_to_client(
                                                 *peer_start_stop_state,
-                                                s_state_loop.try_lock().unwrap().timeline,
-                                                s_state_loop.try_lock().unwrap().ghost_x_form,
+                                                timeline,
+                                                ghost_x_form,
                                             )
                                     }
                                 }
@@ -300,6 +305,7 @@ impl Controller {
             client_state,
             // last_is_playing_for_start_stop_state_callback: false,
             session_peer_counter: session_peer_counter.clone(),
+            enabled: Arc::new(Mutex::new(false)),
             start_stop_sync_enabled,
             peers: peers.clone(),
             sessions,
@@ -311,6 +317,8 @@ impl Controller {
     }
 
     pub async fn enable(&mut self) {
+        *self.enabled.try_lock().unwrap() = true;
+        
         reset_state(
             self.peer_state.clone(),
             self.session_state.clone(),
@@ -322,15 +330,22 @@ impl Controller {
         )
         .await;
 
-        let discovery = self.discovery.clone();
-        let rx_event = self.rx_event.take().unwrap();
-        let notifier = self.notifier.clone();
+        // Only start the discovery listener if it hasn't been started already
+        if let Some(rx_event) = self.rx_event.take() {
+            let discovery = self.discovery.clone();
+            let notifier = self.notifier.clone();
 
-        discovery.listen(rx_event, notifier).await;
+            tokio::spawn(async move {
+                discovery.listen(rx_event, notifier).await;
+            });
+        }
+    }
 
-        // tokio::spawn(async move {
-        //     discovery.listen(rx_event, notifier).await;
-        // });
+    pub async fn disable(&mut self) {
+        *self.enabled.try_lock().unwrap() = false;
+        
+        // TODO: Implement proper cleanup of discovery/networking
+        // For now, just set enabled to false
     }
 
     pub async fn set_state(&self, mut new_client_state: IncomingClientState) {
@@ -357,26 +372,38 @@ impl Controller {
         info!("client_state: {:?}", client_state);
 
         if let Some(timeline) = client_state.timeline {
+            let (session_timeline, ghost_x_form) = {
+                let session_state = self.session_state.try_lock().unwrap();
+                (session_state.timeline, session_state.ghost_x_form)
+            };
+            
             let session_timeline = update_session_timeline_from_client(
-                self.session_state.try_lock().unwrap().timeline,
+                session_timeline,
                 timeline,
                 client_state.timeline_timestamp,
-                self.session_state.try_lock().unwrap().ghost_x_form,
+                ghost_x_form,
             );
 
             self.sessions.reset_timeline(session_timeline);
 
             // setSessionTimeline
+            let peer_session_id = self.peer_state.try_lock().unwrap().session_id();
             for peer in self.peers.try_lock().unwrap().iter_mut().filter(|p| {
-                p.peer_state.session_id() == self.peer_state.try_lock().unwrap().session_id()
+                p.peer_state.session_id() == peer_session_id
             }) {
                 peer.peer_state.node_state.timeline = session_timeline;
             }
+            
+            let ghost_x_form = {
+                let session_state = self.session_state.try_lock().unwrap();
+                session_state.ghost_x_form
+            };
+            
             update_session_timing(
                 self.session_state.clone(),
                 self.client_state.clone(),
                 session_timeline,
-                self.session_state.try_lock().unwrap().ghost_x_form,
+                ghost_x_form,
                 self.clock,
                 self.start_stop_sync_enabled.clone(),
             );
@@ -401,11 +428,12 @@ impl Controller {
                         .start_stop_state
                         .timestamp
                 {
-                    self.session_state.try_lock().unwrap().start_stop_state =
+                    let mut session_state = self.session_state.try_lock().unwrap();
+                    session_state.start_stop_state =
                         map_start_stop_state_from_client_to_session(
                             client_start_stop_state,
-                            self.session_state.try_lock().unwrap().timeline,
-                            self.session_state.try_lock().unwrap().ghost_x_form,
+                            session_state.timeline,
+                            session_state.ghost_x_form,
                         );
 
                     self.client_state.try_lock().unwrap().start_stop_state =
@@ -425,6 +453,18 @@ impl Controller {
             )
             .await;
         }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        *self.enabled.try_lock().unwrap()
+    }
+
+    pub fn is_start_stop_sync_enabled(&self) -> bool {
+        *self.start_stop_sync_enabled.try_lock().unwrap()
+    }
+
+    pub fn enable_start_stop_sync(&mut self, enable: bool) {
+        *self.start_stop_sync_enabled.try_lock().unwrap() = enable;
     }
 
     pub fn num_peers(&self) -> usize {

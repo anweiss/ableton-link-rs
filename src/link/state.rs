@@ -49,7 +49,7 @@ impl bincode::Encode for StartStopState {
     }
 }
 
-impl bincode::Decode for StartStopState {
+impl bincode::Decode<()> for StartStopState {
     fn decode<D: bincode::de::Decoder>(
         decoder: &mut D,
     ) -> std::result::Result<Self, bincode::error::DecodeError> {

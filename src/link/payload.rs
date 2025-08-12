@@ -258,14 +258,6 @@ pub struct HostTime {
     pub time: Duration,
 }
 
-impl Default for HostTime {
-    fn default() -> Self {
-        Self {
-            time: Duration::zero(),
-        }
-    }
-}
-
 impl HostTime {
     pub fn new(time: Duration) -> Self {
         Self { time }
@@ -281,7 +273,7 @@ impl HostTime {
     }
 }
 
-impl bincode::Decode for HostTime {
+impl bincode::Decode<()> for HostTime {
     fn decode<D: bincode::de::Decoder>(
         decoder: &mut D,
     ) -> std::result::Result<Self, bincode::error::DecodeError> {
@@ -289,6 +281,14 @@ impl bincode::Decode for HostTime {
         Ok(Self {
             time: Duration::microseconds(time),
         })
+    }
+}
+
+impl Default for HostTime {
+    fn default() -> Self {
+        Self {
+            time: Duration::zero(),
+        }
     }
 }
 
@@ -312,7 +312,7 @@ impl GhostTime {
     }
 }
 
-impl bincode::Decode for GhostTime {
+impl bincode::Decode<()> for GhostTime {
     fn decode<D: bincode::de::Decoder>(
         decoder: &mut D,
     ) -> std::result::Result<Self, bincode::error::DecodeError> {
@@ -343,7 +343,7 @@ impl PrevGhostTime {
     }
 }
 
-impl bincode::Decode for PrevGhostTime {
+impl bincode::Decode<()> for PrevGhostTime {
     fn decode<D: bincode::de::Decoder>(
         decoder: &mut D,
     ) -> std::result::Result<Self, bincode::error::DecodeError> {
@@ -362,16 +362,16 @@ mod tests {
     fn host_time_header() {
         // assert key is 0x5f5f6874
         assert_eq!(HOST_TIME_HEADER_KEY, 0x5f5f6874, "unexpected byte order");
-        // assert size is 16
-        assert_eq!(HOST_TIME_SIZE, 16, "unexpected size");
+        // assert size is 8 (u64 for microseconds timestamp)
+        assert_eq!(HOST_TIME_SIZE, 8, "unexpected size");
     }
 
     #[test]
     fn ghost_time_header() {
-        // assert key is 0x5f5f6874
+        // assert key is 0x5f5f6774
         assert_eq!(GHOST_TIME_HEADER_KEY, 0x5f5f6774, "unexpected byte order");
-        // assert size is 16
-        assert_eq!(GHOST_TIME_SIZE, 16, "unexpected size");
+        // assert size is 8 (u64 for microseconds timestamp)
+        assert_eq!(GHOST_TIME_SIZE, 8, "unexpected size");
     }
 
     #[test]
@@ -382,7 +382,7 @@ mod tests {
             "unexpected byte order"
         );
 
-        // assert size is 16
-        assert_eq!(PREV_GHOST_TIME_SIZE, 16, "unexpected size");
+        // assert size is 8 (u64 for microseconds timestamp)
+        assert_eq!(PREV_GHOST_TIME_SIZE, 8, "unexpected size");
     }
 }

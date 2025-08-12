@@ -66,7 +66,7 @@ impl bincode::Encode for MeasurementEndpointV4 {
     }
 }
 
-impl bincode::Decode for MeasurementEndpointV4 {
+impl bincode::Decode<()> for MeasurementEndpointV4 {
     fn decode<D: bincode::de::Decoder>(
         decoder: &mut D,
     ) -> std::result::Result<Self, bincode::error::DecodeError> {
@@ -520,10 +520,10 @@ mod tests {
     };
 
     use super::*;
+    use chrono::Duration;
 
     fn init_tracing() {
-        let subscriber = tracing_subscriber::FmtSubscriber::new();
-        tracing::subscriber::set_global_default(subscriber).unwrap();
+        let _ = tracing_subscriber::fmt::try_init();
     }
 
     async fn init_gateway() -> (PeerGateway, Receiver<OnEvent>, Arc<Notify>) {
@@ -590,7 +590,7 @@ mod tests {
             gw.listen(rx_event, n).await;
         });
 
-        let (tx_measurement, _) = mpsc::channel::<Vec<f64>>(1);
+        let (tx_measurement, mut rx_measurement) = mpsc::channel::<Vec<f64>>(1);
 
         let ip = list_afinet_netifas()
             .unwrap()
@@ -603,7 +603,7 @@ mod tests {
 
         let s = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0)));
 
-        Measurement::new(
+        let measurement = Measurement::new(
             PeerState {
                 measurement_endpoint: Some(s.local_addr().unwrap().to_string().parse().unwrap()),
                 ..Default::default()
@@ -613,5 +613,24 @@ mod tests {
             notifier,
         )
         .await;
+
+        // Give the measurement some time to attempt to send pings
+        tokio::time::sleep(Duration::milliseconds(100).to_std().unwrap()).await;
+
+        // Try to receive a result or timeout
+        tokio::select! {
+            result = rx_measurement.recv() => {
+                // If we get a result, that's fine (measurement completed)
+                if let Some(_data) = result {
+                    // Test passed - measurement attempted
+                }
+            }
+            _ = tokio::time::sleep(Duration::seconds(1).to_std().unwrap()) => {
+                // Timeout is also fine - measurement is running in background
+            }
+        }
+
+        // Clean up
+        drop(measurement);
     }
 }

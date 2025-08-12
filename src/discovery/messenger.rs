@@ -4,6 +4,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
 use tokio::{
     net::UdpSocket,
     select,
@@ -42,9 +45,26 @@ pub fn new_udp_reuseport(addr: SocketAddrV4) -> UdpSocket {
         None,
     )
     .unwrap();
-    udp_sock.set_reuse_port(true).unwrap();
-    // from tokio-rs/mio/blob/master/src/sys/unix/net.rs
-    udp_sock.set_cloexec(true).unwrap();
+    
+    // Try to set reuse address for better socket sharing
+    udp_sock.set_reuse_address(true).unwrap();
+    
+    // Set SO_REUSEPORT on Unix systems for better multicast support
+    #[cfg(unix)]
+    {
+        let fd = udp_sock.as_raw_fd();
+        unsafe {
+            let optval: libc::c_int = 1;
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&optval) as libc::socklen_t,
+            );
+        }
+    }
+    
     udp_sock.set_nonblocking(true).unwrap();
     udp_sock.bind(&socket2::SockAddr::from(addr)).unwrap();
     let udp_sock: std::net::UdpSocket = udp_sock.into();
