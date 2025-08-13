@@ -528,7 +528,7 @@ mod tests {
 
     async fn init_gateway() -> (PeerGateway, Receiver<OnEvent>, Arc<Notify>) {
         let session_id = SessionId::default();
-        let node_1 = NodeState::new(session_id.clone());
+        let node_1 = NodeState::new(session_id);
         let (tx_measure_peer_result, _) = mpsc::channel::<MeasurePeerEvent>(1);
         let (_, rx_measure_peer_state) = mpsc::channel::<MeasurePeerEvent>(1);
         let (tx_event, rx_event) = mpsc::channel::<OnEvent>(1);
@@ -541,7 +541,7 @@ mod tests {
         let c = calls.clone();
 
         tokio::spawn(async move {
-            while let Some(_) = rx_peer_state_change.recv().await {
+            while (rx_peer_state_change.recv().await).is_some() {
                 *c.try_lock().unwrap() += 1;
             }
         });

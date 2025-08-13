@@ -417,7 +417,7 @@ mod tests {
         // console_subscriber::init();
 
         let session_id = SessionId::default();
-        let node_1 = NodeState::new(session_id.clone());
+        let node_1 = NodeState::new(session_id);
         let (tx_measure_peer_result, _) = tokio::sync::mpsc::channel::<MeasurePeerEvent>(1);
         let (_, rx_measure_peer_state) = tokio::sync::mpsc::channel::<MeasurePeerEvent>(1);
         let (tx_event, rx_event) = mpsc::channel::<OnEvent>(1);

@@ -5,11 +5,15 @@ pub mod clock;
 pub mod controller;
 pub mod error;
 pub mod ghostxform;
+pub mod host_time_filter;
+pub mod linear_regression;
 pub mod measurement;
+pub mod median;
 pub mod node;
 pub mod payload;
 pub mod phase;
 pub mod pingresponder;
+pub mod rt_session_state;
 pub mod sessions;
 pub mod state;
 pub mod tempo;
@@ -27,6 +31,7 @@ use self::{
     clock::Clock,
     controller::Controller,
     phase::{force_beat_at_time_impl, from_phase_encoded_beats, phase, to_phase_encoded_beats},
+    rt_session_state::RtSessionStateHandler,
     state::{ClientStartStopState, ClientState},
     tempo::Tempo,
     timeline::{clamp_tempo, Timeline},
@@ -44,6 +49,8 @@ pub struct BasicLink {
     start_stop_callback: Option<StartStopCallback>,
     controller: Controller,
     clock: Clock,
+    rt_session_handler: Option<RtSessionStateHandler>,
+    last_is_playing_for_callback: bool,
 }
 
 impl BasicLink {
@@ -61,6 +68,8 @@ impl BasicLink {
             start_stop_callback: None,
             controller,
             clock,
+            rt_session_handler: None,
+            last_is_playing_for_callback: false,
         }
     }
 }
@@ -95,6 +104,14 @@ impl BasicLink {
         F: Fn(usize) + Send + 'static,
     {
         self.peer_count_callback = Some(Arc::new(Mutex::new(Box::new(callback))));
+        
+        // Trigger initial callback with current peer count
+        let current_count = self.num_peers();
+        if let Some(ref callback) = self.peer_count_callback {
+            if let Ok(callback) = callback.try_lock() {
+                callback(current_count);
+            }
+        }
     }
 
     pub fn set_tempo_callback<F>(&mut self, callback: F)
@@ -102,6 +119,15 @@ impl BasicLink {
         F: Fn(f64) + Send + 'static,
     {
         self.tempo_callback = Some(Arc::new(Mutex::new(Box::new(callback))));
+        
+        // Trigger initial callback with current tempo
+        if let Ok(client_state) = self.controller.client_state.try_lock() {
+            if let Some(ref callback) = self.tempo_callback {
+                if let Ok(callback) = callback.try_lock() {
+                    callback(client_state.timeline.tempo.bpm());
+                }
+            }
+        }
     }
 
     pub fn set_start_stop_callback<F>(&mut self, callback: F)
@@ -109,41 +135,82 @@ impl BasicLink {
         F: Fn(bool) + Send + 'static,
     {
         self.start_stop_callback = Some(Arc::new(Mutex::new(Box::new(callback))));
+        
+        // Update our cached playing state and trigger initial callback
+        if let Ok(client_state) = self.controller.client_state.try_lock() {
+            self.last_is_playing_for_callback = client_state.start_stop_state.is_playing;
+            if let Some(ref callback) = self.start_stop_callback {
+                if let Ok(callback) = callback.try_lock() {
+                    callback(self.last_is_playing_for_callback);
+                }
+            }
+        }
     }
 
     pub fn clock(&self) -> Clock {
         self.clock
     }
 
-    pub fn capture_audio_session_state(&self) -> SessionState {
-        // In a real implementation, this should use a realtime-safe mechanism
-        // For now, we'll use the same as app session state but this should be optimized
-        to_session_state(
-            &self.controller.client_state.try_lock().unwrap(),
-            self.num_peers() > 0,
-        )
+    pub fn capture_audio_session_state(&mut self) -> SessionState {
+        // Initialize rt_session_handler if not already done
+        if self.rt_session_handler.is_none() {
+            let client_state = *self.controller.client_state.try_lock().unwrap();
+            self.rt_session_handler = Some(RtSessionStateHandler::new(
+                client_state,
+                controller::LOCAL_MOD_GRACE_PERIOD,
+            ));
+        }
+
+        // For real-time access, we use the rt_session_handler
+        if let Some(ref handler) = self.rt_session_handler {
+            let client_state = handler.get_rt_client_state(self.clock.micros());
+            to_session_state(&client_state, self.num_peers() > 0)
+        } else {
+            // Fallback to non-realtime access
+            to_session_state(
+                &self.controller.client_state.try_lock().unwrap(),
+                self.num_peers() > 0,
+            )
+        }
     }
 
     pub fn commit_audio_session_state(&mut self, state: SessionState) {
-        // In a real implementation, this should be realtime-safe
-        // For now, we'll use the same mechanism as app session state but synchronously
-        let incoming_state =
-            to_incoming_client_state(&state.state, &state.original_state, self.clock.micros());
+        let current_time = self.clock.micros();
+        let is_enabled = self.is_enabled();
+        
+        let incoming_state = to_incoming_client_state(
+            &state.state,
+            &state.original_state,
+            current_time,
+        );
 
-        // This should be made async or use a realtime-safe mechanism
-        // For now, we'll just update the client state directly
-        *self.controller.client_state.try_lock().unwrap() = ClientState {
-            timeline: incoming_state
-                .timeline
-                .unwrap_or(self.controller.client_state.try_lock().unwrap().timeline),
-            start_stop_state: incoming_state.start_stop_state.unwrap_or(
-                self.controller
-                    .client_state
-                    .try_lock()
-                    .unwrap()
-                    .start_stop_state,
-            ),
-        };
+        // Use real-time handler if available
+        if let Some(ref mut handler) = self.rt_session_handler {
+            handler.update_rt_client_state(incoming_state, current_time, is_enabled);
+            
+            // Process any pending updates to sync with the main controller
+            if let Some(processed_state) = handler.process_pending_updates() {
+                // This should be done asynchronously in a real implementation
+                // For now, we'll update the controller state directly
+                if let Ok(mut client_state) = self.controller.client_state.try_lock() {
+                    if let Some(timeline) = processed_state.timeline {
+                        client_state.timeline = timeline;
+                    }
+                    if let Some(start_stop_state) = processed_state.start_stop_state {
+                        client_state.start_stop_state = start_stop_state;
+                    }
+                }
+            }
+        } else {
+            // Fallback to the original non-realtime method
+            let mut client_state = self.controller.client_state.try_lock().unwrap();
+            if let Some(timeline) = incoming_state.timeline {
+                client_state.timeline = timeline;
+            }
+            if let Some(start_stop_state) = incoming_state.start_stop_state {
+                client_state.start_stop_state = start_stop_state;
+            }
+        }
     }
 
     pub fn capture_app_session_state(&self) -> SessionState {
@@ -153,14 +220,44 @@ impl BasicLink {
         )
     }
 
-    pub async fn commit_app_session_state(&self, state: SessionState) {
-        self.controller
-            .set_state(to_incoming_client_state(
-                &state.state,
-                &state.original_state,
-                self.clock.micros(),
-            ))
-            .await
+    pub async fn commit_app_session_state(&mut self, state: SessionState) {
+        let incoming_state = to_incoming_client_state(
+            &state.state,
+            &state.original_state,
+            self.clock.micros(),
+        );
+
+        // Check if start/stop state changed for callback
+        let should_invoke_callback = if let Some(start_stop_state) = incoming_state.start_stop_state {
+            let changed = self.last_is_playing_for_callback != start_stop_state.is_playing;
+            if changed {
+                self.last_is_playing_for_callback = start_stop_state.is_playing;
+            }
+            changed
+        } else {
+            false
+        };
+
+        // Update the controller state
+        self.controller.set_state(incoming_state).await;
+
+        // Invoke start/stop callback if needed
+        if should_invoke_callback {
+            if let Some(ref callback) = self.start_stop_callback {
+                if let Ok(callback) = callback.try_lock() {
+                    callback(self.last_is_playing_for_callback);
+                }
+            }
+        }
+
+        // Check for tempo changes and invoke callback
+        if let Some(ref callback) = self.tempo_callback {
+            if let Ok(client_state) = self.controller.client_state.try_lock() {
+                if let Ok(callback) = callback.try_lock() {
+                    callback(client_state.timeline.tempo.bpm());
+                }
+            }
+        }
     }
 }
 

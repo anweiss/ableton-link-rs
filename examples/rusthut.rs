@@ -1,24 +1,174 @@
 use ableton_link_rs::link::{BasicLink, SessionState};
+use cpal::traits::{DeviceTrait, HostTrait};
+use rodio::{cpal, OutputStreamBuilder, Sink};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
+
+/// Channel-based audio metronome that's Send-safe
+#[derive(Debug)]
+enum MetronomeMessage {
+    PlayClick { is_downbeat: bool },
+    Stop,
+}
+
+struct MetronomeHandle {
+    sender: mpsc::UnboundedSender<MetronomeMessage>,
+    last_beat_time: Arc<std::sync::Mutex<Option<chrono::Duration>>>,
+}
+
+impl MetronomeHandle {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Spawn background thread for audio handling (not tokio task to avoid Send issues)
+        std::thread::spawn(move || {
+            Self::audio_thread(rx);
+        });
+
+        println!("Audio metronome initialized successfully");
+        Ok(Self {
+            sender: tx,
+            last_beat_time: Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    fn audio_thread(mut rx: mpsc::UnboundedReceiver<MetronomeMessage>) {
+        // Create audio stream in the background thread
+        let stream = match OutputStreamBuilder::open_default_stream() {
+            Ok(stream) => stream,
+            Err(e) => {
+                eprintln!("Failed to create audio stream: {}", e);
+                return;
+            }
+        };
+        let sink = Sink::connect_new(stream.mixer());
+
+        // Use blocking receive since we're in a regular thread
+        while let Some(msg) = rx.blocking_recv() {
+            match msg {
+                MetronomeMessage::PlayClick { is_downbeat } => {
+                    if let Err(e) = Self::play_click_sync(&sink, is_downbeat) {
+                        eprintln!("Error playing click: {}", e);
+                    }
+                }
+                MetronomeMessage::Stop => break,
+            }
+        }
+    }
+
+    fn play_click_sync(sink: &Sink, is_downbeat: bool) -> Result<(), Box<dyn std::error::Error>> {
+        // Generate click audio exactly like C++ LinkHut
+        let frequency = if is_downbeat { 1567.98 } else { 1108.73 }; // Same frequencies as C++
+        let duration_ms = 100; // 100ms click duration like C++ version
+        let sample_rate = 44100u32;
+        let amplitude = 0.3f32;
+
+        // Generate cosine wave with exponential decay envelope (matching C++ algorithm)
+        let samples: Vec<f32> = (0..sample_rate * duration_ms / 1000)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                // Envelope: 1 - sin(5 * PI * t) for exponential decay
+                let envelope = 1.0 - (5.0 * std::f32::consts::PI * t).sin();
+                // Cosine wave: cos(2 * PI * freq * t)
+                let wave = (2.0 * std::f32::consts::PI * frequency as f32 * t).cos();
+                amplitude * wave * envelope
+            })
+            .collect();
+
+        // Create audio source from samples
+        let source = rodio::buffer::SamplesBuffer::new(1, sample_rate, samples);
+
+        // Play the click sound
+        sink.append(source);
+
+        Ok(())
+    }
+
+    fn play_click(&self, is_downbeat: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if let Err(e) = self
+            .sender
+            .send(MetronomeMessage::PlayClick { is_downbeat })
+        {
+            eprintln!("Failed to send metronome message: {}", e);
+        }
+        Ok(())
+    }
+
+    fn check_and_play_beat(
+        &self,
+        session_state: &SessionState,
+        current_time: chrono::Duration,
+        quantum: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !session_state.is_playing() {
+            return Ok(());
+        }
+
+        let beat_at_time = session_state.beat_at_time(current_time, quantum);
+
+        // Only play for positive beats (no count-in), matching C++ behavior
+        if beat_at_time < 0.0 {
+            return Ok(());
+        }
+
+        let mut last_beat_time = self.last_beat_time.lock().unwrap();
+
+        // Check if we've crossed a beat boundary using phase comparison (like C++ AudioEngine)
+        if let Some(last_time) = *last_beat_time {
+            // Check if the phase wraps around between the last time and current time
+            let current_phase = session_state.phase_at_time(current_time, 1.0);
+            let last_phase = session_state.phase_at_time(last_time, 1.0);
+
+            // Phase wrap-around indicates a beat boundary crossing
+            if current_phase < last_phase {
+                // Calculate the precise time when the beat crossing occurred
+                let beats_at_current = session_state.beat_at_time(current_time, quantum);
+                let beat_number = beats_at_current.floor();
+                let precise_beat_time = session_state.time_at_beat(beat_number, quantum);
+
+                // Determine if this is a downbeat (quantum boundary)
+                let phase_at_beat = session_state.phase_at_time(precise_beat_time, quantum);
+                let is_downbeat = phase_at_beat.floor() as i64 % quantum as i64 == 0;
+
+                self.play_click(is_downbeat)?;
+            }
+        }
+
+        *last_beat_time = Some(current_time);
+        Ok(())
+    }
+}
 
 struct State {
     running: Arc<AtomicBool>,
     link: BasicLink,
     quantum: f64,
     is_playing: bool, // Track local playing state like C++ AudioEngine
+    metronome: Option<MetronomeHandle>, // Optional in case audio initialization fails
 }
 
 impl State {
     async fn new() -> Self {
+        // Try to create audio metronome, fall back to no audio if it fails
+        let metronome = match MetronomeHandle::new() {
+            Ok(m) => Some(m),
+            Err(e) => {
+                println!("Warning: Could not initialize audio metronome: {}", e);
+                println!("Continuing without audio (visual metronome only)...");
+                None
+            }
+        };
+
         Self {
             running: Arc::new(AtomicBool::new(true)),
             link: BasicLink::new(120.0).await,
             quantum: 4.0,
             is_playing: false,
+            metronome,
         }
     }
 }
@@ -29,7 +179,7 @@ fn print_help() {
     println!();
     println!("usage:");
     println!("  enable / disable Link: a");
-    println!("  start / stop: space");
+    println!("  start / stop: space (plays audio metronome when enabled)");
     println!("  decrease / increase tempo: w / e");
     println!("  decrease / increase quantum: r / t");
     println!("  enable / disable start stop sync: s");
@@ -103,7 +253,7 @@ async fn handle_input(state: Arc<tokio::sync::Mutex<State>>) {
                 // Handle Ctrl+C as both character and signal
                 if input_byte == 0x03 {
                     // Ctrl+C character (ETX) - handle it directly
-                    let mut state_guard = state.lock().await;
+                    let state_guard = state.lock().await;
                     state_guard.running.store(false, Ordering::Relaxed);
                     drop(state_guard);
                     enable_buffered_input();
@@ -219,9 +369,76 @@ fn enable_buffered_input() {
     }
 }
 
+fn print_audio_device_info() {
+    match get_audio_device_info() {
+        Ok(info) => {
+            println!("SAMPLE RATE: {}", info.sample_rate);
+            println!("DEVICE NAME: {}", info.device_name);
+            match info.buffer_size_range {
+                Some((min, max)) => {
+                    // Use a typical buffer size (512 is common)
+                    let typical_buffer_size = 512u32.clamp(min, max);
+                    let buffer_duration_ms =
+                        (typical_buffer_size as f64 / info.sample_rate as f64) * 1000.0;
+                    println!(
+                        "BUFFER SIZE: {} samples, {:.2} ms.",
+                        typical_buffer_size, buffer_duration_ms
+                    );
+
+                    // Estimate latency (similar to LinkHut's output device latency)
+                    let latency_samples = typical_buffer_size / 8; // Rough estimate
+                    let latency_ms = (latency_samples as f64 / info.sample_rate as f64) * 1000.0;
+                    println!(
+                        "OUTPUT DEVICE LATENCY: {} samples, {:.5} ms.",
+                        latency_samples, latency_ms
+                    );
+                }
+                None => {
+                    println!("BUFFER SIZE: Unknown");
+                    println!("OUTPUT DEVICE LATENCY: Unknown");
+                }
+            }
+            println!(); // Empty line for spacing
+        }
+        Err(e) => {
+            println!("Failed to get audio device info: {}", e);
+            println!(); // Empty line for spacing
+        }
+    }
+}
+
+struct AudioDeviceInfo {
+    device_name: String,
+    sample_rate: u32,
+    buffer_size_range: Option<(u32, u32)>,
+}
+
+fn get_audio_device_info() -> Result<AudioDeviceInfo, Box<dyn std::error::Error>> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or("No default output device found")?;
+    let device_name = device.name()?;
+    let default_config = device.default_output_config()?;
+
+    let buffer_size_range = match default_config.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => Some((*min, *max)),
+        cpal::SupportedBufferSize::Unknown => None,
+    };
+
+    Ok(AudioDeviceInfo {
+        device_name,
+        sample_rate: default_config.sample_rate().0,
+        buffer_size_range,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(tokio::sync::Mutex::new(State::new().await));
+
+    // Print audio device information like C++ LinkHut
+    print_audio_device_info();
 
     print_help();
     print_state_header();
@@ -232,6 +449,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_task = {
         let state = state.clone();
         tokio::spawn(handle_input(state))
+    };
+
+    // Start high-frequency beat detection task
+    let beat_task = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_micros(100)); // 10kHz for precise timing
+            loop {
+                interval.tick().await;
+
+                if !state.lock().await.running.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let time = {
+                    let state_guard = state.lock().await;
+                    state_guard.link.clock().micros()
+                };
+                let (session_state, quantum) = {
+                    let state_guard = state.lock().await;
+                    let session_state = state_guard.link.capture_app_session_state();
+                    let quantum = state_guard.quantum;
+                    (session_state, quantum)
+                };
+
+                if let Some(ref metronome) = state.lock().await.metronome {
+                    let _ = metronome.check_and_play_beat(&session_state, time, quantum);
+                }
+            }
+        })
     };
 
     // Main display loop
@@ -273,7 +520,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Commit any timeline modifications
         if should_commit {
-            let state_guard = state.lock().await;
+            let mut state_guard = state.lock().await;
             state_guard
                 .link
                 .commit_app_session_state(session_state)
@@ -312,6 +559,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cleanup
     enable_buffered_input();
     input_task.abort();
+    beat_task.abort();
 
     Ok(())
 }

@@ -104,7 +104,7 @@ impl GatewayObserver {
                 return;
             }
         };
-        
+
         if let Ok(mut peers) = self.peers.try_lock() {
             peers.retain(|peer| peer.peer_state.session_id() != session_id_val);
         } else {
@@ -157,25 +157,44 @@ pub fn unique_session_peer_count(
             return 0;
         }
     };
-    debug!("unique_session_peer_count: looking for session_id={}, self_node_id={}", session_id, self_node_id);
-    debug!("unique_session_peer_count: total peers in list: {}", all_peers.len());
-    
+    debug!(
+        "unique_session_peer_count: looking for session_id={}, self_node_id={}",
+        session_id, self_node_id
+    );
+    debug!(
+        "unique_session_peer_count: total peers in list: {}",
+        all_peers.len()
+    );
+
     for (i, peer) in all_peers.iter().enumerate() {
-        debug!("  peer[{}]: node_id={}, session_id={}", i, peer.peer_state.ident(), peer.peer_state.session_id());
+        debug!(
+            "  peer[{}]: node_id={}, session_id={}",
+            i,
+            peer.peer_state.ident(),
+            peer.peer_state.session_id()
+        );
     }
-    
+
     let mut peers = all_peers
         .iter()
         .filter(|p| {
             let matches_session = p.peer_state.session_id() == session_id;
             let is_not_self = p.peer_state.ident() != self_node_id;
-            debug!("  filtering peer {}: matches_session={}, is_not_self={}", p.peer_state.ident(), matches_session, is_not_self);
+            debug!(
+                "  filtering peer {}: matches_session={}, is_not_self={}",
+                p.peer_state.ident(),
+                matches_session,
+                is_not_self
+            );
             matches_session && is_not_self
         })
         .cloned()
         .collect::<Vec<_>>();
-    
-    debug!("unique_session_peer_count: before dedup, filtered peers count: {}", peers.len());
+
+    debug!(
+        "unique_session_peer_count: before dedup, filtered peers count: {}",
+        peers.len()
+    );
     peers.dedup_by(|a, b| {
         let is_duplicate = a.peer_state.ident() == b.peer_state.ident();
         if is_duplicate {
@@ -184,7 +203,10 @@ pub fn unique_session_peer_count(
         is_duplicate
     });
 
-    debug!("unique_session_peer_count: after dedup, final peers count: {}", peers.len());
+    debug!(
+        "unique_session_peer_count: after dedup, final peers count: {}",
+        peers.len()
+    );
     peers.len()
 }
 
@@ -209,12 +231,15 @@ async fn saw_peer(
         Err(_) => {
             debug!("Could not acquire self_peer_state lock in saw_peer, skipping self-check");
             // If we can't get the lock, continue anyway - the duplicate check later will catch self-peers
-            peer_seen_peer_state.ident()  // This will not match unless it's actually self, which is unlikely
+            peer_seen_peer_state.ident() // This will not match unless it's actually self, which is unlikely
         }
     };
-    
+
     if peer_seen_peer_state.ident() == self_ident {
-        debug!("ignoring peer state from self (node {})", peer_seen_peer_state.ident());
+        debug!(
+            "ignoring peer state from self (node {})",
+            peer_seen_peer_state.ident()
+        );
         return;
     }
 
@@ -233,25 +258,29 @@ async fn saw_peer(
         }),
         Err(_) => {
             debug!("Could not acquire peers lock to check session timeline, assuming new");
-            true  // Assume it's new if we can't check
+            true // Assume it's new if we can't check
         }
     };
 
     let is_new_session_start_stop_state = match peers.try_lock() {
-        Ok(guard) => !guard.iter().any(|p| p.peer_state.start_stop_state() == peer_start_stop_state),
+        Ok(guard) => !guard
+            .iter()
+            .any(|p| p.peer_state.start_stop_state() == peer_start_stop_state),
         Err(_) => {
             debug!("Could not acquire peers lock to check start/stop state, assuming new");
-            true  // Assume it's new if we can't check
+            true // Assume it's new if we can't check
         }
     };
 
     let peer = ControllerPeer { peer_state: ps };
 
     let existing_peer_index = match peers.try_lock() {
-        Ok(guard) => guard.iter().position(|p| p.peer_state.ident() == peer.peer_state.ident()),
+        Ok(guard) => guard
+            .iter()
+            .position(|p| p.peer_state.ident() == peer.peer_state.ident()),
         Err(_) => {
             debug!("Could not acquire peers lock to find existing peer, assuming new");
-            None  // Assume it's new if we can't check
+            None // Assume it's new if we can't check
         }
     };
 
@@ -263,10 +292,10 @@ async fn saw_peer(
                 guard[index] = peer.clone();
                 // Session membership changed if the session ID changed
                 old_session_id != peer_session
-            },
+            }
             Err(_) => {
                 debug!("Could not acquire peers lock to update existing peer");
-                false  // No change if we can't update
+                false // No change if we can't update
             }
         }
     } else {
@@ -275,10 +304,10 @@ async fn saw_peer(
             Ok(mut guard) => {
                 guard.push(peer.clone());
                 true
-            },
+            }
             Err(_) => {
                 debug!("Could not acquire peers lock to add new peer");
-                false  // No change if we can't add
+                false // No change if we can't add
             }
         }
     };
@@ -334,14 +363,23 @@ async fn peer_left(
             }
         });
         let final_count = peers_guard.len();
-        info!("Peer count changed from {} to {} after removing peer {}", initial_count, final_count, node_id);
+        info!(
+            "Peer count changed from {} to {} after removing peer {}",
+            initial_count, final_count, node_id
+        );
     } else {
-        debug!("Could not acquire peers lock in peer_left for node {}", node_id);
+        debug!(
+            "Could not acquire peers lock in peer_left for node {}",
+            node_id
+        );
         return;
     }
 
     if did_session_membership_change {
-        info!("Session membership changed due to peer {} leaving, sending PeerLeft event", node_id);
+        info!(
+            "Session membership changed due to peer {} leaving, sending PeerLeft event",
+            node_id
+        );
         if let Err(e) = tx_peer_state_change
             .send(vec![PeerStateChange::PeerLeft])
             .await
@@ -351,7 +389,10 @@ async fn peer_left(
             info!("Successfully sent PeerLeft event for peer {}", node_id);
         }
     } else {
-        info!("No session membership change for peer {} (peer not found in list)", node_id);
+        info!(
+            "No session membership change for peer {} (peer not found in list)",
+            node_id
+        );
     }
 }
 
@@ -374,8 +415,8 @@ mod tests {
             messenger::new_udp_reuseport,
         },
         link::{
-            beats::Beats, clock::Clock, measurement::MeasurePeerEvent,
-            sessions::session_peers, state::SessionState, tempo::Tempo,
+            beats::Beats, clock::Clock, measurement::MeasurePeerEvent, sessions::session_peers,
+            state::SessionState, tempo::Tempo,
         },
     };
 
@@ -440,7 +481,7 @@ mod tests {
         Arc<Mutex<u8>>,
     ) {
         let session_id = SessionId::default();
-        let node_1 = NodeState::new(session_id.clone());
+        let node_1 = NodeState::new(session_id);
         let (tx_measure_peer_result, _) = mpsc::channel::<MeasurePeerEvent>(1);
         let (_, rx_measure_peer_state) = mpsc::channel::<MeasurePeerEvent>(1);
         let (tx_event, _) = mpsc::channel::<OnEvent>(1);
@@ -453,7 +494,7 @@ mod tests {
         let c = calls.clone();
 
         tokio::spawn(async move {
-            while let Some(_) = rx_peer_state_change.recv().await {
+            while (rx_peer_state_change.recv().await).is_some() {
                 *c.try_lock().unwrap() += 1;
             }
         });
