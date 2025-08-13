@@ -36,6 +36,7 @@ local-ip-address = "0.5.6"
 termios = "0.3"
 triple_buffer = "8.1.1"
 rodio = "0.21.1"
+if-addrs = "0.10.2"
 
 [dev-dependencies]
 console-subscriber = "0.2.0"

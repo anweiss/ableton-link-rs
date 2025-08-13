@@ -98,7 +98,7 @@ impl Controller {
             })
             .unwrap();
 
-        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0)));
+        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
 
         let discovery = Arc::new(
             PeerGateway::new(
@@ -668,11 +668,20 @@ pub async fn join_session(
 
         // session_peer_counter(session_id, peers, session_peer_count);
 
-        let s_id = peer_state.try_lock().unwrap().session_id();
-        let count = unique_session_peer_count(s_id, peers, peer_state.try_lock().unwrap().ident());
-        let old_count = session_peer_count.try_lock().unwrap().session_peer_count;
-        session_peer_count.try_lock().unwrap().session_peer_count = count;
-        if old_count != count && count == 0 {
+        let should_reset = if let (Ok(peer_state_guard), Ok(mut session_peer_count_guard)) = 
+            (peer_state.try_lock(), session_peer_count.try_lock()) {
+            
+            let s_id = peer_state_guard.session_id();
+            let count = unique_session_peer_count(s_id, peers, peer_state_guard.ident());
+            let old_count = session_peer_count_guard.session_peer_count;
+            session_peer_count_guard.session_peer_count = count;
+            
+            old_count != count && count == 0
+        } else {
+            false
+        };
+        
+        if should_reset {
             reset_state(
                 peer_state.clone(),
                 session_state.clone(),
@@ -697,7 +706,11 @@ pub async fn reset_state(
     start_stop_sync_enabled: Arc<Mutex<bool>>,
 ) {
     // Preserve the existing NodeId to maintain peer identity across enable/disable cycles
-    let existing_node_id = peer_state.try_lock().unwrap().node_state.node_id;
+    let existing_node_id = if let Ok(peer_state_guard) = peer_state.try_lock() {
+        peer_state_guard.node_state.node_id
+    } else {
+        NodeId::default()
+    };
 
     // Only generate a new NodeId if this is the very first initialization
     let n_id = if existing_node_id == NodeId::default() {
@@ -709,23 +722,24 @@ pub async fn reset_state(
     // Always create a new session when resetting state - this allows joining other sessions
     let s_id = SessionId(n_id);
 
-    peer_state.try_lock().unwrap().node_state.node_id = n_id;
-    peer_state.try_lock().unwrap().node_state.session_id = s_id;
+    if let Ok(mut peer_state_guard) = peer_state.try_lock() {
+        peer_state_guard.node_state.node_id = n_id;
+        peer_state_guard.node_state.session_id = s_id;
+    }
 
     let x_form = init_x_form(clock);
     let host_time = -x_form.intercept;
 
-    let timeline = session_state.try_lock().unwrap().timeline;
+    let (timeline, ghost_x_form) = if let Ok(session_state_guard) = session_state.try_lock() {
+        (session_state_guard.timeline, session_state_guard.ghost_x_form)
+    } else {
+        // Fallback to default values if lock fails
+        (Timeline::default(), GhostXForm::default())
+    };
 
     let new_tl = Timeline {
         tempo: timeline.tempo,
-        beat_origin: timeline.to_beats(
-            session_state
-                .try_lock()
-                .unwrap()
-                .ghost_x_form
-                .host_to_ghost(host_time),
-        ),
+        beat_origin: timeline.to_beats(ghost_x_form.host_to_ghost(host_time)),
         time_origin: x_form.host_to_ghost(host_time),
         // time_origin: Duration::zero(),
     };
@@ -765,13 +779,25 @@ pub async fn update_discovery(
     peer_state: Arc<Mutex<PeerState>>,
     discovery: Arc<PeerGateway>,
 ) {
-    let timeline = session_state.try_lock().unwrap().timeline;
-    let start_stop_state = session_state.try_lock().unwrap().start_stop_state;
-    let ghost_xform = session_state.try_lock().unwrap().ghost_x_form;
+    let (timeline, start_stop_state, ghost_xform) = if let Ok(session_state_guard) = session_state.try_lock() {
+        (
+            session_state_guard.timeline,
+            session_state_guard.start_stop_state,
+            session_state_guard.ghost_x_form,
+        )
+    } else {
+        return; // Skip update if we can't get the lock
+    };
 
-    let node_id = peer_state.try_lock().unwrap().node_state.node_id;
-    let session_id = peer_state.try_lock().unwrap().session_id();
-    let measurement_endpoint = peer_state.try_lock().unwrap().measurement_endpoint;
+    let (node_id, session_id, measurement_endpoint) = if let Ok(peer_state_guard) = peer_state.try_lock() {
+        (
+            peer_state_guard.node_state.node_id,
+            peer_state_guard.session_id(),
+            peer_state_guard.measurement_endpoint,
+        )
+    } else {
+        return; // Skip update if we can't get the lock
+    };
 
     discovery
         .update_node_state(
@@ -788,7 +814,9 @@ pub async fn update_discovery(
 }
 
 pub fn reset_session_start_stop_state(session_state: Arc<Mutex<SessionState>>) {
-    session_state.try_lock().unwrap().start_stop_state = StartStopState::default();
+    if let Ok(mut session_state_guard) = session_state.try_lock() {
+        session_state_guard.start_stop_state = StartStopState::default();
+    }
 }
 
 pub fn update_session_timing(
@@ -809,23 +837,25 @@ pub fn update_session_timing(
             session_state.timeline = new_timeline;
             session_state.ghost_x_form = new_x_form;
 
-            let old_client_timeline = client_state.try_lock().unwrap().timeline;
-            client_state.try_lock().unwrap().timeline = update_client_timeline_from_session(
-                new_timeline,
-                old_client_timeline,
-                clock.micros(),
-                new_x_form,
-            );
+            if let Ok(mut client_state_guard) = client_state.try_lock() {
+                let old_client_timeline = client_state_guard.timeline;
+                client_state_guard.timeline = update_client_timeline_from_session(
+                    new_timeline,
+                    old_client_timeline,
+                    clock.micros(),
+                    new_x_form,
+                );
 
-            if *start_stop_sync_enabled.try_lock().unwrap()
-                && session_state.start_stop_state != StartStopState::default()
-            {
-                client_state.try_lock().unwrap().start_stop_state =
-                    map_start_stop_state_from_session_to_client(
-                        session_state.start_stop_state,
-                        session_state.timeline,
-                        session_state.ghost_x_form,
-                    );
+                if let Ok(start_stop_enabled) = start_stop_sync_enabled.try_lock() {
+                    if *start_stop_enabled && session_state.start_stop_state != StartStopState::default() {
+                        client_state_guard.start_stop_state =
+                            map_start_stop_state_from_session_to_client(
+                                session_state.start_stop_state,
+                                session_state.timeline,
+                                session_state.ghost_x_form,
+                            );
+                    }
+                }
             }
 
             if old_timeline.tempo != new_timeline.tempo {

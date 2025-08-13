@@ -33,21 +33,17 @@ use super::{
     LINK_PORT, MULTICAST_ADDR, MULTICAST_IP_ANY,
 };
 
-pub fn new_udp_reuseport(addr: SocketAddrV4) -> UdpSocket {
-    let udp_sock = socket2::Socket::new(
-        // if addr.is_ipv4() {
-        //     socket2::Domain::IPV4
-        // } else {
-        //     socket2::Domain::IPV6
-        // },
-        socket2::Domain::IPV4,
-        socket2::Type::DGRAM,
-        None,
-    )
-    .unwrap();
+pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    
+    let udp_sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
 
     // Try to set reuse address for better socket sharing
-    udp_sock.set_reuse_address(true).unwrap();
+    udp_sock.set_reuse_address(true)?;
 
     // Set SO_REUSEPORT on Unix systems for better multicast support
     #[cfg(unix)]
@@ -65,10 +61,10 @@ pub fn new_udp_reuseport(addr: SocketAddrV4) -> UdpSocket {
         }
     }
 
-    udp_sock.set_nonblocking(true).unwrap();
-    udp_sock.bind(&socket2::SockAddr::from(addr)).unwrap();
+    udp_sock.set_nonblocking(true)?;
+    udp_sock.bind(&socket2::SockAddr::from(addr))?;
     let udp_sock: std::net::UdpSocket = udp_sock.into();
-    udp_sock.try_into().unwrap()
+    Ok(udp_sock.try_into()?)
 }
 
 pub struct Messenger {
@@ -90,7 +86,7 @@ impl Messenger {
         notifier: Arc<Notify>,
         enabled: Arc<Mutex<bool>>,
     ) -> Self {
-        let socket = new_udp_reuseport(MULTICAST_IP_ANY);
+        let socket = new_udp_reuseport(MULTICAST_IP_ANY.into()).unwrap();
         socket
             .join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::new(0, 0, 0, 0))
             .unwrap();
@@ -381,7 +377,7 @@ pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
 pub fn send_byebye(node_state: NodeId) {
     info!("sending bye bye");
 
-    let socket = new_udp_reuseport(MULTICAST_IP_ANY);
+    let socket = new_udp_reuseport(MULTICAST_IP_ANY.into()).unwrap();
     socket.set_broadcast(true).unwrap();
     socket.set_multicast_ttl_v4(2).unwrap();
 

@@ -1,8 +1,11 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod gateway;
+pub mod interface_scanner;
+pub mod ip_interface;
 pub mod messages;
 pub mod messenger;
+pub mod multi_interface_messenger;
 pub mod peers;
 
 use std::net::{Ipv4Addr, SocketAddrV4};

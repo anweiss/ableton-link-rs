@@ -241,7 +241,7 @@ impl Measurement {
             })
             .unwrap();
 
-        let unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0)));
+        let unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
         info!(
             "initiating new unicast socket {} for measurement_endpoint {:?}",
             unicast_socket.local_addr().unwrap(),
@@ -555,7 +555,7 @@ mod tests {
             })
             .unwrap();
 
-        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0)));
+        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
 
         (
             PeerGateway::new(
@@ -602,7 +602,7 @@ mod tests {
             })
             .unwrap();
 
-        let s = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0)));
+        let s = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
 
         let measurement = Measurement::new(
             PeerState {

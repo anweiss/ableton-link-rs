@@ -154,11 +154,16 @@ impl BasicLink {
     pub fn capture_audio_session_state(&mut self) -> SessionState {
         // Initialize rt_session_handler if not already done
         if self.rt_session_handler.is_none() {
-            let client_state = *self.controller.client_state.try_lock().unwrap();
-            self.rt_session_handler = Some(RtSessionStateHandler::new(
-                client_state,
-                controller::LOCAL_MOD_GRACE_PERIOD,
-            ));
+            if let Ok(client_state_guard) = self.controller.client_state.try_lock() {
+                let client_state = *client_state_guard;
+                self.rt_session_handler = Some(RtSessionStateHandler::new(
+                    client_state,
+                    controller::LOCAL_MOD_GRACE_PERIOD,
+                ));
+            } else {
+                // If we can't get the lock, return a default state
+                return SessionState::default();
+            }
         }
 
         // For real-time access, we use the rt_session_handler
@@ -167,10 +172,11 @@ impl BasicLink {
             to_session_state(&client_state, self.num_peers() > 0)
         } else {
             // Fallback to non-realtime access
-            to_session_state(
-                &self.controller.client_state.try_lock().unwrap(),
-                self.num_peers() > 0,
-            )
+            if let Ok(client_state_guard) = self.controller.client_state.try_lock() {
+                to_session_state(&client_state_guard, self.num_peers() > 0)
+            } else {
+                SessionState::default()
+            }
         }
     }
 
@@ -203,21 +209,24 @@ impl BasicLink {
             }
         } else {
             // Fallback to the original non-realtime method
-            let mut client_state = self.controller.client_state.try_lock().unwrap();
-            if let Some(timeline) = incoming_state.timeline {
-                client_state.timeline = timeline;
-            }
-            if let Some(start_stop_state) = incoming_state.start_stop_state {
-                client_state.start_stop_state = start_stop_state;
+            if let Ok(mut client_state) = self.controller.client_state.try_lock() {
+                if let Some(timeline) = incoming_state.timeline {
+                    client_state.timeline = timeline;
+                }
+                if let Some(start_stop_state) = incoming_state.start_stop_state {
+                    client_state.start_stop_state = start_stop_state;
+                }
             }
         }
     }
 
     pub fn capture_app_session_state(&self) -> SessionState {
-        to_session_state(
-            &self.controller.client_state.try_lock().unwrap(),
-            self.num_peers() > 0,
-        )
+        if let Ok(client_state_guard) = self.controller.client_state.try_lock() {
+            to_session_state(&client_state_guard, self.num_peers() > 0)
+        } else {
+            // Return a default state if we can't get the lock
+            SessionState::default()
+        }
     }
 
     pub async fn commit_app_session_state(&mut self, state: SessionState) {
