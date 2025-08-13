@@ -114,6 +114,7 @@ impl Messenger {
         let ttl = self.ttl;
         let tx_event = self.tx_event.clone();
         let last_broadcast_time = self.last_broadcast_time.clone();
+        let enabled = self.enabled.clone();
 
         let _n = self.notifier.clone();
 
@@ -140,9 +141,29 @@ impl Messenger {
                     );
                 }
 
+                // Check if Link is enabled before processing ALIVE and RESPONSE messages
+                // BYEBYE messages should still be processed even when disabled to properly clean up peers
+                let is_enabled = if let Ok(enabled_guard) = enabled.try_lock() {
+                    *enabled_guard
+                } else {
+                    false
+                };
+
                 if let SocketAddr::V4(src) = src {
+                    debug!(
+                        "Received message type {} from peer {}",
+                        header.message_type, header.ident
+                    );
                     match header.message_type {
                         ALIVE => {
+                            if !is_enabled {
+                                debug!(
+                                    "ignoring ALIVE message from peer {} because Link is disabled",
+                                    header.ident
+                                );
+                                continue;
+                            }
+
                             send_response(
                                 socket.clone(),
                                 peer_state.clone(),
@@ -156,10 +177,16 @@ impl Messenger {
                                 .await;
                         }
                         RESPONSE => {
+                            if !is_enabled {
+                                debug!("ignoring RESPONSE message from peer {} because Link is disabled", header.ident);
+                                continue;
+                            }
+
                             receive_peer_state(tx_event.clone(), header, &buf[header_len..amt])
                                 .await;
                         }
                         BYEBYE => {
+                            info!("Received BYEBYE message from peer {}", header.ident);
                             receive_bye_bye(tx_event.clone(), header.ident).await;
                         }
                         _ => todo!(),
@@ -341,8 +368,14 @@ pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf:
 }
 
 pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
-    debug!("receiving bye bye from peer {}", node_id);
-    tokio::spawn(async move { tx.send(OnEvent::Byebye(node_id)).await });
+    info!("Received BYEBYE message from peer {}", node_id);
+    tokio::spawn(async move {
+        if let Err(e) = tx.send(OnEvent::Byebye(node_id)).await {
+            debug!("Failed to send BYEBYE event: {:?}", e);
+        } else {
+            info!("Successfully forwarded BYEBYE event for peer {}", node_id);
+        }
+    });
 }
 
 pub fn send_byebye(node_state: NodeId) {

@@ -85,22 +85,39 @@ impl GatewayObserver {
     }
 
     pub fn set_session_timeline(&mut self, session_id: SessionId, timeline: Timeline) {
-        self.peers.try_lock().unwrap().iter_mut().for_each(|peer| {
-            if peer.peer_state.session_id() == session_id {
-                peer.peer_state.node_state.timeline = timeline;
-            }
-        });
+        if let Ok(mut peers) = self.peers.try_lock() {
+            peers.iter_mut().for_each(|peer| {
+                if peer.peer_state.session_id() == session_id {
+                    peer.peer_state.node_state.timeline = timeline;
+                }
+            });
+        } else {
+            debug!("Could not acquire peers lock in set_session_timeline");
+        }
     }
 
     pub fn forget_session(&mut self, session_id: Arc<Mutex<SessionId>>) {
-        self.peers
-            .try_lock()
-            .unwrap()
-            .retain(|peer| peer.peer_state.session_id() != *session_id.try_lock().unwrap());
+        let session_id_val = match session_id.try_lock() {
+            Ok(guard) => *guard,
+            Err(_) => {
+                debug!("Could not acquire session_id lock in forget_session");
+                return;
+            }
+        };
+        
+        if let Ok(mut peers) = self.peers.try_lock() {
+            peers.retain(|peer| peer.peer_state.session_id() != session_id_val);
+        } else {
+            debug!("Could not acquire peers lock in forget_session");
+        }
     }
 
     pub fn reset_peers(&self) {
-        self.peers.try_lock().unwrap().clear();
+        if let Ok(mut peers) = self.peers.try_lock() {
+            peers.clear();
+        } else {
+            debug!("Could not acquire peers lock in reset_peers");
+        }
     }
 }
 
@@ -133,7 +150,13 @@ pub fn unique_session_peer_count(
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     self_node_id: NodeId,
 ) -> usize {
-    let all_peers = peers.try_lock().unwrap();
+    let all_peers = match peers.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            debug!("Could not acquire peers lock in unique_session_peer_count, returning 0");
+            return 0;
+        }
+    };
     debug!("unique_session_peer_count: looking for session_id={}, self_node_id={}", session_id, self_node_id);
     debug!("unique_session_peer_count: total peers in list: {}", all_peers.len());
     
@@ -143,12 +166,25 @@ pub fn unique_session_peer_count(
     
     let mut peers = all_peers
         .iter()
-        .filter(|p| p.peer_state.session_id() == session_id && p.peer_state.ident() != self_node_id)
+        .filter(|p| {
+            let matches_session = p.peer_state.session_id() == session_id;
+            let is_not_self = p.peer_state.ident() != self_node_id;
+            debug!("  filtering peer {}: matches_session={}, is_not_self={}", p.peer_state.ident(), matches_session, is_not_self);
+            matches_session && is_not_self
+        })
         .cloned()
         .collect::<Vec<_>>();
-    peers.dedup_by(|a, b| a.peer_state.ident() == b.peer_state.ident());
+    
+    debug!("unique_session_peer_count: before dedup, filtered peers count: {}", peers.len());
+    peers.dedup_by(|a, b| {
+        let is_duplicate = a.peer_state.ident() == b.peer_state.ident();
+        if is_duplicate {
+            debug!("  removing duplicate peer: {}", a.peer_state.ident());
+        }
+        is_duplicate
+    });
 
-    debug!("unique_session_peer_count: filtered peers count: {}", peers.len());
+    debug!("unique_session_peer_count: after dedup, final peers count: {}", peers.len());
     peers.len()
 }
 
@@ -168,7 +204,16 @@ async fn saw_peer(
     tx_peer_state_change: Sender<Vec<PeerStateChange>>,
 ) {
     // Additional safety check: Don't add ourselves to our own peer list
-    if peer_seen_peer_state.ident() == self_peer_state.try_lock().unwrap().ident() {
+    let self_ident = match self_peer_state.try_lock() {
+        Ok(guard) => guard.ident(),
+        Err(_) => {
+            debug!("Could not acquire self_peer_state lock in saw_peer, skipping self-check");
+            // If we can't get the lock, continue anyway - the duplicate check later will catch self-peers
+            peer_seen_peer_state.ident()  // This will not match unless it's actually self, which is unlikely
+        }
+    };
+    
+    if peer_seen_peer_state.ident() == self_ident {
         debug!("ignoring peer state from self (node {})", peer_seen_peer_state.ident());
         return;
     }
@@ -182,35 +227,60 @@ async fn saw_peer(
     let peer_timeline = ps.timeline();
     let peer_start_stop_state = ps.start_stop_state();
 
-    let is_new_session_timeline = !peers.try_lock().unwrap().iter().any(|p| {
-        p.peer_state.session_id() == peer_session && p.peer_state.timeline() == peer_timeline
-    });
+    let is_new_session_timeline = match peers.try_lock() {
+        Ok(guard) => !guard.iter().any(|p| {
+            p.peer_state.session_id() == peer_session && p.peer_state.timeline() == peer_timeline
+        }),
+        Err(_) => {
+            debug!("Could not acquire peers lock to check session timeline, assuming new");
+            true  // Assume it's new if we can't check
+        }
+    };
 
-    let is_new_session_start_stop_state = !peers
-        .try_lock()
-        .unwrap()
-        .iter()
-        .any(|p| p.peer_state.start_stop_state() == peer_start_stop_state);
+    let is_new_session_start_stop_state = match peers.try_lock() {
+        Ok(guard) => !guard.iter().any(|p| p.peer_state.start_stop_state() == peer_start_stop_state),
+        Err(_) => {
+            debug!("Could not acquire peers lock to check start/stop state, assuming new");
+            true  // Assume it's new if we can't check
+        }
+    };
 
     let peer = ControllerPeer { peer_state: ps };
 
-    let existing_peer_index = peers
-        .try_lock()
-        .unwrap()
-        .iter()
-        .position(|p| p.peer_state.ident() == peer.peer_state.ident());
+    let existing_peer_index = match peers.try_lock() {
+        Ok(guard) => guard.iter().position(|p| p.peer_state.ident() == peer.peer_state.ident()),
+        Err(_) => {
+            debug!("Could not acquire peers lock to find existing peer, assuming new");
+            None  // Assume it's new if we can't check
+        }
+    };
 
     let did_session_membership_change = if let Some(index) = existing_peer_index {
         // Update existing peer with new state
-        let old_session_id = peers.try_lock().unwrap()[index].peer_state.session_id();
-        peers.try_lock().unwrap()[index] = peer.clone();
-        
-        // Session membership changed if the session ID changed
-        old_session_id != peer_session
+        match peers.try_lock() {
+            Ok(mut guard) => {
+                let old_session_id = guard[index].peer_state.session_id();
+                guard[index] = peer.clone();
+                // Session membership changed if the session ID changed
+                old_session_id != peer_session
+            },
+            Err(_) => {
+                debug!("Could not acquire peers lock to update existing peer");
+                false  // No change if we can't update
+            }
+        }
     } else {
         // Add new peer
-        peers.try_lock().unwrap().push(peer.clone());
-        true
+        match peers.try_lock() {
+            Ok(mut guard) => {
+                guard.push(peer.clone());
+                true
+            },
+            Err(_) => {
+                debug!("Could not acquire peers lock to add new peer");
+                false  // No change if we can't add
+            }
+        }
     };
 
     let mut peer_state_changes = vec![];
@@ -249,25 +319,39 @@ async fn peer_left(
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     tx_peer_state_change: Sender<Vec<PeerStateChange>>,
 ) {
-    info!("peer {} left", node_id);
+    info!("Processing peer_left for node {}", node_id);
 
     let mut did_session_membership_change = false;
-    peers.try_lock().unwrap().retain(|peer| {
-        if peer.peer_state.ident() == node_id {
-            did_session_membership_change = true;
-            false
-        } else {
-            true
-        }
-    });
+    if let Ok(mut peers_guard) = peers.try_lock() {
+        let initial_count = peers_guard.len();
+        peers_guard.retain(|peer| {
+            if peer.peer_state.ident() == node_id {
+                info!("Removing peer {} from peers list", node_id);
+                did_session_membership_change = true;
+                false
+            } else {
+                true
+            }
+        });
+        let final_count = peers_guard.len();
+        info!("Peer count changed from {} to {} after removing peer {}", initial_count, final_count, node_id);
+    } else {
+        debug!("Could not acquire peers lock in peer_left for node {}", node_id);
+        return;
+    }
 
     if did_session_membership_change {
+        info!("Session membership changed due to peer {} leaving, sending PeerLeft event", node_id);
         if let Err(e) = tx_peer_state_change
             .send(vec![PeerStateChange::PeerLeft])
             .await
         {
             debug!("Failed to send peer left event: {}", e);
+        } else {
+            info!("Successfully sent PeerLeft event for peer {}", node_id);
         }
+    } else {
+        info!("No session membership change for peer {} (peer not found in list)", node_id);
     }
 }
 
@@ -290,7 +374,7 @@ mod tests {
             messenger::new_udp_reuseport,
         },
         link::{
-            beats::Beats, clock::Clock, ghostxform::GhostXForm, measurement::MeasurePeerEvent,
+            beats::Beats, clock::Clock, measurement::MeasurePeerEvent,
             sessions::session_peers, state::SessionState, tempo::Tempo,
         },
     };

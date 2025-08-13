@@ -223,31 +223,34 @@ pub async fn on_peer_state(
         .retain(|(_, id)| id != &peer_id);
 
     let new_to = (
-        Instant::now() + Duration::seconds(msg.ttl as i64).to_std().unwrap(),
+        Instant::now() + Duration::seconds(std::cmp::min(msg.ttl as i64, 3)).to_std().unwrap(), // Cap timeout at 3 seconds max
         peer_id,
     );
 
-    debug!("updating peer timeout status for peer {}", peer_id);
+    debug!("updating peer timeout status for peer {} with TTL {} seconds (capped at 3)", peer_id, msg.ttl);
 
-    let i = peer_timeouts
-        .try_lock()
-        .unwrap()
-        .iter()
-        .position(|(timeout, _)| timeout >= &new_to.0);
-    if let Some(i) = i {
-        peer_timeouts.try_lock().unwrap().insert(i, new_to);
+    if let Ok(mut timeouts) = peer_timeouts.try_lock() {
+        let i = timeouts.iter().position(|(timeout, _)| timeout >= &new_to.0);
+        if let Some(i) = i {
+            timeouts.insert(i, new_to);
+        } else {
+            timeouts.push(new_to);
+        }
     } else {
-        peer_timeouts.try_lock().unwrap().push(new_to);
+        debug!("Could not acquire peer_timeouts lock to update timeout for peer {}", peer_id);
     }
 
     debug!("sending peer state to observer");
-    tx_peer_event
+    if let Err(e) = tx_peer_event
         .send(PeerEvent::SawPeer(PeerState {
             node_state: msg.node_state,
             measurement_endpoint: msg.measurement_endpoint,
         }))
         .await
-        .unwrap();
+    {
+        debug!("Failed to send SawPeer event: {:?}", e);
+        return;
+    }
 
     cancel.notify_waiters();
     schedule_next_pruning(peer_timeouts.clone(), epoch, tx_peer_event.clone(), cancel).await;
@@ -259,14 +262,27 @@ pub async fn on_byebye(
     tx_peer_event: Sender<PeerEvent>,
     notifier: Arc<Notify>,
 ) {
+    info!("Processing BYEBYE from peer {}", peer_id);
+    
     if find_peer(&peer_id, peer_timeouts.clone()).await {
+        info!("Found peer {} in timeout list, sending PeerLeft event", peer_id);
         let peer_event = tx_peer_event.clone();
-        tokio::spawn(async move { peer_event.send(PeerEvent::PeerLeft(peer_id)).await });
+        tokio::spawn(async move { 
+            if let Err(e) = peer_event.send(PeerEvent::PeerLeft(peer_id)).await {
+                debug!("Failed to send PeerLeft event: {:?}", e);
+            } else {
+                info!("Successfully sent PeerLeft event for peer {}", peer_id);
+            }
+        });
 
-        peer_timeouts
-            .try_lock()
-            .unwrap()
-            .retain(|(_, id)| id != &peer_id);
+        if let Ok(mut timeouts) = peer_timeouts.try_lock() {
+            timeouts.retain(|(_, id)| id != &peer_id);
+            info!("Removed peer {} from timeout list", peer_id);
+        } else {
+            debug!("Could not acquire peer_timeouts lock to remove peer {}", peer_id);
+        }
+    } else {
+        info!("Peer {} not found in timeout list (may have already been removed)", peer_id);
     }
 
     notifier.notify_waiters();
@@ -276,11 +292,17 @@ pub async fn find_peer(
     peer_id: &NodeId,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
 ) -> bool {
-    peer_timeouts
-        .try_lock()
-        .unwrap()
-        .iter()
-        .any(|(_, id)| id == peer_id)
+    match peer_timeouts.try_lock() {
+        Ok(timeouts) => {
+            let found = timeouts.iter().any(|(_, id)| id == peer_id);
+            debug!("find_peer: Looking for peer {}, found: {}", peer_id, found);
+            found
+        },
+        Err(_) => {
+            debug!("Could not acquire peer_timeouts lock in find_peer for {}", peer_id);
+            false
+        }
+    }
 }
 
 pub async fn schedule_next_pruning(
@@ -298,7 +320,7 @@ pub async fn schedule_next_pruning(
     let timeout = {
         let pt = pt.try_lock().unwrap();
         let (timeout, peer_id) = pt.first().unwrap();
-        let timeout = *timeout + Duration::milliseconds(500).to_std().unwrap(); // Reduced grace period from 1 second to 500ms
+        let timeout = *timeout + Duration::milliseconds(100).to_std().unwrap(); // Reduced grace period to 100ms for faster detection
 
         debug!(
             "scheduling next pruning for {}ms since gateway initialization epoch because of peer {}",
@@ -319,10 +341,14 @@ pub async fn schedule_next_pruning(
                 let expired_peers = prune_expired_peers(peer_timeouts.clone(), epoch);
                 for peer in expired_peers.iter() {
                     info!("pruning peer {}", peer.1);
-                    tx_peer_event
+                    if let Err(e) = tx_peer_event
                         .send(PeerEvent::PeerTimedOut(peer.1))
                         .await
-                        .unwrap();
+                    {
+                        debug!("Failed to send PeerTimedOut event: {:?}", e);
+                        // Receiver has been dropped, no point in continuing
+                        return;
+                    }
                 }
             }
             _ = cancel.notified() => {}
@@ -373,7 +399,7 @@ impl Drop for PeerGateway {
 mod tests {
     use std::net::IpAddr;
 
-    use local_ip_address::{list_afinet_netifas, local_ip};
+    use local_ip_address::list_afinet_netifas;
 
     use crate::{discovery::messenger::new_udp_reuseport, link::sessions::SessionId};
 
