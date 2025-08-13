@@ -319,10 +319,15 @@ pub async fn handle_successful_measurement(
         timestamp: clock.micros(),
     };
 
-    if current.try_lock().unwrap().session_id == session_id {
+    let current_session_id = current.try_lock().unwrap().session_id;
+    debug!("Current session: {}, measured session: {}", current_session_id, session_id);
+
+    if current_session_id == session_id {
         current.try_lock().unwrap().measurement = measurement;
         let session = current.try_lock().unwrap().clone();
-        tx_join_session.send(session).await.unwrap();
+        if let Err(e) = tx_join_session.send(session).await {
+            debug!("Failed to send session join event: {}", e);
+        }
     } else {
         let s = other_sessions
             .try_lock()
@@ -348,21 +353,31 @@ pub async fn handle_successful_measurement(
             other_sessions.try_lock().unwrap()[idx] = s.clone();
 
             let ghost_diff = new_ghost - cur_ghost;
+            debug!("Ghost time comparison: current={} us, new={} us, diff={} us, eps={} us", 
+                   cur_ghost.num_microseconds().unwrap(), 
+                   new_ghost.num_microseconds().unwrap(),
+                   ghost_diff.num_microseconds().unwrap(),
+                   SESSION_EPS.num_microseconds().unwrap());
 
             if ghost_diff > SESSION_EPS
                 || (ghost_diff.num_microseconds().unwrap().abs()
                     < SESSION_EPS.num_microseconds().unwrap()
-                    && session_id != current.try_lock().unwrap().session_id)
+                    && session_id < current.try_lock().unwrap().session_id)
             {
+                debug!("Session {} wins over current session, switching!", session_id);
                 let c = current.try_lock().unwrap().clone();
 
                 *current.try_lock().unwrap() = s.clone();
                 other_sessions.try_lock().unwrap().remove(idx);
                 other_sessions.try_lock().unwrap().insert(idx, c);
 
-                tx_join_session.send(s.clone()).await.unwrap();
+                if let Err(e) = tx_join_session.send(s.clone()).await {
+                    debug!("Failed to send session join event: {}", e);
+                }
 
                 schedule_remeasurement(peers.clone(), tx_measure_peer_state.clone(), s).await;
+            } else {
+                debug!("Session {} does not win over current session, staying with current", session_id);
             }
         }
     }

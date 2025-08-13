@@ -48,7 +48,7 @@ pub struct PeerGateway {
     messenger: Messenger,
     tx_peer_event: Sender<PeerEvent>,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
-    cancel: Arc<Notify>,
+    _cancel: Arc<Notify>,
 }
 
 #[derive(Clone)]
@@ -70,6 +70,7 @@ impl PeerGateway {
         notifier: Arc<Notify>,
         rx_measure_peer_state: Receiver<MeasurePeerEvent>,
         ping_responder_unicast_socket: Arc<UdpSocket>,
+        enabled: Arc<Mutex<bool>>,
     ) -> Self {
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
@@ -87,6 +88,7 @@ impl PeerGateway {
             tx_event.clone(),
             epoch,
             notifier.clone(),
+            enabled.clone(),
         );
 
         PeerGateway {
@@ -115,7 +117,7 @@ impl PeerGateway {
             tx_peer_event,
             peer_timeouts: Arc::new(Mutex::new(vec![])),
             session_peer_counter,
-            cancel: Arc::new(Notify::new()),
+            _cancel: Arc::new(Notify::new()),
         }
     }
 
@@ -147,6 +149,9 @@ impl PeerGateway {
         let ctrl_socket = self.messenger.interface.as_ref().unwrap().clone();
         let peer_state = self.peer_state.clone();
 
+        // Get self node ID for filtering self-messages
+        let self_node_id = peer_state.try_lock().unwrap().node_state.node_id;
+
         let peer_timeouts = self.peer_timeouts.clone();
         let tx_peer_event = self.tx_peer_event.clone();
         let epoch = self.epoch;
@@ -177,8 +182,6 @@ impl PeerGateway {
             notifier.notify_waiters();
         });
 
-        let c = self.cancel.clone();
-
         let measurement_notifier = Arc::new(Notify::new());
 
         tokio::spawn(async move {
@@ -187,7 +190,7 @@ impl PeerGateway {
                     Some(val) = rx_event.recv() => {
                         match val {
                             OnEvent::PeerState(msg) => {
-                                on_peer_state(msg, peer_timeouts.clone(), tx_peer_event.clone(), epoch, c.clone())
+                                on_peer_state(msg, peer_timeouts.clone(), tx_peer_event.clone(), epoch, measurement_notifier.clone(), self_node_id)
                                     .await
                             }
                             OnEvent::Byebye(node_id) => {
@@ -209,6 +212,7 @@ pub async fn on_peer_state(
     tx_peer_event: Sender<PeerEvent>,
     epoch: Instant,
     cancel: Arc<Notify>,
+    _self_node_id: NodeId,
 ) {
     debug!("received peer state from messenger");
 
@@ -294,7 +298,7 @@ pub async fn schedule_next_pruning(
     let timeout = {
         let pt = pt.try_lock().unwrap();
         let (timeout, peer_id) = pt.first().unwrap();
-        let timeout = *timeout + Duration::seconds(1).to_std().unwrap();
+        let timeout = *timeout + Duration::milliseconds(500).to_std().unwrap(); // Reduced grace period from 1 second to 500ms
 
         debug!(
             "scheduling next pruning for {}ms since gateway initialization epoch because of peer {}",
@@ -428,6 +432,7 @@ mod tests {
             notifier.clone(),
             rx_measure_peer_state,
             ping_responder_unicast_socket,
+            Arc::new(Mutex::new(true)), // enabled for test
         )
         .await;
 
@@ -462,8 +467,9 @@ mod tests {
         // Use a timeout to prevent indefinite blocking on the listen operation
         let listen_result = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            gw.listen(rx_event, notifier)
-        ).await;
+            gw.listen(rx_event, notifier),
+        )
+        .await;
 
         match listen_result {
             Ok(_) => {
@@ -472,7 +478,9 @@ mod tests {
             }
             Err(_) => {
                 // Listen timed out (expected behavior for network operations)
-                println!("Gateway listen timed out as expected - gateway initialization successful");
+                println!(
+                    "Gateway listen timed out as expected - gateway initialization successful"
+                );
             }
         }
     }

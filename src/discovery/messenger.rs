@@ -45,10 +45,10 @@ pub fn new_udp_reuseport(addr: SocketAddrV4) -> UdpSocket {
         None,
     )
     .unwrap();
-    
+
     // Try to set reuse address for better socket sharing
     udp_sock.set_reuse_address(true).unwrap();
-    
+
     // Set SO_REUSEPORT on Unix systems for better multicast support
     #[cfg(unix)]
     {
@@ -64,7 +64,7 @@ pub fn new_udp_reuseport(addr: SocketAddrV4) -> UdpSocket {
             );
         }
     }
-    
+
     udp_sock.set_nonblocking(true).unwrap();
     udp_sock.bind(&socket2::SockAddr::from(addr)).unwrap();
     let udp_sock: std::net::UdpSocket = udp_sock.into();
@@ -79,6 +79,7 @@ pub struct Messenger {
     pub last_broadcast_time: Arc<Mutex<Instant>>,
     pub tx_event: Sender<OnEvent>,
     pub notifier: Arc<Notify>,
+    pub enabled: Arc<Mutex<bool>>,
 }
 
 impl Messenger {
@@ -87,6 +88,7 @@ impl Messenger {
         tx_event: Sender<OnEvent>,
         epoch: Instant,
         notifier: Arc<Notify>,
+        enabled: Arc<Mutex<bool>>,
     ) -> Self {
         let socket = new_udp_reuseport(MULTICAST_IP_ANY);
         socket
@@ -97,11 +99,12 @@ impl Messenger {
         Messenger {
             interface: Some(Arc::new(socket)),
             peer_state,
-            ttl: 5,
+            ttl: 2, // Reduced from 5 to 2 seconds for faster peer timeout detection
             ttl_ratio: 20,
             last_broadcast_time: Arc::new(Mutex::new(epoch)),
             tx_event,
             notifier,
+            enabled,
         }
     }
 
@@ -122,7 +125,12 @@ impl Messenger {
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
 
                 // TODO figure out how to encode group ID
-                if header.ident == peer_state.try_lock().unwrap().ident() && header.group_id == 0 {
+                let should_ignore = match peer_state.try_lock() {
+                    Ok(guard) => header.ident == guard.ident() && header.group_id == 0,
+                    Err(_) => false, // If we can't get the lock, don't ignore
+                };
+
+                if should_ignore {
                     debug!("ignoring messages from self (peer {})", header.ident);
                     continue;
                 } else {
@@ -171,6 +179,7 @@ impl Messenger {
             self.peer_state.clone(),
             SocketAddrV4::new(MULTICAST_ADDR, LINK_PORT),
             self.notifier.clone(),
+            self.enabled.clone(),
         )
         .await;
     }
@@ -184,6 +193,7 @@ pub async fn broadcast_state(
     peer_state: Arc<Mutex<PeerState>>,
     to: SocketAddrV4,
     n: Arc<Notify>,
+    enabled: Arc<Mutex<bool>>,
 ) {
     let lbt = last_broadcast_time.clone();
     let s = socket.clone();
@@ -199,12 +209,20 @@ pub async fn broadcast_state(
 
                 let lbt = lbt.clone();
 
-                let time_since_last_broadcast = if *lbt.try_lock().unwrap() > Instant::now() {
-                    0
-                } else {
-                    Instant::now()
-                        .duration_since(*lbt.try_lock().unwrap())
-                        .as_millis()
+                let time_since_last_broadcast = match lbt.try_lock() {
+                    Ok(last_time) => {
+                        if *last_time > Instant::now() {
+                            0
+                        } else {
+                            Instant::now()
+                                .duration_since(*last_time)
+                                .as_millis()
+                        }
+                    }
+                    Err(_) => {
+                        // If we can't get the lock, use a conservative value
+                        0
+                    }
                 };
 
                 let tslb = Duration::from_millis(time_since_last_broadcast as u64);
@@ -221,7 +239,16 @@ pub async fn broadcast_state(
                 };
 
                 if delay < Duration::from_millis(1) {
-                    send_peer_state(s.clone(), peer_state.clone(), ttl, ALIVE, to, lbt).await;
+                    // Only broadcast if Link is enabled
+                    let should_broadcast = if let Ok(enabled_guard) = enabled.try_lock() {
+                        *enabled_guard
+                    } else {
+                        false
+                    };
+
+                    if should_broadcast {
+                        send_peer_state(s.clone(), peer_state.clone(), ttl, ALIVE, to, lbt).await;
+                    }
                 }
             }
             _ = n.notified() => {
@@ -266,12 +293,27 @@ pub async fn send_peer_state(
     to: SocketAddrV4,
     last_broadcast_time: Arc<Mutex<Instant>>,
 ) {
-    let ident = peer_state.try_lock().unwrap().ident();
-    let peer_state = peer_state.try_lock().unwrap().clone();
+    let (ident, peer_state_clone) = match peer_state.try_lock() {
+        Ok(guard) => (guard.ident(), guard.clone()),
+        Err(_) => {
+            // If we can't get the lock, skip this broadcast
+            return;
+        }
+    };
 
-    send_message(socket, ident, ttl, message_type, &peer_state.into(), to).await;
+    send_message(
+        socket,
+        ident,
+        ttl,
+        message_type,
+        &peer_state_clone.into(),
+        to,
+    )
+    .await;
 
-    *last_broadcast_time.try_lock().unwrap() = Instant::now();
+    if let Ok(mut last_time) = last_broadcast_time.try_lock() {
+        *last_time = Instant::now();
+    }
 }
 
 pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf: &[u8]) {

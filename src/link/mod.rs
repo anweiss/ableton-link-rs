@@ -400,33 +400,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_basic_link_enable_with_timeout() {
+    async fn test_peer_count_reset_on_disable() {
         let _ = tracing_subscriber::fmt::try_init();
 
         let bpm = 120.0;
         let mut link = BasicLink::new(bpm).await;
 
-        info!("testing Link enable with timeout");
+        info!("testing peer count reset when Link is disabled");
 
-        // Test that enable doesn't panic and sets the enabled state
-        // Use a timeout to prevent indefinite blocking
+        // Initially disabled, should have 0 peers
+        assert!(!link.is_enabled());
+        assert_eq!(link.num_peers(), 0);
+
+        // Enable Link briefly
         let enable_result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), link.enable()).await;
+            tokio::time::timeout(std::time::Duration::from_millis(100), link.enable()).await;
+        let _ = enable_result; // May timeout, that's ok
 
-        match enable_result {
-            Ok(_) => {
-                // Enable completed within timeout
-                assert!(link.is_enabled());
-                info!("Link enabled successfully within timeout");
-            }
-            Err(_) => {
-                // Enable timed out, but that's expected due to network discovery
-                // The important thing is that the enable flag should still be set
-                info!("Link enable timed out (expected due to network discovery)");
-                // Note: is_enabled() might still return true even if discovery is ongoing
-            }
-        }
+        // Now disable Link
+        link.disable().await;
 
-        info!("test_basic_link_enable_with_timeout completed");
+        // After disabling, peer count should be reset to 0
+        assert!(!link.is_enabled());
+        assert_eq!(
+            link.num_peers(),
+            0,
+            "Peer count should be reset to 0 when Link is disabled"
+        );
+
+        info!("test_peer_count_reset_on_disable completed - peer count correctly resets to 0 when disabled");
     }
 }

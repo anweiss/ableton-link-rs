@@ -63,6 +63,7 @@ impl Controller {
         let s_state = init_session_state(tempo, clock);
         let client_state = Arc::new(Mutex::new(init_client_state(s_state)));
 
+        let enabled = Arc::new(Mutex::new(false));
         let start_stop_sync_enabled = Arc::new(Mutex::new(false));
 
         let timeline = s_state.timeline;
@@ -112,6 +113,7 @@ impl Controller {
                 notifier.clone(),
                 rx_measure_peer_state,
                 ping_responder_unicast_socket,
+                enabled.clone(),
             )
             .await,
         );
@@ -121,7 +123,11 @@ impl Controller {
                 session_id,
                 timeline,
                 measurement: SessionMeasurement {
-                    x_form: session_state.try_lock().unwrap().ghost_x_form,
+                    x_form: if let Ok(session_state) = session_state.try_lock() {
+                        session_state.ghost_x_form
+                    } else {
+                        GhostXForm::default()
+                    },
                     timestamp: clock.micros(),
                 },
             },
@@ -178,12 +184,44 @@ impl Controller {
                     for peer_state_change in peer_state_changes.iter() {
                         match peer_state_change {
                             PeerStateChange::SessionMembership => {
+                                debug!("Controller received SessionMembership change");
+                                let session_id = if let Ok(ps) = peer_state_loop.try_lock() {
+                                    ps.session_id()
+                                } else {
+                                    continue;
+                                };
+                                let self_node_id = if let Ok(ps) = peer_state_loop.try_lock() {
+                                    ps.ident()
+                                } else {
+                                    continue;
+                                };
+
                                 let count = unique_session_peer_count(
-                                    peer_state_loop.try_lock().unwrap().session_id(),
+                                    session_id,
                                     p_loop.clone(),
+                                    self_node_id,
                                 );
-                                let old_count =
-                                    s_peer_counter_loop.try_lock().unwrap().session_peer_count;
+                                let old_count = if let Ok(spc) = s_peer_counter_loop.try_lock() {
+                                    spc.session_peer_count
+                                } else {
+                                    continue;
+                                };
+
+                                debug!(
+                                    "SessionMembership: old_count={}, new_count={}",
+                                    old_count, count
+                                );
+
+                                // Only update the session peer count if it has actually changed
+                                if old_count != count {
+                                    if let Ok(mut spc) = s_peer_counter_loop.try_lock() {
+                                        spc.session_peer_count = count;
+                                    }
+                                    debug!(
+                                        "Updated session peer count from {} to {}",
+                                        old_count, count
+                                    );
+                                }
 
                                 if old_count != count && count == 0 {
                                     reset_state(
@@ -210,11 +248,17 @@ impl Controller {
                                     .saw_session_timeline(*peer_session, *timeline)
                                     .await;
 
+                                let ghost_x_form = if let Ok(state) = s_state_loop.try_lock() {
+                                    state.ghost_x_form
+                                } else {
+                                    continue;
+                                };
+
                                 update_session_timing(
                                     s_state_loop.clone(),
                                     c_state_loop.clone(),
                                     new_timeline,
-                                    s_state_loop.try_lock().unwrap().ghost_x_form,
+                                    ghost_x_form,
                                     clock,
                                     s_stop_sync_enabled_loop.clone(),
                                 );
@@ -240,16 +284,27 @@ impl Controller {
                                     peer_session,
                                 );
 
-                                if *peer_session == peer_state_loop.try_lock().unwrap().session_id()
-                                    && peer_start_stop_state.timestamp
-                                        > s_state_loop
-                                            .try_lock()
-                                            .unwrap()
-                                            .start_stop_state
-                                            .timestamp
+                                let peer_session_id = if let Ok(ps) = peer_state_loop.try_lock() {
+                                    ps.session_id()
+                                } else {
+                                    continue;
+                                };
+
+                                let current_timestamp = if let Ok(s_state) = s_state_loop.try_lock()
                                 {
-                                    s_state_loop.try_lock().unwrap().start_stop_state =
-                                        *peer_start_stop_state;
+                                    s_state.start_stop_state.timestamp
+                                } else {
+                                    continue;
+                                };
+
+                                if *peer_session == peer_session_id
+                                    && peer_start_stop_state.timestamp > current_timestamp
+                                {
+                                    if let Ok(mut s_state) = s_state_loop.try_lock() {
+                                        s_state.start_stop_state = *peer_start_stop_state;
+                                    } else {
+                                        continue;
+                                    }
 
                                     update_discovery(
                                         s_state_loop.clone(),
@@ -258,26 +313,53 @@ impl Controller {
                                     )
                                     .await;
 
-                                    if *s_stop_sync_enabled_loop.try_lock().unwrap() {
-                                        let (timeline, ghost_x_form) = {
-                                            let s_state = s_state_loop.try_lock().unwrap();
-                                            (s_state.timeline, s_state.ghost_x_form)
+                                    let sync_enabled =
+                                        if let Ok(enabled) = s_stop_sync_enabled_loop.try_lock() {
+                                            *enabled
+                                        } else {
+                                            continue;
                                         };
-                                        c_state_loop.try_lock().unwrap().start_stop_state =
-                                            map_start_stop_state_from_session_to_client(
-                                                *peer_start_stop_state,
-                                                timeline,
-                                                ghost_x_form,
-                                            )
+
+                                    if sync_enabled {
+                                        let (timeline, ghost_x_form) =
+                                            if let Ok(s_state) = s_state_loop.try_lock() {
+                                                (s_state.timeline, s_state.ghost_x_form)
+                                            } else {
+                                                continue;
+                                            };
+
+                                        if let Ok(mut c_state) = c_state_loop.try_lock() {
+                                            c_state.start_stop_state =
+                                                map_start_stop_state_from_session_to_client(
+                                                    *peer_start_stop_state,
+                                                    timeline,
+                                                    ghost_x_form,
+                                                );
+                                        }
                                     }
                                 }
                             }
                             PeerStateChange::PeerLeft => {
-                                let s_id = peer_state_loop.try_lock().unwrap().session_id();
-                                let count = unique_session_peer_count(s_id, p_loop.clone());
-                                let old_count =
-                                    s_peer_counter_loop.try_lock().unwrap().session_peer_count;
-                                s_peer_counter_loop.try_lock().unwrap().session_peer_count = count;
+                                let s_id = if let Ok(ps) = peer_state_loop.try_lock() {
+                                    ps.session_id()
+                                } else {
+                                    continue;
+                                };
+                                let peer_ident = if let Ok(ps) = peer_state_loop.try_lock() {
+                                    ps.ident()
+                                } else {
+                                    continue;
+                                };
+                                let count =
+                                    unique_session_peer_count(s_id, p_loop.clone(), peer_ident);
+                                let old_count = if let Ok(spc) = s_peer_counter_loop.try_lock() {
+                                    spc.session_peer_count
+                                } else {
+                                    continue;
+                                };
+                                if let Ok(mut spc) = s_peer_counter_loop.try_lock() {
+                                    spc.session_peer_count = count;
+                                }
                                 if old_count != count && count == 0 {
                                     reset_state(
                                         peer_state_loop.clone(),
@@ -305,7 +387,7 @@ impl Controller {
             client_state,
             // last_is_playing_for_start_stop_state_callback: false,
             session_peer_counter: session_peer_counter.clone(),
-            enabled: Arc::new(Mutex::new(false)),
+            enabled,
             start_stop_sync_enabled,
             peers: peers.clone(),
             sessions,
@@ -317,8 +399,10 @@ impl Controller {
     }
 
     pub async fn enable(&mut self) {
-        *self.enabled.try_lock().unwrap() = true;
-        
+        if let Ok(mut enabled) = self.enabled.try_lock() {
+            *enabled = true;
+        }
+
         reset_state(
             self.peer_state.clone(),
             self.session_state.clone(),
@@ -342,25 +426,57 @@ impl Controller {
     }
 
     pub async fn disable(&mut self) {
-        *self.enabled.try_lock().unwrap() = false;
-        
+        // Send bye bye message before disabling to properly notify other peers
+        use crate::discovery::messenger::send_byebye;
+        let node_id = if let Ok(peer_state) = self.peer_state.try_lock() {
+            peer_state.node_state.node_id
+        } else {
+            return; // If we can't get the node_id, we can't send bye message
+        };
+        send_byebye(node_id);
+
+        if let Ok(mut enabled) = self.enabled.try_lock() {
+            *enabled = false;
+        }
+
+        // Reset peer count to 0 when disabled, like the C++ implementation
+        self.session_peer_counter
+            .try_lock()
+            .unwrap()
+            .session_peer_count = 0;
+
+        // Clear all peers from the discovery
+        self.discovery.observer.reset_peers();
+
+        // Give some time for the bye bye message to be sent and processed
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
         // TODO: Implement proper cleanup of discovery/networking
-        // For now, just set enabled to false
+        // For now, just set enabled to false and reset peers
     }
 
     pub async fn set_state(&self, mut new_client_state: IncomingClientState) {
         info!("setting state");
         if let Some(timeline) = new_client_state.timeline.as_mut() {
             *timeline = clamp_tempo(*timeline);
-            self.client_state.try_lock().unwrap().timeline = *timeline;
+            if let Ok(mut client_state) = self.client_state.try_lock() {
+                client_state.timeline = *timeline;
+            }
         }
 
         if let Some(mut start_stop_state) = new_client_state.start_stop_state {
-            start_stop_state = select_preferred_start_stop_state(
-                self.client_state.try_lock().unwrap().start_stop_state,
-                start_stop_state,
-            );
-            self.client_state.try_lock().unwrap().start_stop_state = start_stop_state;
+            let current_start_stop_state = if let Ok(client_state) = self.client_state.try_lock() {
+                client_state.start_stop_state
+            } else {
+                return; // If we can't access the state, exit early
+            };
+
+            start_stop_state =
+                select_preferred_start_stop_state(current_start_stop_state, start_stop_state);
+
+            if let Ok(mut client_state) = self.client_state.try_lock() {
+                client_state.start_stop_state = start_stop_state;
+            }
         }
 
         self.handle_client_state(new_client_state).await
@@ -372,11 +488,13 @@ impl Controller {
         info!("client_state: {:?}", client_state);
 
         if let Some(timeline) = client_state.timeline {
-            let (session_timeline, ghost_x_form) = {
-                let session_state = self.session_state.try_lock().unwrap();
-                (session_state.timeline, session_state.ghost_x_form)
-            };
-            
+            let (session_timeline, ghost_x_form) =
+                if let Ok(session_state) = self.session_state.try_lock() {
+                    (session_state.timeline, session_state.ghost_x_form)
+                } else {
+                    return; // If we can't access session state, exit early
+                };
+
             let session_timeline = update_session_timeline_from_client(
                 session_timeline,
                 timeline,
@@ -387,18 +505,27 @@ impl Controller {
             self.sessions.reset_timeline(session_timeline);
 
             // setSessionTimeline
-            let peer_session_id = self.peer_state.try_lock().unwrap().session_id();
-            for peer in self.peers.try_lock().unwrap().iter_mut().filter(|p| {
-                p.peer_state.session_id() == peer_session_id
-            }) {
-                peer.peer_state.node_state.timeline = session_timeline;
-            }
-            
-            let ghost_x_form = {
-                let session_state = self.session_state.try_lock().unwrap();
-                session_state.ghost_x_form
+            let peer_session_id = if let Ok(peer_state) = self.peer_state.try_lock() {
+                peer_state.session_id()
+            } else {
+                return; // If we can't access peer state, exit early
             };
-            
+
+            if let Ok(mut peers) = self.peers.try_lock() {
+                for peer in peers
+                    .iter_mut()
+                    .filter(|p| p.peer_state.session_id() == peer_session_id)
+                {
+                    peer.peer_state.node_state.timeline = session_timeline;
+                }
+            }
+
+            let ghost_x_form = if let Ok(session_state) = self.session_state.try_lock() {
+                session_state.ghost_x_form
+            } else {
+                return; // If we can't access session state, exit early
+            };
+
             update_session_timing(
                 self.session_state.clone(),
                 self.client_state.clone(),
@@ -412,34 +539,42 @@ impl Controller {
         }
 
         if let Some(client_start_stop_state) = client_state.start_stop_state {
-            if *self.start_stop_sync_enabled.try_lock().unwrap() {
-                let new_ghost_time = self
-                    .session_state
-                    .try_lock()
-                    .unwrap()
-                    .ghost_x_form
-                    .host_to_ghost(client_start_stop_state.timestamp);
+            let sync_enabled = if let Ok(enabled) = self.start_stop_sync_enabled.try_lock() {
+                *enabled
+            } else {
+                return; // If we can't access sync enabled state, exit early
+            };
 
-                if new_ghost_time
-                    > self
-                        .session_state
-                        .try_lock()
-                        .unwrap()
-                        .start_stop_state
-                        .timestamp
-                {
-                    let mut session_state = self.session_state.try_lock().unwrap();
-                    session_state.start_stop_state =
-                        map_start_stop_state_from_client_to_session(
-                            client_start_stop_state,
-                            session_state.timeline,
-                            session_state.ghost_x_form,
-                        );
+            if sync_enabled {
+                let new_ghost_time = if let Ok(session_state) = self.session_state.try_lock() {
+                    session_state
+                        .ghost_x_form
+                        .host_to_ghost(client_start_stop_state.timestamp)
+                } else {
+                    return; // If we can't access session state, exit early
+                };
 
-                    self.client_state.try_lock().unwrap().start_stop_state =
-                        client_start_stop_state;
+                let current_timestamp = if let Ok(session_state) = self.session_state.try_lock() {
+                    session_state.start_stop_state.timestamp
+                } else {
+                    return; // If we can't access session state, exit early
+                };
 
-                    must_update_discovery = true;
+                if new_ghost_time > current_timestamp {
+                    if let Ok(mut session_state) = self.session_state.try_lock() {
+                        session_state.start_stop_state =
+                            map_start_stop_state_from_client_to_session(
+                                client_start_stop_state,
+                                session_state.timeline,
+                                session_state.ghost_x_form,
+                            );
+
+                        if let Ok(mut client_state) = self.client_state.try_lock() {
+                            client_state.start_stop_state = client_start_stop_state;
+                        }
+
+                        must_update_discovery = true;
+                    }
                 }
             }
         }
@@ -456,15 +591,23 @@ impl Controller {
     }
 
     pub fn is_enabled(&self) -> bool {
-        *self.enabled.try_lock().unwrap()
+        self.enabled
+            .try_lock()
+            .map(|enabled| *enabled)
+            .unwrap_or(false)
     }
 
     pub fn is_start_stop_sync_enabled(&self) -> bool {
-        *self.start_stop_sync_enabled.try_lock().unwrap()
+        self.start_stop_sync_enabled
+            .try_lock()
+            .map(|enabled| *enabled)
+            .unwrap_or(false)
     }
 
     pub fn enable_start_stop_sync(&mut self, enable: bool) {
-        *self.start_stop_sync_enabled.try_lock().unwrap() = enable;
+        if let Ok(mut sync_enabled) = self.start_stop_sync_enabled.try_lock() {
+            *sync_enabled = enable;
+        }
     }
 
     pub fn num_peers(&self) -> usize {
@@ -487,8 +630,19 @@ pub async fn join_session(
     session_peer_count: Arc<Mutex<SessionPeerCounter>>,
     sessions: Sessions,
 ) {
-    let session_id_changed = peer_state.try_lock().unwrap().session_id() != session.session_id;
-    peer_state.try_lock().unwrap().node_state.session_id = session.session_id;
+    let session_id_changed = if let Ok(ps) = peer_state.try_lock() {
+        ps.session_id() != session.session_id
+    } else {
+        debug!("Failed to lock peer_state in join_session");
+        return;
+    };
+
+    if let Ok(mut ps) = peer_state.try_lock() {
+        ps.node_state.session_id = session.session_id;
+    } else {
+        debug!("Failed to lock peer_state to update session_id");
+        return;
+    };
 
     if session_id_changed {
         reset_session_start_stop_state(session_state.clone())
@@ -515,7 +669,7 @@ pub async fn join_session(
         // session_peer_counter(session_id, peers, session_peer_count);
 
         let s_id = peer_state.try_lock().unwrap().session_id();
-        let count = unique_session_peer_count(s_id, peers);
+        let count = unique_session_peer_count(s_id, peers, peer_state.try_lock().unwrap().ident());
         let old_count = session_peer_count.try_lock().unwrap().session_peer_count;
         session_peer_count.try_lock().unwrap().session_peer_count = count;
         if old_count != count && count == 0 {
@@ -542,9 +696,21 @@ pub async fn reset_state(
     clock: Clock,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
 ) {
-    let n_id = NodeId::new();
+    // Preserve the existing NodeId to maintain peer identity across enable/disable cycles
+    let existing_node_id = peer_state.try_lock().unwrap().node_state.node_id;
+
+    // Only generate a new NodeId if this is the very first initialization
+    let n_id = if existing_node_id == NodeId::default() {
+        NodeId::new()
+    } else {
+        existing_node_id
+    };
+
+    // Always create a new session when resetting state - this allows joining other sessions
+    let s_id = SessionId(n_id);
+
     peer_state.try_lock().unwrap().node_state.node_id = n_id;
-    peer_state.try_lock().unwrap().node_state.session_id = SessionId(n_id);
+    peer_state.try_lock().unwrap().node_state.session_id = s_id;
 
     let x_form = init_x_form(clock);
     let host_time = -x_form.intercept;
@@ -565,9 +731,8 @@ pub async fn reset_state(
     };
 
     info!(
-        "initializing new session {} with timeline {:?}",
-        peer_state.try_lock().unwrap().node_state.session_id,
-        new_tl,
+        "initializing session {} with timeline {:?} (preserving NodeId: {})",
+        s_id, new_tl, n_id,
     );
 
     reset_session_start_stop_state(session_state.clone());
@@ -584,7 +749,7 @@ pub async fn reset_state(
     update_discovery(session_state.clone(), peer_state.clone(), discovery.clone()).await;
 
     sessions.reset_session(Session {
-        session_id: peer_state.try_lock().unwrap().session_id(),
+        session_id: s_id,
         timeline: new_tl,
         measurement: SessionMeasurement {
             x_form,

@@ -33,7 +33,7 @@ fn print_help() {
     println!("  decrease / increase tempo: w / e");
     println!("  decrease / increase quantum: r / t");
     println!("  enable / disable start stop sync: s");
-    println!("  quit: q");
+    println!("  quit: q or Ctrl+C");
     println!();
 }
 
@@ -89,17 +89,40 @@ async fn handle_input(state: Arc<tokio::sync::Mutex<State>>) {
     let mut buffer = [0u8; 1];
 
     loop {
-        // Read input - this will block until input is available
+        // Check if we should exit before attempting to read
+        if !state.lock().await.running.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Read input character by character
         match stdin.read_exact(&mut buffer).await {
             Ok(_) => {
                 let input = buffer[0] as char;
+                let input_byte = buffer[0];
+
+                // Handle Ctrl+C as both character and signal
+                if input_byte == 0x03 {
+                    // Ctrl+C character (ETX) - handle it directly
+                    let mut state_guard = state.lock().await;
+                    state_guard.running.store(false, Ordering::Relaxed);
+                    drop(state_guard);
+                    enable_buffered_input();
+                    clear_line();
+                    std::process::exit(0);
+                }
 
                 let mut state_guard = state.lock().await;
+
+                // Check running flag again after getting input
+                if !state_guard.running.load(Ordering::Relaxed) {
+                    return;
+                }
+
                 let mut session_state = state_guard.link.capture_app_session_state();
 
                 match input {
-                    'q' | '\x03' => {
-                        // 'q' or Ctrl+C (0x03)
+                    'q' => {
+                        // 'q' for quit
                         state_guard.running.store(false, Ordering::Relaxed);
                         clear_line();
                         return;
@@ -157,7 +180,7 @@ async fn handle_input(state: Arc<tokio::sync::Mutex<State>>) {
                 }
             }
             Err(_) => {
-                // EOF or error, exit gracefully
+                // Error reading from stdin, exit gracefully
                 break;
             }
         }
@@ -168,12 +191,13 @@ fn disable_buffered_input() {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        use termios::{Termios, ECHO, ICANON, TCSANOW};
+        use termios::{Termios, ECHO, ICANON, ISIG, TCSANOW};
 
         let fd = io::stdin().as_raw_fd();
         if let Ok(mut termios) = Termios::from_fd(fd) {
-            termios.c_lflag &= !ICANON;
-            termios.c_lflag &= !ECHO;
+            termios.c_lflag &= !ICANON; // Disable canonical mode (line buffering)
+            termios.c_lflag &= !ECHO; // Disable echo
+            termios.c_lflag &= !ISIG; // Disable ISIG so Ctrl+C is read as character
             let _ = termios::tcsetattr(fd, TCSANOW, &termios);
         }
     }
@@ -183,12 +207,13 @@ fn enable_buffered_input() {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        use termios::{Termios, ECHO, ICANON, TCSANOW};
+        use termios::{Termios, ECHO, ICANON, ISIG, TCSANOW};
 
         let fd = io::stdin().as_raw_fd();
         if let Ok(mut termios) = Termios::from_fd(fd) {
-            termios.c_lflag |= ICANON;
-            termios.c_lflag |= ECHO;
+            termios.c_lflag |= ICANON; // Re-enable canonical mode
+            termios.c_lflag |= ECHO; // Re-enable echo
+            termios.c_lflag |= ISIG; // Ensure ISIG remains enabled for signal handling
             let _ = termios::tcsetattr(fd, TCSANOW, &termios);
         }
     }
@@ -275,7 +300,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             is_playing,
         );
 
-        sleep(Duration::from_millis(10)).await;
+        // Use a shorter sleep and check running flag more frequently
+        for _ in 0..10 {
+            sleep(Duration::from_millis(1)).await;
+            if !state.lock().await.running.load(Ordering::Relaxed) {
+                break;
+            }
+        }
     }
 
     // Cleanup

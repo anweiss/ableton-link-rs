@@ -573,6 +573,7 @@ mod tests {
                 notifier.clone(),
                 rx_measure_peer_state,
                 ping_responder_unicast_socket,
+                Arc::new(Mutex::new(true)),
             )
             .await,
             rx_event,

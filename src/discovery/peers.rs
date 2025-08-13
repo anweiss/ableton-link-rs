@@ -131,16 +131,24 @@ impl PeerState {
 pub fn unique_session_peer_count(
     session_id: SessionId,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
+    self_node_id: NodeId,
 ) -> usize {
-    let mut peers = peers
-        .try_lock()
-        .unwrap()
+    let all_peers = peers.try_lock().unwrap();
+    debug!("unique_session_peer_count: looking for session_id={}, self_node_id={}", session_id, self_node_id);
+    debug!("unique_session_peer_count: total peers in list: {}", all_peers.len());
+    
+    for (i, peer) in all_peers.iter().enumerate() {
+        debug!("  peer[{}]: node_id={}, session_id={}", i, peer.peer_state.ident(), peer.peer_state.session_id());
+    }
+    
+    let mut peers = all_peers
         .iter()
-        .filter(|p| p.peer_state.session_id() == session_id)
+        .filter(|p| p.peer_state.session_id() == session_id && p.peer_state.ident() != self_node_id)
         .cloned()
         .collect::<Vec<_>>();
     peers.dedup_by(|a, b| a.peer_state.ident() == b.peer_state.ident());
 
+    debug!("unique_session_peer_count: filtered peers count: {}", peers.len());
     peers.len()
 }
 
@@ -155,10 +163,16 @@ pub enum PeerStateChange {
 async fn saw_peer(
     peer_seen_peer_state: PeerState,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
-    _self_peer_state: Arc<Mutex<PeerState>>,
+    self_peer_state: Arc<Mutex<PeerState>>,
     _session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
     tx_peer_state_change: Sender<Vec<PeerStateChange>>,
 ) {
+    // Additional safety check: Don't add ourselves to our own peer list
+    if peer_seen_peer_state.ident() == self_peer_state.try_lock().unwrap().ident() {
+        debug!("ignoring peer state from self (node {})", peer_seen_peer_state.ident());
+        return;
+    }
+
     let ps = PeerState {
         node_state: peer_seen_peer_state.node_state,
         measurement_endpoint: peer_seen_peer_state.measurement_endpoint,
@@ -180,20 +194,23 @@ async fn saw_peer(
 
     let peer = ControllerPeer { peer_state: ps };
 
-    let did_session_membership_change = if !peers
+    let existing_peer_index = peers
         .try_lock()
         .unwrap()
         .iter()
-        .any(|p| p.peer_state.ident() == peer.peer_state.ident())
-    {
+        .position(|p| p.peer_state.ident() == peer.peer_state.ident());
+
+    let did_session_membership_change = if let Some(index) = existing_peer_index {
+        // Update existing peer with new state
+        let old_session_id = peers.try_lock().unwrap()[index].peer_state.session_id();
+        peers.try_lock().unwrap()[index] = peer.clone();
+        
+        // Session membership changed if the session ID changed
+        old_session_id != peer_session
+    } else {
+        // Add new peer
         peers.try_lock().unwrap().push(peer.clone());
         true
-    } else {
-        peers
-            .try_lock()
-            .unwrap()
-            .iter()
-            .all(|p| p.peer_state.session_id() != peer_session)
     };
 
     let mut peer_state_changes = vec![];
@@ -221,7 +238,9 @@ async fn saw_peer(
 
     if !peer_state_changes.is_empty() {
         debug!("sending peer state changes to controller");
-        tx_peer_state_change.send(peer_state_changes).await.unwrap();
+        if let Err(e) = tx_peer_state_change.send(peer_state_changes).await {
+            debug!("Failed to send peer state changes: {}", e);
+        }
     }
 }
 
@@ -243,10 +262,12 @@ async fn peer_left(
     });
 
     if did_session_membership_change {
-        tx_peer_state_change
+        if let Err(e) = tx_peer_state_change
             .send(vec![PeerStateChange::PeerLeft])
             .await
-            .unwrap();
+        {
+            debug!("Failed to send peer left event: {}", e);
+        }
     }
 }
 
@@ -380,6 +401,7 @@ mod tests {
                 notifier.clone(),
                 rx_measure_peer_state,
                 ping_responder_unicast_socket,
+                Arc::new(Mutex::new(true)), // enabled for test
             )
             .await,
             tx_peer_state_change,
