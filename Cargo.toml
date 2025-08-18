@@ -1,6 +1,6 @@
 [package]
 name = "ableton-link-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Native Rust implementation of the Ableton Link protocol"
 license = "GPL-3.0"
@@ -38,12 +38,12 @@ triple_buffer = "8.1.1"
 rodio = "0.21.1"
 if-addrs = "0.10.2"
 
+[dependencies.libc]
+version = "0.2"
+
 [dev-dependencies]
 console-subscriber = "0.2.0"
 
 [[example]]
 name = "rusthut"
 path = "examples/rusthut.rs"
-
-[dependencies.libc]
-version = "0.2"
