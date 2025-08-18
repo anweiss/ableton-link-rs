@@ -186,16 +186,26 @@ mod tests {
 
         // Test single scan
         scanner.scan_once().await;
-        
+
         let scanned_interfaces = interfaces.lock().unwrap().clone();
-        assert!(!scanned_interfaces.is_empty(), "Should find at least one interface");
+        assert!(
+            !scanned_interfaces.is_empty(),
+            "Should find at least one interface"
+        );
 
         // Verify we found some usable interfaces
         for addr in &scanned_interfaces {
-            assert!(is_usable_interface(addr), "All returned interfaces should be usable");
+            assert!(
+                is_usable_interface(addr),
+                "All returned interfaces should be usable"
+            );
         }
 
-        info!("Found {} interfaces: {:?}", scanned_interfaces.len(), scanned_interfaces);
+        info!(
+            "Found {} interfaces: {:?}",
+            scanned_interfaces.len(),
+            scanned_interfaces
+        );
     }
 
     #[test]
@@ -210,6 +220,8 @@ mod tests {
         assert!(!is_usable_ipv6(&Ipv6Addr::LOCALHOST)); // ::1
         assert!(!is_usable_ipv6(&Ipv6Addr::UNSPECIFIED)); // ::
         assert!(is_usable_ipv6(&Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))); // Link-local
-        assert!(is_usable_ipv6(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))); // Global unicast
+        assert!(is_usable_ipv6(&Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+        ))); // Global unicast
     }
 }

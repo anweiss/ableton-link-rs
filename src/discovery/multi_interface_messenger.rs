@@ -155,7 +155,7 @@ impl MultiInterfaceMessenger {
         addr: IpAddr,
     ) -> Result<UdpSocket, Box<dyn std::error::Error + Send + Sync>> {
         let socket_addr = to_socket_addr(addr);
-        let socket = new_udp_reuseport(socket_addr.into())?;
+        let socket = new_udp_reuseport(socket_addr)?;
 
         // Join multicast group
         if let IpAddr::V4(ipv4_addr) = addr {

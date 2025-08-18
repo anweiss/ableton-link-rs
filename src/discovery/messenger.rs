@@ -64,7 +64,7 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     udp_sock.set_nonblocking(true)?;
     udp_sock.bind(&socket2::SockAddr::from(addr))?;
     let udp_sock: std::net::UdpSocket = udp_sock.into();
-    Ok(udp_sock.try_into()?)
+    udp_sock.try_into()
 }
 
 pub struct Messenger {

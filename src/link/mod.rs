@@ -104,7 +104,7 @@ impl BasicLink {
         F: Fn(usize) + Send + 'static,
     {
         self.peer_count_callback = Some(Arc::new(Mutex::new(Box::new(callback))));
-        
+
         // Trigger initial callback with current peer count
         let current_count = self.num_peers();
         if let Some(ref callback) = self.peer_count_callback {
@@ -119,7 +119,7 @@ impl BasicLink {
         F: Fn(f64) + Send + 'static,
     {
         self.tempo_callback = Some(Arc::new(Mutex::new(Box::new(callback))));
-        
+
         // Trigger initial callback with current tempo
         if let Ok(client_state) = self.controller.client_state.try_lock() {
             if let Some(ref callback) = self.tempo_callback {
@@ -135,7 +135,7 @@ impl BasicLink {
         F: Fn(bool) + Send + 'static,
     {
         self.start_stop_callback = Some(Arc::new(Mutex::new(Box::new(callback))));
-        
+
         // Update our cached playing state and trigger initial callback
         if let Ok(client_state) = self.controller.client_state.try_lock() {
             self.last_is_playing_for_callback = client_state.start_stop_state.is_playing;
@@ -183,17 +183,14 @@ impl BasicLink {
     pub fn commit_audio_session_state(&mut self, state: SessionState) {
         let current_time = self.clock.micros();
         let is_enabled = self.is_enabled();
-        
-        let incoming_state = to_incoming_client_state(
-            &state.state,
-            &state.original_state,
-            current_time,
-        );
+
+        let incoming_state =
+            to_incoming_client_state(&state.state, &state.original_state, current_time);
 
         // Use real-time handler if available
         if let Some(ref mut handler) = self.rt_session_handler {
             handler.update_rt_client_state(incoming_state, current_time, is_enabled);
-            
+
             // Process any pending updates to sync with the main controller
             if let Some(processed_state) = handler.process_pending_updates() {
                 // This should be done asynchronously in a real implementation
@@ -230,14 +227,12 @@ impl BasicLink {
     }
 
     pub async fn commit_app_session_state(&mut self, state: SessionState) {
-        let incoming_state = to_incoming_client_state(
-            &state.state,
-            &state.original_state,
-            self.clock.micros(),
-        );
+        let incoming_state =
+            to_incoming_client_state(&state.state, &state.original_state, self.clock.micros());
 
         // Check if start/stop state changed for callback
-        let should_invoke_callback = if let Some(start_stop_state) = incoming_state.start_stop_state {
+        let should_invoke_callback = if let Some(start_stop_state) = incoming_state.start_stop_state
+        {
             let changed = self.last_is_playing_for_callback != start_stop_state.is_playing;
             if changed {
                 self.last_is_playing_for_callback = start_stop_state.is_playing;
