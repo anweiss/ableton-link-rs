@@ -326,7 +326,16 @@ impl Measurement {
     pub async fn listen(&mut self) {
         let socket = self.unicast_socket.as_ref().unwrap().clone();
         let endpoint = *self.measurement_endpoint.as_ref().unwrap();
-        socket.connect(endpoint).await.unwrap();
+
+        // Handle connection failure gracefully
+        if let Err(e) = socket.connect(endpoint).await {
+            debug!(
+                "Failed to connect to measurement endpoint {}: {}",
+                endpoint, e
+            );
+            return;
+        }
+
         let clock = self.clock;
         let s_id = self.session_id;
         let data = self.data.clone();
@@ -342,8 +351,14 @@ impl Measurement {
             loop {
                 let mut buf = [0; MAX_MESSAGE_SIZE];
 
-                // TODO: check to see if peer has left before receiving pong
-                let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
+                // Handle receive failure gracefully - peer may have disconnected
+                let (amt, src) = match socket.recv_from(&mut buf).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        debug!("Failed to receive from measurement socket: {}", e);
+                        break;
+                    }
+                };
 
                 let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
                 if header.message_type == PONG {
@@ -435,14 +450,17 @@ async fn reset_timer(
                         time: clock.micros(),
                     };
 
-                    let _ = send_ping(
+                    if let Err(e) = send_ping(
                         unicast_socket.as_ref().unwrap().clone(),
                         measurement_endpoint,
                         &Payload {
                             entries: vec![PayloadEntry::HostTime(ht)],
                         },
                     )
-                    .await.unwrap();
+                    .await {
+                        debug!("Failed to send ping to {}: {}", measurement_endpoint, e);
+                        break;
+                    }
 
                     tokio::time::sleep(Duration::seconds(1).to_std().unwrap()).await;
 
@@ -555,7 +573,8 @@ mod tests {
             })
             .unwrap();
 
-        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
+        let ping_responder_unicast_socket =
+            Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
 
         (
             PeerGateway::new(

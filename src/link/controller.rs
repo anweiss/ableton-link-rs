@@ -433,10 +433,12 @@ impl Controller {
         } else {
             return; // If we can't get the node_id, we can't send bye message
         };
+        info!("Disabling Link instance, sending bye-bye message for node {}", node_id);
         send_byebye(node_id);
 
         if let Ok(mut enabled) = self.enabled.try_lock() {
             *enabled = false;
+            info!("Set Link enabled state to false");
         }
 
         // Reset peer count to 0 when disabled, like the C++ implementation
@@ -444,12 +446,15 @@ impl Controller {
             .try_lock()
             .unwrap()
             .session_peer_count = 0;
+        info!("Reset session peer count to 0");
 
         // Clear all peers from the discovery
         self.discovery.observer.reset_peers();
+        info!("Reset discovery peers");
 
         // Give some time for the bye bye message to be sent and processed
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        info!("Completed Link disable process");
 
         // TODO: Implement proper cleanup of discovery/networking
         // For now, just set enabled to false and reset peers
