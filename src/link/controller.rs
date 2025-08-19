@@ -98,7 +98,8 @@ impl Controller {
             })
             .unwrap();
 
-        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
+        let ping_responder_unicast_socket =
+            Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
 
         let discovery = Arc::new(
             PeerGateway::new(
@@ -433,7 +434,10 @@ impl Controller {
         } else {
             return; // If we can't get the node_id, we can't send bye message
         };
-        info!("Disabling Link instance, sending bye-bye message for node {}", node_id);
+        info!(
+            "Disabling Link instance, sending bye-bye message for node {}",
+            node_id
+        );
         send_byebye(node_id);
 
         if let Ok(mut enabled) = self.enabled.try_lock() {
@@ -442,11 +446,10 @@ impl Controller {
         }
 
         // Reset peer count to 0 when disabled, like the C++ implementation
-        self.session_peer_counter
-            .try_lock()
-            .unwrap()
-            .session_peer_count = 0;
-        info!("Reset session peer count to 0");
+        if let Ok(mut counter) = self.session_peer_counter.try_lock() {
+            counter.session_peer_count = 0;
+            info!("Reset session peer count to 0");
+        }
 
         // Clear all peers from the discovery
         self.discovery.observer.reset_peers();
@@ -618,8 +621,8 @@ impl Controller {
     pub fn num_peers(&self) -> usize {
         self.session_peer_counter
             .try_lock()
-            .unwrap()
-            .session_peer_count
+            .map(|counter| counter.session_peer_count)
+            .unwrap_or(0) // Return 0 if lock is contended
     }
 }
 
@@ -662,6 +665,15 @@ pub async fn join_session(
         start_stop_sync_enabled.clone(),
     );
 
+    // Verify that client state was actually updated
+    if let Ok(client_state_check) = client_state.try_lock() {
+        info!(
+            "after joining session {}, client state tempo is now: {}",
+            session.session_id,
+            client_state_check.timeline.tempo.bpm()
+        );
+    }
+
     update_discovery(session_state.clone(), peer_state.clone(), discovery.clone()).await;
 
     if session_id_changed {
@@ -673,19 +685,19 @@ pub async fn join_session(
 
         // session_peer_counter(session_id, peers, session_peer_count);
 
-        let should_reset = if let (Ok(peer_state_guard), Ok(mut session_peer_count_guard)) = 
-            (peer_state.try_lock(), session_peer_count.try_lock()) {
-            
+        let should_reset = if let (Ok(peer_state_guard), Ok(mut session_peer_count_guard)) =
+            (peer_state.try_lock(), session_peer_count.try_lock())
+        {
             let s_id = peer_state_guard.session_id();
             let count = unique_session_peer_count(s_id, peers, peer_state_guard.ident());
             let old_count = session_peer_count_guard.session_peer_count;
             session_peer_count_guard.session_peer_count = count;
-            
+
             old_count != count && count == 0
         } else {
             false
         };
-        
+
         if should_reset {
             reset_state(
                 peer_state.clone(),
@@ -724,7 +736,8 @@ pub async fn reset_state(
         existing_node_id
     };
 
-    // Always create a new session when resetting state - this allows joining other sessions
+    // Create a temporary session while waiting for discovery
+    // This session will be replaced if we find a better session on the network
     let s_id = SessionId(n_id);
 
     if let Ok(mut peer_state_guard) = peer_state.try_lock() {
@@ -736,7 +749,10 @@ pub async fn reset_state(
     let host_time = -x_form.intercept;
 
     let (timeline, ghost_x_form) = if let Ok(session_state_guard) = session_state.try_lock() {
-        (session_state_guard.timeline, session_state_guard.ghost_x_form)
+        (
+            session_state_guard.timeline,
+            session_state_guard.ghost_x_form,
+        )
     } else {
         // Fallback to default values if lock fails
         (Timeline::default(), GhostXForm::default())
@@ -750,7 +766,7 @@ pub async fn reset_state(
     };
 
     info!(
-        "initializing session {} with timeline {:?} (preserving NodeId: {})",
+        "initializing temporary session {} with timeline {:?} (preserving NodeId: {})",
         s_id, new_tl, n_id,
     );
 
@@ -784,25 +800,27 @@ pub async fn update_discovery(
     peer_state: Arc<Mutex<PeerState>>,
     discovery: Arc<PeerGateway>,
 ) {
-    let (timeline, start_stop_state, ghost_xform) = if let Ok(session_state_guard) = session_state.try_lock() {
-        (
-            session_state_guard.timeline,
-            session_state_guard.start_stop_state,
-            session_state_guard.ghost_x_form,
-        )
-    } else {
-        return; // Skip update if we can't get the lock
-    };
+    let (timeline, start_stop_state, ghost_xform) =
+        if let Ok(session_state_guard) = session_state.try_lock() {
+            (
+                session_state_guard.timeline,
+                session_state_guard.start_stop_state,
+                session_state_guard.ghost_x_form,
+            )
+        } else {
+            return; // Skip update if we can't get the lock
+        };
 
-    let (node_id, session_id, measurement_endpoint) = if let Ok(peer_state_guard) = peer_state.try_lock() {
-        (
-            peer_state_guard.node_state.node_id,
-            peer_state_guard.session_id(),
-            peer_state_guard.measurement_endpoint,
-        )
-    } else {
-        return; // Skip update if we can't get the lock
-    };
+    let (node_id, session_id, measurement_endpoint) =
+        if let Ok(peer_state_guard) = peer_state.try_lock() {
+            (
+                peer_state_guard.node_state.node_id,
+                peer_state_guard.session_id(),
+                peer_state_guard.measurement_endpoint,
+            )
+        } else {
+            return; // Skip update if we can't get the lock
+        };
 
     discovery
         .update_node_state(
@@ -845,14 +863,16 @@ pub fn update_session_timing(
             if let Ok(mut client_state_guard) = client_state.try_lock() {
                 let old_client_timeline = client_state_guard.timeline;
                 client_state_guard.timeline = update_client_timeline_from_session(
-                    new_timeline,
-                    old_client_timeline,
+                    old_client_timeline, // Current client timeline
+                    new_timeline,        // Session timeline to sync to
                     clock.micros(),
                     new_x_form,
                 );
 
                 if let Ok(start_stop_enabled) = start_stop_sync_enabled.try_lock() {
-                    if *start_stop_enabled && session_state.start_stop_state != StartStopState::default() {
+                    if *start_stop_enabled
+                        && session_state.start_stop_state != StartStopState::default()
+                    {
                         client_state_guard.start_stop_state =
                             map_start_stop_state_from_session_to_client(
                                 session_state.start_stop_state,

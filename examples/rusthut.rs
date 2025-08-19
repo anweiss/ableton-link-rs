@@ -149,6 +149,7 @@ struct State {
     quantum: f64,
     is_playing: bool, // Track local playing state like C++ AudioEngine
     metronome: Option<MetronomeHandle>, // Optional in case audio initialization fails
+    last_tempo_change: Option<(f64, std::time::Instant)>, // Track recent tempo changes for immediate display
 }
 
 impl State {
@@ -169,6 +170,7 @@ impl State {
             quantum: 4.0,
             is_playing: false,
             metronome,
+            last_tempo_change: None,
         }
     }
 }
@@ -204,6 +206,7 @@ fn print_state(
     quantum: f64,
     start_stop_sync: bool,
     is_playing: bool,
+    tempo_override: Option<f64>,
 ) {
     let enabled = if link_enabled { "yes" } else { "no" };
     let beats = session_state.beat_at_time(time, quantum);
@@ -211,15 +214,11 @@ fn print_state(
     let start_stop = if start_stop_sync { "yes" } else { "no" };
     let playing_status = if is_playing { "[playing]" } else { "[stopped]" };
 
+    let tempo_to_display = tempo_override.unwrap_or_else(|| session_state.tempo());
+
     print!(
         "{:<7} | {:<9} | {:<7.0} | {:<3} {:<11} | {:<7.2} | {:<7.2} | ",
-        enabled,
-        num_peers,
-        quantum,
-        start_stop,
-        playing_status,
-        session_state.tempo(),
-        beats
+        enabled, num_peers, quantum, start_stop, playing_status, tempo_to_display, beats
     );
 
     for i in 0..(quantum.ceil() as i32) {
@@ -233,10 +232,7 @@ fn print_state(
 }
 
 async fn handle_input(state: Arc<tokio::sync::Mutex<State>>) {
-    use tokio::io::{stdin, AsyncReadExt};
-
-    let mut stdin = stdin();
-    let mut buffer = [0u8; 1];
+    use std::io::Read;
 
     loop {
         // Check if we should exit before attempting to read
@@ -244,95 +240,111 @@ async fn handle_input(state: Arc<tokio::sync::Mutex<State>>) {
             return;
         }
 
-        // Read input character by character
-        match stdin.read_exact(&mut buffer).await {
-            Ok(_) => {
-                let input = buffer[0] as char;
-                let input_byte = buffer[0];
+        // Use blocking read in a separate thread to avoid async issues
+        let input_result = tokio::task::spawn_blocking(|| {
+            let mut stdin = std::io::stdin();
+            let mut buffer = [0u8; 1];
+            match stdin.read_exact(&mut buffer) {
+                Ok(_) => Some(buffer[0] as char),
+                Err(_) => None,
+            }
+        })
+        .await;
 
-                // Handle Ctrl+C as both character and signal
-                if input_byte == 0x03 {
-                    // Ctrl+C character (ETX) - handle it directly
-                    let state_guard = state.lock().await;
+        if let Ok(Some(input)) = input_result {
+            // Handle Ctrl+C as both character and signal
+            if input as u8 == 0x03 {
+                // Ctrl+C character (ETX) - handle it directly
+                let state_guard = state.lock().await;
+                state_guard.running.store(false, Ordering::Relaxed);
+                drop(state_guard);
+                enable_buffered_input();
+                clear_line();
+                std::process::exit(0);
+            }
+
+            let mut state_guard = state.lock().await;
+
+            // Check running flag again after getting input
+            if !state_guard.running.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let mut session_state = state_guard.link.capture_app_session_state();
+
+            match input {
+                'q' => {
+                    // 'q' for quit
                     state_guard.running.store(false, Ordering::Relaxed);
-                    drop(state_guard);
-                    enable_buffered_input();
                     clear_line();
-                    std::process::exit(0);
-                }
-
-                let mut state_guard = state.lock().await;
-
-                // Check running flag again after getting input
-                if !state_guard.running.load(Ordering::Relaxed) {
                     return;
                 }
-
-                let mut session_state = state_guard.link.capture_app_session_state();
-
-                match input {
-                    'q' => {
-                        // 'q' for quit
-                        state_guard.running.store(false, Ordering::Relaxed);
-                        clear_line();
-                        return;
+                'a' => {
+                    let enabled = state_guard.link.is_enabled();
+                    if enabled {
+                        state_guard.link.disable().await;
+                    } else {
+                        state_guard.link.enable().await;
                     }
-                    'a' => {
-                        let enabled = state_guard.link.is_enabled();
-                        if enabled {
-                            state_guard.link.disable().await;
-                        } else {
-                            state_guard.link.enable().await;
-                        }
-                    }
-                    'w' => {
-                        let new_tempo = (session_state.tempo() - 1.0).max(20.0); // Min tempo like C++
-                        session_state.set_tempo(new_tempo, session_state.time_for_is_playing());
-                        state_guard
-                            .link
-                            .commit_app_session_state(session_state)
-                            .await;
-                    }
-                    'e' => {
-                        let new_tempo = (session_state.tempo() + 1.0).min(999.0); // Max tempo like C++
-                        session_state.set_tempo(new_tempo, session_state.time_for_is_playing());
-                        state_guard
-                            .link
-                            .commit_app_session_state(session_state)
-                            .await;
-                    }
-                    'r' => {
-                        state_guard.quantum = (state_guard.quantum - 1.0).max(1.0);
-                    }
-                    't' => {
-                        state_guard.quantum = (state_guard.quantum + 1.0).min(16.0);
-                        // Reasonable max
-                    }
-                    's' => {
-                        let current_sync = state_guard.link.is_start_stop_sync_enabled();
-                        state_guard.link.enable_start_stop_sync(!current_sync);
-                    }
-                    ' ' => {
-                        let was_playing = session_state.is_playing();
-                        if was_playing {
-                            let current_time = state_guard.link.clock().micros();
-                            session_state.set_is_playing(false, current_time);
-                        } else {
-                            let current_time = state_guard.link.clock().micros();
-                            session_state.set_is_playing(true, current_time);
-                        }
-                        state_guard
-                            .link
-                            .commit_app_session_state(session_state)
-                            .await;
-                    }
-                    _ => {}
                 }
+                'w' => {
+                    let new_tempo = (session_state.tempo() - 1.0).max(20.0); // Min tempo like C++
+                    let current_time = state_guard.link.clock().micros();
+                    session_state.set_tempo(new_tempo, current_time);
+
+                    // Store the tempo change for immediate display feedback
+                    state_guard.last_tempo_change = Some((new_tempo, std::time::Instant::now()));
+
+                    // Commit the change to Link in background
+                    state_guard
+                        .link
+                        .commit_app_session_state(session_state)
+                        .await;
+                }
+                'e' => {
+                    let new_tempo = (session_state.tempo() + 1.0).min(999.0); // Max tempo like C++
+                    let current_time = state_guard.link.clock().micros();
+                    session_state.set_tempo(new_tempo, current_time);
+
+                    // Store the tempo change for immediate display feedback
+                    state_guard.last_tempo_change = Some((new_tempo, std::time::Instant::now()));
+
+                    // Commit the change to Link in background
+                    state_guard
+                        .link
+                        .commit_app_session_state(session_state)
+                        .await;
+                }
+                'r' => {
+                    state_guard.quantum = (state_guard.quantum - 1.0).max(1.0);
+                }
+                't' => {
+                    state_guard.quantum = (state_guard.quantum + 1.0).min(16.0);
+                    // Reasonable max
+                }
+                's' => {
+                    let current_sync = state_guard.link.is_start_stop_sync_enabled();
+                    state_guard.link.enable_start_stop_sync(!current_sync);
+                }
+                ' ' => {
+                    let was_playing = session_state.is_playing();
+                    if was_playing {
+                        let current_time = state_guard.link.clock().micros();
+                        session_state.set_is_playing(false, current_time);
+                    } else {
+                        let current_time = state_guard.link.clock().micros();
+                        session_state.set_is_playing(true, current_time);
+                    }
+                    state_guard
+                        .link
+                        .commit_app_session_state(session_state)
+                        .await;
+                }
+                _ => {}
             }
-            Err(_) => {
-                // Error reading from stdin, exit gracefully
-                break;
-            }
+        } else {
+            // No input or error, yield to other tasks
+            tokio::task::yield_now().await;
         }
     }
 }
@@ -483,42 +495,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Main display loop
     while state.lock().await.running.load(Ordering::Relaxed) {
-        let (mut session_state, link_enabled, num_peers, quantum, start_stop_sync) = {
-            let state_guard = state.lock().await;
+        // Capture all state in a single lock acquisition to ensure consistency
+        let (
+            time,
+            session_state,
+            link_enabled,
+            num_peers,
+            quantum,
+            start_stop_sync,
+            should_commit,
+            tempo_override,
+        ) = {
+            let mut state_guard = state.lock().await;
+            let time = state_guard.link.clock().micros();
             let session_state = state_guard.link.capture_app_session_state();
             let link_enabled = state_guard.link.is_enabled();
             let num_peers = state_guard.link.num_peers();
             let quantum = state_guard.quantum;
             let start_stop_sync = state_guard.link.is_start_stop_sync_enabled();
 
-            (
-                session_state,
-                link_enabled,
-                num_peers,
-                quantum,
-                start_stop_sync,
-            )
-        };
+            // Check for cached tempo change for immediate display feedback
+            let tempo_override =
+                if let Some((cached_tempo, change_time)) = state_guard.last_tempo_change {
+                    let elapsed = change_time.elapsed();
+                    if elapsed < std::time::Duration::from_millis(200) {
+                        // Use cached tempo for immediate feedback (longer timeout)
+                        Some(cached_tempo)
+                    } else {
+                        // Clear the cached tempo change after timeout
+                        state_guard.last_tempo_change = None;
+                        None
+                    }
+                } else {
+                    None
+                };
 
-        // Critical: Check for playing state transitions like C++ AudioEngine
-        let mut should_commit = false;
-        {
-            let mut state_guard = state.lock().await;
+            // Check for playing state transitions
             let local_is_playing = state_guard.is_playing;
             let session_is_playing = session_state.is_playing();
+            let mut should_commit = false;
 
             if !local_is_playing && session_is_playing {
                 // Transition from not playing to playing - reset beat to 0
-                session_state.request_beat_at_start_playing_time(0.0, quantum);
+                let mut modified_session_state = session_state;
+                modified_session_state.request_beat_at_start_playing_time(0.0, quantum);
                 state_guard.is_playing = true;
                 should_commit = true;
+                (
+                    time,
+                    modified_session_state,
+                    link_enabled,
+                    num_peers,
+                    quantum,
+                    start_stop_sync,
+                    should_commit,
+                    tempo_override,
+                )
             } else if local_is_playing && !session_is_playing {
                 // Transition from playing to not playing
                 state_guard.is_playing = false;
+                (
+                    time,
+                    session_state,
+                    link_enabled,
+                    num_peers,
+                    quantum,
+                    start_stop_sync,
+                    should_commit,
+                    tempo_override,
+                )
+            } else {
+                (
+                    time,
+                    session_state,
+                    link_enabled,
+                    num_peers,
+                    quantum,
+                    start_stop_sync,
+                    should_commit,
+                    tempo_override,
+                )
             }
-        }
+        };
 
-        // Commit any timeline modifications
+        // Commit any timeline modifications outside the lock
         if should_commit {
             let mut state_guard = state.lock().await;
             state_guard
@@ -527,15 +587,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await;
         }
 
-        // Get the final state for display
-        let (time, session_state, is_playing) = {
-            let state_guard = state.lock().await;
-            let time = state_guard.link.clock().micros();
-            let session_state = state_guard.link.capture_app_session_state();
-            let is_playing = session_state.is_playing();
-
-            (time, session_state, is_playing)
-        };
+        let is_playing = session_state.is_playing();
 
         print_state(
             time,
@@ -545,15 +597,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             quantum,
             start_stop_sync,
             is_playing,
+            tempo_override,
         );
 
-        // Use a shorter sleep and check running flag more frequently
-        for _ in 0..10 {
-            sleep(Duration::from_millis(1)).await;
-            if !state.lock().await.running.load(Ordering::Relaxed) {
-                break;
-            }
-        }
+        // Use a longer sleep to reduce display update frequency and prevent flickering
+        sleep(Duration::from_millis(10)).await;
     }
 
     // Cleanup

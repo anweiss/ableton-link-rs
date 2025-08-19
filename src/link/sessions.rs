@@ -359,12 +359,29 @@ pub async fn handle_successful_measurement(
                    ghost_diff.num_microseconds().unwrap(),
                    SESSION_EPS.num_microseconds().unwrap());
 
-            if ghost_diff > SESSION_EPS
-                || (ghost_diff.num_microseconds().unwrap().abs()
-                    < SESSION_EPS.num_microseconds().unwrap()
-                    && session_id < current.try_lock().unwrap().session_id)
-            {
-                debug!("Session {} wins over current session, switching!", session_id);
+            // Session switching logic: be selective about when to join other sessions
+            // 1. Always join if we have significantly better timing (>500ms)
+            // 2. Join if times are similar and we prefer older session IDs
+            // 3. Join if we just started up and have no peers (prefer any established session)
+            let current_session_has_no_peers = session_peers(peers.clone(), current.try_lock().unwrap().session_id).is_empty();
+            let just_started = current_session_has_no_peers && measurement.timestamp < Duration::seconds(5);
+            let current_session_id = current.try_lock().unwrap().session_id;
+            
+            let should_switch = 
+                // Significant timing advantage
+                ghost_diff > SESSION_EPS
+                // Similar timing, prefer older session
+                || (ghost_diff.num_microseconds().unwrap().abs() < SESSION_EPS.num_microseconds().unwrap()
+                    && session_id < current_session_id)
+                // Just started, prefer any established session over isolation
+                || just_started;
+
+            if should_switch {
+                info!("Session {} wins over current session (ghost_diff={} us, just_started={}, tempo={}), switching!", 
+                      session_id, 
+                      ghost_diff.num_microseconds().unwrap(),
+                      just_started,
+                      s.timeline.tempo.bpm());
                 let c = current.try_lock().unwrap().clone();
 
                 *current.try_lock().unwrap() = s.clone();
@@ -377,7 +394,10 @@ pub async fn handle_successful_measurement(
 
                 schedule_remeasurement(peers.clone(), tx_measure_peer_state.clone(), s).await;
             } else {
-                debug!("Session {} does not win over current session, staying with current", session_id);
+                debug!("Session {} does not win over current session (ghost_diff={} us, just_started={}), staying with current", 
+                       session_id, 
+                       ghost_diff.num_microseconds().unwrap(),
+                       just_started);
             }
         }
     }

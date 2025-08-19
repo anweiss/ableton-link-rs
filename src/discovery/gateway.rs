@@ -75,13 +75,16 @@ impl PeerGateway {
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
         // let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(UNICAST_IP_ANY));
-        peer_state.try_lock().unwrap().measurement_endpoint = if let SocketAddr::V4(socket_addr) =
-            ping_responder_unicast_socket.local_addr().unwrap()
-        {
-            Some(socket_addr)
-        } else {
-            None
-        };
+        
+        if let Ok(mut state) = peer_state.try_lock() {
+            state.measurement_endpoint = if let SocketAddr::V4(socket_addr) =
+                ping_responder_unicast_socket.local_addr().unwrap()
+            {
+                Some(socket_addr)
+            } else {
+                None
+            };
+        }
 
         let messenger = Messenger::new(
             peer_state.clone(),
@@ -131,13 +134,19 @@ impl PeerGateway {
             .update_node_state(node_state.session_id, ghost_xform)
             .await;
 
-        self.peer_state.try_lock().unwrap().node_state = node_state;
+        if let Ok(mut state) = self.peer_state.try_lock() {
+            state.node_state = node_state;
+        }
     }
 
     pub async fn listen(&self, mut rx_event: Receiver<OnEvent>, notifier: Arc<Notify>) {
+        let node_id = self.peer_state.try_lock()
+            .map(|state| state.node_state.node_id)
+            .unwrap_or_default();
+        
         info!(
             "initializing peer gateway {:?} on interface {}",
-            &self.peer_state.try_lock().unwrap().node_state.node_id,
+            node_id,
             self.messenger
                 .interface
                 .as_ref()
@@ -150,7 +159,9 @@ impl PeerGateway {
         let peer_state = self.peer_state.clone();
 
         // Get self node ID for filtering self-messages
-        let self_node_id = peer_state.try_lock().unwrap().node_state.node_id;
+        let self_node_id = peer_state.try_lock()
+            .map(|state| state.node_state.node_id)
+            .unwrap_or_default();
 
         let peer_timeouts = self.peer_timeouts.clone();
         let tx_peer_event = self.tx_peer_event.clone();
@@ -166,8 +177,12 @@ impl PeerGateway {
             ctrl_socket.set_broadcast(true).unwrap();
             ctrl_socket.set_multicast_ttl_v4(2).unwrap();
 
+            let peer_ident = peer_state.try_lock()
+                .map(|state| state.ident())
+                .unwrap_or_default();
+
             let message = encode_message(
-                peer_state.try_lock().unwrap().ident(),
+                peer_ident,
                 0,
                 BYEBYE,
                 &Payload::default(),
@@ -313,28 +328,41 @@ pub async fn schedule_next_pruning(
 ) {
     let pt = peer_timeouts.clone();
 
-    if peer_timeouts.try_lock().unwrap().is_empty() {
+    let has_timeouts = peer_timeouts.try_lock()
+        .map(|timeouts| !timeouts.is_empty())
+        .unwrap_or(false);
+    
+    if !has_timeouts {
         return;
     }
 
-    let timeout = {
-        let pt = pt.try_lock().unwrap();
-        let (timeout, peer_id) = pt.first().unwrap();
-        let timeout = *timeout + Duration::milliseconds(100).to_std().unwrap(); // Reduced grace period to 100ms for faster detection
-
-        debug!(
-            "scheduling next pruning for {}ms since gateway initialization epoch because of peer {}",
-            timeout.duration_since(epoch).as_millis(),
-            peer_id
-        );
-
-        timeout
+    let (timeout_instant, peer_id) = {
+        if let Ok(timeouts) = pt.try_lock() {
+            if let Some((timeout, peer_id)) = timeouts.first().copied() {
+                let timeout_instant = timeout + Duration::milliseconds(100).to_std().unwrap();
+                (timeout_instant, peer_id)
+            } else {
+                return; // No timeouts available
+            }
+        } else {
+            return; // Cannot acquire lock
+        }
     };
+
+    debug!(
+        "scheduling next pruning for {}ms since gateway initialization epoch because of peer {}",
+        timeout_instant.duration_since(epoch).as_millis(),
+        peer_id
+    );
 
     tokio::spawn(async move {
         select! {
-            _ = tokio::time::sleep_until(timeout) => {
-                if peer_timeouts.try_lock().unwrap().is_empty() {
+            _ = tokio::time::sleep_until(timeout_instant) => {
+                let has_timeouts = peer_timeouts.try_lock()
+                    .map(|timeouts| !timeouts.is_empty())
+                    .unwrap_or(false);
+                
+                if !has_timeouts {
                     return;
                 }
 
@@ -370,28 +398,27 @@ fn prune_expired_peers(
 
     let i = peer_timeouts
         .try_lock()
-        .unwrap()
-        .iter()
-        .position(|(timeout, _)| timeout >= &Instant::now());
+        .ok()
+        .and_then(|timeouts| timeouts.iter().position(|(timeout, _)| timeout >= &Instant::now()));
 
     if let Some(i) = i {
         peer_timeouts
             .try_lock()
-            .unwrap()
-            .drain(0..i)
-            .collect::<Vec<_>>()
+            .map(|mut timeouts| timeouts.drain(0..i).collect::<Vec<_>>())
+            .unwrap_or_default()
     } else {
         peer_timeouts
             .try_lock()
-            .unwrap()
-            .drain(..)
-            .collect::<Vec<_>>()
+            .map(|mut timeouts| timeouts.drain(..).collect::<Vec<_>>())
+            .unwrap_or_default()
     }
 }
 
 impl Drop for PeerGateway {
     fn drop(&mut self) {
-        send_byebye(self.messenger.peer_state.try_lock().unwrap().ident());
+        if let Ok(state) = self.messenger.peer_state.try_lock() {
+            send_byebye(state.ident());
+        }
     }
 }
 
