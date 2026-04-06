@@ -11,8 +11,8 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use super::{
-    interface_scanner::{InterfaceScanner, scan_network_interfaces},
-    ip_interface::{multicast_endpoint_for_addr, is_ipv4, to_socket_addr},
+    interface_scanner::{scan_network_interfaces, InterfaceScanner},
+    ip_interface::{is_ipv4, multicast_endpoint_for_addr, to_socket_addr},
     messenger::new_udp_reuseport,
 };
 
@@ -33,7 +33,8 @@ impl MultiInterfaceMessenger {
     /// Create a new multi-interface messenger
     pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let interfaces = Arc::new(Mutex::new(HashMap::new()));
-        let (message_tx, mut message_rx) = mpsc::unbounded_channel::<(Vec<u8>, Option<SocketAddr>)>();
+        let (message_tx, mut message_rx) =
+            mpsc::unbounded_channel::<(Vec<u8>, Option<SocketAddr>)>();
 
         // Create interface scanner
         let interfaces_for_scanner = interfaces.clone();
@@ -69,7 +70,7 @@ impl MultiInterfaceMessenger {
     /// Enable or disable the messenger
     pub async fn enable(&self, enable: bool) {
         self.scanner.enable(enable).await;
-        
+
         if !enable {
             // Clear all interfaces when disabled
             self.interfaces.lock().await.clear();
@@ -77,15 +78,24 @@ impl MultiInterfaceMessenger {
     }
 
     /// Send a message to all interfaces (multicast)
-    pub async fn send_multicast(&self, message: Vec<u8>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.message_tx.send((message, None))
+    pub async fn send_multicast(
+        &self,
+        message: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.message_tx
+            .send((message, None))
             .map_err(|e| format!("Failed to queue multicast message: {}", e))?;
         Ok(())
     }
 
     /// Send a message to a specific target
-    pub async fn send_unicast(&self, message: Vec<u8>, target: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.message_tx.send((message, Some(target)))
+    pub async fn send_unicast(
+        &self,
+        message: Vec<u8>,
+        target: SocketAddr,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.message_tx
+            .send((message, Some(target)))
             .map_err(|e| format!("Failed to queue unicast message: {}", e))?;
         Ok(())
     }
@@ -131,7 +141,10 @@ impl MultiInterfaceMessenger {
             }
         }
 
-        debug!("Active interfaces: {:?}", interface_map.keys().collect::<Vec<_>>());
+        debug!(
+            "Active interfaces: {:?}",
+            interface_map.keys().collect::<Vec<_>>()
+        );
     }
 
     /// Create a handler for a specific interface
@@ -180,7 +193,7 @@ impl MultiInterfaceMessenger {
             // This is a simplified implementation - in practice, you'd want to
             // get the actual interface index from the system
             let interface_index = 0; // Default interface
-            
+
             socket.join_multicast_v6(&super::ip_interface::MULTICAST_ADDR_V6, interface_index)?;
             socket.set_multicast_loop_v6(true)?;
             socket.set_multicast_loop_v6(true)?;
@@ -214,24 +227,30 @@ impl MultiInterfaceMessenger {
     ) {
         // Find an appropriate interface for the target
         let target_is_ipv4 = target.is_ipv4();
-        
+
         for (_, handler) in interfaces.iter() {
             let handler_is_ipv4 = is_ipv4(&handler.ip_addr);
-            
+
             // Use matching IP version
             if target_is_ipv4 == handler_is_ipv4 {
                 match handler.socket.send_to(message, target).await {
                     Ok(bytes_sent) => {
-                        debug!("Sent {} bytes to {} via {}", bytes_sent, target, handler.ip_addr);
+                        debug!(
+                            "Sent {} bytes to {} via {}",
+                            bytes_sent, target, handler.ip_addr
+                        );
                         return; // Success, no need to try other interfaces
                     }
                     Err(e) => {
-                        warn!("Failed to send to {} via {}: {}", target, handler.ip_addr, e);
+                        warn!(
+                            "Failed to send to {} via {}: {}",
+                            target, handler.ip_addr, e
+                        );
                     }
                 }
             }
         }
-        
+
         error!("Failed to send unicast message to {}", target);
     }
 
@@ -242,11 +261,13 @@ impl MultiInterfaceMessenger {
     ) {
         for (_, handler) in interfaces.iter() {
             let multicast_addr = multicast_endpoint_for_addr(&handler.ip_addr);
-            
+
             match handler.socket.send_to(message, multicast_addr).await {
                 Ok(bytes_sent) => {
-                    debug!("Sent {} bytes multicast via {} to {}", 
-                           bytes_sent, handler.ip_addr, multicast_addr);
+                    debug!(
+                        "Sent {} bytes multicast via {} to {}",
+                        bytes_sent, handler.ip_addr, multicast_addr
+                    );
                 }
                 Err(e) => {
                     warn!("Failed to send multicast via {}: {}", handler.ip_addr, e);
@@ -256,42 +277,47 @@ impl MultiInterfaceMessenger {
     }
 
     /// Start receiving messages on all interfaces
-    pub async fn start_receiving<F>(&self, _handler: F) 
+    pub async fn start_receiving<F>(&self, _handler: F)
     where
         F: FnMut(SocketAddr, Vec<u8>) + Send + 'static,
     {
         let interfaces = self.interfaces.clone();
-        
+
         tokio::spawn(async move {
             loop {
                 let interface_map = interfaces.lock().await;
-                
+
                 for (addr, interface_handler) in interface_map.iter() {
                     let socket = interface_handler.socket.clone();
                     let interface_addr = *addr;
-                    
+
                     // Spawn a task for each interface to receive messages
                     tokio::spawn(async move {
                         let mut buffer = vec![0u8; 1024];
-                        
+
                         loop {
                             match socket.recv_from(&mut buffer).await {
                                 Ok((size, source)) => {
-                                    debug!("Received {} bytes from {} on interface {}", 
-                                           size, source, interface_addr);
+                                    debug!(
+                                        "Received {} bytes from {} on interface {}",
+                                        size, source, interface_addr
+                                    );
                                     // Note: We need to handle the closure capture differently
                                     // This is a simplified version
                                     // In practice, you'd use channels to communicate with the handler
                                 }
                                 Err(e) => {
-                                    warn!("Failed to receive on interface {}: {}", interface_addr, e);
+                                    warn!(
+                                        "Failed to receive on interface {}: {}",
+                                        interface_addr, e
+                                    );
                                     break;
                                 }
                             }
                         }
                     });
                 }
-                
+
                 // Check for interface changes periodically
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
@@ -305,11 +331,13 @@ mod tests {
     use tokio::time::Duration;
 
     #[tokio::test]
+    #[ignore] // Requires real multicast networking — run locally with --include-ignored
     async fn test_multi_interface_messenger() {
         let _ = tracing_subscriber::fmt::try_init();
 
         // Create messenger
-        let messenger = MultiInterfaceMessenger::new().await
+        let messenger = MultiInterfaceMessenger::new()
+            .await
             .expect("Failed to create multi-interface messenger");
 
         // Enable the messenger
@@ -320,14 +348,18 @@ mod tests {
 
         // Check that we have some interfaces
         let interface_count = messenger.interface_count().await;
-        assert!(interface_count > 0, "Should discover at least one interface");
+        assert!(
+            interface_count > 0,
+            "Should discover at least one interface"
+        );
 
         let addresses = messenger.interface_addresses().await;
         info!("Discovered {} interfaces: {:?}", interface_count, addresses);
 
         // Test sending a multicast message
         let test_message = b"Hello, Link!".to_vec();
-        messenger.send_multicast(test_message)
+        messenger
+            .send_multicast(test_message)
             .await
             .expect("Failed to send multicast message");
     }

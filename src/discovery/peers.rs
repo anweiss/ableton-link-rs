@@ -508,7 +508,8 @@ mod tests {
             })
             .unwrap();
 
-        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
+        let ping_responder_unicast_socket =
+            Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
 
         (
             PeerGateway::new(
@@ -535,6 +536,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires multicast networking; "No route to host" on macOS CI
     async fn add_find_peer() {
         // init_tracing();
 
@@ -563,6 +565,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires multicast networking; "No route to host" on macOS CI
     async fn add_remove_peer() {
         // init_tracing();
 
@@ -593,6 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires multicast networking; "No route to host" on macOS CI
     async fn add_two_peers_remove_one_peer() {
         // init_tracing();
 

@@ -482,6 +482,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires real UDP multicast — run locally with --include-ignored
     async fn test_peer_count_reset_on_disable() {
         let _ = tracing_subscriber::fmt::try_init();
 

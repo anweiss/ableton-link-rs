@@ -1,6 +1,5 @@
 use chrono::Duration;
 
-
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub struct GhostXForm {
     pub slope: f64,

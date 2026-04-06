@@ -11,7 +11,10 @@ use tokio::time::sleep;
 /// Channel-based audio metronome that's Send-safe
 #[derive(Debug)]
 enum MetronomeMessage {
-    PlayClick { is_downbeat: bool },
+    PlayClick {
+        is_downbeat: bool,
+    },
+    #[allow(dead_code)]
     Stop,
 }
 
@@ -198,6 +201,7 @@ fn clear_line() {
     io::stdout().flush().unwrap();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_state(
     time: chrono::Duration,
     session_state: &SessionState,
@@ -363,6 +367,22 @@ fn disable_buffered_input() {
             let _ = termios::tcsetattr(fd, TCSANOW, &termios);
         }
     }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
+        use winapi::um::wincon::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT};
+
+        unsafe {
+            let handle = io::stdin().as_raw_handle();
+            let mut mode: u32 = 0;
+            if GetConsoleMode(handle as *mut _, &mut mode) != 0 {
+                mode &= !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+                SetConsoleMode(handle as *mut _, mode);
+            }
+        }
+    }
 }
 
 fn enable_buffered_input() {
@@ -377,6 +397,22 @@ fn enable_buffered_input() {
             termios.c_lflag |= ECHO; // Re-enable echo
             termios.c_lflag |= ISIG; // Ensure ISIG remains enabled for signal handling
             let _ = termios::tcsetattr(fd, TCSANOW, &termios);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
+        use winapi::um::wincon::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT};
+
+        unsafe {
+            let handle = io::stdin().as_raw_handle();
+            let mut mode: u32 = 0;
+            if GetConsoleMode(handle as *mut _, &mut mode) != 0 {
+                mode |= ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT;
+                SetConsoleMode(handle as *mut _, mode);
+            }
         }
     }
 }

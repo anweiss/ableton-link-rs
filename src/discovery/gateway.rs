@@ -75,7 +75,7 @@ impl PeerGateway {
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
         // let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(UNICAST_IP_ANY));
-        
+
         if let Ok(mut state) = peer_state.try_lock() {
             state.measurement_endpoint = if let SocketAddr::V4(socket_addr) =
                 ping_responder_unicast_socket.local_addr().unwrap()
@@ -140,10 +140,12 @@ impl PeerGateway {
     }
 
     pub async fn listen(&self, mut rx_event: Receiver<OnEvent>, notifier: Arc<Notify>) {
-        let node_id = self.peer_state.try_lock()
+        let node_id = self
+            .peer_state
+            .try_lock()
             .map(|state| state.node_state.node_id)
             .unwrap_or_default();
-        
+
         info!(
             "initializing peer gateway {:?} on interface {}",
             node_id,
@@ -159,7 +161,8 @@ impl PeerGateway {
         let peer_state = self.peer_state.clone();
 
         // Get self node ID for filtering self-messages
-        let self_node_id = peer_state.try_lock()
+        let self_node_id = peer_state
+            .try_lock()
             .map(|state| state.node_state.node_id)
             .unwrap_or_default();
 
@@ -177,17 +180,12 @@ impl PeerGateway {
             ctrl_socket.set_broadcast(true).unwrap();
             ctrl_socket.set_multicast_ttl_v4(2).unwrap();
 
-            let peer_ident = peer_state.try_lock()
+            let peer_ident = peer_state
+                .try_lock()
                 .map(|state| state.ident())
                 .unwrap_or_default();
 
-            let message = encode_message(
-                peer_ident,
-                0,
-                BYEBYE,
-                &Payload::default(),
-            )
-            .unwrap();
+            let message = encode_message(peer_ident, 0, BYEBYE, &Payload::default()).unwrap();
 
             ctrl_socket
                 .send_to(&message, (MULTICAST_ADDR, LINK_PORT))
@@ -238,21 +236,32 @@ pub async fn on_peer_state(
         .retain(|(_, id)| id != &peer_id);
 
     let new_to = (
-        Instant::now() + Duration::seconds(std::cmp::min(msg.ttl as i64, 3)).to_std().unwrap(), // Cap timeout at 3 seconds max
+        Instant::now()
+            + Duration::seconds(std::cmp::min(msg.ttl as i64, 3))
+                .to_std()
+                .unwrap(), // Cap timeout at 3 seconds max
         peer_id,
     );
 
-    debug!("updating peer timeout status for peer {} with TTL {} seconds (capped at 3)", peer_id, msg.ttl);
+    debug!(
+        "updating peer timeout status for peer {} with TTL {} seconds (capped at 3)",
+        peer_id, msg.ttl
+    );
 
     if let Ok(mut timeouts) = peer_timeouts.try_lock() {
-        let i = timeouts.iter().position(|(timeout, _)| timeout >= &new_to.0);
+        let i = timeouts
+            .iter()
+            .position(|(timeout, _)| timeout >= &new_to.0);
         if let Some(i) = i {
             timeouts.insert(i, new_to);
         } else {
             timeouts.push(new_to);
         }
     } else {
-        debug!("Could not acquire peer_timeouts lock to update timeout for peer {}", peer_id);
+        debug!(
+            "Could not acquire peer_timeouts lock to update timeout for peer {}",
+            peer_id
+        );
     }
 
     debug!("sending peer state to observer");
@@ -278,11 +287,14 @@ pub async fn on_byebye(
     notifier: Arc<Notify>,
 ) {
     info!("Processing BYEBYE from peer {}", peer_id);
-    
+
     if find_peer(&peer_id, peer_timeouts.clone()).await {
-        info!("Found peer {} in timeout list, sending PeerLeft event", peer_id);
+        info!(
+            "Found peer {} in timeout list, sending PeerLeft event",
+            peer_id
+        );
         let peer_event = tx_peer_event.clone();
-        tokio::spawn(async move { 
+        tokio::spawn(async move {
             if let Err(e) = peer_event.send(PeerEvent::PeerLeft(peer_id)).await {
                 debug!("Failed to send PeerLeft event: {:?}", e);
             } else {
@@ -294,10 +306,16 @@ pub async fn on_byebye(
             timeouts.retain(|(_, id)| id != &peer_id);
             info!("Removed peer {} from timeout list", peer_id);
         } else {
-            debug!("Could not acquire peer_timeouts lock to remove peer {}", peer_id);
+            debug!(
+                "Could not acquire peer_timeouts lock to remove peer {}",
+                peer_id
+            );
         }
     } else {
-        info!("Peer {} not found in timeout list (may have already been removed)", peer_id);
+        info!(
+            "Peer {} not found in timeout list (may have already been removed)",
+            peer_id
+        );
     }
 
     notifier.notify_waiters();
@@ -312,9 +330,12 @@ pub async fn find_peer(
             let found = timeouts.iter().any(|(_, id)| id == peer_id);
             debug!("find_peer: Looking for peer {}, found: {}", peer_id, found);
             found
-        },
+        }
         Err(_) => {
-            debug!("Could not acquire peer_timeouts lock in find_peer for {}", peer_id);
+            debug!(
+                "Could not acquire peer_timeouts lock in find_peer for {}",
+                peer_id
+            );
             false
         }
     }
@@ -328,10 +349,11 @@ pub async fn schedule_next_pruning(
 ) {
     let pt = peer_timeouts.clone();
 
-    let has_timeouts = peer_timeouts.try_lock()
+    let has_timeouts = peer_timeouts
+        .try_lock()
         .map(|timeouts| !timeouts.is_empty())
         .unwrap_or(false);
-    
+
     if !has_timeouts {
         return;
     }
@@ -361,7 +383,7 @@ pub async fn schedule_next_pruning(
                 let has_timeouts = peer_timeouts.try_lock()
                     .map(|timeouts| !timeouts.is_empty())
                     .unwrap_or(false);
-                
+
                 if !has_timeouts {
                     return;
                 }
@@ -396,10 +418,11 @@ fn prune_expired_peers(
     // find the first element in pt whose timeout value is not less than Instant::now()
     // NOTE: peer_timeouts will be empty if byebye message is received prior to pruning
 
-    let i = peer_timeouts
-        .try_lock()
-        .ok()
-        .and_then(|timeouts| timeouts.iter().position(|(timeout, _)| timeout >= &Instant::now()));
+    let i = peer_timeouts.try_lock().ok().and_then(|timeouts| {
+        timeouts
+            .iter()
+            .position(|(timeout, _)| timeout >= &Instant::now())
+    });
 
     if let Some(i) = i {
         peer_timeouts
@@ -437,7 +460,7 @@ mod tests {
     }
 
     #[tokio::test]
-
+    #[ignore] // Requires real UDP multicast; crashes on macOS CI — run locally with --include-ignored
     async fn test_gateway() {
         init_tracing();
 
@@ -468,7 +491,8 @@ mod tests {
             })
             .unwrap();
 
-        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
+        let ping_responder_unicast_socket =
+            Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
 
         let gw = PeerGateway::new(
             Arc::new(Mutex::new(PeerState {

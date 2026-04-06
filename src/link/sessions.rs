@@ -6,7 +6,7 @@ use std::{
 
 use bincode::{Decode, Encode};
 use chrono::Duration;
-use tokio::{sync::Notify};
+use tokio::sync::Notify;
 use tracing::{debug, info};
 
 use crate::discovery::{peers::ControllerPeer, ENCODING_CONFIG};
@@ -320,7 +320,10 @@ pub async fn handle_successful_measurement(
     };
 
     let current_session_id = current.try_lock().unwrap().session_id;
-    debug!("Current session: {}, measured session: {}", current_session_id, session_id);
+    debug!(
+        "Current session: {}, measured session: {}",
+        current_session_id, session_id
+    );
 
     if current_session_id == session_id {
         current.try_lock().unwrap().measurement = measurement;
@@ -353,21 +356,25 @@ pub async fn handle_successful_measurement(
             other_sessions.try_lock().unwrap()[idx] = s.clone();
 
             let ghost_diff = new_ghost - cur_ghost;
-            debug!("Ghost time comparison: current={} us, new={} us, diff={} us, eps={} us", 
-                   cur_ghost.num_microseconds().unwrap(), 
-                   new_ghost.num_microseconds().unwrap(),
-                   ghost_diff.num_microseconds().unwrap(),
-                   SESSION_EPS.num_microseconds().unwrap());
+            debug!(
+                "Ghost time comparison: current={} us, new={} us, diff={} us, eps={} us",
+                cur_ghost.num_microseconds().unwrap(),
+                new_ghost.num_microseconds().unwrap(),
+                ghost_diff.num_microseconds().unwrap(),
+                SESSION_EPS.num_microseconds().unwrap()
+            );
 
             // Session switching logic: be selective about when to join other sessions
             // 1. Always join if we have significantly better timing (>500ms)
             // 2. Join if times are similar and we prefer older session IDs
             // 3. Join if we just started up and have no peers (prefer any established session)
-            let current_session_has_no_peers = session_peers(peers.clone(), current.try_lock().unwrap().session_id).is_empty();
-            let just_started = current_session_has_no_peers && measurement.timestamp < Duration::seconds(5);
+            let current_session_has_no_peers =
+                session_peers(peers.clone(), current.try_lock().unwrap().session_id).is_empty();
+            let just_started =
+                current_session_has_no_peers && measurement.timestamp < Duration::seconds(5);
             let current_session_id = current.try_lock().unwrap().session_id;
-            
-            let should_switch = 
+
+            let should_switch =
                 // Significant timing advantage
                 ghost_diff > SESSION_EPS
                 // Similar timing, prefer older session
@@ -377,8 +384,8 @@ pub async fn handle_successful_measurement(
                 || just_started;
 
             if should_switch {
-                info!("Session {} wins over current session (ghost_diff={} us, just_started={}, tempo={}), switching!", 
-                      session_id, 
+                info!("Session {} wins over current session (ghost_diff={} us, just_started={}, tempo={}), switching!",
+                      session_id,
                       ghost_diff.num_microseconds().unwrap(),
                       just_started,
                       s.timeline.tempo.bpm());
@@ -394,8 +401,8 @@ pub async fn handle_successful_measurement(
 
                 schedule_remeasurement(peers.clone(), tx_measure_peer_state.clone(), s).await;
             } else {
-                debug!("Session {} does not win over current session (ghost_diff={} us, just_started={}), staying with current", 
-                       session_id, 
+                debug!("Session {} does not win over current session (ghost_diff={} us, just_started={}), staying with current",
+                       session_id,
                        ghost_diff.num_microseconds().unwrap(),
                        just_started);
             }

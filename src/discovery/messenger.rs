@@ -10,7 +10,7 @@ use tokio::{
     sync::{mpsc::Sender, Notify},
     time::Instant,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     discovery::{messages::MESSAGE_TYPES, peers::PeerStateMessageType},
@@ -37,25 +37,17 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     } else {
         socket2::Domain::IPV6
     };
-    
+
     let udp_sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
 
-    // Set socket options using safe socket2 APIs
     udp_sock.set_reuse_address(true)?;
 
-    // Set SO_REUSEPORT on Unix systems for better multicast support
-    // Note: socket2 doesn't provide set_reuse_port, so we'll skip this optimization
-    // The socket will still work fine without SO_REUSEPORT
     #[cfg(unix)]
-    {
-        // We could use socket2's raw methods here, but for maximum safety
-        // we'll skip the SO_REUSEPORT optimization. The socket will still work.
-        tracing::debug!("Note: SO_REUSEPORT not set (using safe implementation)");
-    }
+    udp_sock.set_reuse_port(true)?;
 
     udp_sock.set_nonblocking(true)?;
     udp_sock.bind(&socket2::SockAddr::from(addr))?;
-    
+
     // Convert to std::net::UdpSocket and then to tokio::net::UdpSocket
     let std_socket: std::net::UdpSocket = udp_sock.into();
     std_socket.try_into()
@@ -179,7 +171,14 @@ impl Messenger {
                             info!("Received BYEBYE message from peer {}", header.ident);
                             receive_bye_bye(tx_event.clone(), header.ident).await;
                         }
-                        _ => todo!(),
+                        _ => {
+                            tracing::warn!(
+                                "unknown message type {} from peer {}",
+                                header.message_type,
+                                header.ident
+                            );
+                            continue;
+                        }
                     }
                 }
             }
@@ -371,15 +370,27 @@ pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
 pub fn send_byebye(node_state: NodeId) {
     info!("sending bye bye");
 
-    let socket = new_udp_reuseport(MULTICAST_IP_ANY.into()).unwrap();
-    socket.set_broadcast(true).unwrap();
-    socket.set_multicast_ttl_v4(2).unwrap();
+    let socket = match new_udp_reuseport(MULTICAST_IP_ANY.into()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to create socket for BYEBYE: {}", e);
+            return;
+        }
+    };
+    let _ = socket.set_broadcast(true);
+    let _ = socket.set_multicast_ttl_v4(2);
 
-    let message = encode_message(node_state, 0, BYEBYE, &Payload::default()).unwrap();
+    let message = match encode_message(node_state, 0, BYEBYE, &Payload::default()) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("Failed to encode BYEBYE message: {}", e);
+            return;
+        }
+    };
 
-    let _ = socket
-        .into_std()
-        .unwrap()
-        .send_to(&message, (MULTICAST_ADDR, LINK_PORT))
-        .unwrap();
+    if let Ok(std_socket) = socket.into_std() {
+        if let Err(e) = std_socket.send_to(&message, (MULTICAST_ADDR, LINK_PORT)) {
+            warn!("Failed to send BYEBYE: {}", e);
+        }
+    }
 }

@@ -42,7 +42,7 @@ impl From<RtClientState> for ClientState {
 /// This provides lock-free access to session state for real-time audio threads
 /// while allowing safe updates from other threads.
 ///
-/// Uses RwLock for cached state (readers won't block each other) and 
+/// Uses RwLock for cached state (readers won't block each other) and
 /// triple_buffer crate for lock-free producer-consumer communication.
 pub struct SafeRtSessionStateHandler {
     /// Triple buffer for sharing client state between RT and non-RT threads
@@ -105,18 +105,18 @@ impl SafeRtSessionStateHandler {
             if let Ok(mut output) = self.client_state_output.try_lock() {
                 // Check if there's new data available
                 if output.updated() {
-                    let new_state = output.read().clone();
+                    let new_state = *output.read();
 
                     // Try to update the cached state (non-blocking)
                     if let Ok(mut cached_state) = self.cached_rt_state.try_write() {
                         if timeline_grace_expired && new_state.timeline != cached_state.timeline {
-                            cached_state.timeline = new_state.timeline.clone();
+                            cached_state.timeline = new_state.timeline;
                         }
 
                         if start_stop_grace_expired
                             && new_state.start_stop_state != cached_state.start_stop_state
                         {
-                            cached_state.start_stop_state = new_state.start_stop_state.clone();
+                            cached_state.start_stop_state = new_state.start_stop_state;
                         }
                     }
 
@@ -173,7 +173,7 @@ impl SafeRtSessionStateHandler {
             // Try to send updated state to non-RT thread via triple buffer (non-blocking)
             if let Ok(mut input) = self.client_state_input.try_lock() {
                 input.write(cached_state.clone().into());
-                
+
                 // Mark that we have pending updates
                 self.has_pending_updates.store(true, Ordering::Release);
             }
@@ -191,11 +191,11 @@ impl SafeRtSessionStateHandler {
         // Check for new state data from triple buffer (can block for non-RT thread)
         if let Ok(mut output) = self.client_state_output.lock() {
             if output.updated() {
-                let new_state = output.read().clone();
+                let new_state = *output.read();
 
                 let result = IncomingClientState {
-                    timeline: Some(new_state.timeline.clone()),
-                    start_stop_state: Some(new_state.start_stop_state.clone()),
+                    timeline: Some(new_state.timeline),
+                    start_stop_state: Some(new_state.start_stop_state),
                     timeline_timestamp: Duration::microseconds(
                         self.timeline_timestamp.load(Ordering::Acquire) as i64,
                     ),
@@ -223,7 +223,8 @@ impl SafeRtSessionStateHandler {
     /// Set a new grace period for local modifications
     pub fn set_grace_period(&self, grace_period: Duration) {
         let grace_period_micros = grace_period.num_microseconds().unwrap_or(1000000) as u64;
-        self.local_mod_grace_period_micros.store(grace_period_micros, Ordering::Release);
+        self.local_mod_grace_period_micros
+            .store(grace_period_micros, Ordering::Release);
     }
 }
 
@@ -347,21 +348,24 @@ mod tests {
         use std::time::Duration as StdDuration;
 
         let client_state = create_test_client_state();
-        let handler = Arc::new(SafeRtSessionStateHandler::new(client_state, Duration::milliseconds(1000)));
-        
+        let handler = Arc::new(SafeRtSessionStateHandler::new(
+            client_state,
+            Duration::milliseconds(1000),
+        ));
+
         let handler_clone = handler.clone();
-        
+
         // Spawn a thread that simulates RT thread behavior
         let rt_thread = thread::spawn(move || {
             for i in 0..100 {
                 let current_time = Duration::milliseconds(i * 10);
                 let _state = handler_clone.get_rt_client_state(current_time);
-                
+
                 // Simulate some RT work
                 thread::sleep(StdDuration::from_micros(10));
             }
         });
-        
+
         // Main thread simulates non-RT updates
         for i in 0..50 {
             let new_timeline = Timeline {
@@ -377,17 +381,17 @@ mod tests {
             };
 
             handler.update_rt_client_state(incoming_state, Duration::milliseconds(i * 20), true);
-            
+
             // Process updates occasionally
             if i % 10 == 0 {
                 handler.process_pending_updates();
             }
-            
+
             thread::sleep(StdDuration::from_micros(20));
         }
-        
+
         rt_thread.join().unwrap();
-        
+
         // Verify we can still read state
         let final_state = handler.get_rt_client_state(Duration::milliseconds(1000));
         assert!(final_state.timeline.tempo.bpm() >= 120.0);

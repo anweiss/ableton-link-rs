@@ -514,7 +514,7 @@ pub fn median(mut numbers: Vec<f64>) -> f64 {
     let length = numbers.len();
 
     assert!(length > 2);
-    if length % 2 == 0 {
+    if length.is_multiple_of(2) {
         let mid = length / 2;
         (numbers[mid - 1] + numbers[mid]) / 2.0
     } else {
@@ -601,6 +601,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires real UDP multicast; crashes on macOS CI — run locally with --include-ignored
     async fn test_send_ping_on_new() {
         init_tracing();
 

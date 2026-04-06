@@ -6,7 +6,10 @@ pub const MULTICAST_ADDR_V6: Ipv6Addr = Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0, 
 
 /// Get the multicast endpoint for IPv4
 pub fn multicast_endpoint_v4() -> SocketAddrV4 {
-    SocketAddrV4::new(crate::discovery::MULTICAST_ADDR, crate::discovery::LINK_PORT)
+    SocketAddrV4::new(
+        crate::discovery::MULTICAST_ADDR,
+        crate::discovery::LINK_PORT,
+    )
 }
 
 /// Get the multicast endpoint for IPv6 with the given scope ID

@@ -73,4 +73,6 @@ jobs:
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --all -- --nocapture
+      # Run tests serially — many tests bind the Link multicast port (20808)
+      # and will collide when run in parallel
+      - run: cargo test --all -- --nocapture --test-threads=1
