@@ -40,18 +40,10 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
 
     let udp_sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
 
-    // Set socket options using safe socket2 APIs
     udp_sock.set_reuse_address(true)?;
 
-    // Set SO_REUSEPORT on Unix systems for better multicast support
-    // Note: socket2 doesn't provide set_reuse_port, so we'll skip this optimization
-    // The socket will still work fine without SO_REUSEPORT
     #[cfg(unix)]
-    {
-        // We could use socket2's raw methods here, but for maximum safety
-        // we'll skip the SO_REUSEPORT optimization. The socket will still work.
-        tracing::debug!("Note: SO_REUSEPORT not set (using safe implementation)");
-    }
+    udp_sock.set_reuse_port(true)?;
 
     udp_sock.set_nonblocking(true)?;
     udp_sock.bind(&socket2::SockAddr::from(addr))?;

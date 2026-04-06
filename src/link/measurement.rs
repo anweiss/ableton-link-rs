@@ -601,6 +601,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires real UDP multicast; crashes on macOS CI — run locally with --include-ignored
     async fn test_send_ping_on_new() {
         init_tracing();
 

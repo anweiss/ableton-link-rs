@@ -331,6 +331,7 @@ mod tests {
     use tokio::time::Duration;
 
     #[tokio::test]
+    #[ignore] // Requires real multicast networking — run locally with --include-ignored
     async fn test_multi_interface_messenger() {
         let _ = tracing_subscriber::fmt::try_init();
 
