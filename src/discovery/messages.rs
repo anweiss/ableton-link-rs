@@ -120,6 +120,15 @@ pub fn parse_payload(data: &[u8]) -> Result<Payload> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::{
+        beats::Beats,
+        node::{NodeId, NodeState},
+        sessions::SessionId,
+        state::StartStopState,
+        tempo::Tempo,
+        timeline::Timeline,
+    };
+    use chrono::Duration;
 
     #[test]
     fn test_parse_message_header() {
@@ -133,5 +142,100 @@ mod tests {
 
         let (decoded_header, _) = parse_message_header(&encoded).unwrap();
         assert_eq!(decoded_header, header);
+    }
+
+    #[test]
+    fn alive_message_roundtrip() {
+        let node_id = NodeId::from_array([1, 2, 3, 4, 5, 6, 7, 8]);
+        let session_id = SessionId(node_id);
+        let node_state = NodeState {
+            node_id,
+            session_id,
+            timeline: Timeline {
+                tempo: Tempo::new(120.0),
+                beat_origin: Beats::new(0.0),
+                time_origin: Duration::zero(),
+            },
+            start_stop_state: StartStopState::default(),
+        };
+        let payload = Payload::from(node_state);
+        let msg = alive_message(node_id, 5, &payload, 0).unwrap();
+
+        let (header, offset) = parse_message_header(&msg).unwrap();
+        assert_eq!(header.message_type, ALIVE);
+        assert_eq!(header.ttl, 5);
+        assert_eq!(header.ident, node_id);
+
+        let decoded_payload = parse_payload(&msg[offset..]).unwrap();
+        assert!(!decoded_payload.entries.is_empty());
+    }
+
+    #[test]
+    fn response_message_roundtrip() {
+        let node_id = NodeId::from_array([10, 20, 30, 40, 50, 60, 70, 80]);
+        let payload = Payload::default();
+        let msg = response_message(node_id, 3, &payload, 42).unwrap();
+
+        let (header, _) = parse_message_header(&msg).unwrap();
+        assert_eq!(header.message_type, RESPONSE);
+        assert_eq!(header.ttl, 3);
+        assert_eq!(header.group_id, 42);
+        assert_eq!(header.ident, node_id);
+    }
+
+    #[test]
+    fn byebye_message_roundtrip() {
+        let node_id = NodeId::from_array([99, 88, 77, 66, 55, 44, 33, 22]);
+        let msg = byebye_message(node_id).unwrap();
+
+        let (header, _) = parse_message_header(&msg).unwrap();
+        assert_eq!(header.message_type, BYEBYE);
+        assert_eq!(header.ttl, 0);
+        assert_eq!(header.ident, node_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid message size")]
+    fn parse_message_header_too_short() {
+        let data = [0u8; 4]; // Way too short
+        let _ = parse_message_header(&data);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid protocol header")]
+    fn parse_message_header_bad_protocol() {
+        // Create data of correct length but wrong protocol header
+        let mut data = vec![0u8; PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE];
+        data[0] = 0xFF; // Wrong protocol
+        let _ = parse_message_header(&data);
+    }
+
+    #[test]
+    fn message_type_constants() {
+        assert_eq!(INVALID, 0);
+        assert_eq!(ALIVE, 1);
+        assert_eq!(RESPONSE, 2);
+        assert_eq!(BYEBYE, 3);
+    }
+
+    #[test]
+    fn protocol_header_format() {
+        assert_eq!(&PROTOCOL_HEADER[..6], b"_asdp_");
+        assert_eq!(PROTOCOL_HEADER[6], b'v');
+        assert_eq!(PROTOCOL_HEADER[7], 1); // Version 1
+    }
+
+    #[test]
+    fn message_types_labels() {
+        assert_eq!(MESSAGE_TYPES[INVALID as usize], "INVALID");
+        assert_eq!(MESSAGE_TYPES[ALIVE as usize], "ALIVE");
+        assert_eq!(MESSAGE_TYPES[RESPONSE as usize], "RESPONSE");
+        assert_eq!(MESSAGE_TYPES[BYEBYE as usize], "BYEBYE");
+    }
+
+    #[test]
+    fn parse_payload_empty() {
+        let payload = parse_payload(&[]).unwrap();
+        assert!(payload.entries.is_empty());
     }
 }

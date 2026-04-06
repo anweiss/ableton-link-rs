@@ -102,4 +102,70 @@ mod tests {
             Duration::microseconds(1000000)
         );
     }
+
+    #[test]
+    fn tempo_display() {
+        let tempo = Tempo::new(128.5);
+        assert_eq!(format!("{}", tempo), "128.5");
+    }
+
+    #[test]
+    fn tempo_from_duration() {
+        // 500,000 µs per beat → 120 BPM
+        let tempo = Tempo::from(Duration::microseconds(500_000));
+        assert_eq!(tempo.bpm(), 120.0);
+    }
+
+    #[test]
+    fn tempo_micros_to_beats_zero_duration() {
+        let tempo = Tempo::new(120.0);
+        assert_eq!(tempo.micros_to_beats(Duration::zero()), Beats::new(0.0));
+    }
+
+    #[test]
+    fn tempo_beats_to_micros_zero_beats() {
+        let tempo = Tempo::new(120.0);
+        assert_eq!(tempo.beats_to_micros(Beats::new(0.0)), Duration::zero());
+    }
+
+    #[test]
+    fn tempo_roundtrip_bpm_to_micros_and_back() {
+        for bpm in [20.0, 60.0, 120.0, 200.0, 999.0] {
+            let tempo = Tempo::new(bpm);
+            let micros = tempo.micros_per_beat();
+            let recovered = Tempo::from(micros);
+            assert!(
+                (recovered.bpm() - bpm).abs() < 0.01,
+                "roundtrip failed for bpm={}",
+                bpm
+            );
+        }
+    }
+
+    #[test]
+    fn tempo_very_slow() {
+        let tempo = Tempo::new(20.0);
+        // 20 BPM → 3,000,000 µs per beat
+        assert_eq!(tempo.micros_per_beat(), Duration::microseconds(3_000_000));
+    }
+
+    #[test]
+    fn tempo_very_fast() {
+        let tempo = Tempo::new(999.0);
+        let mpb = tempo.micros_per_beat();
+        // 999 BPM → ~60060 µs per beat
+        assert!(mpb.num_microseconds().unwrap() > 0);
+        assert!(mpb.num_microseconds().unwrap() < 100_000);
+    }
+
+    #[test]
+    fn tempo_equality() {
+        assert_eq!(Tempo::new(120.0), Tempo { value: 120.0 });
+        assert_ne!(Tempo::new(120.0), Tempo::new(121.0));
+    }
+
+    #[test]
+    fn tempo_default_is_zero() {
+        assert_eq!(Tempo::default().bpm(), 0.0);
+    }
 }

@@ -213,4 +213,101 @@ mod tests {
             Duration::microseconds(5200000)
         );
     }
+
+    #[test]
+    fn clamp_tempo_within_range() {
+        let tl = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::new(0.0),
+            time_origin: Duration::zero(),
+        };
+        let clamped = clamp_tempo(tl);
+        assert_eq!(clamped.tempo.bpm(), 120.0);
+    }
+
+    #[test]
+    fn clamp_tempo_below_minimum() {
+        let tl = Timeline {
+            tempo: Tempo::new(5.0),
+            beat_origin: Beats::new(1.0),
+            time_origin: Duration::microseconds(100),
+        };
+        let clamped = clamp_tempo(tl);
+        assert_eq!(clamped.tempo.bpm(), 20.0);
+        // beat_origin and time_origin should be preserved
+        assert_eq!(clamped.beat_origin, tl.beat_origin);
+        assert_eq!(clamped.time_origin, tl.time_origin);
+    }
+
+    #[test]
+    fn clamp_tempo_above_maximum() {
+        let tl = Timeline {
+            tempo: Tempo::new(1500.0),
+            beat_origin: Beats::new(0.0),
+            time_origin: Duration::zero(),
+        };
+        let clamped = clamp_tempo(tl);
+        assert_eq!(clamped.tempo.bpm(), 999.0);
+    }
+
+    #[test]
+    fn clamp_tempo_at_boundaries() {
+        let tl_min = Timeline {
+            tempo: Tempo::new(20.0),
+            beat_origin: Beats::new(0.0),
+            time_origin: Duration::zero(),
+        };
+        assert_eq!(clamp_tempo(tl_min).tempo.bpm(), 20.0);
+
+        let tl_max = Timeline {
+            tempo: Tempo::new(999.0),
+            beat_origin: Beats::new(0.0),
+            time_origin: Duration::zero(),
+        };
+        assert_eq!(clamp_tempo(tl_max).tempo.bpm(), 999.0);
+    }
+
+    #[test]
+    fn timeline_default_values() {
+        let tl = Timeline::default();
+        assert_eq!(tl.tempo.bpm(), 0.0);
+        assert_eq!(tl.beat_origin, Beats::default());
+        assert_eq!(tl.time_origin, Duration::zero());
+    }
+
+    #[test]
+    fn timeline_encode_roundtrip() {
+        let tl = Timeline {
+            tempo: Tempo::new(128.0),
+            beat_origin: Beats::new(4.0),
+            time_origin: Duration::microseconds(2_000_000),
+        };
+        let encoded = tl.encode().unwrap();
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn to_beats_and_from_beats_roundtrip() {
+        let tl = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::new(0.0),
+            time_origin: Duration::zero(),
+        };
+        let time = Duration::microseconds(3_000_000);
+        let beats = tl.to_beats(time);
+        let recovered = tl.from_beats(beats);
+        assert_eq!(recovered, time);
+    }
+
+    #[test]
+    fn to_beats_with_offset_origin() {
+        let tl = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::new(8.0),
+            time_origin: Duration::microseconds(1_000_000),
+        };
+        // At 120 BPM, 1 second later (t=2s) should be 2 beats later → beat 10.0
+        let beats = tl.to_beats(Duration::microseconds(2_000_000));
+        assert!((beats.floating() - 10.0).abs() < 1e-6);
+    }
 }

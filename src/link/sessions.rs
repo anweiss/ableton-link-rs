@@ -483,9 +483,66 @@ pub fn session_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::node::NodeId;
 
     #[test]
     fn test_key() {
         assert_eq!(SESSION_MEMBERSHIP_HEADER_KEY, 0x73657373);
+    }
+
+    #[test]
+    fn session_id_equality() {
+        let id1 = SessionId(NodeId::from_array([1, 2, 3, 4, 5, 6, 7, 8]));
+        let id2 = SessionId(NodeId::from_array([1, 2, 3, 4, 5, 6, 7, 8]));
+        let id3 = SessionId(NodeId::from_array([8, 7, 6, 5, 4, 3, 2, 1]));
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn session_id_ordering() {
+        let id_low = SessionId(NodeId::from_array([0, 0, 0, 0, 0, 0, 0, 1]));
+        let id_high = SessionId(NodeId::from_array([0, 0, 0, 0, 0, 0, 0, 2]));
+        assert!(id_low < id_high);
+    }
+
+    #[test]
+    fn session_id_display() {
+        let id = SessionId(NodeId::from_array([
+            0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44,
+        ]));
+        let display = format!("{}", id);
+        assert_eq!(display, "aabbccdd11223344");
+    }
+
+    #[test]
+    fn session_membership_from_session_id() {
+        let id = SessionId(NodeId::from_array([1, 2, 3, 4, 5, 6, 7, 8]));
+        let membership = SessionMembership::from(id);
+        assert_eq!(membership.session_id, id);
+    }
+
+    #[test]
+    fn session_membership_roundtrip_encode() {
+        let id = SessionId(NodeId::from_array([10, 20, 30, 40, 50, 60, 70, 80]));
+        let membership = SessionMembership::from(id);
+        let encoded = membership.encode().unwrap();
+        // Should include the header + SessionId bytes
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn session_measurement_default() {
+        let sm = SessionMeasurement::default();
+        assert_eq!(sm.x_form, GhostXForm::default());
+        assert_eq!(sm.timestamp, Duration::zero());
+    }
+
+    #[test]
+    fn session_peers_empty_when_no_match() {
+        let peers = Arc::new(Mutex::new(vec![]));
+        let session_id = SessionId(NodeId::from_array([1, 2, 3, 4, 5, 6, 7, 8]));
+        let result = session_peers(peers, session_id);
+        assert!(result.is_empty());
     }
 }
