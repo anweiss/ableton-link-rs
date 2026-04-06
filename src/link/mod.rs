@@ -519,4 +519,237 @@ mod tests {
 
         info!("test_peer_count_reset_on_disable completed - peer count correctly resets to 0 when disabled");
     }
+
+    #[tokio::test]
+    async fn test_session_state_tempo_getset() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let link = BasicLink::new(120.0).await;
+        let mut state = link.capture_app_session_state();
+        assert_eq!(state.tempo(), 120.0);
+
+        let time = link.clock().micros();
+        state.set_tempo(140.0, time);
+        assert_eq!(state.tempo(), 140.0);
+    }
+
+    #[tokio::test]
+    async fn test_session_state_clamped_tempo() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let link = BasicLink::new(120.0).await;
+        let mut state = link.capture_app_session_state();
+        let time = link.clock().micros();
+
+        // Set below minimum (20 BPM)
+        state.set_tempo(5.0, time);
+        assert_eq!(state.tempo(), 20.0);
+
+        // Set above maximum (999 BPM)
+        state.set_tempo(2000.0, time);
+        assert_eq!(state.tempo(), 999.0);
+    }
+
+    #[tokio::test]
+    async fn test_session_state_is_playing() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let link = BasicLink::new(120.0).await;
+        let mut state = link.capture_app_session_state();
+        assert!(!state.is_playing());
+
+        let time = link.clock().micros();
+        state.set_is_playing(true, time);
+        assert!(state.is_playing());
+        assert_eq!(state.time_for_is_playing(), time);
+
+        state.set_is_playing(false, time + Duration::microseconds(1_000_000));
+        assert!(!state.is_playing());
+    }
+
+    #[tokio::test]
+    async fn test_session_state_beat_at_time() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let link = BasicLink::new(120.0).await;
+        let state = link.capture_app_session_state();
+
+        let time = link.clock().micros();
+        let beat = state.beat_at_time(time, 4.0);
+        // beat should be a finite number
+        assert!(beat.is_finite());
+    }
+
+    #[tokio::test]
+    async fn test_session_state_phase_at_time() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let link = BasicLink::new(120.0).await;
+        let state = link.capture_app_session_state();
+
+        let time = link.clock().micros();
+        let phase_val = state.phase_at_time(time, 4.0);
+        // Phase should be in [0, 4)
+        assert!(phase_val >= 0.0);
+        assert!(phase_val < 4.0);
+    }
+
+    #[tokio::test]
+    async fn test_session_state_force_beat_at_time() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let link = BasicLink::new(120.0).await;
+        let mut state = link.capture_app_session_state();
+
+        let time = link.clock().micros();
+        state.force_beat_at_time(0.0, time, 4.0);
+        let beat = state.beat_at_time(time, 4.0);
+        assert!((beat - 0.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn test_session_state_request_beat_at_time() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let link = BasicLink::new(120.0).await;
+        let mut state = link.capture_app_session_state();
+
+        let time = link.clock().micros();
+        state.request_beat_at_time(0.0, time, 4.0);
+        // After requesting, beat should be quantum-aligned
+        let beat = state.beat_at_time(time, 4.0);
+        let phase_val = state.phase_at_time(time, 4.0);
+        // Phase should correspond to beat 0 → phase 0
+        assert!(phase_val.abs() < 0.001 || (4.0 - phase_val).abs() < 0.001);
+        assert!(beat.is_finite());
+    }
+
+    #[tokio::test]
+    async fn test_to_incoming_client_state_no_change() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let state = ApiState::default();
+        let incoming = to_incoming_client_state(&state, &state, Duration::zero());
+        assert!(incoming.timeline.is_none());
+        assert!(incoming.start_stop_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_to_incoming_client_state_with_tempo_change() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let original = ApiState::default();
+        let mut modified = original;
+        modified.timeline.tempo = Tempo::new(140.0);
+        let ts = Duration::microseconds(1_000_000);
+        let incoming = to_incoming_client_state(&modified, &original, ts);
+        assert!(incoming.timeline.is_some());
+        assert_eq!(incoming.timeline.unwrap().tempo.bpm(), 140.0);
+        assert!(incoming.start_stop_state.is_none());
+        assert_eq!(incoming.timeline_timestamp, ts);
+    }
+
+    #[tokio::test]
+    async fn test_session_state_commit_and_capture_roundtrip() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let mut link = BasicLink::new(120.0).await;
+
+        // Capture, modify, commit
+        let mut state = link.capture_app_session_state();
+        let time = link.clock().micros();
+        state.set_tempo(160.0, time);
+        link.commit_app_session_state(state).await;
+
+        // Re-capture and verify
+        let state2 = link.capture_app_session_state();
+        assert_eq!(state2.tempo(), 160.0);
+    }
+
+    #[tokio::test]
+    async fn test_session_state_start_stop_commit_roundtrip() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let mut link = BasicLink::new(120.0).await;
+
+        let mut state = link.capture_app_session_state();
+        assert!(!state.is_playing());
+
+        let time = link.clock().micros();
+        state.set_is_playing(true, time);
+        link.commit_app_session_state(state).await;
+
+        let state2 = link.capture_app_session_state();
+        assert!(state2.is_playing());
+    }
+
+    #[tokio::test]
+    async fn test_tempo_callback_on_commit() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let mut link = BasicLink::new(120.0).await;
+
+        let recorded_bpm = Arc::new(Mutex::new(0.0f64));
+        let recorded_bpm_clone = recorded_bpm.clone();
+        link.set_tempo_callback(move |bpm| {
+            *recorded_bpm_clone.lock().unwrap() = bpm;
+        });
+
+        let mut state = link.capture_app_session_state();
+        let time = link.clock().micros();
+        state.set_tempo(180.0, time);
+        link.commit_app_session_state(state).await;
+
+        let bpm = *recorded_bpm.lock().unwrap();
+        assert_eq!(bpm, 180.0, "Tempo callback should fire with new BPM");
+    }
+
+    #[tokio::test]
+    async fn test_start_stop_callback_on_commit() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let mut link = BasicLink::new(120.0).await;
+
+        let recorded_playing = Arc::new(Mutex::new(false));
+        let recorded_clone = recorded_playing.clone();
+        link.set_start_stop_callback(move |is_playing| {
+            *recorded_clone.lock().unwrap() = is_playing;
+        });
+
+        let mut state = link.capture_app_session_state();
+        let time = link.clock().micros();
+        state.set_is_playing(true, time);
+        link.commit_app_session_state(state).await;
+
+        assert!(
+            *recorded_playing.lock().unwrap(),
+            "Start/stop callback should fire with true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_is_playing_and_request_beat_at_time() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let link = BasicLink::new(120.0).await;
+        let mut state = link.capture_app_session_state();
+
+        let time = link.clock().micros();
+        state.set_is_playing_and_request_beat_at_time(true, time, 0.0, 4.0);
+        assert!(state.is_playing());
+        let beat = state.beat_at_time(time, 4.0);
+        assert!(beat.is_finite());
+    }
+
+    #[tokio::test]
+    async fn test_request_beat_at_start_playing_time_not_playing() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let link = BasicLink::new(120.0).await;
+        let mut state = link.capture_app_session_state();
+        // Not playing — should be a no-op
+        let tempo_before = state.tempo();
+        state.request_beat_at_start_playing_time(0.0, 4.0);
+        assert_eq!(state.tempo(), tempo_before);
+    }
 }

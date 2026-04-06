@@ -360,32 +360,277 @@ impl bincode::Decode<()> for PrevGhostTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::{
+        beats::Beats,
+        node::{NodeId, NodeState},
+        sessions::{SessionId, SessionMembership},
+        state::StartStopState,
+        tempo::Tempo,
+        timeline::Timeline,
+    };
 
     #[test]
     fn host_time_header() {
-        // assert key is 0x5f5f6874
         assert_eq!(HOST_TIME_HEADER_KEY, 0x5f5f6874, "unexpected byte order");
-        // assert size is 8 (u64 for microseconds timestamp)
         assert_eq!(HOST_TIME_SIZE, 8, "unexpected size");
     }
 
     #[test]
     fn ghost_time_header() {
-        // assert key is 0x5f5f6774
         assert_eq!(GHOST_TIME_HEADER_KEY, 0x5f5f6774, "unexpected byte order");
-        // assert size is 8 (u64 for microseconds timestamp)
         assert_eq!(GHOST_TIME_SIZE, 8, "unexpected size");
     }
 
     #[test]
     fn prev_ghost_time_header() {
-        // assert key is 0x5f5f6874
         assert_eq!(
             PREV_GHOST_TIME_HEADER_KEY, 0x5f706774,
             "unexpected byte order"
         );
-
-        // assert size is 8 (u64 for microseconds timestamp)
         assert_eq!(PREV_GHOST_TIME_SIZE, 8, "unexpected size");
+    }
+
+    #[test]
+    fn roundtrip_timeline_payload() {
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::new(4.0),
+            time_origin: Duration::microseconds(1_000_000),
+        };
+        let payload = Payload {
+            entries: vec![PayloadEntry::Timeline(timeline)],
+        };
+        let encoded = payload.encode().unwrap();
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &encoded).unwrap();
+
+        assert_eq!(decoded_payload.entries.len(), 1);
+        if let PayloadEntry::Timeline(tl) = &decoded_payload.entries[0] {
+            assert_eq!(tl.tempo.bpm(), 120.0);
+            assert_eq!(tl.beat_origin, Beats::new(4.0));
+            assert_eq!(tl.time_origin, Duration::microseconds(1_000_000));
+        } else {
+            panic!("expected Timeline entry");
+        }
+    }
+
+    #[test]
+    fn roundtrip_start_stop_state_payload() {
+        let sss = StartStopState {
+            is_playing: true,
+            beats: Beats::new(8.5),
+            timestamp: Duration::microseconds(2_000_000),
+        };
+        let payload = Payload {
+            entries: vec![PayloadEntry::StartStopState(sss)],
+        };
+        let encoded = payload.encode().unwrap();
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &encoded).unwrap();
+
+        assert_eq!(decoded_payload.entries.len(), 1);
+        if let PayloadEntry::StartStopState(decoded) = &decoded_payload.entries[0] {
+            assert!(decoded.is_playing);
+            assert_eq!(decoded.beats, Beats::new(8.5));
+            assert_eq!(decoded.timestamp, Duration::microseconds(2_000_000));
+        } else {
+            panic!("expected StartStopState entry");
+        }
+    }
+
+    #[test]
+    fn roundtrip_host_time_payload() {
+        let ht = HostTime::new(Duration::microseconds(9_876_543));
+        let payload = Payload {
+            entries: vec![PayloadEntry::HostTime(ht)],
+        };
+        let encoded = payload.encode().unwrap();
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &encoded).unwrap();
+
+        assert_eq!(decoded_payload.entries.len(), 1);
+        if let PayloadEntry::HostTime(decoded) = &decoded_payload.entries[0] {
+            assert_eq!(decoded.time, Duration::microseconds(9_876_543));
+        } else {
+            panic!("expected HostTime entry");
+        }
+    }
+
+    #[test]
+    fn roundtrip_ghost_time_payload() {
+        let gt = GhostTime::new(Duration::microseconds(1_234_567));
+        let payload = Payload {
+            entries: vec![PayloadEntry::GhostTime(gt)],
+        };
+        let encoded = payload.encode().unwrap();
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &encoded).unwrap();
+
+        assert_eq!(decoded_payload.entries.len(), 1);
+        if let PayloadEntry::GhostTime(decoded) = &decoded_payload.entries[0] {
+            assert_eq!(decoded.time, Duration::microseconds(1_234_567));
+        } else {
+            panic!("expected GhostTime entry");
+        }
+    }
+
+    #[test]
+    fn roundtrip_prev_ghost_time_payload() {
+        let pgt = PrevGhostTime::new(Duration::microseconds(7_654_321));
+        let payload = Payload {
+            entries: vec![PayloadEntry::PrevGhostTime(pgt)],
+        };
+        let encoded = payload.encode().unwrap();
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &encoded).unwrap();
+
+        assert_eq!(decoded_payload.entries.len(), 1);
+        if let PayloadEntry::PrevGhostTime(decoded) = &decoded_payload.entries[0] {
+            assert_eq!(decoded.time, Duration::microseconds(7_654_321));
+        } else {
+            panic!("expected PrevGhostTime entry");
+        }
+    }
+
+    #[test]
+    fn roundtrip_multi_entry_payload() {
+        let timeline = Timeline {
+            tempo: Tempo::new(140.0),
+            beat_origin: Beats::new(1.0),
+            time_origin: Duration::microseconds(500_000),
+        };
+        let sss = StartStopState {
+            is_playing: false,
+            beats: Beats::new(0.0),
+            timestamp: Duration::zero(),
+        };
+        let session_membership = SessionMembership {
+            session_id: SessionId(NodeId::from_array([1, 2, 3, 4, 5, 6, 7, 8])),
+        };
+        let payload = Payload {
+            entries: vec![
+                PayloadEntry::Timeline(timeline),
+                PayloadEntry::SessionMembership(session_membership),
+                PayloadEntry::StartStopState(sss),
+            ],
+        };
+        let encoded = payload.encode().unwrap();
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &encoded).unwrap();
+
+        assert_eq!(decoded_payload.entries.len(), 3);
+        assert!(matches!(
+            &decoded_payload.entries[0],
+            PayloadEntry::Timeline(_)
+        ));
+        assert!(matches!(
+            &decoded_payload.entries[1],
+            PayloadEntry::SessionMembership(_)
+        ));
+        assert!(matches!(
+            &decoded_payload.entries[2],
+            PayloadEntry::StartStopState(_)
+        ));
+    }
+
+    #[test]
+    fn roundtrip_node_state_payload() {
+        let node_id = NodeId::from_array([10, 20, 30, 40, 50, 60, 70, 80]);
+        let session_id = SessionId(NodeId::from_array([1, 2, 3, 4, 5, 6, 7, 8]));
+        let node_state = NodeState {
+            node_id,
+            session_id,
+            timeline: Timeline {
+                tempo: Tempo::new(100.0),
+                beat_origin: Beats::new(2.0),
+                time_origin: Duration::microseconds(3_000_000),
+            },
+            start_stop_state: StartStopState {
+                is_playing: true,
+                beats: Beats::new(5.0),
+                timestamp: Duration::microseconds(4_000_000),
+            },
+        };
+        let payload = Payload::from(node_state.clone());
+        let encoded = payload.encode().unwrap();
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &encoded).unwrap();
+
+        let recovered = NodeState::from_payload(node_id, &decoded_payload);
+        assert_eq!(recovered.node_id, node_id);
+        assert_eq!(recovered.session_id, session_id);
+        assert_eq!(recovered.timeline.tempo.bpm(), 100.0);
+        assert!(recovered.start_stop_state.is_playing);
+    }
+
+    #[test]
+    fn unknown_entry_type_skipped_gracefully() {
+        // Build a valid HostTime entry followed by a fake unknown entry, then a GhostTime entry
+        let ht = HostTime::new(Duration::microseconds(42));
+        let gt = GhostTime::new(Duration::microseconds(99));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&ht.encode().unwrap());
+
+        // Fabricate an unknown entry: key=0xDEADBEEF, size=4, payload=4 zero bytes
+        let unknown_header = PayloadEntryHeader {
+            key: 0xDEADBEEF,
+            size: 4,
+        };
+        data.extend_from_slice(&unknown_header.encode().unwrap());
+        data.extend_from_slice(&[0u8; 4]);
+
+        data.extend_from_slice(&gt.encode().unwrap());
+
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &data).unwrap();
+
+        // Should have decoded the HostTime and GhostTime, skipping the unknown entry
+        assert_eq!(decoded_payload.entries.len(), 2);
+        assert!(matches!(
+            &decoded_payload.entries[0],
+            PayloadEntry::HostTime(_)
+        ));
+        assert!(matches!(
+            &decoded_payload.entries[1],
+            PayloadEntry::GhostTime(_)
+        ));
+    }
+
+    #[test]
+    fn empty_payload_decode() {
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &[]).unwrap();
+        assert!(decoded_payload.entries.is_empty());
+    }
+
+    #[test]
+    fn payload_too_short_for_header_is_ok() {
+        // Data shorter than PAYLOAD_ENTRY_HEADER_SIZE should just return Ok with no entries
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &[0u8; 3]).unwrap();
+        assert!(decoded_payload.entries.is_empty());
+    }
+
+    #[test]
+    fn payload_size_matches_encoded_length() {
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::new(0.0),
+            time_origin: Duration::zero(),
+        };
+        let payload = Payload {
+            entries: vec![PayloadEntry::Timeline(timeline)],
+        };
+        let encoded = payload.encode().unwrap();
+        assert_eq!(payload.size() as usize, encoded.len());
+    }
+
+    #[test]
+    fn empty_payload_encode() {
+        let payload = Payload::default();
+        let encoded = payload.encode().unwrap();
+        assert!(encoded.is_empty());
+        assert_eq!(payload.size(), 0);
     }
 }

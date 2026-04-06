@@ -111,4 +111,66 @@ mod tests {
     fn size_bytes() {
         assert_eq!(BEATS_SIZE, 8);
     }
+
+    #[test]
+    fn beats_neg() {
+        let b = Beats::new(3.0);
+        assert_eq!((-b).floating(), -3.0);
+    }
+
+    #[test]
+    fn beats_add() {
+        let a = Beats::new(1.5);
+        let b = Beats::new(2.5);
+        assert_eq!((a + b).floating(), 4.0);
+    }
+
+    #[test]
+    fn beats_sub() {
+        let a = Beats::new(5.0);
+        let b = Beats::new(2.0);
+        assert_eq!((a - b).floating(), 3.0);
+    }
+
+    #[test]
+    fn beats_abs() {
+        assert_eq!(Beats::new(-3.0).abs(), Beats::new(3.0));
+        assert_eq!(Beats::new(3.0).abs(), Beats::new(3.0));
+        assert_eq!(Beats::new(0.0).abs(), Beats::new(0.0));
+    }
+
+    #[test]
+    fn beats_mod() {
+        let a = Beats::new(7.0);
+        let b = Beats::new(4.0);
+        assert_eq!(a.r#mod(b).floating(), 3.0);
+    }
+
+    #[test]
+    fn beats_into_f64() {
+        let b = Beats::new(2.5);
+        let f: f64 = b.into();
+        assert!((f - 2.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn beats_default_is_zero() {
+        let b = Beats::default();
+        assert_eq!(b.value, 0);
+        assert_eq!(b.floating(), 0.0);
+    }
+
+    #[test]
+    fn beats_ordering() {
+        assert!(Beats::new(1.0) < Beats::new(2.0));
+        assert!(Beats::new(2.0) > Beats::new(1.0));
+        assert_eq!(Beats::new(1.0), Beats::new(1.0));
+    }
+
+    #[test]
+    fn beats_negative_value() {
+        let b = Beats::new(-2.5);
+        assert_eq!(b.micro_beats(), -2_500_000);
+        assert!((b.floating() - (-2.5)).abs() < 1e-10);
+    }
 }
