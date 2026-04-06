@@ -10,7 +10,7 @@ use tokio::{
     sync::{mpsc::Sender, Notify},
     time::Instant,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     discovery::{messages::MESSAGE_TYPES, peers::PeerStateMessageType},
@@ -370,15 +370,27 @@ pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
 pub fn send_byebye(node_state: NodeId) {
     info!("sending bye bye");
 
-    let socket = new_udp_reuseport(MULTICAST_IP_ANY.into()).unwrap();
-    socket.set_broadcast(true).unwrap();
-    socket.set_multicast_ttl_v4(2).unwrap();
+    let socket = match new_udp_reuseport(MULTICAST_IP_ANY.into()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to create socket for BYEBYE: {}", e);
+            return;
+        }
+    };
+    let _ = socket.set_broadcast(true);
+    let _ = socket.set_multicast_ttl_v4(2);
 
-    let message = encode_message(node_state, 0, BYEBYE, &Payload::default()).unwrap();
+    let message = match encode_message(node_state, 0, BYEBYE, &Payload::default()) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("Failed to encode BYEBYE message: {}", e);
+            return;
+        }
+    };
 
-    let _ = socket
-        .into_std()
-        .unwrap()
-        .send_to(&message, (MULTICAST_ADDR, LINK_PORT))
-        .unwrap();
+    if let Ok(std_socket) = socket.into_std() {
+        if let Err(e) = std_socket.send_to(&message, (MULTICAST_ADDR, LINK_PORT)) {
+            warn!("Failed to send BYEBYE: {}", e);
+        }
+    }
 }
