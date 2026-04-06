@@ -514,7 +514,7 @@ pub fn median(mut numbers: Vec<f64>) -> f64 {
     let length = numbers.len();
 
     assert!(length > 2);
-    if length % 2 == 0 {
+    if length.is_multiple_of(2) {
         let mid = length / 2;
         (numbers[mid - 1] + numbers[mid]) / 2.0
     } else {

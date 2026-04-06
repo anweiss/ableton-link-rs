@@ -37,7 +37,7 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     } else {
         socket2::Domain::IPV6
     };
-    
+
     let udp_sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
 
     // Set socket options using safe socket2 APIs
@@ -55,7 +55,7 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
 
     udp_sock.set_nonblocking(true)?;
     udp_sock.bind(&socket2::SockAddr::from(addr))?;
-    
+
     // Convert to std::net::UdpSocket and then to tokio::net::UdpSocket
     let std_socket: std::net::UdpSocket = udp_sock.into();
     std_socket.try_into()
@@ -179,7 +179,14 @@ impl Messenger {
                             info!("Received BYEBYE message from peer {}", header.ident);
                             receive_bye_bye(tx_event.clone(), header.ident).await;
                         }
-                        _ => todo!(),
+                        _ => {
+                            tracing::warn!(
+                                "unknown message type {} from peer {}",
+                                header.message_type,
+                                header.ident
+                            );
+                            continue;
+                        }
                     }
                 }
             }

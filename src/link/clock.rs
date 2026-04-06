@@ -1,17 +1,9 @@
-use chrono::Duration;
 use crate::platform::clock::OptimizedClock;
+use chrono::Duration;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct Clock {
     inner: OptimizedClock,
-}
-
-impl Default for Clock {
-    fn default() -> Self {
-        Self {
-            inner: OptimizedClock::new(),
-        }
-    }
 }
 
 impl Clock {

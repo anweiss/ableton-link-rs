@@ -2,25 +2,25 @@
 // Based on Ableton Link's interface detection implementations
 // Now using 100% safe Rust implementations!
 
+use network_interface::NetworkInterfaceConfig;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tracing::{debug, error};
-use network_interface::NetworkInterfaceConfig;
 
 /// Safe Rust implementation using the network-interface crate
 /// This provides cross-platform network interface scanning without unsafe code
 pub async fn scan_network_interfaces() -> Vec<IpAddr> {
-    tokio::task::spawn_blocking(|| {
-        scan_interfaces_safe()
-    }).await.unwrap_or_else(|e| {
-        error!("Failed to scan network interfaces: {}", e);
-        Vec::new()
-    })
+    tokio::task::spawn_blocking(scan_interfaces_safe)
+        .await
+        .unwrap_or_else(|e| {
+            error!("Failed to scan network interfaces: {}", e);
+            Vec::new()
+        })
 }
 
 // Safe implementation using the network-interface crate
 fn scan_interfaces_safe() -> Vec<IpAddr> {
     use std::collections::HashMap;
-    
+
     let mut addresses = Vec::new();
     let mut ipv4_interfaces: HashMap<String, IpAddr> = HashMap::new();
 
@@ -32,7 +32,7 @@ fn scan_interfaces_safe() -> Vec<IpAddr> {
                 if !interface.addr.is_empty() {
                     for addr in &interface.addr {
                         let ip_addr = addr.ip();
-                        
+
                         if let IpAddr::V4(ipv4) = ip_addr {
                             if is_usable_ipv4(&ipv4) {
                                 addresses.push(ip_addr);
@@ -49,7 +49,7 @@ fn scan_interfaces_safe() -> Vec<IpAddr> {
                 if ipv4_interfaces.contains_key(&interface.name) && !interface.addr.is_empty() {
                     for addr in &interface.addr {
                         let ip_addr = addr.ip();
-                        
+
                         if let IpAddr::V6(ipv6) = ip_addr {
                             if is_usable_ipv6(&ipv6) {
                                 addresses.push(ip_addr);
@@ -61,8 +61,11 @@ fn scan_interfaces_safe() -> Vec<IpAddr> {
             }
         }
         Err(e) => {
-            error!("Failed to get network interfaces using network-interface crate: {}", e);
-            
+            error!(
+                "Failed to get network interfaces using network-interface crate: {}",
+                e
+            );
+
             // Fallback to if-addrs crate for better compatibility
             match if_addrs::get_if_addrs() {
                 Ok(interfaces) => {
@@ -85,7 +88,10 @@ fn scan_interfaces_safe() -> Vec<IpAddr> {
     addresses.sort();
     addresses.dedup();
 
-    debug!("Found {} total network interfaces using safe implementation", addresses.len());
+    debug!(
+        "Found {} total network interfaces using safe implementation",
+        addresses.len()
+    );
     addresses
 }
 
@@ -124,11 +130,19 @@ mod tests {
         let interfaces = scan_network_interfaces().await;
         // Should find at least one interface on most systems
         // Note: This might fail in containerized environments
-        println!("Found {} interfaces using safe implementation: {:?}", interfaces.len(), interfaces);
-        
+        println!(
+            "Found {} interfaces using safe implementation: {:?}",
+            interfaces.len(),
+            interfaces
+        );
+
         // Verify all returned interfaces are usable
         for interface in &interfaces {
-            assert!(is_usable_interface(interface), "Interface {:?} should be usable", interface);
+            assert!(
+                is_usable_interface(interface),
+                "Interface {:?} should be usable",
+                interface
+            );
         }
     }
 
@@ -143,7 +157,7 @@ mod tests {
         // IPv6 tests
         assert!(!is_usable_ipv6(&Ipv6Addr::LOCALHOST)); // ::1
         assert!(!is_usable_ipv6(&Ipv6Addr::UNSPECIFIED)); // ::
-        
+
         // Link-local IPv6 should be usable
         let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
         assert!(is_usable_ipv6(&link_local));
@@ -152,16 +166,16 @@ mod tests {
     #[test]
     fn test_safe_interface_filtering() {
         // Test various IP addresses to ensure proper filtering
-        let test_addresses = vec![
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),      // Loopback - should be filtered
-            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),        // Unspecified - should be filtered
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),  // Private - should be kept
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),       // Private - should be kept
-            IpAddr::V6(Ipv6Addr::LOCALHOST),              // IPv6 loopback - should be filtered
+        let test_addresses = [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), // Loopback - should be filtered
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),   // Unspecified - should be filtered
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), // Private - should be kept
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),  // Private - should be kept
+            IpAddr::V6(Ipv6Addr::LOCALHOST),         // IPv6 loopback - should be filtered
             IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), // Link-local - should be kept
         ];
 
-        let expected_usable = vec![
+        let expected_usable = [
             false, // 127.0.0.1
             false, // 0.0.0.0
             true,  // 192.168.1.100
@@ -172,10 +186,10 @@ mod tests {
 
         for (addr, expected) in test_addresses.iter().zip(expected_usable.iter()) {
             assert_eq!(
-                is_usable_interface(addr), 
-                *expected, 
-                "Interface {:?} usability should be {}", 
-                addr, 
+                is_usable_interface(addr),
+                *expected,
+                "Interface {:?} usability should be {}",
+                addr,
                 expected
             );
         }
@@ -186,14 +200,25 @@ mod tests {
         // Test that the network-interface crate is working
         match network_interface::NetworkInterface::show() {
             Ok(interfaces) => {
-                println!("network-interface crate found {} interfaces", interfaces.len());
+                println!(
+                    "network-interface crate found {} interfaces",
+                    interfaces.len()
+                );
                 // Just verify we can access the interface data safely
-                for interface in interfaces.iter().take(3) { // Limit to first 3 for testing
-                    println!("Interface: {} with {} addresses", interface.name, interface.addr.len());
+                for interface in interfaces.iter().take(3) {
+                    // Limit to first 3 for testing
+                    println!(
+                        "Interface: {} with {} addresses",
+                        interface.name,
+                        interface.addr.len()
+                    );
                 }
             }
             Err(e) => {
-                println!("network-interface crate error (may be expected in some environments): {}", e);
+                println!(
+                    "network-interface crate error (may be expected in some environments): {}",
+                    e
+                );
                 // This is okay - the code will fallback to if-addrs
             }
         }
@@ -205,14 +230,22 @@ mod tests {
         match if_addrs::get_if_addrs() {
             Ok(interfaces) => {
                 println!("if-addrs fallback found {} interfaces", interfaces.len());
-                for interface in interfaces.iter().take(3) { // Limit for testing
-                    println!("Fallback interface: {} ({})", interface.name, interface.ip());
+                for interface in interfaces.iter().take(3) {
+                    // Limit for testing
+                    println!(
+                        "Fallback interface: {} ({})",
+                        interface.name,
+                        interface.ip()
+                    );
                     // Verify we can safely access the data
                     assert!(!interface.name.is_empty());
                 }
             }
             Err(e) => {
-                println!("if-addrs error (may be expected in some environments): {}", e);
+                println!(
+                    "if-addrs error (may be expected in some environments): {}",
+                    e
+                );
             }
         }
     }

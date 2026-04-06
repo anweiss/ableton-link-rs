@@ -194,7 +194,10 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
         }
         _ => {
             warn!("unknown payload entry key {:x}", payload_entry_header.key);
-            todo!()
+            let skip_len = PAYLOAD_ENTRY_HEADER_SIZE + payload_entry_header.size as usize;
+            if skip_len <= data.len() {
+                decode(payload, &data[skip_len..])?;
+            }
         }
     }
 

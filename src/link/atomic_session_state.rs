@@ -5,16 +5,10 @@ use chrono::Duration;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::{
-    state::ClientState,
-    safe_rt_session_state::SafeRtSessionStateHandler,
-};
+use super::{safe_rt_session_state::SafeRtSessionStateHandler, state::ClientState};
 
 #[cfg(test)]
-use super::{
-    state::ClientStartStopState,
-    timeline::Timeline,
-};
+use super::{state::ClientStartStopState, timeline::Timeline};
 use crate::link::IncomingClientState;
 
 /// Atomic session state that provides lock-free access for real-time threads
@@ -22,10 +16,10 @@ use crate::link::IncomingClientState;
 pub struct AtomicSessionState {
     /// Real-time session state handler for lock-free access (now using safe implementation)
     rt_handler: Arc<SafeRtSessionStateHandler>,
-    
+
     /// Enable state for determining if we should respect remote updates
     is_enabled: AtomicBool,
-    
+
     /// Last known peer count for determining connection state
     peer_count: AtomicU64,
 }
@@ -47,9 +41,14 @@ impl AtomicSessionState {
 
     /// Update session state from audio thread (real-time safe)
     /// This method is guaranteed to be non-blocking and suitable for audio threads
-    pub fn commit_audio_session_state(&self, incoming_state: IncomingClientState, current_time: Duration) {
+    pub fn commit_audio_session_state(
+        &self,
+        incoming_state: IncomingClientState,
+        current_time: Duration,
+    ) {
         let is_enabled = self.is_enabled.load(Ordering::Acquire);
-        self.rt_handler.update_rt_client_state(incoming_state, current_time, is_enabled);
+        self.rt_handler
+            .update_rt_client_state(incoming_state, current_time, is_enabled);
     }
 
     /// Get current session state for application thread (may block briefly)
@@ -61,9 +60,14 @@ impl AtomicSessionState {
 
     /// Update session state from application thread (may block briefly)
     /// This method can use more expensive operations than the audio version
-    pub fn commit_app_session_state(&self, incoming_state: IncomingClientState, current_time: Duration) {
+    pub fn commit_app_session_state(
+        &self,
+        incoming_state: IncomingClientState,
+        current_time: Duration,
+    ) {
         let is_enabled = self.is_enabled.load(Ordering::Acquire);
-        self.rt_handler.update_rt_client_state(incoming_state, current_time, is_enabled);
+        self.rt_handler
+            .update_rt_client_state(incoming_state, current_time, is_enabled);
     }
 
     /// Process any pending updates from real-time thread
@@ -127,7 +131,7 @@ mod tests {
     fn test_atomic_session_state_creation() {
         let client_state = create_test_client_state();
         let session_state = AtomicSessionState::new(client_state, Duration::milliseconds(1000));
-        
+
         assert!(!session_state.is_enabled());
         assert_eq!(session_state.peer_count(), 0);
         assert_eq!(session_state.grace_period(), Duration::milliseconds(1000));
@@ -137,10 +141,10 @@ mod tests {
     fn test_atomic_session_state_enable() {
         let client_state = create_test_client_state();
         let session_state = AtomicSessionState::new(client_state, Duration::milliseconds(1000));
-        
+
         session_state.set_enabled(true);
         assert!(session_state.is_enabled());
-        
+
         session_state.set_enabled(false);
         assert!(!session_state.is_enabled());
     }
@@ -149,10 +153,10 @@ mod tests {
     fn test_atomic_session_state_peer_count() {
         let client_state = create_test_client_state();
         let session_state = AtomicSessionState::new(client_state, Duration::milliseconds(1000));
-        
+
         session_state.set_peer_count(5);
         assert_eq!(session_state.peer_count(), 5);
-        
+
         session_state.set_peer_count(0);
         assert_eq!(session_state.peer_count(), 0);
     }
@@ -161,30 +165,30 @@ mod tests {
     fn test_atomic_session_state_capture_commit() {
         let client_state = create_test_client_state();
         let session_state = AtomicSessionState::new(client_state, Duration::milliseconds(1000));
-        
+
         let current_time = Duration::milliseconds(1000);
-        
+
         // Test audio thread capture
         let captured_audio = session_state.capture_audio_session_state(current_time);
         assert_eq!(captured_audio.timeline.tempo.bpm(), 120.0);
-        
-        // Test app thread capture  
+
+        // Test app thread capture
         let captured_app = session_state.capture_app_session_state(current_time);
         assert_eq!(captured_app.timeline.tempo.bpm(), 120.0);
-        
+
         // Test commit from audio thread
         let new_timeline = Timeline {
             tempo: Tempo::new(140.0),
             beat_origin: Beats::new(1.0),
             time_origin: Duration::milliseconds(2000),
         };
-        
+
         let incoming_state = IncomingClientState {
             timeline: Some(new_timeline),
             start_stop_state: None,
             timeline_timestamp: Duration::milliseconds(2000),
         };
-        
+
         session_state.commit_audio_session_state(incoming_state, current_time);
         assert!(session_state.has_pending_updates());
     }

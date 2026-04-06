@@ -33,7 +33,6 @@ hex = "0.4.3"
 async-trait = "0.1.73"
 chrono = "0.4.31"
 local-ip-address = "0.5.6"
-termios = "0.3"
 triple_buffer = "8.1.1"
 rodio = "0.21.1"
 if-addrs = "0.10.2"
@@ -41,6 +40,9 @@ network-interface = "2.0.3"
 
 [dependencies.libc]
 version = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+termios = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
@@ -52,6 +54,9 @@ winapi = { version = "0.3", features = [
     "iptypes",
     "ws2def",
     "winerror",
+    "consoleapi",
+    "wincon",
+    "handleapi",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

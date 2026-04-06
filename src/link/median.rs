@@ -7,11 +7,11 @@ pub fn median(data: &mut [f64]) -> Option<f64> {
     }
 
     let n = data.len();
-    
+
     // Sort the data using partial_cmp which handles floats properly
     data.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    
-    if n % 2 == 0 {
+
+    if n.is_multiple_of(2) {
         // Even number of elements - return average of two middle elements
         let mid1_idx = n / 2 - 1;
         let mid2_idx = n / 2;
@@ -104,7 +104,7 @@ mod tests {
         // Simulate measurement data with some outliers
         let mut measurements = [100.0, 102.0, 101.0, 150.0, 103.0, 99.0, 101.5];
         let result = median(&mut measurements);
-        
+
         // Should filter out the outlier (150.0) and return a reasonable median
         assert!(result.is_some());
         let median_val = result.unwrap();

@@ -13,9 +13,7 @@ use crate::{
     },
 };
 
-use super::{
-    clock::Clock, ghostxform::GhostXForm, payload::Payload, sessions::SessionId, Result,
-};
+use super::{clock::Clock, ghostxform::GhostXForm, payload::Payload, sessions::SessionId, Result};
 
 pub const MAX_MESSAGE_SIZE: usize = 512;
 pub const PROTOCOL_HEADER_SIZE: usize = 8;

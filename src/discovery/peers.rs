@@ -508,7 +508,8 @@ mod tests {
             })
             .unwrap();
 
-        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
+        let ping_responder_unicast_socket =
+            Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
 
         (
             PeerGateway::new(
