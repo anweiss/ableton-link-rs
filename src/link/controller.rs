@@ -26,18 +26,16 @@ use super::{
         clamp_tempo, update_client_timeline_from_session, update_session_timeline_from_client,
         Timeline,
     },
-    IncomingClientState,
+    IncomingClientState, TempoCallback,
 };
 
 pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 
 pub struct Controller {
-    // tempo_callback: Option<TempoCallback>,
-    // start_stop_callback: Option<StartStopCallback>,
+    pub tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
     pub peer_state: Arc<Mutex<PeerState>>,
     pub session_state: Arc<Mutex<SessionState>>,
     pub client_state: Arc<Mutex<ClientState>>,
-    // last_is_playing_for_start_stop_state_callback: bool,
     session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
     enabled: Arc<Mutex<bool>>,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
@@ -50,14 +48,9 @@ pub struct Controller {
 }
 
 impl Controller {
-    pub async fn new(
-        tempo: tempo::Tempo,
-        // peer_count_callback: Option<PeerCountCallback>,
-        // tempo_callback: Option<TempoCallback>,
-        // start_stop_callback: Option<StartStopCallback>,
-        clock: Clock,
-    ) -> Self {
+    pub async fn new(tempo: tempo::Tempo, clock: Clock) -> Self {
         let node_id = NodeId::new();
+        let tempo_callback: Arc<Mutex<Option<TempoCallback>>> = Arc::new(Mutex::new(None));
         let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
         let session_id = SessionId(node_id);
         let s_state = init_session_state(tempo, clock);
@@ -148,6 +141,7 @@ impl Controller {
         let s_peer_counter_loop = session_peer_counter.clone();
         let s_loop = sessions.clone();
         let ps_loop = peer_state.clone();
+        let tempo_cb_loop = tempo_callback.clone();
 
         tokio::spawn(async move {
             loop {
@@ -163,6 +157,7 @@ impl Controller {
                         peers_loop.clone(),
                         s_peer_counter_loop.clone(),
                         s_loop.clone(),
+                        tempo_cb_loop.clone(),
                     )
                     .await;
                 }
@@ -177,6 +172,7 @@ impl Controller {
         let p_loop = peers.clone();
         let s_peer_counter_loop = session_peer_counter.clone();
         let peer_state_loop = peer_state.clone();
+        let tempo_cb_loop = tempo_callback.clone();
 
         tokio::spawn(async move {
             loop {
@@ -233,6 +229,7 @@ impl Controller {
                                         sessions_loop.clone(),
                                         clock,
                                         s_stop_sync_enabled_loop.clone(),
+                                        tempo_cb_loop.clone(),
                                     )
                                     .await
                                 }
@@ -262,6 +259,7 @@ impl Controller {
                                     ghost_x_form,
                                     clock,
                                     s_stop_sync_enabled_loop.clone(),
+                                    tempo_cb_loop.clone(),
                                 );
 
                                 update_discovery(
@@ -370,6 +368,7 @@ impl Controller {
                                         sessions_loop.clone(),
                                         clock,
                                         s_stop_sync_enabled_loop.clone(),
+                                        tempo_cb_loop.clone(),
                                     )
                                     .await;
                                 }
@@ -381,12 +380,10 @@ impl Controller {
         });
 
         Self {
-            // tempo_callback,
-            // start_stop_callback,
+            tempo_callback,
             peer_state,
             session_state,
             client_state,
-            // last_is_playing_for_start_stop_state_callback: false,
             session_peer_counter: session_peer_counter.clone(),
             enabled,
             start_stop_sync_enabled,
@@ -412,6 +409,7 @@ impl Controller {
             self.sessions.clone(),
             self.clock,
             self.start_stop_sync_enabled.clone(),
+            self.tempo_callback.clone(),
         )
         .await;
 
@@ -445,6 +443,10 @@ impl Controller {
             info!("Set Link enabled state to false");
         }
 
+        // Signal background tasks (broadcast loop, discovery listener) to stop
+        self.notifier.notify_waiters();
+        info!("Notified background tasks to stop");
+
         // Reset peer count to 0 when disabled, like the C++ implementation
         if let Ok(mut counter) = self.session_peer_counter.try_lock() {
             counter.session_peer_count = 0;
@@ -455,12 +457,14 @@ impl Controller {
         self.discovery.observer.reset_peers();
         info!("Reset discovery peers");
 
-        // Give some time for the bye bye message to be sent and processed
+        // Give some time for the bye bye message to be sent and background tasks to wind down
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         info!("Completed Link disable process");
 
-        // TODO: Implement proper cleanup of discovery/networking
-        // For now, just set enabled to false and reset peers
+        // NOTE: Spawned tokio tasks (discovery listener, measurement tasks) will observe
+        // enabled=false and stop processing new messages. The notifier signal causes
+        // the broadcast loop to exit. Full task cancellation (e.g., via JoinHandle::abort)
+        // would require storing task handles, which is left for a future refactor.
     }
 
     pub async fn set_state(&self, mut new_client_state: IncomingClientState) {
@@ -541,6 +545,7 @@ impl Controller {
                 ghost_x_form,
                 self.clock,
                 self.start_stop_sync_enabled.clone(),
+                self.tempo_callback.clone(),
             );
 
             must_update_discovery = true;
@@ -637,6 +642,7 @@ pub async fn join_session(
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     session_peer_count: Arc<Mutex<SessionPeerCounter>>,
     sessions: Sessions,
+    tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
 ) {
     let session_id_changed = if let Ok(ps) = peer_state.try_lock() {
         ps.session_id() != session.session_id
@@ -663,6 +669,7 @@ pub async fn join_session(
         session.measurement.x_form,
         clock,
         start_stop_sync_enabled.clone(),
+        tempo_callback.clone(),
     );
 
     // Verify that client state was actually updated
@@ -707,6 +714,7 @@ pub async fn join_session(
                 sessions,
                 clock,
                 start_stop_sync_enabled,
+                tempo_callback,
             )
             .await;
         }
@@ -721,6 +729,7 @@ pub async fn reset_state(
     mut sessions: Sessions,
     clock: Clock,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
+    tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
 ) {
     // Preserve the existing NodeId to maintain peer identity across enable/disable cycles
     let existing_node_id = if let Ok(peer_state_guard) = peer_state.try_lock() {
@@ -779,6 +788,7 @@ pub async fn reset_state(
         x_form,
         clock,
         start_stop_sync_enabled,
+        tempo_callback,
     );
 
     update_discovery(session_state.clone(), peer_state.clone(), discovery.clone()).await;
@@ -849,6 +859,7 @@ pub fn update_session_timing(
     new_x_form: GhostXForm,
     clock: Clock,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
+    tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
 ) {
     let new_timeline = clamp_tempo(new_timeline);
 
@@ -884,7 +895,13 @@ pub fn update_session_timing(
             }
 
             if old_timeline.tempo != new_timeline.tempo {
-                // TODO: user callback
+                if let Ok(callback_guard) = tempo_callback.try_lock() {
+                    if let Some(ref callback) = *callback_guard {
+                        if let Ok(cb) = callback.try_lock() {
+                            cb(new_timeline.tempo.bpm());
+                        }
+                    }
+                }
             }
         }
     }

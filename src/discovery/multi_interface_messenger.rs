@@ -277,12 +277,21 @@ impl MultiInterfaceMessenger {
     }
 
     /// Start receiving messages on all interfaces
-    pub async fn start_receiving<F>(&self, _handler: F)
+    pub async fn start_receiving<F>(&self, mut handler: F)
     where
         F: FnMut(SocketAddr, Vec<u8>) + Send + 'static,
     {
         let interfaces = self.interfaces.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
 
+        // Consumer task: invokes the handler for each received message
+        tokio::spawn(async move {
+            while let Some((addr, data)) = rx.recv().await {
+                handler(addr, data);
+            }
+        });
+
+        // Producer: spawns per-interface receive tasks
         tokio::spawn(async move {
             loop {
                 let interface_map = interfaces.lock().await;
@@ -290,6 +299,7 @@ impl MultiInterfaceMessenger {
                 for (addr, interface_handler) in interface_map.iter() {
                     let socket = interface_handler.socket.clone();
                     let interface_addr = *addr;
+                    let tx = tx.clone();
 
                     // Spawn a task for each interface to receive messages
                     tokio::spawn(async move {
@@ -302,9 +312,9 @@ impl MultiInterfaceMessenger {
                                         "Received {} bytes from {} on interface {}",
                                         size, source, interface_addr
                                     );
-                                    // Note: We need to handle the closure capture differently
-                                    // This is a simplified version
-                                    // In practice, you'd use channels to communicate with the handler
+                                    if tx.send((source, buffer[..size].to_vec())).is_err() {
+                                        break;
+                                    }
                                 }
                                 Err(e) => {
                                     warn!(
@@ -317,6 +327,9 @@ impl MultiInterfaceMessenger {
                         }
                     });
                 }
+
+                // Release the lock before sleeping
+                drop(interface_map);
 
                 // Check for interface changes periodically
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;

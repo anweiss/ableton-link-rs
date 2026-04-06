@@ -31,6 +31,7 @@ use crate::{
 use super::{
     clock::Clock,
     ghostxform::GhostXForm,
+    linear_regression::linear_regression,
     node::NodeId,
     payload::{HostTime, Payload, PayloadEntry, PayloadEntryHeader},
     pingresponder::{encode_message, PingResponder, PING},
@@ -189,12 +190,29 @@ pub async fn measure_peer(
                         .await
                         .unwrap();
                 } else {
+                    let (slope, intercept) = if data.len() >= 3 {
+                        let (reg_slope, reg_intercept) = linear_regression(data.iter().copied());
+                        if reg_intercept.is_finite() {
+                            (1.0 + reg_slope, reg_intercept)
+                        } else {
+                            // Fallback to slope=1.0 with median offset
+                            let offsets: Vec<f64> = data.iter().map(|(_, y)| *y).collect();
+                            (1.0, median(offsets))
+                        }
+                    } else {
+                        // Not enough data for regression, use median offset
+                        let mut offsets: Vec<f64> = data.iter().map(|(_, y)| *y).collect();
+                        offsets
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let mid = offsets[offsets.len() / 2];
+                        (1.0, mid)
+                    };
                     tx_measure_peer_result_loop
                         .send(MeasurePeerEvent::XForm(
                             session_id,
                             GhostXForm {
-                                slope: 1.0,
-                                intercept: Duration::microseconds(median(data).round() as i64),
+                                slope,
+                                intercept: Duration::microseconds(intercept.round() as i64),
                             },
                         ))
                         .await
@@ -215,7 +233,7 @@ pub struct Measurement {
     pub unicast_socket: Option<Arc<UdpSocket>>,
     pub session_id: SessionId,
     pub measurement_endpoint: Option<SocketAddrV4>,
-    pub data: Arc<Mutex<Vec<f64>>>,
+    pub data: Arc<Mutex<Vec<(f64, f64)>>>,
     pub clock: Clock,
     pub measurements_started: Arc<Mutex<usize>>,
     pub success: Arc<Mutex<bool>>,
@@ -227,7 +245,7 @@ impl Measurement {
     pub async fn new(
         state: PeerState,
         clock: Clock,
-        tx_measurement: Sender<Vec<f64>>,
+        tx_measurement: Sender<Vec<(f64, f64)>>,
         notifier: Arc<Notify>,
     ) -> Self {
         let (tx_timer, mut rx_timer) = mpsc::channel(1);
@@ -401,20 +419,23 @@ impl Measurement {
                         if ghost_time != Duration::microseconds(0)
                             && prev_host_time != Duration::microseconds(0)
                         {
-                            data.try_lock().unwrap().push(
-                                ghost_time.num_microseconds().unwrap() as f64
-                                    - ((host_time + prev_host_time).num_microseconds().unwrap()
-                                        as f64
-                                        * 0.5),
-                            );
+                            let avg_host = (host_time + prev_host_time).num_microseconds().unwrap()
+                                as f64
+                                * 0.5;
+                            let offset = ghost_time.num_microseconds().unwrap() as f64 - avg_host;
+                            data.try_lock().unwrap().push((avg_host, offset));
 
                             if prev_ghost_time != Duration::microseconds(0) {
-                                data.try_lock().unwrap().push(
-                                    ((ghost_time + prev_ghost_time).num_microseconds().unwrap()
+                                let avg_ghost =
+                                    (ghost_time + prev_ghost_time).num_microseconds().unwrap()
                                         as f64
-                                        * 0.5)
-                                        - prev_host_time.num_microseconds().unwrap() as f64,
-                                );
+                                        * 0.5;
+                                let offset2 =
+                                    avg_ghost - prev_host_time.num_microseconds().unwrap() as f64;
+                                data.try_lock().unwrap().push((
+                                    prev_host_time.num_microseconds().unwrap() as f64,
+                                    offset2,
+                                ));
                             }
                         }
 
@@ -434,8 +455,8 @@ async fn reset_timer(
     clock: Clock,
     unicast_socket: Option<Arc<UdpSocket>>,
     measurement_endpoint: SocketAddrV4,
-    data: Arc<Mutex<Vec<f64>>>,
-    tx_measurement: Sender<Vec<f64>>,
+    data: Arc<Mutex<Vec<(f64, f64)>>>,
+    tx_measurement: Sender<Vec<(f64, f64)>>,
     finished_notifier: Arc<Notify>,
 ) {
     loop {
@@ -484,8 +505,8 @@ async fn reset_timer(
 async fn finish(
     success: Arc<Mutex<bool>>,
     measurement_endpoint: SocketAddrV4,
-    data: Arc<Mutex<Vec<f64>>>,
-    tx_measurement: Sender<Vec<f64>>,
+    data: Arc<Mutex<Vec<(f64, f64)>>>,
+    tx_measurement: Sender<Vec<(f64, f64)>>,
 ) {
     *success.try_lock().unwrap() = true;
     debug!("measuring {} done", measurement_endpoint);
@@ -611,7 +632,7 @@ mod tests {
             gw.listen(rx_event, n).await;
         });
 
-        let (tx_measurement, mut rx_measurement) = mpsc::channel::<Vec<f64>>(1);
+        let (tx_measurement, mut rx_measurement) = mpsc::channel::<Vec<(f64, f64)>>(1);
 
         let ip = list_afinet_netifas()
             .unwrap()

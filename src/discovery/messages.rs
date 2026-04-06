@@ -48,11 +48,12 @@ pub fn encode_message(
     ttl: u8,
     message_type: MessageType,
     payload: &Payload,
+    group_id: SessionGroupId,
 ) -> Result<Vec<u8>> {
     let header = MessageHeader {
         message_type,
         ttl,
-        group_id: 0,
+        group_id,
         ident: from,
     };
 
@@ -69,16 +70,26 @@ pub fn encode_message(
     Ok(encoded)
 }
 
-pub fn alive_message(from: NodeId, ttl: u8, payload: &Payload) -> Result<Vec<u8>> {
-    encode_message(from, ttl, ALIVE, payload)
+pub fn alive_message(
+    from: NodeId,
+    ttl: u8,
+    payload: &Payload,
+    group_id: SessionGroupId,
+) -> Result<Vec<u8>> {
+    encode_message(from, ttl, ALIVE, payload, group_id)
 }
 
-pub fn response_message(from: NodeId, ttl: u8, payload: &Payload) -> Result<Vec<u8>> {
-    encode_message(from, ttl, RESPONSE, payload)
+pub fn response_message(
+    from: NodeId,
+    ttl: u8,
+    payload: &Payload,
+    group_id: SessionGroupId,
+) -> Result<Vec<u8>> {
+    encode_message(from, ttl, RESPONSE, payload, group_id)
 }
 
 pub fn byebye_message(from: NodeId) -> Result<Vec<u8>> {
-    encode_message(from, 0, BYEBYE, &Payload::default())
+    encode_message(from, 0, BYEBYE, &Payload::default(), 0)
 }
 
 pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {

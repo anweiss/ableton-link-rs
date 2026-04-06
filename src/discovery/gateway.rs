@@ -185,7 +185,7 @@ impl PeerGateway {
                 .map(|state| state.ident())
                 .unwrap_or_default();
 
-            let message = encode_message(peer_ident, 0, BYEBYE, &Payload::default()).unwrap();
+            let message = encode_message(peer_ident, 0, BYEBYE, &Payload::default(), 0).unwrap();
 
             ctrl_socket
                 .send_to(&message, (MULTICAST_ADDR, LINK_PORT))
