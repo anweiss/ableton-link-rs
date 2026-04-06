@@ -159,7 +159,7 @@ async fn test_beat_and_phase_various_quantums() {
             quantum
         );
         assert!(
-            phase_val >= 0.0 && phase_val < quantum,
+            (0.0..quantum).contains(&phase_val),
             "phase {} should be in [0, {}) for quantum={}",
             phase_val,
             quantum,
