@@ -147,7 +147,13 @@ impl BasicLink {
     where
         F: Fn(f64) + Send + 'static,
     {
-        self.tempo_callback = Some(Arc::new(Mutex::new(Box::new(callback))));
+        let cb: TempoCallback = Arc::new(Mutex::new(Box::new(callback)));
+        self.tempo_callback = Some(cb.clone());
+
+        // Also wire the callback into the controller for peer-initiated tempo changes
+        if let Ok(mut guard) = self.controller.tempo_callback.try_lock() {
+            *guard = Some(cb);
+        }
 
         // Trigger initial callback with current tempo
         if let Ok(client_state) = self.controller.client_state.try_lock() {

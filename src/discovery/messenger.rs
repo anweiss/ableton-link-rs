@@ -23,8 +23,8 @@ use crate::{
 use super::{
     gateway::OnEvent,
     messages::{
-        encode_message, parse_message_header, parse_payload, MessageHeader, MessageType, ALIVE,
-        BYEBYE, MAX_MESSAGE_SIZE, RESPONSE,
+        encode_message, parse_message_header, parse_payload, MessageHeader, MessageType,
+        SessionGroupId, ALIVE, BYEBYE, MAX_MESSAGE_SIZE, RESPONSE,
     },
     peers::PeerState,
     LINK_PORT, MULTICAST_ADDR, MULTICAST_IP_ANY,
@@ -62,6 +62,7 @@ pub struct Messenger {
     pub tx_event: Sender<OnEvent>,
     pub notifier: Arc<Notify>,
     pub enabled: Arc<Mutex<bool>>,
+    pub group_id: SessionGroupId,
 }
 
 impl Messenger {
@@ -87,6 +88,7 @@ impl Messenger {
             tx_event,
             notifier,
             enabled,
+            group_id: 0,
         }
     }
 
@@ -97,6 +99,7 @@ impl Messenger {
         let tx_event = self.tx_event.clone();
         let last_broadcast_time = self.last_broadcast_time.clone();
         let enabled = self.enabled.clone();
+        let group_id = self.group_id;
 
         let _n = self.notifier.clone();
 
@@ -109,7 +112,7 @@ impl Messenger {
 
                 // TODO figure out how to encode group ID
                 let should_ignore = match peer_state.try_lock() {
-                    Ok(guard) => header.ident == guard.ident() && header.group_id == 0,
+                    Ok(guard) => header.ident == guard.ident() && header.group_id == group_id,
                     Err(_) => false, // If we can't get the lock, don't ignore
                 };
 
@@ -152,6 +155,7 @@ impl Messenger {
                                 ttl,
                                 src,
                                 last_broadcast_time.clone(),
+                                group_id,
                             )
                             .await;
 
@@ -196,6 +200,7 @@ impl Messenger {
             SocketAddrV4::new(MULTICAST_ADDR, LINK_PORT),
             self.notifier.clone(),
             self.enabled.clone(),
+            self.group_id,
         )
         .await;
     }
@@ -210,6 +215,7 @@ pub async fn broadcast_state(
     to: SocketAddrV4,
     n: Arc<Notify>,
     enabled: Arc<Mutex<bool>>,
+    group_id: SessionGroupId,
 ) {
     let lbt = last_broadcast_time.clone();
     let s = socket.clone();
@@ -263,7 +269,7 @@ pub async fn broadcast_state(
                     };
 
                     if should_broadcast {
-                        send_peer_state(s.clone(), peer_state.clone(), ttl, ALIVE, to, lbt).await;
+                        send_peer_state(s.clone(), peer_state.clone(), ttl, ALIVE, to, lbt, group_id).await;
                     }
                 }
             }
@@ -280,8 +286,18 @@ pub async fn send_response(
     ttl: u8,
     to: SocketAddrV4,
     last_broadcast_time: Arc<Mutex<Instant>>,
+    group_id: SessionGroupId,
 ) {
-    send_peer_state(socket, peer_state, ttl, RESPONSE, to, last_broadcast_time).await
+    send_peer_state(
+        socket,
+        peer_state,
+        ttl,
+        RESPONSE,
+        to,
+        last_broadcast_time,
+        group_id,
+    )
+    .await
 }
 
 pub async fn send_message(
@@ -291,12 +307,13 @@ pub async fn send_message(
     message_type: MessageType,
     payload: &Payload,
     to: SocketAddrV4,
+    group_id: SessionGroupId,
 ) {
     socket.set_broadcast(true).unwrap();
     socket.set_multicast_ttl_v4(2).unwrap();
     socket.set_multicast_loop_v4(true).unwrap();
 
-    let message = encode_message(from, ttl, message_type, payload).unwrap();
+    let message = encode_message(from, ttl, message_type, payload, group_id).unwrap();
 
     let _sent_bytes = socket.send_to(&message, to).await.unwrap();
 }
@@ -308,6 +325,7 @@ pub async fn send_peer_state(
     message_type: MessageType,
     to: SocketAddrV4,
     last_broadcast_time: Arc<Mutex<Instant>>,
+    group_id: SessionGroupId,
 ) {
     let (ident, peer_state_clone) = match peer_state.try_lock() {
         Ok(guard) => (guard.ident(), guard.clone()),
@@ -324,6 +342,7 @@ pub async fn send_peer_state(
         message_type,
         &peer_state_clone.into(),
         to,
+        group_id,
     )
     .await;
 
@@ -380,7 +399,7 @@ pub fn send_byebye(node_state: NodeId) {
     let _ = socket.set_broadcast(true);
     let _ = socket.set_multicast_ttl_v4(2);
 
-    let message = match encode_message(node_state, 0, BYEBYE, &Payload::default()) {
+    let message = match encode_message(node_state, 0, BYEBYE, &Payload::default(), 0) {
         Ok(m) => m,
         Err(e) => {
             warn!("Failed to encode BYEBYE message: {}", e);
