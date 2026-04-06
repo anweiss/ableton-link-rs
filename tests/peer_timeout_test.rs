@@ -9,6 +9,7 @@ fn init_tracing() {
 }
 
 #[tokio::test]
+#[ignore] // Requires real UDP multicast; timing-sensitive — run locally with --include-ignored
 async fn test_peer_timeout_when_disabled() {
     init_tracing();
 
@@ -119,6 +120,7 @@ async fn test_peer_timeout_when_disabled() {
 }
 
 #[tokio::test]
+#[ignore] // Requires real UDP multicast; timing-sensitive — run locally with --include-ignored
 async fn test_peer_rejoin_after_timeout() {
     init_tracing();
 
