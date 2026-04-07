@@ -214,6 +214,51 @@ mod tests {
     }
 
     #[test]
+    fn test_espclock_trait_contract() {
+        // Validate the ClockTrait interface contract using SafeClock.
+        // Since EspClock can't run in CI, we verify the shared contract
+        // (inverse conversions, zero handling, large values) on SafeClock,
+        // which EspClock mirrors.
+        let clock = SafeClock::new();
+
+        // micros_to_ticks and ticks_to_micros are inverse operations
+        let test_values: Vec<u64> = vec![0, 1, 500, 1_000, 1_000_000, 3_600_000_000];
+        for &val in &test_values {
+            let micros = Duration::microseconds(val as i64);
+            let ticks = clock.micros_to_ticks(micros);
+            let back = clock.ticks_to_micros(ticks);
+            assert_eq!(micros, back, "Round-trip failed for {val} microseconds");
+        }
+
+        // ticks_to_micros(0) returns zero duration
+        let zero = clock.ticks_to_micros(0);
+        assert_eq!(
+            zero,
+            Duration::microseconds(0),
+            "ticks_to_micros(0) must be zero"
+        );
+
+        // Large value (1 hour) round-trips correctly
+        let one_hour_us: u64 = 3_600_000_000;
+        let one_hour = Duration::microseconds(one_hour_us as i64);
+        let ticks = clock.micros_to_ticks(one_hour);
+        assert_eq!(ticks, one_hour_us);
+        assert_eq!(clock.ticks_to_micros(ticks), one_hour);
+    }
+
+    #[test]
+    fn test_platform_clock_type_exists() {
+        // Verify the cfg-gate PlatformClock alias compiles and works
+        use super::super::PlatformClock;
+        let clock = PlatformClock::new();
+        let dur = clock.micros();
+        assert!(
+            dur.num_microseconds().is_some(),
+            "PlatformClock::micros() should return a valid duration"
+        );
+    }
+
+    #[test]
     fn test_optimized_clock_precision() {
         let clock = OptimizedClock::new();
         let start = clock.micros();
