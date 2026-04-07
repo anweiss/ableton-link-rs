@@ -1,12 +1,12 @@
 use std::mem;
 
-use bincode::{Decode, Encode};
 use chrono::Duration;
 use tracing::{debug, warn};
 
 use crate::{
-    discovery::{peers::PeerState, ENCODING_CONFIG},
+    discovery::peers::PeerState,
     link::{
+        encoding::{PayloadEntryHeader, PAYLOAD_ENTRY_HEADER_SIZE},
         measurement::{
             MeasurementEndpointV4, MEASUREMENT_ENDPOINT_V4_HEADER_KEY, MEASUREMENT_ENDPOINT_V4_SIZE,
         },
@@ -15,11 +15,10 @@ use crate::{
         state::{StartStopState, START_STOP_STATE_HEADER_KEY, START_STOP_STATE_SIZE},
         timeline::{Timeline, TIMELINE_HEADER_KEY, TIMELINE_SIZE},
     },
+    ENCODING_CONFIG,
 };
 
 use super::Result;
-
-pub const PAYLOAD_ENTRY_HEADER_SIZE: usize = mem::size_of::<u32>() + mem::size_of::<u32>();
 
 pub const HOST_TIME_HEADER_KEY: u32 = u32::from_be_bytes(*b"__ht");
 pub const HOST_TIME_SIZE: u32 = mem::size_of::<u64>() as u32;
@@ -202,19 +201,6 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, Encode, Decode, Default)]
-pub struct PayloadEntryHeader {
-    pub key: u32,
-    // payload entry size
-    pub size: u32,
-}
-
-impl PayloadEntryHeader {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        Ok(bincode::encode_to_vec(self, ENCODING_CONFIG)?)
-    }
 }
 
 #[derive(Debug)]

@@ -6,11 +6,12 @@ use tokio::{net::UdpSocket, sync::Notify};
 use tracing::{debug, info};
 
 use crate::{
-    discovery::{messages::parse_payload, ENCODING_CONFIG},
+    discovery::messages::parse_payload,
     link::{
         payload::{GhostTime, PayloadEntry},
         sessions::SessionMembership,
     },
+    ENCODING_CONFIG,
 };
 
 use super::{clock::Clock, ghostxform::GhostXForm, payload::Payload, sessions::SessionId, Result};

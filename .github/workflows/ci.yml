@@ -76,3 +76,13 @@ jobs:
       # Run tests serially — many tests bind the Link multicast port (20808)
       # and will collide when run in parallel
       - run: cargo test --all -- --nocapture --test-threads=1
+
+  no-std:
+    name: no_std check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --lib --no-default-features

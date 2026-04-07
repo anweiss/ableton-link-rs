@@ -1,11 +1,12 @@
-use std::mem;
+use core::mem;
 
+use alloc::vec::Vec;
 use chrono::Duration;
 
-use crate::discovery::ENCODING_CONFIG;
+use crate::ENCODING_CONFIG;
 
 use super::{
-    beats::Beats, ghostxform::GhostXForm, payload::PayloadEntryHeader, timeline::Timeline, Result,
+    beats::Beats, encoding::PayloadEntryHeader, ghostxform::GhostXForm, timeline::Timeline, Result,
 };
 
 pub const START_STOP_STATE_HEADER_KEY: u32 = u32::from_be_bytes(*b"stst");
@@ -37,7 +38,7 @@ impl bincode::Encode for StartStopState {
     fn encode<E: bincode::enc::Encoder>(
         &self,
         encoder: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
         bincode::Encode::encode(
             &(
                 self.is_playing,
@@ -52,7 +53,7 @@ impl bincode::Encode for StartStopState {
 impl bincode::Decode<()> for StartStopState {
     fn decode<D: bincode::de::Decoder>(
         decoder: &mut D,
-    ) -> std::result::Result<Self, bincode::error::DecodeError> {
+    ) -> core::result::Result<Self, bincode::error::DecodeError> {
         let (is_playing, beats, timestamp) = bincode::Decode::decode(decoder)?;
         Ok(Self {
             is_playing,

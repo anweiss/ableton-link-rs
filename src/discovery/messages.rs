@@ -3,12 +3,12 @@ use std::mem;
 use bincode::{Decode, Encode};
 
 use crate::{
-    discovery::ENCODING_CONFIG,
     link::{
         node::NodeId,
         payload::{self, Payload},
         Result,
     },
+    ENCODING_CONFIG,
 };
 
 pub const MAX_MESSAGE_SIZE: usize = 512;

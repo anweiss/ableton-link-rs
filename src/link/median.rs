@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 /// Calculate the median of a collection of values
 /// This is used in measurement processing for clock synchronization
 /// to filter out outliers and get a robust estimate.
@@ -9,7 +11,7 @@ pub fn median(data: &mut [f64]) -> Option<f64> {
     let n = data.len();
 
     // Sort the data using partial_cmp which handles floats properly
-    data.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    data.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
 
     if n.is_multiple_of(2) {
         // Even number of elements - return average of two middle elements

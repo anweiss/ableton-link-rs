@@ -1,13 +1,14 @@
-use std::mem;
+use core::mem;
 
+use alloc::vec::Vec;
 use chrono::Duration;
 
-use crate::discovery::ENCODING_CONFIG;
+use crate::ENCODING_CONFIG;
 
 use super::{
     beats::{Beats, BEATS_SIZE},
+    encoding::PayloadEntryHeader,
     ghostxform::GhostXForm,
-    payload::PayloadEntryHeader,
     tempo::{Tempo, TEMPO_SIZE},
     Result,
 };
@@ -56,7 +57,7 @@ impl bincode::Encode for Timeline {
     fn encode<E: bincode::enc::Encoder>(
         &self,
         encoder: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
         bincode::Encode::encode(
             &(
                 self.tempo,
@@ -71,7 +72,7 @@ impl bincode::Encode for Timeline {
 impl bincode::Decode<()> for Timeline {
     fn decode<D: bincode::de::Decoder>(
         decoder: &mut D,
-    ) -> std::result::Result<Self, bincode::error::DecodeError> {
+    ) -> core::result::Result<Self, bincode::error::DecodeError> {
         // Decode the raw i64 values as they are encoded
         let tempo_micros: i64 = bincode::Decode::decode(decoder)?;
         let beat_origin_micro_beats: i64 = bincode::Decode::decode(decoder)?;

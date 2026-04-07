@@ -1,32 +1,44 @@
 #![allow(clippy::too_many_arguments)]
 
+#[cfg(feature = "std")]
 pub mod atomic_session_state;
 pub mod beats;
+#[cfg(feature = "std")]
 pub mod clock;
+#[cfg(feature = "std")]
 pub mod controller;
+pub mod encoding;
 pub mod error;
 pub mod ghostxform;
+#[cfg(feature = "std")]
 pub mod host_time_filter;
 pub mod linear_regression;
+#[cfg(feature = "std")]
 pub mod measurement;
 pub mod median;
 pub mod node;
+#[cfg(feature = "std")]
 pub mod payload;
 pub mod phase;
+#[cfg(feature = "std")]
 pub mod pingresponder;
+#[cfg(feature = "std")]
 pub mod safe_rt_session_state;
+#[cfg(feature = "std")]
 pub mod sessions;
 pub mod state;
 pub mod tempo;
 pub mod timeline;
 
-use std::{
-    result,
-    sync::{Arc, Mutex},
-};
+use core::result;
 
+#[cfg(feature = "std")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "std")]
 use chrono::Duration;
 
+#[cfg(feature = "std")]
 use self::{
     atomic_session_state::AtomicSessionState,
     beats::Beats,
@@ -40,10 +52,14 @@ use self::{
 
 pub type Result<T> = result::Result<T, error::Error>;
 
+#[cfg(feature = "std")]
 pub type PeerCountCallback = Arc<Mutex<Box<dyn Fn(usize) + Send>>>;
+#[cfg(feature = "std")]
 pub type TempoCallback = Arc<Mutex<Box<dyn Fn(f64) + Send>>>;
+#[cfg(feature = "std")]
 pub type StartStopCallback = Arc<Mutex<Box<dyn Fn(bool) + Send>>>;
 
+#[cfg(feature = "std")]
 pub struct BasicLink {
     peer_count_callback: Option<PeerCountCallback>,
     tempo_callback: Option<TempoCallback>,
@@ -54,6 +70,7 @@ pub struct BasicLink {
     last_is_playing_for_callback: bool,
 }
 
+#[cfg(feature = "std")]
 impl BasicLink {
     pub async fn new(bpm: f64) -> Self {
         // Only set up tracing if not already set up
@@ -97,6 +114,7 @@ impl BasicLink {
     }
 }
 
+#[cfg(feature = "std")]
 impl BasicLink {
     pub async fn enable(&mut self) {
         self.controller.enable().await;
@@ -252,6 +270,7 @@ impl BasicLink {
     }
 }
 
+#[cfg(feature = "std")]
 pub fn to_session_state(state: &ClientState, _is_connected: bool) -> SessionState {
     SessionState::new(
         ApiState {
@@ -265,6 +284,7 @@ pub fn to_session_state(state: &ClientState, _is_connected: bool) -> SessionStat
     )
 }
 
+#[cfg(feature = "std")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IncomingClientState {
     pub timeline: Option<Timeline>,
@@ -272,6 +292,7 @@ pub struct IncomingClientState {
     pub timeline_timestamp: Duration,
 }
 
+#[cfg(feature = "std")]
 pub fn to_incoming_client_state(
     state: &ApiState,
     original_state: &ApiState,
@@ -300,18 +321,21 @@ pub fn to_incoming_client_state(
     }
 }
 
+#[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ApiState {
     timeline: Timeline,
     start_stop_state: ApiStartStopState,
 }
 
+#[cfg(feature = "std")]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 struct ApiStartStopState {
     is_playing: bool,
     time: Duration,
 }
 
+#[cfg(feature = "std")]
 impl Default for ApiStartStopState {
     fn default() -> Self {
         Self {
@@ -321,12 +345,14 @@ impl Default for ApiStartStopState {
     }
 }
 
+#[cfg(feature = "std")]
 impl ApiStartStopState {
     fn new(is_playing: bool, time: Duration) -> Self {
         Self { is_playing, time }
     }
 }
 
+#[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SessionState {
     original_state: ApiState,
@@ -334,6 +360,7 @@ pub struct SessionState {
     respect_quantum: bool,
 }
 
+#[cfg(feature = "std")]
 impl SessionState {
     pub fn new(state: ApiState, respect_quantum: bool) -> Self {
         Self {
