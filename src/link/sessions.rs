@@ -9,11 +9,11 @@ use chrono::Duration;
 use tokio::sync::Notify;
 use tracing::{debug, info};
 
-use crate::discovery::{peers::ControllerPeer, ENCODING_CONFIG};
+use crate::{discovery::peers::ControllerPeer, ENCODING_CONFIG};
 
 use super::{
-    clock::Clock, ghostxform::GhostXForm, measurement::MeasurePeerEvent, node::NodeId,
-    payload::PayloadEntryHeader, timeline::Timeline, Result,
+    clock::Clock, encoding::PayloadEntryHeader, ghostxform::GhostXForm,
+    measurement::MeasurePeerEvent, node::NodeId, timeline::Timeline, Result,
 };
 
 pub const SESSION_MEMBERSHIP_HEADER_KEY: u32 = u32::from_be_bytes(*b"sess");

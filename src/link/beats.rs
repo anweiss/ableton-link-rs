@@ -1,4 +1,4 @@
-use std::{
+use core::{
     mem,
     ops::{Add, Neg, Sub},
 };
@@ -16,7 +16,7 @@ impl bincode::Encode for Beats {
     fn encode<E: bincode::enc::Encoder>(
         &self,
         encoder: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
         bincode::Encode::encode(&self.micro_beats(), encoder)
     }
 }

@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 /// Linear regression implementation for clock synchronization
 /// Used to calculate the best-fit line through a set of time measurements
 pub fn linear_regression<I>(points: I) -> (f64, f64)

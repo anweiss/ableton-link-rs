@@ -21,25 +21,46 @@ exclude = [
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["std"]
+std = [
+    "tokio",
+    "thiserror",
+    "socket2",
+    "tracing-subscriber",
+    "async-trait",
+    "local-ip-address",
+    "triple_buffer",
+    "rodio",
+    "if-addrs",
+    "network-interface",
+    "libc",
+    "hex/std",
+    "chrono/std",
+    "rand/std",
+    "rand/std_rng",
+]
+
 [dependencies]
-rand = "0.8.4"
-tokio = { version = "1", features = ["full"] }
+rand = { version = "0.8.4", default-features = false }
+tokio = { version = "1", features = ["full"], optional = true }
 bincode = { version = "2.0.0-rc.3", features = ["derive", "serde"] }
-thiserror = "1.0.48"
-socket2 = { version = "0.5.3", features = ["all"] }
+thiserror = { version = "1.0.48", optional = true }
+socket2 = { version = "0.5.3", features = ["all"], optional = true }
 tracing = "0.1.37"
-tracing-subscriber = "0.3.17"
-hex = "0.4.3"
-async-trait = "0.1.73"
-chrono = "0.4.31"
-local-ip-address = "0.5.6"
-triple_buffer = "8.1.1"
-rodio = "0.21.1"
-if-addrs = "0.10.2"
-network-interface = "2.0.3"
+tracing-subscriber = { version = "0.3.17", optional = true }
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
+async-trait = { version = "0.1.73", optional = true }
+chrono = { version = "0.4.31", default-features = false, features = ["alloc"] }
+local-ip-address = { version = "0.5.6", optional = true }
+triple_buffer = { version = "8.1.1", optional = true }
+rodio = { version = "0.21.1", optional = true }
+if-addrs = { version = "0.10.2", optional = true }
+network-interface = { version = "2.0.3", optional = true }
 
 [dependencies.libc]
 version = "0.2"
+optional = true
 
 [target.'cfg(unix)'.dependencies]
 termios = "0.3"

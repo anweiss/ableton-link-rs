@@ -18,22 +18,22 @@ use tokio::{
 use tracing::{debug, info};
 
 use crate::{
-    discovery::{
-        messages::parse_payload, messenger::new_udp_reuseport, peers::PeerState, ENCODING_CONFIG,
-    },
+    discovery::{messages::parse_payload, messenger::new_udp_reuseport, peers::PeerState},
     link::{
         payload::PrevGhostTime,
         pingresponder::{parse_message_header, MAX_MESSAGE_SIZE, PONG},
         Result,
     },
+    ENCODING_CONFIG,
 };
 
 use super::{
     clock::Clock,
+    encoding::PayloadEntryHeader,
     ghostxform::GhostXForm,
     linear_regression::linear_regression,
     node::NodeId,
-    payload::{HostTime, Payload, PayloadEntry, PayloadEntryHeader},
+    payload::{HostTime, Payload, PayloadEntry},
     pingresponder::{encode_message, PingResponder, PING},
     sessions::SessionId,
     state::SessionState,

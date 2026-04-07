@@ -10,11 +10,7 @@ pub mod peers;
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use bincode::config::{BigEndian, Configuration, Fixint};
-
-pub const ENCODING_CONFIG: Configuration<BigEndian, Fixint> = bincode::config::standard()
-    .with_big_endian()
-    .with_fixed_int_encoding();
+pub use crate::ENCODING_CONFIG;
 
 pub const LINK_PORT: u16 = 20808;
 pub const MULTICAST_IP_ANY: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), LINK_PORT);

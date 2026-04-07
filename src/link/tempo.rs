@@ -1,4 +1,4 @@
-use std::{
+use core::{
     fmt::{self, Display},
     mem,
 };
@@ -60,7 +60,7 @@ impl bincode::Encode for Tempo {
     fn encode<E: bincode::enc::Encoder>(
         &self,
         encoder: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
         bincode::Encode::encode(&self.micros_per_beat().num_microseconds().unwrap(), encoder)
     }
 }
@@ -68,7 +68,7 @@ impl bincode::Encode for Tempo {
 impl bincode::Decode<()> for Tempo {
     fn decode<D: bincode::de::Decoder>(
         decoder: &mut D,
-    ) -> std::result::Result<Self, bincode::error::DecodeError> {
+    ) -> core::result::Result<Self, bincode::error::DecodeError> {
         Ok(Self::from(Duration::microseconds(bincode::Decode::decode(
             decoder,
         )?)))

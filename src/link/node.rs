@@ -1,5 +1,5 @@
 use core::fmt;
-use std::fmt::Display;
+use core::fmt::Display;
 
 use bincode::{Decode, Encode};
 use rand::{
@@ -7,12 +7,14 @@ use rand::{
     Rng,
 };
 
-use super::{
-    payload::{Payload, PayloadEntry},
-    sessions::SessionId,
-    state::StartStopState,
-    timeline::Timeline,
-};
+#[cfg(feature = "std")]
+use super::payload::{Payload, PayloadEntry};
+#[cfg(feature = "std")]
+use super::sessions::SessionId;
+#[cfg(feature = "std")]
+use super::state::StartStopState;
+#[cfg(feature = "std")]
+use super::timeline::Timeline;
 
 pub type NodeIdArray = [u8; 8];
 
@@ -20,12 +22,13 @@ pub type NodeIdArray = [u8; 8];
 pub struct NodeId(pub NodeIdArray);
 
 impl Display for NodeId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result {
         write!(f, "{}", hex::encode(self.0))
     }
 }
 
 impl NodeId {
+    #[cfg(feature = "std")]
     pub fn new() -> Self {
         let mut rng = rand::thread_rng();
         NodeId::random(&mut rng)
@@ -37,16 +40,12 @@ impl NodeId {
 
     pub fn random<R: Rng>(mut rng: R) -> Self {
         let dist = Uniform::from(33..127);
-        NodeId(
-            (0..8)
-                .map(|_| dist.sample(&mut rng))
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
-        )
+        let arr: [u8; 8] = core::array::from_fn(|_| dist.sample(&mut rng));
+        NodeId(arr)
     }
 }
 
+#[cfg(feature = "std")]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct NodeState {
     pub node_id: NodeId,
@@ -55,6 +54,7 @@ pub struct NodeState {
     pub start_stop_state: StartStopState,
 }
 
+#[cfg(feature = "std")]
 impl NodeState {
     pub fn new(session_id: SessionId) -> Self {
         let node_id = NodeId::new();
