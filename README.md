@@ -103,6 +103,23 @@ docker run -it --network host rusthut-app
 
 Host networking is required for Ableton Link peer discovery across the network.
 
+### ESP32
+
+The `examples/esp32/` directory contains a standalone ESP32 project that mirrors the
+[C++ Link ESP32 example](https://github.com/Ableton/link/tree/master/examples/esp32).
+It connects to WiFi, joins a Link session, and blinks the on-board LED on every beat.
+
+**Prerequisites:** [espup](https://github.com/esp-rs/espup), ldproxy, espflash
+
+```bash
+cd examples/esp32
+# Edit src/main.rs to set WIFI_SSID and WIFI_PASS
+cargo build
+espflash flash target/xtensa-esp32-espidf/debug/link-esp32-example --monitor
+```
+
+See [`examples/esp32/README.md`](examples/esp32/README.md) for full setup instructions.
+
 ### RustHut Controls
 
 | Key | Action |
@@ -192,6 +209,7 @@ let current_time = clock.micros(); // chrono::Duration
 | Linux | `clock_gettime(CLOCK_MONOTONIC_RAW)` |
 | Windows | `QueryPerformanceCounter()` |
 | Other | `std::time::Instant` fallback |
+| ESP32 (ESP-IDF) | `esp_timer_get_time()` |
 
 ## Architecture
 
@@ -215,7 +233,7 @@ ableton-link-rs
 │   ├── measurement.rs       # Clock measurement (std)
 │   ├── payload.rs           # Protocol encoding (std)
 │   ├── pingresponder.rs     # Ping/pong responder (std)
-│   ├── clock.rs             # Platform clocks (std)
+│   ├── clock.rs             # Platform clocks (std); includes EspClock on target_os = "espidf"
 │   └── ...
 ├── discovery/               # Peer discovery (std)
 │   ├── gateway.rs           # Peer gateway
@@ -241,6 +259,7 @@ Without `std`, only core types and math are available (requires `alloc`).
 | macOS | 10.15+ |
 | Linux | glibc 2.28+, `libasound2-dev` (for `rodio`) |
 | Windows | Windows 10+ |
+| ESP32 | ESP-IDF v5.3+, espup toolchain |
 
 ## Contributing
 
