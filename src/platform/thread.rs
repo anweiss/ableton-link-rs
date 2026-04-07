@@ -76,25 +76,24 @@ mod tests {
 
     #[test]
     fn test_completely_safe_thread_with_null_bytes() {
-        // Test with a name that contains null bytes
-        // std::thread::Builder will handle this safely by either rejecting it
-        // or truncating at the first null byte
-        let name_with_nulls = "test\0thread\0name".to_string();
+        // std::thread::Builder::name() panics on null bytes.
+        // Suppress the default panic hook to keep test output clean.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
 
-        // This should either succeed or fail gracefully
+        let name_with_nulls = "test\0thread\0name".to_string();
         let handle_result =
             std::panic::catch_unwind(|| ThreadFactory::make_thread(name_with_nulls, || 100));
 
-        // Either the thread creation succeeded or it failed gracefully
+        std::panic::set_hook(prev_hook);
+
         match handle_result {
             Ok(handle) => {
-                // Thread was created successfully
                 let result = handle.join().unwrap();
                 assert_eq!(result, 100);
             }
             Err(_) => {
-                // Thread creation failed, which is acceptable for names with null bytes
-                // This is safe behavior from std::thread::Builder
+                // Panic is expected — null bytes are rejected by std::thread::Builder
             }
         }
     }
