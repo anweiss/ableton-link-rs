@@ -1,0 +1,11 @@
+# Rust needs a larger main task stack
+CONFIG_MAIN_TASK_STACK_SIZE=8192
+
+# Enable C++ exception support (needed by some ESP-IDF components)
+CONFIG_COMPILER_CXX_EXCEPTIONS=y
+
+# Use single large app partition for development
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# Enable WiFi
+CONFIG_ESP_WIFI_ENABLED=y

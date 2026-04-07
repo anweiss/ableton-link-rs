@@ -89,3 +89,30 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo check --lib --no-default-features
+
+  esp32-example-check:
+    name: ESP32 example structure check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Verify ESP32 example structure
+        run: |
+          # Verify all required ESP32 example files exist
+          test -f examples/esp32/Cargo.toml
+          test -f examples/esp32/src/main.rs
+          test -f examples/esp32/.cargo/config.toml
+          test -f examples/esp32/build.rs
+          test -f examples/esp32/sdkconfig.defaults
+          test -f examples/esp32/rust-toolchain.toml
+          test -f examples/esp32/README.md
+          echo "✓ All ESP32 example files present"
+
+          # Verify the example depends on the library
+          grep -q 'ableton-link-rs' examples/esp32/Cargo.toml
+          echo "✓ ESP32 example depends on ableton-link-rs"
+
+          # Verify the example targets ESP32
+          grep -q 'xtensa-esp32-espidf' examples/esp32/.cargo/config.toml
+          echo "✓ ESP32 target configured"

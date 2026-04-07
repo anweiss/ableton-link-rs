@@ -1,0 +1,17 @@
+[package]
+name = "link-esp32-example"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Ableton Link on ESP32 — blinks LED on beat and prints session info"
+
+[dependencies]
+ableton-link-rs = { path = "../..", features = ["std"] }
+esp-idf-svc = { version = "0.51", features = ["binstart"] }
+esp-idf-hal = "0.46"
+log = "0.4"
+esp-idf-sys = "0.36"
+chrono = "0.4"
+
+[build-dependencies]
+embuild = "0.33"

@@ -1,0 +1,14 @@
+[build]
+target = "xtensa-esp32-espidf"
+
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+# Uncomment to flash and monitor after build:
+# runner = "espflash flash --monitor"
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+# ESP-IDF version used by esp-idf-sys
+ESP_IDF_VERSION = "v5.3"

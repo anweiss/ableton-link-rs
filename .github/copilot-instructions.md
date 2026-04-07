@@ -70,3 +70,15 @@ Releases are managed by [release-please](https://github.com/googleapis/release-p
 - Run tests serially: `cargo test --all -- --nocapture --test-threads=1`
 - Tests using real UDP multicast are marked `#[ignore]` — run with `--include-ignored` locally
 - macOS CI runners lack multicast routing, so some network tests may fail there
+
+## ESP32 Support
+
+The library includes an ESP32 platform clock (`EspClock`) gated behind `#[cfg(target_os = "espidf")]`.
+The `examples/esp32/` directory is a standalone Cargo project (not a workspace member) targeting
+`xtensa-esp32-espidf` with its own toolchain and dependencies.
+
+When modifying ESP32-related code:
+1. The main library should NOT depend on `esp-idf-svc` or `esp-idf-hal` — those are example-only deps
+2. ESP32 platform code uses `#[cfg(target_os = "espidf")]` gates
+3. The ESP32 example cannot be cross-compiled in CI — only structure checks are run
+4. Test ESP32 clock changes by verifying the `ClockTrait` contract on native targets
