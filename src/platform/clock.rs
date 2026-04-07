@@ -64,6 +64,57 @@ impl ClockTrait for SafeClock {
     }
 }
 
+// ESP-IDF clock implementation using esp_timer_get_time() for microsecond precision.
+// This mirrors the C++ Ableton Link reference implementation's ESP32 platform code.
+#[cfg(target_os = "espidf")]
+mod espidf_clock {
+    use chrono::Duration;
+
+    unsafe extern "C" {
+        fn esp_timer_get_time() -> i64;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct EspClock;
+
+    impl EspClock {
+        pub fn new() -> Self {
+            Self
+        }
+
+        pub fn micros(&self) -> Duration {
+            Duration::microseconds(unsafe { esp_timer_get_time() })
+        }
+    }
+
+    impl Default for EspClock {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl super::ClockTrait for EspClock {
+        fn micros(&self) -> Duration {
+            self.micros()
+        }
+
+        fn ticks(&self) -> u64 {
+            self.micros().num_microseconds().unwrap_or(0) as u64
+        }
+
+        fn ticks_to_micros(&self, ticks: u64) -> Duration {
+            Duration::microseconds(ticks as i64)
+        }
+
+        fn micros_to_ticks(&self, micros: Duration) -> u64 {
+            micros.num_microseconds().unwrap_or(0) as u64
+        }
+    }
+}
+
+#[cfg(target_os = "espidf")]
+pub use espidf_clock::EspClock;
+
 // High-level Clock type that uses the safe implementation
 #[derive(Clone, Copy, Debug)]
 pub struct OptimizedClock {
@@ -143,6 +194,23 @@ mod tests {
 
         let time2 = clock.micros();
         assert!(time2 > time1, "OptimizedClock should be monotonic");
+    }
+
+    #[test]
+    fn test_clock_trait_conversions_roundtrip() {
+        // Verify the ClockTrait conversion contract: ticks_to_micros and micros_to_ticks
+        // are inverses of each other. This validates the interface for all implementations.
+        let clock = SafeClock::new();
+        let test_values: Vec<u64> = vec![0, 1, 1000, 1_000_000, 60_000_000];
+        for &val in &test_values {
+            let micros = Duration::microseconds(val as i64);
+            let ticks = clock.micros_to_ticks(micros);
+            let back = clock.ticks_to_micros(ticks);
+            assert_eq!(
+                micros, back,
+                "Round-trip conversion failed for {val} microseconds"
+            );
+        }
     }
 
     #[test]
