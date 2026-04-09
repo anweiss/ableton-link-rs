@@ -39,6 +39,7 @@ std = [
     "chrono/std",
     "rand/std",
     "rand/std_rng",
+    "rand/thread_rng",
 ]
 
 [dependencies]

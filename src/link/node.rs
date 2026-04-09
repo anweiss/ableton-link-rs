@@ -3,7 +3,7 @@ use core::fmt::Display;
 
 use bincode::{Decode, Encode};
 use rand::{
-    distributions::{Distribution, Uniform},
+    distr::{Distribution, Uniform},
     Rng,
 };
 
@@ -30,7 +30,7 @@ impl Display for NodeId {
 impl NodeId {
     #[cfg(feature = "std")]
     pub fn new() -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         NodeId::random(&mut rng)
     }
 
@@ -39,7 +39,7 @@ impl NodeId {
     }
 
     pub fn random<R: Rng>(mut rng: R) -> Self {
-        let dist = Uniform::from(33..127);
+        let dist = Uniform::new(33u8, 127u8).unwrap();
         let arr: [u8; 8] = core::array::from_fn(|_| dist.sample(&mut rng));
         NodeId(arr)
     }
