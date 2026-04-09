@@ -84,7 +84,7 @@ winapi = { version = "0.3", features = [
 mach2 = "0.6"
 
 [dev-dependencies]
-console-subscriber = "0.2.0"
+console-subscriber = "0.5.0"
 
 [[example]]
 name = "rusthut"
