@@ -45,7 +45,7 @@ std = [
 [dependencies]
 rand = { version = "0.10.0", default-features = false }
 tokio = { version = "1", features = ["full"], optional = true }
-bincode = { version = "2.0.0-rc.3", features = ["derive", "serde"] }
+bincode = { version = "3.0.0", features = ["derive", "serde"] }
 thiserror = { version = "1.0.48", optional = true }
 socket2 = { version = "0.5.3", features = ["all"], optional = true }
 tracing = "0.1.37"
