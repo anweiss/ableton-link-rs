@@ -42,6 +42,8 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
 
     udp_sock.set_reuse_address(true)?;
 
+    // Set SO_REUSEPORT on Unix systems so multiple sockets (discovery listener,
+    // send_byebye, etc.) can bind to the same multicast port concurrently.
     #[cfg(unix)]
     udp_sock.set_reuse_port(true)?;
 
