@@ -1,25 +1,42 @@
 name: Re-trigger CI for bot PRs
 
-# GitHub Actions using GITHUB_TOKEN cannot trigger other workflows via
-# `push` / `pull_request` events (anti-recursion). The ONLY events exempt
-# from this rule are `workflow_dispatch` and `repository_dispatch`.
+# Why this workflow exists
+# ========================
+# When release-please opens or updates its release PR, it does so using
+# GITHUB_TOKEN. GitHub's anti-recursion rule means that any event
+# triggered by GITHUB_TOKEN (push, pull_request, etc., with the
+# exception of workflow_dispatch and repository_dispatch) will NOT fire
+# downstream workflows. That means the required CI / Security Audit /
+# Conventional Commits checks never run on the release PR, and branch
+# protection stays BLOCKED forever.
 #
-# This workflow listens for the "Release Please" workflow to complete,
-# then dispatches CI / Security Audit / Conventional Commits against the
-# open release-please PR branch(es). The resulting check runs are attached
-# to the PR's head SHA so branch protection sees them as required.
+# The standard GitHub-documented workaround is to use a non-GITHUB_TOKEN
+# identity (Personal Access Token or GitHub App token) to close and
+# re-open the PR. The resulting pull_request events then fire workflows
+# as expected, and their check runs are properly associated with the PR
+# for branch protection evaluation.
 #
-# For dependabot PRs, this isn't needed: dependabot has its own token
-# context and CI triggers normally.
+# Trials of the workflow_dispatch approach (triggering CI directly)
+# failed because workflow_dispatch-triggered check runs, while visible
+# on the commit, are NOT included in the PR's statusCheckRollup that
+# branch protection evaluates.
+#
+# Setup required
+# ==============
+# Create a fine-grained PAT (or classic token with `repo` scope) with
+# write access to pull requests on this repository, and store it as a
+# repository secret named RELEASE_PLEASE_PAT.
+#
+# If the secret is not set, the workflow logs a clear warning and exits
+# cleanly — a maintainer can still close/reopen the PR by hand, or an
+# admin can merge with branch protection bypassed.
 on:
   workflow_run:
     workflows: ["Release Please"]
     types: [completed]
-  # Also allow manual dispatch for debugging.
   workflow_dispatch: {}
 
 permissions:
-  actions: write
   pull-requests: read
   contents: read
 
@@ -27,10 +44,21 @@ jobs:
   retrigger:
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch CI workflows for open release-please PRs
+      - name: Close and reopen release-please PRs to trigger CI
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v8
+        env:
+          RELEASE_PLEASE_PAT: ${{ secrets.RELEASE_PLEASE_PAT }}
         with:
+          github-token: ${{ secrets.RELEASE_PLEASE_PAT || secrets.GITHUB_TOKEN }}
           script: |
+            if (!process.env.RELEASE_PLEASE_PAT) {
+              core.warning(
+                'RELEASE_PLEASE_PAT secret is not set. Close/reopen via ' +
+                'GITHUB_TOKEN will not trigger CI. Set a PAT with ' +
+                '`pull-requests: write` access to make this work.'
+              );
+              return;
+            }
             const { owner, repo } = context.repo;
             const { data: prs } = await github.rest.pulls.list({
               owner, repo, state: 'open', per_page: 100,
@@ -43,32 +71,13 @@ jobs:
               core.info('No open release-please PRs to retrigger.');
               return;
             }
-            // Workflows to dispatch. Each must declare `workflow_dispatch:`.
-            // Conventional Commits takes the PR number as an input; the
-            // others run on the branch HEAD with no inputs.
-            const branchWorkflows = ['ci.yml', 'security-audit.yml'];
-            const prInputWorkflows = ['conventional-commits.yml'];
             for (const pr of releasePRs) {
-              core.info(`Retriggering CI for PR #${pr.number} (${pr.head.ref})`);
-              for (const wf of branchWorkflows) {
-                try {
-                  await github.rest.actions.createWorkflowDispatch({
-                    owner, repo, workflow_id: wf, ref: pr.head.ref,
-                  });
-                  core.info(`  dispatched ${wf} on ${pr.head.ref}`);
-                } catch (e) {
-                  core.warning(`  failed to dispatch ${wf}: ${e.message}`);
-                }
-              }
-              for (const wf of prInputWorkflows) {
-                try {
-                  await github.rest.actions.createWorkflowDispatch({
-                    owner, repo, workflow_id: wf, ref: pr.head.ref,
-                    inputs: { pull_request_number: String(pr.number) },
-                  });
-                  core.info(`  dispatched ${wf} with PR #${pr.number}`);
-                } catch (e) {
-                  core.warning(`  failed to dispatch ${wf}: ${e.message}`);
-                }
-              }
+              core.info(`Retriggering CI for PR #${pr.number}`);
+              await github.rest.pulls.update({
+                owner, repo, pull_number: pr.number, state: 'closed',
+              });
+              await new Promise(r => setTimeout(r, 3000));
+              await github.rest.pulls.update({
+                owner, repo, pull_number: pr.number, state: 'open',
+              });
             }

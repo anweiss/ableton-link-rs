@@ -20,4 +20,10 @@ jobs:
         id: release
         with:
           release-type: rust
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Prefer a PAT so the resulting PR triggers downstream workflows
+          # (CI, Security Audit, Conventional Commits). GITHUB_TOKEN is
+          # subject to the anti-recursion rule and won't fire those
+          # workflows. The retrigger-ci workflow provides a fallback but
+          # also requires a PAT to work. Set RELEASE_PLEASE_PAT with
+          # pull-requests: write access to wire this up.
+          token: ${{ secrets.RELEASE_PLEASE_PAT || secrets.GITHUB_TOKEN }}
