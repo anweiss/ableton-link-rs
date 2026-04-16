@@ -3,7 +3,7 @@ use core::mem;
 use alloc::vec::Vec;
 use chrono::Duration;
 
-use crate::ENCODING_CONFIG;
+use crate::encoding::{self, Decode, Encode};
 
 use super::{
     beats::{Beats, BEATS_SIZE},
@@ -48,43 +48,38 @@ impl Timeline {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = TIMELINE_HEADER.encode()?;
-        encoded.append(&mut bincode::encode_to_vec(self, ENCODING_CONFIG)?);
+        encoded.append(&mut encoding::encode_to_vec(self)?);
         Ok(encoded)
     }
 }
 
-impl bincode::Encode for Timeline {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> core::result::Result<(), bincode::error::EncodeError> {
-        bincode::Encode::encode(
-            &(
-                self.tempo,
-                self.beat_origin,
-                self.time_origin.num_microseconds().unwrap(),
-            ),
-            encoder,
-        )
+impl Encode for Timeline {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        self.tempo.encode_to(out);
+        self.beat_origin.encode_to(out);
+        self.time_origin.num_microseconds().unwrap().encode_to(out);
+    }
+    fn encoded_size(&self) -> usize {
+        self.tempo.encoded_size() + self.beat_origin.encoded_size() + 8
     }
 }
 
-impl bincode::Decode<()> for Timeline {
-    fn decode<D: bincode::de::Decoder>(
-        decoder: &mut D,
-    ) -> core::result::Result<Self, bincode::error::DecodeError> {
-        // Decode the raw i64 values as they are encoded
-        let tempo_micros: i64 = bincode::Decode::decode(decoder)?;
-        let beat_origin_micro_beats: i64 = bincode::Decode::decode(decoder)?;
-        let time_origin_micros: i64 = bincode::Decode::decode(decoder)?;
+impl Decode for Timeline {
+    fn decode_from(bytes: &[u8]) -> core::result::Result<(Self, usize), encoding::DecodeError> {
+        let (tempo_micros, n1) = i64::decode_from(bytes)?;
+        let (beat_origin_micro_beats, n2) = i64::decode_from(&bytes[n1..])?;
+        let (time_origin_micros, n3) = i64::decode_from(&bytes[n1 + n2..])?;
 
-        Ok(Self {
-            tempo: Tempo::from(Duration::microseconds(tempo_micros)),
-            beat_origin: Beats {
-                value: beat_origin_micro_beats,
+        Ok((
+            Self {
+                tempo: Tempo::from(Duration::microseconds(tempo_micros)),
+                beat_origin: Beats {
+                    value: beat_origin_micro_beats,
+                },
+                time_origin: Duration::microseconds(time_origin_micros),
             },
-            time_origin: Duration::microseconds(time_origin_micros),
-        })
+            n1 + n2 + n3,
+        ))
     }
 }
 

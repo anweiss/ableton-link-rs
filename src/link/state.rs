@@ -3,7 +3,7 @@ use core::mem;
 use alloc::vec::Vec;
 use chrono::Duration;
 
-use crate::ENCODING_CONFIG;
+use crate::encoding::{self, Decode, Encode};
 
 use super::{
     beats::Beats, encoding::PayloadEntryHeader, ghostxform::GhostXForm, timeline::Timeline, Result,
@@ -34,39 +34,37 @@ impl Default for StartStopState {
     }
 }
 
-impl bincode::Encode for StartStopState {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> core::result::Result<(), bincode::error::EncodeError> {
-        bincode::Encode::encode(
-            &(
-                self.is_playing,
-                self.beats,
-                self.timestamp.num_microseconds().unwrap(),
-            ),
-            encoder,
-        )
+impl Encode for StartStopState {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        self.is_playing.encode_to(out);
+        self.beats.encode_to(out);
+        self.timestamp.num_microseconds().unwrap().encode_to(out);
+    }
+    fn encoded_size(&self) -> usize {
+        self.is_playing.encoded_size() + self.beats.encoded_size() + 8
     }
 }
 
-impl bincode::Decode<()> for StartStopState {
-    fn decode<D: bincode::de::Decoder>(
-        decoder: &mut D,
-    ) -> core::result::Result<Self, bincode::error::DecodeError> {
-        let (is_playing, beats, timestamp) = bincode::Decode::decode(decoder)?;
-        Ok(Self {
-            is_playing,
-            beats,
-            timestamp: Duration::microseconds(timestamp),
-        })
+impl Decode for StartStopState {
+    fn decode_from(bytes: &[u8]) -> core::result::Result<(Self, usize), encoding::DecodeError> {
+        let (is_playing, n1) = bool::decode_from(bytes)?;
+        let (beats, n2) = Beats::decode_from(&bytes[n1..])?;
+        let (timestamp, n3) = i64::decode_from(&bytes[n1 + n2..])?;
+        Ok((
+            Self {
+                is_playing,
+                beats,
+                timestamp: Duration::microseconds(timestamp),
+            },
+            n1 + n2 + n3,
+        ))
     }
 }
 
 impl StartStopState {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = START_STOP_STATE_HEADER.encode()?;
-        encoded.append(&mut bincode::encode_to_vec(self, ENCODING_CONFIG)?);
+        encoded.append(&mut encoding::encode_to_vec(self)?);
         Ok(encoded)
     }
 }
@@ -124,10 +122,9 @@ mod tests {
             timestamp: Duration::zero(),
         };
 
-        let encoded = bincode::encode_to_vec(start_stop_state, ENCODING_CONFIG).unwrap();
+        let encoded = encoding::encode_to_vec(&start_stop_state).unwrap();
 
-        let (decoded, _) =
-            bincode::decode_from_slice::<StartStopState, _>(&encoded[..], ENCODING_CONFIG).unwrap();
+        let (decoded, _) = encoding::decode_from_slice::<StartStopState>(&encoded[..]).unwrap();
 
         assert_eq!(decoded, start_stop_state);
     }
@@ -147,9 +144,8 @@ mod tests {
             beats: Beats::new(16.0),
             timestamp: Duration::microseconds(5_000_000),
         };
-        let encoded = bincode::encode_to_vec(sss, ENCODING_CONFIG).unwrap();
-        let (decoded, _) =
-            bincode::decode_from_slice::<StartStopState, _>(&encoded, ENCODING_CONFIG).unwrap();
+        let encoded = encoding::encode_to_vec(&sss).unwrap();
+        let (decoded, _) = encoding::decode_from_slice::<StartStopState>(&encoded).unwrap();
         assert_eq!(decoded, sss);
     }
 

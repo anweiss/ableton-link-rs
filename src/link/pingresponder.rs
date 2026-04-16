@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use bincode::{Decode, Encode};
+use crate::encoding::{self, Decode, Encode};
 
 use tokio::{net::UdpSocket, sync::Notify};
 use tracing::{debug, info};
@@ -11,7 +11,6 @@ use crate::{
         payload::{GhostTime, PayloadEntry},
         sessions::SessionMembership,
     },
-    ENCODING_CONFIG,
 };
 
 use super::{clock::Clock, ghostxform::GhostXForm, payload::Payload, sessions::SessionId, Result};
@@ -31,9 +30,25 @@ pub const PROTOCOL_HEADER: ProtocolHeader = [b'_', b'l', b'i', b'n', b'k', b'_',
 
 pub const MESSAGE_HEADER_SIZE: usize = std::mem::size_of::<MessageType>();
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug)]
 pub struct MessageHeader {
     pub message_type: MessageType,
+}
+
+impl Encode for MessageHeader {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        self.message_type.encode_to(out);
+    }
+    fn encoded_size(&self) -> usize {
+        1
+    }
+}
+
+impl Decode for MessageHeader {
+    fn decode_from(bytes: &[u8]) -> std::result::Result<(Self, usize), encoding::DecodeError> {
+        let (message_type, n) = u8::decode_from(bytes)?;
+        Ok((Self { message_type }, n))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -154,8 +169,8 @@ pub fn encode_message(message_type: MessageType, payload: &Payload) -> Result<Ve
         panic!("exceeded maximum message size");
     }
 
-    let mut encoded = bincode::encode_to_vec(PROTOCOL_HEADER, ENCODING_CONFIG)?;
-    encoded.append(&mut bincode::encode_to_vec(header, ENCODING_CONFIG)?);
+    let mut encoded = encoding::encode_to_vec(&PROTOCOL_HEADER)?;
+    encoded.append(&mut encoding::encode_to_vec(&header)?);
     encoded.append(&mut payload.encode()?);
 
     Ok(encoded)
@@ -172,11 +187,10 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
         panic!("invalid protocol header");
     }
 
-    Ok(bincode::decode_from_slice(
+    let (header, consumed) = encoding::decode_from_slice::<MessageHeader>(
         &data[PROTOCOL_HEADER_SIZE..min_message_size],
-        ENCODING_CONFIG,
-    )
-    .map(|header| (header.0, PROTOCOL_HEADER_SIZE + header.1))?)
+    )?;
+    Ok((header, PROTOCOL_HEADER_SIZE + consumed))
 }
 
 #[cfg(test)]

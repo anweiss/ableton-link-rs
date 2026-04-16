@@ -3,21 +3,30 @@ use core::{
     ops::{Add, Neg, Sub},
 };
 
-use bincode::Decode;
+use crate::encoding::{self, Decode, Encode};
+#[cfg(not(feature = "std"))]
+use num_traits::float::FloatCore;
 
 pub const BEATS_SIZE: u32 = mem::size_of::<i64>() as u32;
 
-#[derive(PartialEq, Eq, Copy, Clone, Default, PartialOrd, Ord, Decode, Debug)]
+#[derive(PartialEq, Eq, Copy, Clone, Default, PartialOrd, Ord, Debug)]
 pub struct Beats {
     pub value: i64,
 }
 
-impl bincode::Encode for Beats {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> core::result::Result<(), bincode::error::EncodeError> {
-        bincode::Encode::encode(&self.micro_beats(), encoder)
+impl Encode for Beats {
+    fn encode_to(&self, out: &mut alloc::vec::Vec<u8>) {
+        self.micro_beats().encode_to(out);
+    }
+    fn encoded_size(&self) -> usize {
+        8
+    }
+}
+
+impl Decode for Beats {
+    fn decode_from(bytes: &[u8]) -> Result<(Self, usize), encoding::DecodeError> {
+        let (value, n) = i64::decode_from(bytes)?;
+        Ok((Self { value }, n))
     }
 }
 

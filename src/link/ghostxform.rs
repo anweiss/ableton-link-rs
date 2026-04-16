@@ -1,4 +1,6 @@
 use chrono::Duration;
+#[cfg(not(feature = "std"))]
+use num_traits::float::FloatCore;
 
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub struct GhostXForm {
