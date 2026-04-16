@@ -1,36 +1,74 @@
 name: Re-trigger CI for bot PRs
 
-# GitHub Actions using GITHUB_TOKEN cannot trigger other workflows.
-# This detects PRs created/synced by github-actions[bot] (e.g. release-please)
-# and closes/reopens them to trigger the regular CI workflow.
+# GitHub Actions using GITHUB_TOKEN cannot trigger other workflows via
+# `push` / `pull_request` events (anti-recursion). The ONLY events exempt
+# from this rule are `workflow_dispatch` and `repository_dispatch`.
+#
+# This workflow listens for the "Release Please" workflow to complete,
+# then dispatches CI / Security Audit / Conventional Commits against the
+# open release-please PR branch(es). The resulting check runs are attached
+# to the PR's head SHA so branch protection sees them as required.
+#
+# For dependabot PRs, this isn't needed: dependabot has its own token
+# context and CI triggers normally.
 on:
-  pull_request_target:
-    types: [opened, synchronize]
-    branches: [main]
+  workflow_run:
+    workflows: ["Release Please"]
+    types: [completed]
+  # Also allow manual dispatch for debugging.
+  workflow_dispatch: {}
 
 permissions:
-  pull-requests: write
+  actions: write
+  pull-requests: read
+  contents: read
 
 jobs:
   retrigger:
-    if: github.actor == 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
-      - name: Close and reopen PR to trigger CI
-        uses: actions/github-script@v9
+      - name: Dispatch CI workflows for open release-please PRs
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v8
         with:
           script: |
-            const prNumber = context.payload.pull_request.number;
-            await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber,
-              state: 'closed',
+            const { owner, repo } = context.repo;
+            const { data: prs } = await github.rest.pulls.list({
+              owner, repo, state: 'open', per_page: 100,
             });
-            await new Promise(r => setTimeout(r, 2000));
-            await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber,
-              state: 'open',
-            });
+            const releasePRs = prs.filter(pr =>
+              pr.user && pr.user.login === 'github-actions[bot]' &&
+              pr.head.ref.startsWith('release-please--')
+            );
+            if (releasePRs.length === 0) {
+              core.info('No open release-please PRs to retrigger.');
+              return;
+            }
+            // Workflows to dispatch. Each must declare `workflow_dispatch:`.
+            // Conventional Commits takes the PR number as an input; the
+            // others run on the branch HEAD with no inputs.
+            const branchWorkflows = ['ci.yml', 'security-audit.yml'];
+            const prInputWorkflows = ['conventional-commits.yml'];
+            for (const pr of releasePRs) {
+              core.info(`Retriggering CI for PR #${pr.number} (${pr.head.ref})`);
+              for (const wf of branchWorkflows) {
+                try {
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner, repo, workflow_id: wf, ref: pr.head.ref,
+                  });
+                  core.info(`  dispatched ${wf} on ${pr.head.ref}`);
+                } catch (e) {
+                  core.warning(`  failed to dispatch ${wf}: ${e.message}`);
+                }
+              }
+              for (const wf of prInputWorkflows) {
+                try {
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner, repo, workflow_id: wf, ref: pr.head.ref,
+                    inputs: { pull_request_number: String(pr.number) },
+                  });
+                  core.info(`  dispatched ${wf} with PR #${pr.number}`);
+                } catch (e) {
+                  core.warning(`  failed to dispatch ${wf}: ${e.message}`);
+                }
+              }
+            }
