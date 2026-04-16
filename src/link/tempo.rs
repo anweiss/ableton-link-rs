@@ -56,22 +56,24 @@ impl Tempo {
     }
 }
 
-impl bincode::Encode for Tempo {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> core::result::Result<(), bincode::error::EncodeError> {
-        bincode::Encode::encode(&self.micros_per_beat().num_microseconds().unwrap(), encoder)
+impl crate::encoding::Encode for Tempo {
+    fn encode_to(&self, out: &mut alloc::vec::Vec<u8>) {
+        self.micros_per_beat()
+            .num_microseconds()
+            .unwrap()
+            .encode_to(out);
+    }
+    fn encoded_size(&self) -> usize {
+        8
     }
 }
 
-impl bincode::Decode<()> for Tempo {
-    fn decode<D: bincode::de::Decoder>(
-        decoder: &mut D,
-    ) -> core::result::Result<Self, bincode::error::DecodeError> {
-        Ok(Self::from(Duration::microseconds(bincode::Decode::decode(
-            decoder,
-        )?)))
+impl crate::encoding::Decode for Tempo {
+    fn decode_from(
+        bytes: &[u8],
+    ) -> core::result::Result<(Self, usize), crate::encoding::DecodeError> {
+        let (micros, n) = i64::decode_from(bytes)?;
+        Ok((Self::from(Duration::microseconds(micros)), n))
     }
 }
 

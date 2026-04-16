@@ -19,12 +19,12 @@ use tracing::{debug, info};
 
 use crate::{
     discovery::{messages::parse_payload, messenger::new_udp_reuseport, peers::PeerState},
+    encoding::{self, Decode, Encode},
     link::{
         payload::PrevGhostTime,
         pingresponder::{parse_message_header, MAX_MESSAGE_SIZE, PONG},
         Result,
     },
-    ENCODING_CONFIG,
 };
 
 use super::{
@@ -52,36 +52,34 @@ pub struct MeasurementEndpointV4 {
     pub endpoint: Option<SocketAddrV4>,
 }
 
-impl bincode::Encode for MeasurementEndpointV4 {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
-        bincode::Encode::encode(
-            &(
-                u32::from(*self.endpoint.unwrap().ip()),
-                self.endpoint.unwrap().port(),
-            ),
-            encoder,
-        )
+impl Encode for MeasurementEndpointV4 {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        let ep = self.endpoint.unwrap();
+        u32::from(*ep.ip()).encode_to(out);
+        ep.port().encode_to(out);
+    }
+    fn encoded_size(&self) -> usize {
+        6
     }
 }
 
-impl bincode::Decode<()> for MeasurementEndpointV4 {
-    fn decode<D: bincode::de::Decoder>(
-        decoder: &mut D,
-    ) -> std::result::Result<Self, bincode::error::DecodeError> {
-        let (ip, port) = bincode::Decode::decode(decoder)?;
-        Ok(Self {
-            endpoint: Some(SocketAddrV4::new(ip, port)),
-        })
+impl Decode for MeasurementEndpointV4 {
+    fn decode_from(bytes: &[u8]) -> std::result::Result<(Self, usize), encoding::DecodeError> {
+        let (ip_raw, n1) = u32::decode_from(bytes)?;
+        let (port, n2) = u16::decode_from(&bytes[n1..])?;
+        Ok((
+            Self {
+                endpoint: Some(SocketAddrV4::new(Ipv4Addr::from(ip_raw), port)),
+            },
+            n1 + n2,
+        ))
     }
 }
 
 impl MeasurementEndpointV4 {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = MEASUREMENT_ENDPOINT_V4_HEADER.encode()?;
-        encoded.append(&mut bincode::encode_to_vec(self, ENCODING_CONFIG)?);
+        encoded.append(&mut encoding::encode_to_vec(self)?);
         Ok(encoded)
     }
 }

@@ -1,6 +1,6 @@
 use std::mem;
 
-use bincode::{Decode, Encode};
+use crate::encoding::{self, Decode, Encode};
 
 use crate::{
     link::{
@@ -8,7 +8,6 @@ use crate::{
         payload::{self, Payload},
         Result,
     },
-    ENCODING_CONFIG,
 };
 
 pub const MAX_MESSAGE_SIZE: usize = 512;
@@ -33,12 +32,42 @@ pub const MESSAGE_HEADER_SIZE: usize = mem::size_of::<MessageType>()
     + mem::size_of::<SessionGroupId>()
     + mem::size_of::<NodeId>();
 
-#[derive(Debug, Clone, Copy, Default, Encode, Decode, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MessageHeader {
     pub message_type: MessageType,
     pub ttl: u8,
     pub group_id: SessionGroupId,
     pub ident: NodeId,
+}
+
+impl Encode for MessageHeader {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        self.message_type.encode_to(out);
+        self.ttl.encode_to(out);
+        self.group_id.encode_to(out);
+        self.ident.encode_to(out);
+    }
+    fn encoded_size(&self) -> usize {
+        1 + 1 + 2 + 8
+    }
+}
+
+impl Decode for MessageHeader {
+    fn decode_from(bytes: &[u8]) -> std::result::Result<(Self, usize), encoding::DecodeError> {
+        let (message_type, n1) = u8::decode_from(bytes)?;
+        let (ttl, n2) = u8::decode_from(&bytes[n1..])?;
+        let (group_id, n3) = u16::decode_from(&bytes[n1 + n2..])?;
+        let (ident, n4) = NodeId::decode_from(&bytes[n1 + n2 + n3..])?;
+        Ok((
+            Self {
+                message_type,
+                ttl,
+                group_id,
+                ident,
+            },
+            n1 + n2 + n3 + n4,
+        ))
+    }
 }
 
 impl MessageHeader {}
@@ -63,8 +92,8 @@ pub fn encode_message(
         panic!("exceeded maximum message size");
     }
 
-    let mut encoded = bincode::encode_to_vec(PROTOCOL_HEADER, ENCODING_CONFIG)?;
-    encoded.append(&mut bincode::encode_to_vec(header, ENCODING_CONFIG)?);
+    let mut encoded = encoding::encode_to_vec(&PROTOCOL_HEADER)?;
+    encoded.append(&mut encoding::encode_to_vec(&header)?);
     encoded.append(&mut payload.encode()?);
 
     Ok(encoded)
@@ -103,11 +132,10 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
         panic!("invalid protocol header");
     }
 
-    Ok(bincode::decode_from_slice(
+    let (header, consumed) = encoding::decode_from_slice::<MessageHeader>(
         &data[PROTOCOL_HEADER_SIZE..min_message_size],
-        ENCODING_CONFIG,
-    )
-    .map(|header| (header.0, PROTOCOL_HEADER_SIZE + header.1))?)
+    )?;
+    Ok((header, PROTOCOL_HEADER_SIZE + consumed))
 }
 
 pub fn parse_payload(data: &[u8]) -> Result<Payload> {
@@ -137,8 +165,8 @@ mod tests {
             ..Default::default()
         };
 
-        let mut encoded = bincode::encode_to_vec(PROTOCOL_HEADER, ENCODING_CONFIG).unwrap();
-        encoded.append(&mut bincode::encode_to_vec(header, ENCODING_CONFIG).unwrap());
+        let mut encoded = encoding::encode_to_vec(&PROTOCOL_HEADER).unwrap();
+        encoded.append(&mut encoding::encode_to_vec(&header).unwrap());
 
         let (decoded_header, _) = parse_message_header(&encoded).unwrap();
         assert_eq!(decoded_header, header);

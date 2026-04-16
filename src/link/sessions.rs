@@ -4,12 +4,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bincode::{Decode, Encode};
 use chrono::Duration;
 use tokio::sync::Notify;
 use tracing::{debug, info};
 
-use crate::{discovery::peers::ControllerPeer, ENCODING_CONFIG};
+use crate::{discovery::peers::ControllerPeer, encoding::{self, Decode, Encode}};
 
 use super::{
     clock::Clock, encoding::PayloadEntryHeader, ghostxform::GhostXForm,
@@ -23,8 +22,24 @@ pub const SESSION_MEMBERSHIP_HEADER: PayloadEntryHeader = PayloadEntryHeader {
     size: SESSION_MEMBERSHIP_SIZE,
 };
 
-#[derive(Clone, Copy, Debug, Encode, Decode, Default, PartialEq, Eq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd)]
 pub struct SessionId(pub NodeId);
+
+impl Encode for SessionId {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        self.0.encode_to(out);
+    }
+    fn encoded_size(&self) -> usize {
+        self.0.encoded_size()
+    }
+}
+
+impl Decode for SessionId {
+    fn decode_from(bytes: &[u8]) -> std::result::Result<(Self, usize), encoding::DecodeError> {
+        let (node_id, n) = NodeId::decode_from(bytes)?;
+        Ok((SessionId(node_id), n))
+    }
+}
 
 impl Display for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -32,9 +47,25 @@ impl Display for SessionId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Encode, Decode)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SessionMembership {
     pub session_id: SessionId,
+}
+
+impl Encode for SessionMembership {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        self.session_id.encode_to(out);
+    }
+    fn encoded_size(&self) -> usize {
+        self.session_id.encoded_size()
+    }
+}
+
+impl Decode for SessionMembership {
+    fn decode_from(bytes: &[u8]) -> std::result::Result<(Self, usize), encoding::DecodeError> {
+        let (session_id, n) = SessionId::decode_from(bytes)?;
+        Ok((Self { session_id }, n))
+    }
 }
 
 impl From<SessionId> for SessionMembership {
@@ -46,9 +77,8 @@ impl From<SessionId> for SessionMembership {
 impl SessionMembership {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = SESSION_MEMBERSHIP_HEADER.encode()?;
-        encoded.append(&mut bincode::encode_to_vec(
-            self.session_id,
-            ENCODING_CONFIG,
+        encoded.append(&mut encoding::encode_to_vec(
+            &self.session_id,
         )?);
         Ok(encoded)
     }

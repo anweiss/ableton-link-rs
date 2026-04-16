@@ -1,7 +1,7 @@
 use core::fmt;
 use core::fmt::Display;
 
-use bincode::{Decode, Encode};
+use crate::encoding::{self, Decode, Encode};
 use rand::{
     distr::{Distribution, Uniform},
     Rng,
@@ -18,8 +18,24 @@ use super::timeline::Timeline;
 
 pub type NodeIdArray = [u8; 8];
 
-#[derive(Default, Clone, Copy, Debug, Encode, Decode, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub NodeIdArray);
+
+impl Encode for NodeId {
+    fn encode_to(&self, out: &mut alloc::vec::Vec<u8>) {
+        self.0.encode_to(out);
+    }
+    fn encoded_size(&self) -> usize {
+        8
+    }
+}
+
+impl Decode for NodeId {
+    fn decode_from(bytes: &[u8]) -> Result<(Self, usize), encoding::DecodeError> {
+        let (arr, n) = <[u8; 8]>::decode_from(bytes)?;
+        Ok((NodeId(arr), n))
+    }
+}
 
 impl Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result {

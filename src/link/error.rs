@@ -1,13 +1,15 @@
 #[cfg(feature = "std")]
 use thiserror::Error;
 
+use crate::encoding;
+
 #[derive(Debug)]
 #[cfg_attr(feature = "std", derive(Error))]
 pub enum Error {
     #[cfg_attr(feature = "std", error("encoding error: {0}"))]
-    Encoding(#[cfg_attr(feature = "std", from)] bincode::error::EncodeError),
+    Encoding(#[cfg_attr(feature = "std", from)] encoding::EncodeError),
     #[cfg_attr(feature = "std", error("decoding error: {0}"))]
-    Decoding(#[cfg_attr(feature = "std", from)] bincode::error::DecodeError),
+    Decoding(#[cfg_attr(feature = "std", from)] encoding::DecodeError),
 }
 
 #[cfg(not(feature = "std"))]
@@ -21,15 +23,15 @@ impl core::fmt::Display for Error {
 }
 
 #[cfg(not(feature = "std"))]
-impl From<bincode::error::EncodeError> for Error {
-    fn from(e: bincode::error::EncodeError) -> Self {
+impl From<encoding::EncodeError> for Error {
+    fn from(e: encoding::EncodeError) -> Self {
         Error::Encoding(e)
     }
 }
 
 #[cfg(not(feature = "std"))]
-impl From<bincode::error::DecodeError> for Error {
-    fn from(e: bincode::error::DecodeError) -> Self {
+impl From<encoding::DecodeError> for Error {
+    fn from(e: encoding::DecodeError) -> Self {
         Error::Decoding(e)
     }
 }
