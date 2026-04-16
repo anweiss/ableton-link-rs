@@ -4,8 +4,8 @@ use chrono::Duration;
 use tracing::{debug, warn};
 
 use crate::{
-    encoding::{self, Decode},
     discovery::peers::PeerState,
+    encoding::{self, Decode},
     link::{
         encoding::{PayloadEntryHeader, PAYLOAD_ENTRY_HEADER_SIZE},
         measurement::{
@@ -97,10 +97,9 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
         return Ok(());
     }
 
-    let (payload_entry_header, _) = encoding::decode_from_slice::<PayloadEntryHeader>(
-        &data[..PAYLOAD_ENTRY_HEADER_SIZE],
-    )
-    .unwrap();
+    let (payload_entry_header, _) =
+        encoding::decode_from_slice::<PayloadEntryHeader>(&data[..PAYLOAD_ENTRY_HEADER_SIZE])
+            .unwrap();
 
     match payload_entry_header.key {
         HOST_TIME_HEADER_KEY => {
@@ -256,7 +255,12 @@ impl HostTime {
 impl Decode for HostTime {
     fn decode_from(bytes: &[u8]) -> std::result::Result<(Self, usize), encoding::DecodeError> {
         let (time, n) = i64::decode_from(bytes)?;
-        Ok((Self { time: Duration::microseconds(time) }, n))
+        Ok((
+            Self {
+                time: Duration::microseconds(time),
+            },
+            n,
+        ))
     }
 }
 
@@ -290,7 +294,12 @@ impl GhostTime {
 impl Decode for GhostTime {
     fn decode_from(bytes: &[u8]) -> std::result::Result<(Self, usize), encoding::DecodeError> {
         let (time, n) = i64::decode_from(bytes)?;
-        Ok((Self { time: Duration::microseconds(time) }, n))
+        Ok((
+            Self {
+                time: Duration::microseconds(time),
+            },
+            n,
+        ))
     }
 }
 
@@ -316,7 +325,12 @@ impl PrevGhostTime {
 impl Decode for PrevGhostTime {
     fn decode_from(bytes: &[u8]) -> std::result::Result<(Self, usize), encoding::DecodeError> {
         let (time, n) = i64::decode_from(bytes)?;
-        Ok((Self { time: Duration::microseconds(time) }, n))
+        Ok((
+            Self {
+                time: Duration::microseconds(time),
+            },
+            n,
+        ))
     }
 }
 

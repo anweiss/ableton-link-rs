@@ -4,6 +4,8 @@ use core::{
 };
 
 use chrono::Duration;
+#[cfg(not(feature = "std"))]
+use num_traits::float::FloatCore;
 
 use super::beats::Beats;
 

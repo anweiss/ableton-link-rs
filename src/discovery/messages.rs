@@ -2,12 +2,10 @@ use std::mem;
 
 use crate::encoding::{self, Decode, Encode};
 
-use crate::{
-    link::{
-        node::NodeId,
-        payload::{self, Payload},
-        Result,
-    },
+use crate::link::{
+    node::NodeId,
+    payload::{self, Payload},
+    Result,
 };
 
 pub const MAX_MESSAGE_SIZE: usize = 512;

@@ -124,8 +124,7 @@ mod tests {
 
         let encoded = encoding::encode_to_vec(&start_stop_state).unwrap();
 
-        let (decoded, _) =
-            encoding::decode_from_slice::<StartStopState>(&encoded[..]).unwrap();
+        let (decoded, _) = encoding::decode_from_slice::<StartStopState>(&encoded[..]).unwrap();
 
         assert_eq!(decoded, start_stop_state);
     }
@@ -146,8 +145,7 @@ mod tests {
             timestamp: Duration::microseconds(5_000_000),
         };
         let encoded = encoding::encode_to_vec(&sss).unwrap();
-        let (decoded, _) =
-            encoding::decode_from_slice::<StartStopState>(&encoded).unwrap();
+        let (decoded, _) = encoding::decode_from_slice::<StartStopState>(&encoded).unwrap();
         assert_eq!(decoded, sss);
     }
 

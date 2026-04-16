@@ -350,8 +350,8 @@ mod tests {
         let enc_false = encode_to_vec(&false).unwrap();
         assert_eq!(enc_true, [1]);
         assert_eq!(enc_false, [0]);
-        assert_eq!(decode_from_slice::<bool>(&enc_true).unwrap().0, true);
-        assert_eq!(decode_from_slice::<bool>(&enc_false).unwrap().0, false);
+        assert!(decode_from_slice::<bool>(&enc_true).unwrap().0);
+        assert!(!decode_from_slice::<bool>(&enc_false).unwrap().0);
     }
 
     #[test]

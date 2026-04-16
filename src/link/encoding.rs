@@ -1,7 +1,7 @@
 use core::mem;
 
-use alloc::vec::Vec;
 use crate::encoding::{self, Decode, Encode};
+use alloc::vec::Vec;
 
 use super::Result;
 

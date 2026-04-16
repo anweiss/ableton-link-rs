@@ -4,6 +4,8 @@ use core::{
 };
 
 use crate::encoding::{self, Decode, Encode};
+#[cfg(not(feature = "std"))]
+use num_traits::float::FloatCore;
 
 pub const BEATS_SIZE: u32 = mem::size_of::<i64>() as u32;
 

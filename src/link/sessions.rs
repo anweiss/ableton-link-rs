@@ -8,7 +8,10 @@ use chrono::Duration;
 use tokio::sync::Notify;
 use tracing::{debug, info};
 
-use crate::{discovery::peers::ControllerPeer, encoding::{self, Decode, Encode}};
+use crate::{
+    discovery::peers::ControllerPeer,
+    encoding::{self, Decode, Encode},
+};
 
 use super::{
     clock::Clock, encoding::PayloadEntryHeader, ghostxform::GhostXForm,
@@ -77,9 +80,7 @@ impl From<SessionId> for SessionMembership {
 impl SessionMembership {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = SESSION_MEMBERSHIP_HEADER.encode()?;
-        encoded.append(&mut encoding::encode_to_vec(
-            &self.session_id,
-        )?);
+        encoded.append(&mut encoding::encode_to_vec(&self.session_id)?);
         Ok(encoded)
     }
 }
