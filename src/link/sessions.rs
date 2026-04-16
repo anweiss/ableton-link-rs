@@ -475,7 +475,7 @@ pub fn session_peers(
         .filter(|p| p.peer_state.session_id() == session_id)
         .cloned()
         .collect::<Vec<_>>();
-    peers.sort_by(|a, b| a.peer_state.ident().cmp(&b.peer_state.ident()));
+    peers.sort_by_key(|a| a.peer_state.ident());
 
     peers
 }
