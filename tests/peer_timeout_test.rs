@@ -17,8 +17,8 @@ async fn test_peer_timeout_when_disabled() {
     sleep(Duration::from_millis(100)).await;
 
     // Create two Link instances
-    let mut link1 = BasicLink::new(120.0).await;
-    let mut link2 = BasicLink::new(120.0).await;
+    let mut link1 = BasicLink::new(120.0).await.unwrap();
+    let mut link2 = BasicLink::new(120.0).await.unwrap();
 
     // Enable both instances
     link1.enable().await;
@@ -128,8 +128,8 @@ async fn test_peer_rejoin_after_timeout() {
     sleep(Duration::from_millis(200)).await;
 
     // Create two Link instances
-    let mut link1 = BasicLink::new(120.0).await;
-    let mut link2 = BasicLink::new(120.0).await;
+    let mut link1 = BasicLink::new(120.0).await.unwrap();
+    let mut link2 = BasicLink::new(120.0).await.unwrap();
 
     // Enable both instances
     link1.enable().await;

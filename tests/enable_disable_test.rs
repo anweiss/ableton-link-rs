@@ -4,7 +4,7 @@ use tokio::time::sleep;
 
 #[tokio::test]
 async fn test_enable_disable_preserves_node_id() {
-    let mut link = BasicLink::new(120.0).await;
+    let mut link = BasicLink::new(120.0).await.unwrap();
 
     // Enable Link
     link.enable().await;
@@ -44,7 +44,7 @@ async fn test_enable_disable_preserves_node_id() {
 #[tokio::test]
 async fn test_multiple_enable_disable_cycles() {
     let _ = tracing_subscriber::fmt::try_init();
-    let mut link = BasicLink::new(140.0).await;
+    let mut link = BasicLink::new(140.0).await.unwrap();
 
     // Run multiple enable/disable cycles
     for i in 1..=3 {

@@ -11,7 +11,7 @@ use chrono::Duration;
 async fn test_invalid_tempo_zero() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let link = BasicLink::new(120.0).await;
+    let link = BasicLink::new(120.0).await.unwrap();
     let mut state = link.capture_app_session_state();
     let time = link.clock().micros();
 
@@ -24,7 +24,7 @@ async fn test_invalid_tempo_zero() {
 async fn test_invalid_tempo_negative() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let link = BasicLink::new(120.0).await;
+    let link = BasicLink::new(120.0).await.unwrap();
     let mut state = link.capture_app_session_state();
     let time = link.clock().micros();
 
@@ -41,7 +41,7 @@ async fn test_invalid_tempo_negative() {
 async fn test_invalid_tempo_extremely_large() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let link = BasicLink::new(120.0).await;
+    let link = BasicLink::new(120.0).await.unwrap();
     let mut state = link.capture_app_session_state();
     let time = link.clock().micros();
 
@@ -93,7 +93,7 @@ fn clamp_tempo_boundary_values() {
 async fn test_rapid_tempo_changes() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let mut link = BasicLink::new(120.0).await;
+    let mut link = BasicLink::new(120.0).await.unwrap();
 
     for bpm in (20..=200).step_by(10) {
         let mut state = link.capture_app_session_state();
@@ -116,7 +116,7 @@ async fn test_rapid_tempo_changes() {
 async fn test_start_stop_transitions() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let mut link = BasicLink::new(120.0).await;
+    let mut link = BasicLink::new(120.0).await.unwrap();
 
     // Verify initial state
     let state = link.capture_app_session_state();
@@ -146,7 +146,7 @@ async fn test_start_stop_transitions() {
 async fn test_beat_and_phase_various_quantums() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let link = BasicLink::new(120.0).await;
+    let link = BasicLink::new(120.0).await.unwrap();
     let state = link.capture_app_session_state();
     let time = link.clock().micros();
 
@@ -173,7 +173,7 @@ async fn test_beat_and_phase_various_quantums() {
 async fn test_beat_time_inverse() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let link = BasicLink::new(120.0).await;
+    let link = BasicLink::new(120.0).await.unwrap();
     let state = link.capture_app_session_state();
     let time = link.clock().micros();
     let quantum = 4.0;

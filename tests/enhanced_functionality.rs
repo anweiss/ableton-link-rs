@@ -136,7 +136,7 @@ fn test_clock_synchronization_components() {
 async fn test_enhanced_basic_link() {
     info!("Testing enhanced BasicLink with callbacks");
 
-    let mut link = BasicLink::new(120.0).await;
+    let mut link = BasicLink::new(120.0).await.unwrap();
 
     // Test callback setup
     let callback_invoked = Arc::new(std::sync::Mutex::new(false));
@@ -194,7 +194,7 @@ async fn test_enhanced_basic_link() {
 async fn test_realtime_session_state() {
     info!("Testing real-time session state handling");
 
-    let link = BasicLink::new(140.0).await;
+    let link = BasicLink::new(140.0).await.unwrap();
 
     // Capture initial state
     let mut session_state = link.capture_audio_session_state();
@@ -223,7 +223,7 @@ async fn test_realtime_performance() {
 
     info!("Starting real-time performance test");
 
-    let link = BasicLink::new(120.0).await;
+    let link = BasicLink::new(120.0).await.unwrap();
 
     let start_time = std::time::Instant::now();
     let iterations = 10000;

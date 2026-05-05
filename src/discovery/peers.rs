@@ -529,7 +529,8 @@ mod tests {
                 ping_responder_unicast_socket,
                 Arc::new(Mutex::new(true)), // enabled for test
             )
-            .await,
+            .await
+            .unwrap(),
             tx_peer_state_change,
             calls,
         )

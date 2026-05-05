@@ -72,12 +72,12 @@ pub struct BasicLink {
 
 #[cfg(feature = "std")]
 impl BasicLink {
-    pub async fn new(bpm: f64) -> Self {
+    pub async fn new(bpm: f64) -> std::result::Result<Self, std::io::Error> {
         // Only set up tracing if not already set up
         let _ = tracing_subscriber::fmt::try_init();
 
         let clock = Clock::default();
-        let controller = Controller::new(tempo::Tempo::new(bpm), clock).await;
+        let controller = Controller::new(tempo::Tempo::new(bpm), clock).await?;
 
         // Create initial client state for atomic session state
         let initial_client_state =
@@ -102,7 +102,7 @@ impl BasicLink {
         let atomic_session_state =
             AtomicSessionState::new(initial_client_state, controller::LOCAL_MOD_GRACE_PERIOD);
 
-        Self {
+        Ok(Self {
             peer_count_callback: None,
             tempo_callback: None,
             start_stop_callback: None,
@@ -110,7 +110,7 @@ impl BasicLink {
             clock,
             atomic_session_state,
             last_is_playing_for_callback: false,
-        }
+        })
     }
 }
 
@@ -479,7 +479,7 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
 
         let bpm = 140.0;
-        let mut link = BasicLink::new(bpm).await;
+        let mut link = BasicLink::new(bpm).await.unwrap();
 
         info!("initializing basic link at {} bpm", bpm);
 
@@ -520,7 +520,7 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
 
         let bpm = 120.0;
-        let mut link = BasicLink::new(bpm).await;
+        let mut link = BasicLink::new(bpm).await.unwrap();
 
         info!("testing peer count reset when Link is disabled");
 
@@ -551,7 +551,7 @@ mod tests {
     async fn test_session_state_tempo_getset() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let link = BasicLink::new(120.0).await;
+        let link = BasicLink::new(120.0).await.unwrap();
         let mut state = link.capture_app_session_state();
         assert_eq!(state.tempo(), 120.0);
 
@@ -564,7 +564,7 @@ mod tests {
     async fn test_session_state_clamped_tempo() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let link = BasicLink::new(120.0).await;
+        let link = BasicLink::new(120.0).await.unwrap();
         let mut state = link.capture_app_session_state();
         let time = link.clock().micros();
 
@@ -581,7 +581,7 @@ mod tests {
     async fn test_session_state_is_playing() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let link = BasicLink::new(120.0).await;
+        let link = BasicLink::new(120.0).await.unwrap();
         let mut state = link.capture_app_session_state();
         assert!(!state.is_playing());
 
@@ -598,7 +598,7 @@ mod tests {
     async fn test_session_state_beat_at_time() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let link = BasicLink::new(120.0).await;
+        let link = BasicLink::new(120.0).await.unwrap();
         let state = link.capture_app_session_state();
 
         let time = link.clock().micros();
@@ -611,7 +611,7 @@ mod tests {
     async fn test_session_state_phase_at_time() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let link = BasicLink::new(120.0).await;
+        let link = BasicLink::new(120.0).await.unwrap();
         let state = link.capture_app_session_state();
 
         let time = link.clock().micros();
@@ -625,7 +625,7 @@ mod tests {
     async fn test_session_state_force_beat_at_time() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let link = BasicLink::new(120.0).await;
+        let link = BasicLink::new(120.0).await.unwrap();
         let mut state = link.capture_app_session_state();
 
         let time = link.clock().micros();
@@ -638,7 +638,7 @@ mod tests {
     async fn test_session_state_request_beat_at_time() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let link = BasicLink::new(120.0).await;
+        let link = BasicLink::new(120.0).await.unwrap();
         let mut state = link.capture_app_session_state();
 
         let time = link.clock().micros();
@@ -682,7 +682,7 @@ mod tests {
     async fn test_session_state_commit_and_capture_roundtrip() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let mut link = BasicLink::new(120.0).await;
+        let mut link = BasicLink::new(120.0).await.unwrap();
 
         // Capture, modify, commit
         let mut state = link.capture_app_session_state();
@@ -699,7 +699,7 @@ mod tests {
     async fn test_session_state_start_stop_commit_roundtrip() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let mut link = BasicLink::new(120.0).await;
+        let mut link = BasicLink::new(120.0).await.unwrap();
 
         let mut state = link.capture_app_session_state();
         assert!(!state.is_playing());
@@ -716,7 +716,7 @@ mod tests {
     async fn test_tempo_callback_on_commit() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let mut link = BasicLink::new(120.0).await;
+        let mut link = BasicLink::new(120.0).await.unwrap();
 
         let recorded_bpm = Arc::new(Mutex::new(0.0f64));
         let recorded_bpm_clone = recorded_bpm.clone();
@@ -737,7 +737,7 @@ mod tests {
     async fn test_start_stop_callback_on_commit() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let mut link = BasicLink::new(120.0).await;
+        let mut link = BasicLink::new(120.0).await.unwrap();
 
         let recorded_playing = Arc::new(Mutex::new(false));
         let recorded_clone = recorded_playing.clone();
@@ -760,7 +760,7 @@ mod tests {
     async fn test_set_is_playing_and_request_beat_at_time() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let link = BasicLink::new(120.0).await;
+        let link = BasicLink::new(120.0).await.unwrap();
         let mut state = link.capture_app_session_state();
 
         let time = link.clock().micros();
@@ -774,7 +774,7 @@ mod tests {
     async fn test_request_beat_at_start_playing_time_not_playing() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let link = BasicLink::new(120.0).await;
+        let link = BasicLink::new(120.0).await.unwrap();
         let mut state = link.capture_app_session_state();
         // Not playing — should be a no-op
         let tempo_before = state.tempo();

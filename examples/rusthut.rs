@@ -169,7 +169,7 @@ impl State {
 
         Self {
             running: Arc::new(AtomicBool::new(true)),
-            link: BasicLink::new(120.0).await,
+            link: BasicLink::new(120.0).await.unwrap(),
             quantum: 4.0,
             is_playing: false,
             metronome,

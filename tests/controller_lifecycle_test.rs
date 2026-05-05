@@ -8,7 +8,7 @@ use tokio::time::sleep;
 async fn test_enable_disable_preserves_tempo() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let mut link = BasicLink::new(128.0).await;
+    let mut link = BasicLink::new(128.0).await.unwrap();
 
     // Capture initial tempo
     let state_before = link.capture_app_session_state();
@@ -35,7 +35,7 @@ async fn test_enable_disable_preserves_tempo() {
 async fn test_enable_disable_resets_peer_count() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let mut link = BasicLink::new(120.0).await;
+    let mut link = BasicLink::new(120.0).await.unwrap();
     assert_eq!(link.num_peers(), 0);
 
     link.enable().await;
@@ -53,7 +53,7 @@ async fn test_enable_disable_resets_peer_count() {
 async fn test_set_tempo_via_commit() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let mut link = BasicLink::new(120.0).await;
+    let mut link = BasicLink::new(120.0).await.unwrap();
 
     let mut state = link.capture_app_session_state();
     let time = link.clock().micros();
@@ -68,7 +68,7 @@ async fn test_set_tempo_via_commit() {
 async fn test_start_stop_via_commit() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let mut link = BasicLink::new(120.0).await;
+    let mut link = BasicLink::new(120.0).await.unwrap();
 
     // Initially not playing
     let state = link.capture_app_session_state();
@@ -97,7 +97,7 @@ async fn test_start_stop_via_commit() {
 async fn test_multiple_tempo_changes() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let mut link = BasicLink::new(100.0).await;
+    let mut link = BasicLink::new(100.0).await.unwrap();
 
     for bpm in [110.0, 120.0, 130.0, 140.0, 150.0] {
         let mut state = link.capture_app_session_state();
@@ -119,7 +119,7 @@ async fn test_multiple_tempo_changes() {
 async fn test_tempo_callback_fires_on_each_commit() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let mut link = BasicLink::new(120.0).await;
+    let mut link = BasicLink::new(120.0).await.unwrap();
 
     let call_count = Arc::new(Mutex::new(0u32));
     let call_count_clone = call_count.clone();
@@ -148,7 +148,7 @@ async fn test_tempo_callback_fires_on_each_commit() {
 async fn test_audio_session_state_roundtrip() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let link = BasicLink::new(120.0).await;
+    let link = BasicLink::new(120.0).await.unwrap();
 
     // Capture, modify, commit via audio path
     let mut state = link.capture_audio_session_state();
@@ -165,7 +165,7 @@ async fn test_audio_session_state_roundtrip() {
 async fn test_start_stop_sync_toggle() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let mut link = BasicLink::new(120.0).await;
+    let mut link = BasicLink::new(120.0).await.unwrap();
     assert!(!link.is_start_stop_sync_enabled());
 
     link.enable_start_stop_sync(true);
@@ -179,7 +179,7 @@ async fn test_start_stop_sync_toggle() {
 async fn test_clock_monotonicity() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let link = BasicLink::new(120.0).await;
+    let link = BasicLink::new(120.0).await.unwrap();
     let clock = link.clock();
 
     let t1 = clock.micros();
