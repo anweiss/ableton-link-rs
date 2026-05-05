@@ -7,7 +7,7 @@ async fn test_single_node_shows_zero_peers() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a single Link instance
-    let mut link = BasicLink::new(120.0).await;
+    let mut link = BasicLink::new(120.0).await.unwrap();
 
     // Enable it
     link.enable().await;

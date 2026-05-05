@@ -613,7 +613,8 @@ mod tests {
                 ping_responder_unicast_socket,
                 Arc::new(Mutex::new(true)),
             )
-            .await,
+            .await
+            .unwrap(),
             rx_event,
             notifier,
         )

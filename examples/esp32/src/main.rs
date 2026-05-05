@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     let link = rt.block_on(async {
-        let mut link = BasicLink::new(DEFAULT_TEMPO).await;
+        let mut link = BasicLink::new(DEFAULT_TEMPO).await.unwrap();
         link.enable().await;
         info!("Link enabled at {} BPM", DEFAULT_TEMPO);
         link

@@ -71,19 +71,18 @@ impl PeerGateway {
         rx_measure_peer_state: Receiver<MeasurePeerEvent>,
         ping_responder_unicast_socket: Arc<UdpSocket>,
         enabled: Arc<Mutex<bool>>,
-    ) -> Self {
+    ) -> Result<Self, std::io::Error> {
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
         // let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(UNICAST_IP_ANY));
 
         if let Ok(mut state) = peer_state.try_lock() {
-            state.measurement_endpoint = if let SocketAddr::V4(socket_addr) =
-                ping_responder_unicast_socket.local_addr().unwrap()
-            {
-                Some(socket_addr)
-            } else {
-                None
-            };
+            state.measurement_endpoint =
+                if let SocketAddr::V4(socket_addr) = ping_responder_unicast_socket.local_addr()? {
+                    Some(socket_addr)
+                } else {
+                    None
+                };
         }
 
         let messenger = Messenger::new(
@@ -92,9 +91,9 @@ impl PeerGateway {
             epoch,
             notifier.clone(),
             enabled.clone(),
-        );
+        )?;
 
-        PeerGateway {
+        Ok(PeerGateway {
             epoch,
             observer: GatewayObserver::new(
                 rx_peer_event,
@@ -121,7 +120,7 @@ impl PeerGateway {
             peer_timeouts: Arc::new(Mutex::new(vec![])),
             session_peer_counter,
             _cancel: Arc::new(Notify::new()),
-        }
+        })
     }
 
     pub async fn update_node_state(
@@ -511,7 +510,8 @@ mod tests {
             ping_responder_unicast_socket,
             Arc::new(Mutex::new(true)), // enabled for test
         )
-        .await;
+        .await
+        .unwrap();
 
         // let s = new_udp_reuseport(IP_ANY);
         // s.set_broadcast(true).unwrap();

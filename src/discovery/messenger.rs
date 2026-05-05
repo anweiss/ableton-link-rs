@@ -74,14 +74,26 @@ impl Messenger {
         epoch: Instant,
         notifier: Arc<Notify>,
         enabled: Arc<Mutex<bool>>,
-    ) -> Self {
-        let socket = new_udp_reuseport(MULTICAST_IP_ANY.into()).unwrap();
-        socket
-            .join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::new(0, 0, 0, 0))
-            .unwrap();
-        socket.set_multicast_loop_v4(true).unwrap();
+    ) -> Result<Self, std::io::Error> {
+        // Bind the multicast listener on LINK_PORT. With SO_REUSEADDR/SO_REUSEPORT this
+        // should coexist with other Ableton Link instances on the same host, but the
+        // bind can still fail (e.g. another process holding the port without the
+        // reuse flags, or the OS otherwise rejecting the bind). Propagate the error
+        // instead of panicking so callers can decide how to handle it.
+        let socket = new_udp_reuseport(MULTICAST_IP_ANY.into()).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to bind Ableton Link multicast socket on {}: {}",
+                    SocketAddr::from(MULTICAST_IP_ANY),
+                    e
+                ),
+            )
+        })?;
+        socket.join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::new(0, 0, 0, 0))?;
+        socket.set_multicast_loop_v4(true)?;
 
-        Messenger {
+        Ok(Messenger {
             interface: Some(Arc::new(socket)),
             peer_state,
             ttl: 2, // Reduced from 5 to 2 seconds for faster peer timeout detection
@@ -91,7 +103,7 @@ impl Messenger {
             notifier,
             enabled,
             group_id: 0,
-        }
+        })
     }
 
     pub async fn listen(&self) {

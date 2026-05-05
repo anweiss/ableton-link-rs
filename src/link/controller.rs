@@ -48,7 +48,7 @@ pub struct Controller {
 }
 
 impl Controller {
-    pub async fn new(tempo: tempo::Tempo, clock: Clock) -> Self {
+    pub async fn new(tempo: tempo::Tempo, clock: Clock) -> Result<Self, std::io::Error> {
         let node_id = NodeId::new();
         let tempo_callback: Arc<Mutex<Option<TempoCallback>>> = Arc::new(Mutex::new(None));
         let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
@@ -83,16 +83,23 @@ impl Controller {
         }));
 
         let ip = list_afinet_netifas()
-            .unwrap()
+            .map_err(|e| {
+                std::io::Error::other(format!("failed to enumerate network interfaces: {}", e))
+            })?
             .iter()
             .find_map(|(_, ip)| match ip {
                 IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
                 _ => None,
             })
-            .unwrap();
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "no non-loopback IPv4 interface found",
+                )
+            })?;
 
         let ping_responder_unicast_socket =
-            Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
+            Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into())?);
 
         let discovery = Arc::new(
             PeerGateway::new(
@@ -109,7 +116,7 @@ impl Controller {
                 ping_responder_unicast_socket,
                 enabled.clone(),
             )
-            .await,
+            .await?,
         );
 
         let sessions = Sessions::new(
@@ -379,7 +386,7 @@ impl Controller {
             }
         });
 
-        Self {
+        Ok(Self {
             tempo_callback,
             peer_state,
             session_state,
@@ -393,7 +400,7 @@ impl Controller {
             clock,
             rx_event: Some(rx_event),
             notifier,
-        }
+        })
     }
 
     pub async fn enable(&mut self) {

@@ -11,7 +11,7 @@ async fn test_node_id_preservation_across_enable_disable() {
     // Create a controller directly to access internal state
     let tempo = Tempo::new(120.0);
     let clock = Clock::default();
-    let mut controller = Controller::new(tempo, clock).await;
+    let mut controller = Controller::new(tempo, clock).await.unwrap();
 
     // Get the initial NodeId
     let initial_node_id = controller.peer_state.try_lock().unwrap().node_state.node_id;
