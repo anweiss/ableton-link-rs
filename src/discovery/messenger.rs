@@ -1,5 +1,5 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -47,6 +47,12 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     #[cfg(unix)]
     udp_sock.set_reuse_port(true)?;
 
+    if let SocketAddr::V4(addr) = addr {
+        if !addr.ip().is_unspecified() {
+            udp_sock.set_multicast_if_v4(addr.ip())?;
+        }
+    }
+
     udp_sock.set_nonblocking(true)?;
     udp_sock.bind(&socket2::SockAddr::from(addr))?;
 
@@ -57,6 +63,7 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
 
 pub struct Messenger {
     pub interface: Option<Arc<UdpSocket>>,
+    pub send_socket: Option<Arc<UdpSocket>>,
     pub peer_state: Arc<Mutex<PeerState>>,
     pub ttl: u8,
     pub ttl_ratio: u8,
@@ -90,11 +97,16 @@ impl Messenger {
                 ),
             )
         })?;
-        socket.join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::new(0, 0, 0, 0))?;
+        let send_interface =
+            preferred_send_interface_v4().unwrap_or_else(|| Ipv4Addr::new(0, 0, 0, 0));
+        socket.join_multicast_v4(MULTICAST_ADDR, send_interface)?;
         socket.set_multicast_loop_v4(true)?;
+
+        let send_socket = new_udp_reuseport(SocketAddrV4::new(send_interface, 0).into())?;
 
         Ok(Messenger {
             interface: Some(Arc::new(socket)),
+            send_socket: Some(Arc::new(send_socket)),
             peer_state,
             ttl: 2, // Reduced from 5 to 2 seconds for faster peer timeout detection
             ttl_ratio: 20,
@@ -107,7 +119,8 @@ impl Messenger {
     }
 
     pub async fn listen(&self) {
-        let socket = self.interface.as_ref().unwrap().clone();
+        let multicast_socket = self.interface.as_ref().unwrap().clone();
+        let send_socket = self.send_socket.as_ref().unwrap().clone();
         let peer_state = self.peer_state.clone();
         let ttl = self.ttl;
         let tx_event = self.tx_event.clone();
@@ -117,99 +130,32 @@ impl Messenger {
 
         let _n = self.notifier.clone();
 
-        tokio::spawn(async move {
-            loop {
-                let mut buf = [0; MAX_MESSAGE_SIZE];
-
-                let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
-                let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
-
-                // TODO figure out how to encode group ID
-                let should_ignore = match peer_state.try_lock() {
-                    Ok(guard) => header.ident == guard.ident() && header.group_id == group_id,
-                    Err(_) => false, // If we can't get the lock, don't ignore
-                };
-
-                if should_ignore {
-                    debug!("ignoring messages from self (peer {})", header.ident);
-                    continue;
-                } else {
-                    debug!(
-                        "received message type {} from peer {} at {}",
-                        MESSAGE_TYPES[header.message_type as usize], header.ident, src
-                    );
-                }
-
-                // Check if Link is enabled before processing ALIVE and RESPONSE messages
-                // BYEBYE messages should still be processed even when disabled to properly clean up peers
-                let is_enabled = if let Ok(enabled_guard) = enabled.try_lock() {
-                    *enabled_guard
-                } else {
-                    false
-                };
-
-                if let SocketAddr::V4(src) = src {
-                    debug!(
-                        "Received message type {} from peer {}",
-                        header.message_type, header.ident
-                    );
-                    match header.message_type {
-                        ALIVE => {
-                            if !is_enabled {
-                                debug!(
-                                    "ignoring ALIVE message from peer {} because Link is disabled",
-                                    header.ident
-                                );
-                                continue;
-                            }
-
-                            send_response(
-                                socket.clone(),
-                                peer_state.clone(),
-                                ttl,
-                                src,
-                                last_broadcast_time.clone(),
-                                group_id,
-                            )
-                            .await;
-
-                            receive_peer_state(tx_event.clone(), header, &buf[header_len..amt])
-                                .await;
-                        }
-                        RESPONSE => {
-                            if !is_enabled {
-                                debug!("ignoring RESPONSE message from peer {} because Link is disabled", header.ident);
-                                continue;
-                            }
-
-                            receive_peer_state(tx_event.clone(), header, &buf[header_len..amt])
-                                .await;
-                        }
-                        BYEBYE => {
-                            info!("Received BYEBYE message from peer {}", header.ident);
-                            receive_bye_bye(tx_event.clone(), header.ident).await;
-                        }
-                        _ => {
-                            tracing::warn!(
-                                "unknown message type {} from peer {}",
-                                header.message_type,
-                                header.ident
-                            );
-                            continue;
-                        }
-                    }
-                }
-            }
-            // _ = n.notified() => {
-            //     break;
-            // }
-        });
+        spawn_receive_loop(
+            multicast_socket,
+            send_socket.clone(),
+            peer_state.clone(),
+            ttl,
+            tx_event.clone(),
+            last_broadcast_time.clone(),
+            enabled.clone(),
+            group_id,
+        );
+        spawn_receive_loop(
+            send_socket.clone(),
+            send_socket.clone(),
+            peer_state.clone(),
+            ttl,
+            tx_event.clone(),
+            last_broadcast_time.clone(),
+            enabled.clone(),
+            group_id,
+        );
 
         broadcast_state(
             self.ttl,
             self.ttl_ratio,
             self.last_broadcast_time.clone(),
-            self.interface.as_ref().unwrap().clone(),
+            send_socket,
             self.peer_state.clone(),
             SocketAddrV4::new(MULTICAST_ADDR, LINK_PORT),
             self.notifier.clone(),
@@ -218,6 +164,113 @@ impl Messenger {
         )
         .await;
     }
+}
+
+fn preferred_send_interface_v4() -> Option<Ipv4Addr> {
+    local_ip_address::list_afinet_netifas()
+        .ok()?
+        .into_iter()
+        .find_map(|(_, ip)| match ip {
+            IpAddr::V4(ipv4) if !ipv4.is_loopback() => Some(ipv4),
+            _ => None,
+        })
+}
+
+fn spawn_receive_loop(
+    receive_socket: Arc<UdpSocket>,
+    send_socket: Arc<UdpSocket>,
+    peer_state: Arc<Mutex<PeerState>>,
+    ttl: u8,
+    tx_event: Sender<OnEvent>,
+    last_broadcast_time: Arc<Mutex<Instant>>,
+    enabled: Arc<Mutex<bool>>,
+    group_id: SessionGroupId,
+) {
+    tokio::spawn(async move {
+        loop {
+            let mut buf = [0; MAX_MESSAGE_SIZE];
+
+            let (amt, src) = receive_socket.recv_from(&mut buf).await.unwrap();
+            let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
+
+            // TODO figure out how to encode group ID
+            let should_ignore = match peer_state.try_lock() {
+                Ok(guard) => header.ident == guard.ident() && header.group_id == group_id,
+                Err(_) => false, // If we can't get the lock, don't ignore
+            };
+
+            if should_ignore {
+                debug!("ignoring messages from self (peer {})", header.ident);
+                continue;
+            } else {
+                debug!(
+                    "received message type {} from peer {} at {}",
+                    MESSAGE_TYPES[header.message_type as usize], header.ident, src
+                );
+            }
+
+            // Check if Link is enabled before processing ALIVE and RESPONSE messages
+            // BYEBYE messages should still be processed even when disabled to properly clean up peers
+            let is_enabled = if let Ok(enabled_guard) = enabled.try_lock() {
+                *enabled_guard
+            } else {
+                false
+            };
+
+            if let SocketAddr::V4(src) = src {
+                debug!(
+                    "Received message type {} from peer {}",
+                    header.message_type, header.ident
+                );
+                match header.message_type {
+                    ALIVE => {
+                        if !is_enabled {
+                            debug!(
+                                "ignoring ALIVE message from peer {} because Link is disabled",
+                                header.ident
+                            );
+                            continue;
+                        }
+
+                        send_response(
+                            send_socket.clone(),
+                            peer_state.clone(),
+                            ttl,
+                            src,
+                            last_broadcast_time.clone(),
+                            group_id,
+                        )
+                        .await;
+
+                        receive_peer_state(tx_event.clone(), header, &buf[header_len..amt]).await;
+                    }
+                    RESPONSE => {
+                        if !is_enabled {
+                            debug!(
+                                "ignoring RESPONSE message from peer {} because Link is disabled",
+                                header.ident
+                            );
+                            continue;
+                        }
+
+                        receive_peer_state(tx_event.clone(), header, &buf[header_len..amt]).await;
+                    }
+                    BYEBYE => {
+                        info!("Received BYEBYE message from peer {}", header.ident);
+                        receive_bye_bye(tx_event.clone(), header.ident).await;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "unknown message type {} from peer {}",
+                            header.message_type,
+                            header.ident
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+    });
 }
 
 pub async fn broadcast_state(
