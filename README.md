@@ -281,6 +281,46 @@ cargo check --lib --no-default-features
 
 All CI checks must pass before merging to `main`.
 
+### Staying in sync with upstream
+
+Two [agentic workflows](https://github.github.com/gh-aw/) track the upstream C++
+project at [Ableton/link](https://github.com/ableton/link), which is vendored as a
+submodule at `vendor/ableton-link`.
+
+The submodule pin is the **port watermark**: everything at or before it has been
+reconciled with this port, everything after it is the backlog. Neither workflow moves
+the pin without a corresponding code change.
+
+| Workflow | Cadence | What it does |
+| --- | --- | --- |
+| `link-upstream-watch.md` | Weekly, Monday | Triages upstream commits landed since the pin and maintains the `Porting backlog: upstream Ableton Link` issue |
+| `link-upstream-port.md` | Weekly, Thursday | Takes the next backlog item, ports it, runs the full CI suite, and opens a draft PR |
+
+Both compute their input with `.github/scripts/link-upstream-drift.sh`, which is
+plain shell and runnable locally:
+
+```bash
+git submodule update --init vendor/ableton-link
+OUT_DIR=/tmp/drift ./.github/scripts/link-upstream-drift.sh
+cat /tmp/drift/summary.md
+```
+
+The porting rules and the C++ header to Rust module map both live in
+[`.github/workflows/shared/link-upstream-context.md`](.github/workflows/shared/link-upstream-context.md).
+Edit that file to change how either workflow reasons about a change.
+
+**Setup.** These need a `COPILOT_GITHUB_TOKEN` repository secret — a fine-grained PAT
+with the *Copilot Requests* permission. Organization-owned repositories can drop the
+secret and use `permissions: copilot-requests: write` instead; that path does not
+apply here. Recompile after any frontmatter change:
+
+```bash
+gh extension install github/gh-aw
+gh aw compile
+```
+
+Both the `.md` source and the generated `.lock.yml` are committed.
+
 ## Documentation
 
 * [Official Ableton Link Documentation](https://ableton.github.io/link)
