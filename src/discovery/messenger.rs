@@ -1,6 +1,10 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, Mutex},
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -47,6 +51,14 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     #[cfg(unix)]
     udp_sock.set_reuse_port(true)?;
 
+    // When binding to a concrete interface address, make sure outgoing multicast
+    // traffic leaves through that very interface.
+    if let SocketAddr::V4(addr) = addr {
+        if !addr.ip().is_unspecified() {
+            udp_sock.set_multicast_if_v4(addr.ip())?;
+        }
+    }
+
     udp_sock.set_nonblocking(true)?;
     udp_sock.bind(&socket2::SockAddr::from(addr))?;
 
@@ -55,8 +67,42 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     std_socket.try_into()
 }
 
+/// How often the set of usable network interfaces is re-scanned.
+const INTERFACE_SCAN_PERIOD: Duration = Duration::from_secs(5);
+
+/// Cancellation handle for a per-interface receive loop.
+#[derive(Clone, Default)]
+struct Cancel {
+    notify: Arc<Notify>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Cancel {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
+/// A send/receive socket bound to a single network interface.
+#[derive(Clone)]
+pub struct InterfaceSocket {
+    socket: Arc<UdpSocket>,
+    cancel: Cancel,
+}
+
+/// The set of per-interface sockets, keyed by the interface address they are bound to.
+pub type InterfaceSockets = Arc<Mutex<HashMap<Ipv4Addr, InterfaceSocket>>>;
+
 pub struct Messenger {
     pub interface: Option<Arc<UdpSocket>>,
+    /// One ephemeral socket per usable interface, used to send discovery messages
+    /// and to listen for the unicast responses they trigger.
+    pub interface_sockets: InterfaceSockets,
     pub peer_state: Arc<Mutex<PeerState>>,
     pub ttl: u8,
     pub ttl_ratio: u8,
@@ -80,7 +126,7 @@ impl Messenger {
         // bind can still fail (e.g. another process holding the port without the
         // reuse flags, or the OS otherwise rejecting the bind). Propagate the error
         // instead of panicking so callers can decide how to handle it.
-        let socket = new_udp_reuseport(MULTICAST_IP_ANY.into()).map_err(|e| {
+        let socket = Arc::new(new_udp_reuseport(MULTICAST_IP_ANY.into()).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!(
@@ -89,12 +135,30 @@ impl Messenger {
                     e
                 ),
             )
-        })?;
-        socket.join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::new(0, 0, 0, 0))?;
+        })?);
         socket.set_multicast_loop_v4(true)?;
 
+        let interface_sockets: InterfaceSockets = Arc::new(Mutex::new(HashMap::new()));
+
+        for addr in usable_interfaces_v4() {
+            match add_interface(&socket, &interface_sockets, addr) {
+                Ok(_) => info!("joined Ableton Link multicast group on interface {}", addr),
+                Err(e) => warn!("failed to set up interface {}: {}", addr, e),
+            }
+        }
+
+        if lock_map(&interface_sockets, |sockets| sockets.is_empty()).unwrap_or(true) {
+            // No usable interface was found or none of them could be set up (e.g. a
+            // container without external networking). Fall back to the default
+            // interface so discovery keeps working; the periodic scan picks up
+            // interfaces as they appear.
+            warn!("no usable multicast interface found, falling back to the default interface");
+            add_interface(&socket, &interface_sockets, Ipv4Addr::UNSPECIFIED)?;
+        }
+
         Ok(Messenger {
-            interface: Some(Arc::new(socket)),
+            interface: Some(socket),
+            interface_sockets,
             peer_state,
             ttl: 2, // Reduced from 5 to 2 seconds for faster peer timeout detection
             ttl_ratio: 20,
@@ -107,7 +171,8 @@ impl Messenger {
     }
 
     pub async fn listen(&self) {
-        let socket = self.interface.as_ref().unwrap().clone();
+        let multicast_socket = self.interface.as_ref().unwrap().clone();
+        let interface_sockets = self.interface_sockets.clone();
         let peer_state = self.peer_state.clone();
         let ttl = self.ttl;
         let tx_event = self.tx_event.clone();
@@ -117,99 +182,37 @@ impl Messenger {
 
         let _n = self.notifier.clone();
 
-        tokio::spawn(async move {
-            loop {
-                let mut buf = [0; MAX_MESSAGE_SIZE];
+        let context = ReceiveContext {
+            interface_sockets: interface_sockets.clone(),
+            peer_state: peer_state.clone(),
+            ttl,
+            tx_event: tx_event.clone(),
+            last_broadcast_time: last_broadcast_time.clone(),
+            enabled: enabled.clone(),
+            group_id,
+        };
 
-                let (amt, src) = socket.recv_from(&mut buf).await.unwrap();
-                let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
+        // The shared multicast socket receives the multicast traffic of every
+        // interface it joined.
+        spawn_receive_loop(multicast_socket.clone(), None, context.clone());
 
-                // TODO figure out how to encode group ID
-                let should_ignore = match peer_state.try_lock() {
-                    Ok(guard) => header.ident == guard.ident() && header.group_id == group_id,
-                    Err(_) => false, // If we can't get the lock, don't ignore
-                };
+        // Each per-interface socket receives the unicast responses triggered by the
+        // messages sent through it.
+        for entry in interface_socket_entries(&interface_sockets) {
+            spawn_receive_loop(
+                entry.socket.clone(),
+                Some(entry.cancel.clone()),
+                context.clone(),
+            );
+        }
 
-                if should_ignore {
-                    debug!("ignoring messages from self (peer {})", header.ident);
-                    continue;
-                } else {
-                    debug!(
-                        "received message type {} from peer {} at {}",
-                        MESSAGE_TYPES[header.message_type as usize], header.ident, src
-                    );
-                }
-
-                // Check if Link is enabled before processing ALIVE and RESPONSE messages
-                // BYEBYE messages should still be processed even when disabled to properly clean up peers
-                let is_enabled = if let Ok(enabled_guard) = enabled.try_lock() {
-                    *enabled_guard
-                } else {
-                    false
-                };
-
-                if let SocketAddr::V4(src) = src {
-                    debug!(
-                        "Received message type {} from peer {}",
-                        header.message_type, header.ident
-                    );
-                    match header.message_type {
-                        ALIVE => {
-                            if !is_enabled {
-                                debug!(
-                                    "ignoring ALIVE message from peer {} because Link is disabled",
-                                    header.ident
-                                );
-                                continue;
-                            }
-
-                            send_response(
-                                socket.clone(),
-                                peer_state.clone(),
-                                ttl,
-                                src,
-                                last_broadcast_time.clone(),
-                                group_id,
-                            )
-                            .await;
-
-                            receive_peer_state(tx_event.clone(), header, &buf[header_len..amt])
-                                .await;
-                        }
-                        RESPONSE => {
-                            if !is_enabled {
-                                debug!("ignoring RESPONSE message from peer {} because Link is disabled", header.ident);
-                                continue;
-                            }
-
-                            receive_peer_state(tx_event.clone(), header, &buf[header_len..amt])
-                                .await;
-                        }
-                        BYEBYE => {
-                            info!("Received BYEBYE message from peer {}", header.ident);
-                            receive_bye_bye(tx_event.clone(), header.ident).await;
-                        }
-                        _ => {
-                            tracing::warn!(
-                                "unknown message type {} from peer {}",
-                                header.message_type,
-                                header.ident
-                            );
-                            continue;
-                        }
-                    }
-                }
-            }
-            // _ = n.notified() => {
-            //     break;
-            // }
-        });
+        spawn_interface_scan(multicast_socket, context);
 
         broadcast_state(
             self.ttl,
             self.ttl_ratio,
             self.last_broadcast_time.clone(),
-            self.interface.as_ref().unwrap().clone(),
+            interface_sockets,
             self.peer_state.clone(),
             SocketAddrV4::new(MULTICAST_ADDR, LINK_PORT),
             self.notifier.clone(),
@@ -220,11 +223,296 @@ impl Messenger {
     }
 }
 
+#[derive(Clone)]
+struct ReceiveContext {
+    interface_sockets: InterfaceSockets,
+    peer_state: Arc<Mutex<PeerState>>,
+    ttl: u8,
+    tx_event: Sender<OnEvent>,
+    last_broadcast_time: Arc<Mutex<Instant>>,
+    enabled: Arc<Mutex<bool>>,
+    group_id: SessionGroupId,
+}
+
+/// All IPv4 interfaces that can be used for Link discovery.
+fn usable_interfaces_v4() -> Vec<Ipv4Addr> {
+    only_ipv4(crate::platform::network::scan_network_interfaces_blocking())
+}
+
+async fn usable_interfaces_v4_async() -> Vec<Ipv4Addr> {
+    only_ipv4(crate::platform::network::scan_network_interfaces().await)
+}
+
+fn only_ipv4(addrs: Vec<IpAddr>) -> Vec<Ipv4Addr> {
+    addrs
+        .into_iter()
+        .filter_map(|addr| match addr {
+            IpAddr::V4(addr) => Some(addr),
+            IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+fn lock_map<T>(
+    sockets: &InterfaceSockets,
+    f: impl FnOnce(&HashMap<Ipv4Addr, InterfaceSocket>) -> T,
+) -> Option<T> {
+    match sockets.lock() {
+        Ok(guard) => Some(f(&guard)),
+        Err(_) => None,
+    }
+}
+
+fn interface_socket_entries(sockets: &InterfaceSockets) -> Vec<InterfaceSocket> {
+    lock_map(sockets, |sockets| sockets.values().cloned().collect()).unwrap_or_default()
+}
+
+/// Join the multicast group on `addr` and create the ephemeral socket used to send
+/// discovery messages through that interface.
+fn add_interface(
+    multicast_socket: &Arc<UdpSocket>,
+    interface_sockets: &InterfaceSockets,
+    addr: Ipv4Addr,
+) -> Result<InterfaceSocket, std::io::Error> {
+    multicast_socket.join_multicast_v4(MULTICAST_ADDR, addr)?;
+
+    let send_socket = match new_udp_reuseport(SocketAddrV4::new(addr, 0).into()) {
+        Ok(socket) => socket,
+        Err(e) => {
+            let _ = multicast_socket.leave_multicast_v4(MULTICAST_ADDR, addr);
+            return Err(e);
+        }
+    };
+    if let Err(e) = send_socket.set_multicast_loop_v4(true) {
+        let _ = multicast_socket.leave_multicast_v4(MULTICAST_ADDR, addr);
+        return Err(e);
+    }
+
+    let entry = InterfaceSocket {
+        socket: Arc::new(send_socket),
+        cancel: Cancel::default(),
+    };
+
+    match interface_sockets.lock() {
+        Ok(mut sockets) => {
+            sockets.insert(addr, entry.clone());
+        }
+        Err(_) => {
+            let _ = multicast_socket.leave_multicast_v4(MULTICAST_ADDR, addr);
+            return Err(std::io::Error::other("interface socket map is poisoned"));
+        }
+    }
+
+    Ok(entry)
+}
+
+fn remove_interface(
+    multicast_socket: &Arc<UdpSocket>,
+    interface_sockets: &InterfaceSockets,
+    addr: Ipv4Addr,
+) {
+    let entry = match interface_sockets.lock() {
+        Ok(mut sockets) => sockets.remove(&addr),
+        Err(_) => None,
+    };
+
+    if let Some(entry) = entry {
+        entry.cancel.cancel();
+        let _ = multicast_socket.leave_multicast_v4(MULTICAST_ADDR, addr);
+        info!("left Ableton Link multicast group on interface {}", addr);
+    }
+}
+
+/// Keep the per-interface sockets in sync with the interfaces of the host.
+fn spawn_interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContext) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(INTERFACE_SCAN_PERIOD);
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            let current = usable_interfaces_v4_async().await;
+            if current.is_empty() {
+                // Keep the existing sockets rather than tearing discovery down while
+                // the host temporarily has no usable interface.
+                continue;
+            }
+
+            let known = lock_map(&context.interface_sockets, |sockets| {
+                sockets.keys().copied().collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+            for addr in known.iter().filter(|addr| !current.contains(addr)) {
+                remove_interface(&multicast_socket, &context.interface_sockets, *addr);
+            }
+
+            for addr in current.iter().filter(|addr| !known.contains(addr)) {
+                match add_interface(&multicast_socket, &context.interface_sockets, *addr) {
+                    Ok(entry) => {
+                        info!("joined Ableton Link multicast group on interface {}", addr);
+                        spawn_receive_loop(
+                            entry.socket.clone(),
+                            Some(entry.cancel.clone()),
+                            context.clone(),
+                        );
+                    }
+                    Err(e) => warn!("failed to set up interface {}: {}", addr, e),
+                }
+            }
+        }
+    });
+}
+
+/// Pick the socket that is most likely to reach `to`, i.e. the one bound to the
+/// interface address sharing the longest prefix with it.
+fn socket_for_target(interface_sockets: &InterfaceSockets, to: Ipv4Addr) -> Option<Arc<UdpSocket>> {
+    lock_map(interface_sockets, |sockets| {
+        sockets
+            .iter()
+            .max_by_key(|(addr, _)| common_prefix_len(**addr, to))
+            .map(|(_, entry)| entry.socket.clone())
+    })
+    .flatten()
+}
+
+fn common_prefix_len(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
+    (u32::from(a) ^ u32::from(b)).leading_zeros()
+}
+
+fn spawn_receive_loop(
+    receive_socket: Arc<UdpSocket>,
+    cancel: Option<Cancel>,
+    context: ReceiveContext,
+) {
+    tokio::spawn(async move {
+        loop {
+            let mut buf = [0; MAX_MESSAGE_SIZE];
+
+            let received = match &cancel {
+                Some(cancel) => {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+
+                    select! {
+                        received = receive_socket.recv_from(&mut buf) => received,
+                        _ = cancel.notify.notified() => break,
+                    }
+                }
+                None => receive_socket.recv_from(&mut buf).await,
+            };
+
+            let (amt, src) = match received {
+                Ok(received) => received,
+                Err(e) => {
+                    warn!("discovery socket receive failed: {}", e);
+                    break;
+                }
+            };
+
+            let (header, header_len) = match parse_message_header(&buf[..amt]) {
+                Ok(header) => header,
+                Err(e) => {
+                    debug!("ignoring malformed message from {}: {}", src, e);
+                    continue;
+                }
+            };
+
+            // TODO figure out how to encode group ID
+            let should_ignore = match context.peer_state.try_lock() {
+                Ok(guard) => header.ident == guard.ident() && header.group_id == context.group_id,
+                Err(_) => false, // If we can't get the lock, don't ignore
+            };
+
+            if should_ignore {
+                debug!("ignoring messages from self (peer {})", header.ident);
+                continue;
+            } else {
+                debug!(
+                    "received message type {} from peer {} at {}",
+                    MESSAGE_TYPES[header.message_type as usize], header.ident, src
+                );
+            }
+
+            // Check if Link is enabled before processing ALIVE and RESPONSE messages
+            // BYEBYE messages should still be processed even when disabled to properly clean up peers
+            let is_enabled = if let Ok(enabled_guard) = context.enabled.try_lock() {
+                *enabled_guard
+            } else {
+                false
+            };
+
+            if let SocketAddr::V4(src) = src {
+                debug!(
+                    "Received message type {} from peer {}",
+                    header.message_type, header.ident
+                );
+                match header.message_type {
+                    ALIVE => {
+                        if !is_enabled {
+                            debug!(
+                                "ignoring ALIVE message from peer {} because Link is disabled",
+                                header.ident
+                            );
+                            continue;
+                        }
+
+                        if let Some(socket) =
+                            socket_for_target(&context.interface_sockets, *src.ip())
+                        {
+                            send_response(
+                                socket,
+                                context.peer_state.clone(),
+                                context.ttl,
+                                src,
+                                context.last_broadcast_time.clone(),
+                                context.group_id,
+                            )
+                            .await;
+                        } else {
+                            warn!("no interface socket available to respond to {}", src);
+                        }
+
+                        receive_peer_state(context.tx_event.clone(), header, &buf[header_len..amt])
+                            .await;
+                    }
+                    RESPONSE => {
+                        if !is_enabled {
+                            debug!(
+                                "ignoring RESPONSE message from peer {} because Link is disabled",
+                                header.ident
+                            );
+                            continue;
+                        }
+
+                        receive_peer_state(context.tx_event.clone(), header, &buf[header_len..amt])
+                            .await;
+                    }
+                    BYEBYE => {
+                        info!("Received BYEBYE message from peer {}", header.ident);
+                        receive_bye_bye(context.tx_event.clone(), header.ident).await;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "unknown message type {} from peer {}",
+                            header.message_type,
+                            header.ident
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+    });
+}
+
 pub async fn broadcast_state(
     ttl: u8,
     ttl_ratio: u8,
     last_broadcast_time: Arc<Mutex<Instant>>,
-    socket: Arc<UdpSocket>,
+    interface_sockets: InterfaceSockets,
     peer_state: Arc<Mutex<PeerState>>,
     to: SocketAddrV4,
     n: Arc<Notify>,
@@ -232,7 +520,6 @@ pub async fn broadcast_state(
     group_id: SessionGroupId,
 ) {
     let lbt = last_broadcast_time.clone();
-    let s = socket.clone();
 
     let mut sleep_time = Duration::default();
 
@@ -283,7 +570,11 @@ pub async fn broadcast_state(
                     };
 
                     if should_broadcast {
-                        send_peer_state(s.clone(), peer_state.clone(), ttl, ALIVE, to, lbt, group_id).await;
+                        // Announce ourselves through every interface, so peers on any
+                        // of them can discover us.
+                        for entry in interface_socket_entries(&interface_sockets) {
+                            send_peer_state(entry.socket.clone(), peer_state.clone(), ttl, ALIVE, to, lbt.clone(), group_id).await;
+                        }
                     }
                 }
             }
@@ -425,5 +716,62 @@ pub fn send_byebye(node_state: NodeId) {
         if let Err(e) = std_socket.send_to(&message, (MULTICAST_ADDR, LINK_PORT)) {
             warn!("Failed to send BYEBYE: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interface_socket() -> InterfaceSocket {
+        InterfaceSocket {
+            socket: Arc::new(
+                new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap(),
+            ),
+            cancel: Cancel::default(),
+        }
+    }
+
+    #[test]
+    fn common_prefix_len_prefers_closest_address() {
+        assert_eq!(
+            common_prefix_len(Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(192, 168, 1, 1)),
+            32
+        );
+        assert!(
+            common_prefix_len(Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(192, 168, 1, 2))
+                > common_prefix_len(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(192, 168, 1, 2))
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_for_target_picks_matching_interface() {
+        let wifi = Ipv4Addr::new(192, 168, 1, 10);
+        let ethernet = Ipv4Addr::new(10, 0, 0, 10);
+
+        let mut sockets = HashMap::new();
+        sockets.insert(wifi, interface_socket());
+        sockets.insert(ethernet, interface_socket());
+        let interface_sockets: InterfaceSockets = Arc::new(Mutex::new(sockets));
+
+        let wifi_socket = interface_sockets.lock().unwrap()[&wifi].socket.clone();
+        let ethernet_socket = interface_sockets.lock().unwrap()[&ethernet].socket.clone();
+
+        let selected = socket_for_target(&interface_sockets, Ipv4Addr::new(10, 0, 0, 42)).unwrap();
+        assert!(Arc::ptr_eq(&selected, &ethernet_socket));
+
+        let selected =
+            socket_for_target(&interface_sockets, Ipv4Addr::new(192, 168, 1, 42)).unwrap();
+        assert!(Arc::ptr_eq(&selected, &wifi_socket));
+    }
+
+    #[test]
+    fn only_ipv4_filters_ipv6_addresses() {
+        let addrs = vec![
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ];
+
+        assert_eq!(only_ipv4(addrs), vec![Ipv4Addr::new(192, 168, 1, 10)]);
     }
 }
