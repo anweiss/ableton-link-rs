@@ -17,6 +17,11 @@ pub async fn scan_network_interfaces() -> Vec<IpAddr> {
         })
 }
 
+/// Blocking variant of [`scan_network_interfaces`] for use from synchronous contexts
+pub fn scan_network_interfaces_blocking() -> Vec<IpAddr> {
+    scan_interfaces_safe()
+}
+
 // Safe implementation using the network-interface crate
 fn scan_interfaces_safe() -> Vec<IpAddr> {
     use std::collections::HashMap;
