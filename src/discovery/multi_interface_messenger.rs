@@ -228,7 +228,7 @@ impl MultiInterfaceMessenger {
         // Find an appropriate interface for the target
         let target_is_ipv4 = target.is_ipv4();
 
-        for (_, handler) in interfaces.iter() {
+        for handler in interfaces.values() {
             let handler_is_ipv4 = is_ipv4(&handler.ip_addr);
 
             // Use matching IP version
@@ -259,7 +259,7 @@ impl MultiInterfaceMessenger {
         interfaces: &HashMap<IpAddr, InterfaceHandler>,
         message: &[u8],
     ) {
-        for (_, handler) in interfaces.iter() {
+        for handler in interfaces.values() {
             let multicast_addr = multicast_endpoint_for_addr(&handler.ip_addr);
 
             match handler.socket.send_to(message, multicast_addr).await {
