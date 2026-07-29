@@ -91,16 +91,32 @@ FILE_COUNT="$(grep -c . "$OUT_DIR/files.txt" || true)"
     echo '```'
     # Sort by total churn so the agent sees the substantive files first rather
     # than whatever happens to sort alphabetically.
+    #
+    # Truncation is done with awk, not `head`. Under `set -o pipefail`, `head`
+    # exiting early closes the pipe, the upstream `sort` takes SIGPIPE, and the
+    # whole script dies with exit 141 and no output. Whether it happens at all
+    # depends on how the write races the pipe buffer, so it passes locally and
+    # fails on a runner. `awk 'NR<=N'` drains its input instead of exiting early.
     awk -F'\t' 'NF==3 && $1 != "-" { printf "%6d  %s\n", $1 + $2, $3 }' "$OUT_DIR/files.txt" \
-      | sort -rn | head -60
+      | sort -rn | awk 'NR<=60'
     echo '```'
     echo
     echo "## Commits, oldest first"
     echo
     echo '```'
-    awk -F'\t' 'NF>=3 { printf "%s  %s\n", substr($1,1,12), $3 }' "$OUT_DIR/commits.txt" | head -80
+    awk -F'\t' 'NF>=3 && NR<=80 { printf "%s  %s\n", substr($1,1,12), $3 }' "$OUT_DIR/commits.txt"
     echo '```'
   fi
 } > "$OUT_DIR/summary.md"
+
+# The workflows treat these four files as authoritative. If any of them is missing or
+# empty the agent would reason from a blank slate and conclude there is nothing to
+# port, so fail loudly instead.
+for f in pinned.txt upstream.txt summary.md; do
+  if [ ! -s "$OUT_DIR/$f" ]; then
+    echo "error: $OUT_DIR/$f is missing or empty; the drift report is incomplete" >&2
+    exit 1
+  fi
+done
 
 echo "wrote drift report to $OUT_DIR ($COMMIT_COUNT commits, $FILE_COUNT files)"
