@@ -543,7 +543,7 @@ mod tests {
             0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44,
         ]));
         let display = format!("{}", id);
-        assert_eq!(display, "aabbccdd11223344");
+        assert_eq!(display, "0xaabbccdd11223344");
     }
 
     #[test]
