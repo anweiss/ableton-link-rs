@@ -135,12 +135,37 @@ watermark has a paper trail) and a **Needs a decision** section.
 End the issue body with the drift header from `summary.md` — pinned SHA, upstream SHA,
 commit count — so the numbers are checkable without re-running anything.
 
+## Every commit gets a bucket
+
+The port workflow advances the submodule pin, and once the pin moves past a commit
+that commit is gone from the next drift report for good. A commit you never mention is
+therefore not "deferred", it is deleted. So coverage is the property that matters most
+here, ahead of how neatly the backlog reads.
+
+Before you write the issue, check yourself: take every SHA in `commits.txt` and
+confirm it appears somewhere in the body you are about to post — as a `Port` item, in
+a **Not applicable** line, or in **Needs a decision**. Grouping is fine and encouraged,
+but a group must name each SHA it covers rather than trailing off with "and related
+commits". If a SHA is not accounted for, you have not finished triaging it.
+
+State the count explicitly at the end of the body, like
+`Coverage: 135 of 135 commits in a729fd4c..902aef95 are accounted for.` If those two
+numbers do not match, say which SHAs you could not classify and why instead of quietly
+dropping them.
+
+The first run of this workflow left 19 of 135 commits unmentioned, including
+`d8a47ba` ("Truncate the peer name to avoid buffer overruns on serialization") and
+`0fc58dc` ("Use int64_t consistently for time"). Both would have been silently retired
+the first time the pin moved past them.
+
 ## Rules
 
 - Every claim traces to a SHA you actually read. If you did not open the diff, do not
   characterize it.
-- Order **Port** items oldest upstream commit first. The watermark only advances
-  monotonically, so the backlog has to be workable front to back.
+- Order **Port** items by their **line order in `commits.txt`**, which is true ancestry
+  order from `git log --reverse`. Do not order them by theme or by how related they
+  feel — the port workflow takes the earliest one and moves a monotonic watermark, so
+  a backlog whose order disagrees with ancestry causes ports to happen out of order.
 - Flag anything touching `src/discovery/messages.rs`, `src/link/payload.rs`, or
   `src/encoding.rs` as `risk: wire-format`. Those change bytes on the network and need
   a human before they ship.

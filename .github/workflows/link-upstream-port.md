@@ -156,13 +156,25 @@ Otherwise, take the next item off the backlog:
 4. Take the **first `Port` item whose SHA still appears in
    `/tmp/gh-aw/agent/upstream/commits.txt`**. An item whose SHA is no longer in that
    file is already behind the watermark and is done, whether or not its checkbox got
-   ticked — skip it and say so. The backlog is ordered oldest upstream commit first
-   and the watermark only moves forward, so work it front to back.
+   ticked — skip it and say so.
+
+   **`commits.txt` is the ordering authority, not the backlog.** It comes from
+   `git log --reverse`, so it is in true ancestry order, oldest first. The backlog is
+   written by a language model and its list order has already been observed to
+   disagree with ancestry — on issue #56, item 2 (`4d10802c`) sits at upstream
+   position 8 while item 3 (`588fd857`) sits at position 3. So do not "work the
+   backlog front to back". Instead, for every unfinished `Port` item, find its line
+   number in `commits.txt` and take the item with the **lowest** line number. That is
+   the earliest unported commit, which is the only one you may safely port next.
 5. Skip an item, and move to the next one, if either holds:
    - It is `risk: api-break`. Those need a maintainer to decide. Comment on the
      backlog issue rather than porting it.
    - It is `risk: wire-format` **and** upstream shipped no test for it that you can
      port as concrete byte-level expectations. See the wire-format rule below.
+
+   Skipping an item does **not** let you advance the watermark past it. See
+   "Advance the watermark" — a skipped item is an unported commit, so the pin stops
+   before it.
 6. If the backlog issue does not exist yet, do not invent a backlog. Read
    `commits.txt` yourself, take the **oldest** commit that touches a mapped path,
    and port that.
@@ -242,10 +254,33 @@ git -C vendor/ableton-link checkout <sha>
 git add vendor/ableton-link
 ```
 
-Only advance to a commit you actually ported, or one you can justify skipping in the
-PR body because it is genuinely not applicable. Never fast-forward the pin to
-`origin/master`. If your change spans several upstream SHAs, pin to the newest one in
-that group.
+**The pin is a claim about the whole range behind it, not a bookmark on one commit.**
+Moving it from `OLD` to `NEW` asserts that every commit in `(OLD, NEW]` has been dealt
+with, because the next run computes drift as `NEW..master` and everything before `NEW`
+disappears from `commits.txt` forever. This rule is the only thing standing between an
+unported upstream bugfix and silent deletion, so treat it as hard:
+
+Before you stage the pin, list every commit you are about to move past:
+
+```bash
+git -C vendor/ableton-link log --reverse --no-merges --oneline <OLD>..<NEW>
+```
+
+Every single line of that output must be either (a) ported by this pull request, or
+(b) genuinely not applicable under the module map. If even one line is a commit you
+skipped, deferred, or never triaged, **the pin is too far forward** — move it back to
+the commit immediately before the first unhandled one, and say so in the PR body. It
+is always correct to advance the pin less than you could. It is never correct to
+advance it past work that has not been done.
+
+This is not hypothetical. PR #59 advanced the pin to `4d10802c` (upstream position 8)
+while positions 1–7 were untouched, which would have silently retired `5bf14d9`
+("Fix a rare crash during initialization"), `588fd85` ("Output random bytes to logs in
+hexadecimal form"), and `0fc58dc` ("Use int64_t consistently for time").
+
+In the PR body, reproduce that range as the **Watermark** section: one line per commit
+moved past, each marked `ported` or `not applicable: <reason>`. If the range is just
+the single commit you ported, say that. Never fast-forward the pin to `origin/master`.
 
 ## Open the pull request
 

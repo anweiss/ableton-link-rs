@@ -100,12 +100,23 @@ FILE_COUNT="$(grep -c . "$OUT_DIR/files.txt" || true)"
     awk -F'\t' 'NF==3 && $1 != "-" { printf "%6d  %s\n", $1 + $2, $3 }' "$OUT_DIR/files.txt" \
       | sort -rn | awk 'NR<=60'
     echo '```'
+    if [ "$FILE_COUNT" -gt 60 ]; then
+      echo
+      echo "_Showing the 60 highest-churn paths of $FILE_COUNT. Full list: \`files.txt\`._"
+    fi
     echo
     echo "## Commits, oldest first"
     echo
+    # Never truncate this listing. The triage agent classifies commits from what it
+    # can see here, and a silently short list reads as a complete one: capping at 80
+    # of 135 left 12 commits untriaged in issue #56, including "Truncate the peer
+    # name to avoid buffer overruns on serialization". Every commit in the range has
+    # to be accounted for, so every commit in the range gets printed.
     echo '```'
-    awk -F'\t' 'NF>=3 && NR<=80 { printf "%s  %s\n", substr($1,1,12), $3 }' "$OUT_DIR/commits.txt"
+    awk -F'\t' 'NF>=3 { printf "%s  %s\n", substr($1,1,12), $3 }' "$OUT_DIR/commits.txt"
     echo '```'
+    echo
+    echo "_All $COMMIT_COUNT commits in \`$PINNED..$UPSTREAM\` are listed above._"
   fi
 } > "$OUT_DIR/summary.md"
 
