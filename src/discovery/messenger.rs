@@ -613,14 +613,15 @@ pub async fn send_message(
     payload: &Payload,
     to: SocketAddrV4,
     group_id: SessionGroupId,
-) {
+) -> std::io::Result<()> {
     socket.set_broadcast(true).unwrap();
     socket.set_multicast_ttl_v4(2).unwrap();
     socket.set_multicast_loop_v4(true).unwrap();
 
     let message = encode_message(from, ttl, message_type, payload, group_id).unwrap();
 
-    let _sent_bytes = socket.send_to(&message, to).await.unwrap();
+    socket.send_to(&message, to).await?;
+    Ok(())
 }
 
 pub async fn send_peer_state(
@@ -640,7 +641,7 @@ pub async fn send_peer_state(
         }
     };
 
-    send_message(
+    match send_message(
         socket,
         ident,
         ttl,
@@ -649,10 +650,16 @@ pub async fn send_peer_state(
         to,
         group_id,
     )
-    .await;
-
-    if let Ok(mut last_time) = last_broadcast_time.try_lock() {
-        *last_time = Instant::now();
+    .await
+    {
+        Ok(()) => {
+            if let Ok(mut last_time) = last_broadcast_time.try_lock() {
+                *last_time = Instant::now();
+            }
+        }
+        Err(err) => {
+            debug!("Failed to send peer state message: {}", err);
+        }
     }
 }
 
