@@ -148,10 +148,21 @@ a **Not applicable** line, or in **Needs a decision**. Grouping is fine and enco
 but a group must name each SHA it covers rather than trailing off with "and related
 commits". If a SHA is not accounted for, you have not finished triaging it.
 
-State the count explicitly at the end of the body, like
-`Coverage: 135 of 135 commits in a729fd4c..902aef95 are accounted for.` If those two
-numbers do not match, say which SHAs you could not classify and why instead of quietly
-dropping them.
+**Compute this, do not eyeball it.** Write your draft issue body to a file and run the
+set difference against `commits.txt`:
+
+```bash
+# body.md = the issue body you are about to post
+cut -f1 /tmp/gh-aw/agent/upstream/commits.txt | grep . | while read sha; do
+  grep -qiF "${sha:0:7}" body.md || echo "UNACCOUNTED $sha"
+done
+```
+
+Every line that command prints is a commit you are about to drop on the floor. Go back
+and classify it, then run the check again. Only post once the command prints nothing,
+and take the `Coverage: N of N` line from what you actually counted rather than from
+what you assume — a previous run asserted "135 of 135" while `f7bae98` was in fact
+missing from the body, which is the exact failure this check exists to catch.
 
 The first run of this workflow left 19 of 135 commits unmentioned, including
 `d8a47ba` ("Truncate the peer name to avoid buffer overruns on serialization") and
