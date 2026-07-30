@@ -39,7 +39,11 @@ impl Decode for NodeId {
 
 impl Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
+        write!(f, "0x")?;
+        for byte in &self.0 {
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
     }
 }
 
@@ -144,7 +148,20 @@ mod tests {
     #[test]
     fn node_id_display_is_hex() {
         let id = NodeId::from_array([0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48]);
-        assert_eq!(format!("{}", id), "4142434445464748");
+        assert_eq!(format!("{}", id), "0x4142434445464748");
+    }
+
+    #[test]
+    fn node_id_display_format() {
+        // bytes with zero padding and boundary values
+        let id = NodeId::from_array([0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff]);
+        assert_eq!(format!("{}", id), "0x01000000000000ff");
+    }
+
+    #[test]
+    fn node_id_display_all_same() {
+        let id = NodeId([0xab; 8]);
+        assert_eq!(format!("{}", id), "0xabababababababab");
     }
 
     #[test]
