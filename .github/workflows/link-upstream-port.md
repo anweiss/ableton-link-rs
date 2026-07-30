@@ -71,6 +71,13 @@ safe-outputs:
     max: 1
     if-no-changes: ignore
     expires: 30
+    # This workflow's whole purpose is to advance the submodule pin, which is a
+    # gitlink (mode 160000). gh-aw's default signed-commit push goes through the
+    # createCommitOnBranch GraphQL mutation, and that mutation cannot represent
+    # gitlinks - so it refuses the push and silently falls back to opening an
+    # issue, which is what happened on run 30514772205. Push over plain git
+    # instead. Safe here because main has required_signatures disabled.
+    signed-commits: false
     protected-files: fallback-to-issue
     # Exclusive allowlist. Anything outside it is refused, so a run cannot quietly
     # add a dependency, rewrite CI, or edit its own prompt to widen its reach.
@@ -134,6 +141,14 @@ Otherwise, take the next item off the backlog:
    the submodule pin from the same starting point, conflict on the gitlink, and
    silently drop the first PR's Rust changes from its own assumptions. Wait for the
    open one to merge.
+
+   **Then check for a stranded port.** Run
+   `gh issue list --state open --label upstream-sync`. Ignore the backlog issue
+   (`Porting backlog: upstream Ableton Link`). If any *other* open issue is there, it
+   is a port whose push failed and got turned into an issue instead of a pull request,
+   and it holds work that is not on `main` yet. **Stop** and comment on that issue
+   saying the port is still stranded and needs a maintainer. Redoing the port would
+   just produce a second copy of the same change.
 3. Find the backlog issue:
    `gh issue list --state open --label upstream-sync --search "Porting backlog in:title"`
 4. Take the **first `Port` item whose SHA still appears in
