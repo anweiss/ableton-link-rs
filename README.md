@@ -291,6 +291,13 @@ The submodule pin is the **port watermark**: everything at or before it has been
 reconciled with this port, everything after it is the backlog. Neither workflow moves
 the pin without a corresponding code change.
 
+Moving the pin from `OLD` to `NEW` asserts that every commit in `(OLD, NEW]` has been
+handled, because the next run computes drift as `NEW..master` and anything earlier
+disappears from the report permanently. So a port PR must account for its whole range
+in the **Watermark** section of its body — each commit either ported or explained as
+not applicable — and the pin stops before the first commit that is neither. Reviewing
+that list is the highest-value part of reviewing one of these PRs.
+
 | Workflow | Cadence | What it does |
 | --- | --- | --- |
 | `link-upstream-watch.md` | Weekly, Monday | Triages upstream commits landed since the pin and maintains the `Porting backlog: upstream Ableton Link` issue |
@@ -308,6 +315,12 @@ cat /tmp/drift/summary.md
 The porting rules and the C++ header to Rust module map both live in
 [`.github/workflows/shared/link-upstream-context.md`](.github/workflows/shared/link-upstream-context.md).
 Edit that file to change how either workflow reasons about a change.
+
+**Reviewing a port PR.** These are opened by `github-actions[bot]`, so their CI runs
+can land in the `action_required` state waiting on a maintainer to approve them. If a
+port PR shows only the CodeQL checks, approve the runs from the PR's Checks tab (or
+`gh api -X POST repos/anweiss/ableton-link-rs/actions/runs/<id>/approve`) to get the
+full suite. Nothing is wrong with the PR when this happens.
 
 **Setup.** These need a `COPILOT_GITHUB_TOKEN` repository secret — a fine-grained PAT
 with the *Copilot Requests* permission. Organization-owned repositories can drop the
