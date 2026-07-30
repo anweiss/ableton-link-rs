@@ -64,7 +64,9 @@ tools:
 
 safe-outputs:
   create-pull-request:
-    title-prefix: "[upstream-sync] "
+    # Deliberately no title-prefix. `Validate PR title` is a required check on main
+    # and enforces conventional commits, so a "[upstream-sync] " prefix makes every
+    # port PR unmergeable. The labels below identify these PRs instead.
     labels: [upstream-sync, automation]
     reviewers: [anweiss]
     draft: true
@@ -247,8 +249,29 @@ that group.
 
 ## Open the pull request
 
-Title: `port <upstream subject>` — the upstream commit's own subject line, so the PR
-is greppable against upstream history.
+Title: a **conventional commit** subject — `<type>: <description>`.
+
+`.github/workflows/conventional-commits.yml` runs `Validate PR title` as a required
+check on `main`, and it rejects anything without one of these types: `feat`, `fix`,
+`docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`. This
+repo squash-merges, so the PR title becomes the commit message on `main` and is what
+release-please reads to decide the next version and write the changelog. Get the type
+wrong and you either miss a release or ship a bogus one.
+
+Pick the type from what the change does **in this crate**, not from how upstream
+worded it:
+
+- `fix:` — corrects wrong behavior (the usual case for a ported upstream bugfix)
+- `feat:` — adds capability users can reach
+- `refactor:` — restructures with no behavior change
+- `perf:`, `docs:`, `test:`, `chore:` — as they normally read
+
+Don't prefix the title with `port` or `[upstream-sync]`. The `upstream-sync` label is
+what marks these PRs, and the body carries the upstream SHA for grepping against
+upstream history. Write the description in your own words for *this* crate rather than
+pasting the upstream subject, since upstream subjects are often C++-specific (e.g.
+`Link Classic Fix: Catch Exception` should become
+`fix: handle UDP send failures when announcing peer state`).
 
 Body:
 
