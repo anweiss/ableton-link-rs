@@ -249,10 +249,7 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sink = sent.clone();
         let mut encoder = Encoder::new(
-            move |buffer: &AudioBuffer| {
-                use super::super::payload::Entry;
-                sink.lock().unwrap().push(buffer.to_payload())
-            },
+            move |buffer: &AudioBuffer| sink.lock().unwrap().push(buffer.encode_raw()),
             id(3),
         );
 
@@ -272,17 +269,10 @@ mod tests {
         let mut decoder = PcmDecoder::new(64);
         let mut decoded = Vec::new();
         for payload in sent.lock().unwrap().iter() {
-            use super::super::payload::{parse_payload, Entry, AUDIO_BUFFER_KEY};
-            parse_payload(payload, |key, reader| {
-                if key == AUDIO_BUFFER_KEY {
-                    let audio_buffer = AudioBuffer::decode_body(reader)?;
-                    decoder.decode(&audio_buffer, |handle| {
-                        decoded.extend_from_slice(handle.samples);
-                    });
-                }
-                Ok(())
-            })
-            .unwrap();
+            let audio_buffer = AudioBuffer::decode_raw(payload).unwrap();
+            decoder.decode(&audio_buffer, |handle| {
+                decoded.extend_from_slice(handle.samples);
+            });
         }
 
         assert_eq!(decoded, samples);

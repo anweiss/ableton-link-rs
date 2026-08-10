@@ -37,7 +37,7 @@ use super::{
     payload::{
         parse_payload, truncate_name, AudioBuffer, ChannelAnnouncement, ChannelAnnouncements,
         ChannelBye, ChannelByes, ChannelRequest, ChannelStopRequest, Entry, HostTime, Id,
-        PeerAnnouncement, PeerInfo, AUDIO_BUFFER_KEY, CHANNEL_BYES_KEY, HOST_TIME_KEY,
+        PeerAnnouncement, PeerInfo, CHANNEL_BYES_KEY, HOST_TIME_KEY,
     },
     queue::Reader,
     receivers::Receivers,
@@ -610,7 +610,7 @@ impl AudioEngine {
                             if endpoints.is_empty() {
                                 continue;
                             }
-                            match audio_buffer_message(node_id, &audio_buffer.to_payload()) {
+                            match audio_buffer_message(node_id, &audio_buffer.encode_raw()) {
                                 Ok(message) => {
                                     for endpoint in &endpoints {
                                         messages.push((message.clone(), *endpoint));
@@ -991,16 +991,12 @@ fn receive_channel_stop_request(state: &mut EngineState, peer_id: NodeId, payloa
 }
 
 fn receive_audio_buffer(state: &mut EngineState, payload: &[u8]) {
-    let mut audio_buffer = None;
-    let _ = parse_payload(payload, |key, reader| {
-        if key == AUDIO_BUFFER_KEY {
-            audio_buffer = Some(AudioBuffer::decode_body(reader)?);
+    let audio_buffer = match AudioBuffer::decode_raw(payload) {
+        Ok(buffer) => buffer,
+        Err(e) => {
+            debug!("failed to decode audio buffer: {}", e);
+            return;
         }
-        Ok(())
-    });
-
-    let Some(audio_buffer) = audio_buffer else {
-        return;
     };
 
     if let Some(entry) = state

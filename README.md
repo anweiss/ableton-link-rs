@@ -100,8 +100,10 @@ cargo build
 # Run the RustHut example
 cargo run --example rusthut
 
-# Run the LinkAudio example (requires the optional audio feature)
-cargo run --features audio --example link_audio -- my-peer-name
+# Run the LinkAudio example (requires the optional audio feature).
+# The second argument selects which remote channel to subscribe to by
+# (case-insensitive) substring; it defaults to "main".
+cargo run --features audio --example link_audio -- my-peer-name main
 
 # Run the platform optimizations demo
 cargo run --example platform_demo
@@ -243,6 +245,20 @@ if let Some(mut buffer) = sink.buffer() {
 LinkAudio runs its own UDP protocol (`"chnnlsv" + 1`) on a dedicated unicast socket. Peers discover each
 other's audio endpoints through the `aep4` entry of the standard Link `PeerState` payload, so LinkAudio
 peers are found via ordinary Link discovery. The subsystem contains no `unsafe` code.
+
+Audio buffer messages are the one exception to the usual payload framing: their body is written directly
+into the message rather than being wrapped in the `key`/`size` entry header, saving eight bytes per packet
+on the hot path. This matches upstream and is required for interoperability.
+
+Receiving from Ableton Live has been verified against a real Live instance: Live publishes one channel per
+track (plus `Main`), so pick the channel you actually want — most tracks stream silence unless they are
+audible in the mix. The `link_audio` example plays the subscribed channel through the default output device
+and prints a peak level meter; set `LINK_AUDIO_PLAYBACK=0` to receive without opening an output device.
+
+The example buffers 50 ms of received audio by default (`LINK_AUDIO_LATENCY_MS`). It performs no
+clock-drift compensation between the sending peer and the local output device, so that buffer has to
+absorb raw network jitter, which was measured at roughly 30 ms peak to peak on an ordinary LAN. Lower
+values underrun audibly.
 
 ### Core Types (available in `no_std`)
 
