@@ -42,6 +42,10 @@ std = [
     "rand/thread_rng",
 ]
 
+# Optional LinkAudio subsystem: streams PCM audio between Link peers over a
+# second, independent UDP protocol. Requires `std`.
+audio = ["std"]
+
 [dependencies]
 rand = { version = "0.10.0", default-features = false }
 tokio = { version = "1", features = ["full"], optional = true }
@@ -94,3 +98,8 @@ path = "examples/rusthut.rs"
 [[example]]
 name = "platform_demo"
 path = "examples/platform_demo.rs"
+
+[[example]]
+name = "link_audio"
+path = "examples/link_audio.rs"
+required-features = ["audio"]

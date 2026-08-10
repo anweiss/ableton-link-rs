@@ -600,6 +600,7 @@ mod tests {
                 Arc::new(Mutex::new(PeerState {
                     node_state: node_1,
                     measurement_endpoint: None,
+                    audio_endpoint: None,
                 })),
                 Arc::new(Mutex::new(SessionState::default())),
                 Clock::default(),
