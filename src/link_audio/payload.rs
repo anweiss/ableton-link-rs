@@ -411,6 +411,22 @@ impl AudioBuffer {
     pub fn num_frames(&self) -> u32 {
         self.chunks.iter().map(|c| c.num_frames as u32).sum()
     }
+
+    /// Encodes the buffer as a bare message body.
+    ///
+    /// Unlike every other LinkAudio entry, an audio buffer is *not* wrapped in
+    /// the `key`/`size` payload framing: upstream writes the body directly into
+    /// the message to save eight bytes per packet on the hot path.
+    pub fn encode_raw(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.body_size() as usize);
+        self.encode_body(&mut out);
+        out
+    }
+
+    /// Decodes a bare audio buffer message body written by [`Self::encode_raw`].
+    pub fn decode_raw(data: &[u8]) -> Result<Self> {
+        Self::decode_body(&mut ByteStreamReader::new(data))
+    }
 }
 
 impl Default for AudioBuffer {

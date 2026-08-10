@@ -160,7 +160,10 @@ with an unspecified-address fallback.
    and the same rule applies to them. Preserve field order, endianness, and sizes
    exactly as upstream encodes them, and say in the PR body which upstream encoder you
    matched. Note that LinkAudio length-prefixes strings and vectors with a **u32**,
-   unlike Link Classic.
+   unlike Link Classic. Note also that a LinkAudio **audio buffer message body is written
+   raw**, without the `key`/`size` payload entry header every other entry uses
+   (`AudioBuffer::{encode_raw,decode_raw}`); wrapping it breaks interoperability with
+   Ableton Live, which is verified working today.
 3. **Respect `no_std`.** `src/link/{beats,tempo,timeline,ghostxform,state,node,phase}.rs`
    and `src/encoding.rs` must keep compiling without the `std` feature. Use `alloc`,
    not `std`, in those modules. `src/link_audio/**` is exempt — the `audio` feature

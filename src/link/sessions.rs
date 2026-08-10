@@ -395,31 +395,27 @@ pub async fn handle_successful_measurement(
                 SESSION_EPS.num_microseconds().unwrap()
             );
 
-            // Session switching logic: be selective about when to join other sessions
-            // 1. Always join if we have significantly better timing (>500ms)
-            // 2. Join if times are similar and we prefer older session IDs
-            // 3. Join if we just started up and have no peers (prefer any established session)
-            let current_session_has_no_peers =
-                session_peers(peers.clone(), current.try_lock().unwrap().session_id).is_empty();
-            let just_started =
-                current_session_has_no_peers && measurement.timestamp < Duration::seconds(5);
+            // Session switching logic, matching upstream `Sessions::
+            // handleSuccessfulMeasurement`:
+            // 1. Join if the other session's ghost time is significantly ahead
+            //    of ours, which is what makes a freshly started peer adopt an
+            //    established session (and its tempo) rather than impose its own.
+            // 2. If the two are within an epsilon, fall back to session id order
+            //    so that both sides break the tie the same way.
             let current_session_id = current.try_lock().unwrap().session_id;
 
-            let should_switch =
-                // Significant timing advantage
-                ghost_diff > SESSION_EPS
-                // Similar timing, prefer older session
-                || (ghost_diff.num_microseconds().unwrap().abs() < SESSION_EPS.num_microseconds().unwrap()
-                    && session_id < current_session_id)
-                // Just started, prefer any established session over isolation
-                || just_started;
+            let should_switch = ghost_diff > SESSION_EPS
+                || (ghost_diff.num_microseconds().unwrap().abs()
+                    < SESSION_EPS.num_microseconds().unwrap()
+                    && session_id < current_session_id);
 
             if should_switch {
-                info!("Session {} wins over current session (ghost_diff={} us, just_started={}, tempo={}), switching!",
-                      session_id,
-                      ghost_diff.num_microseconds().unwrap(),
-                      just_started,
-                      s.timeline.tempo.bpm());
+                info!(
+                    "Session {} wins over current session (ghost_diff={} us, tempo={}), switching!",
+                    session_id,
+                    ghost_diff.num_microseconds().unwrap(),
+                    s.timeline.tempo.bpm()
+                );
                 let c = current.try_lock().unwrap().clone();
 
                 *current.try_lock().unwrap() = s.clone();
@@ -432,10 +428,9 @@ pub async fn handle_successful_measurement(
 
                 schedule_remeasurement(peers.clone(), tx_measure_peer_state.clone(), s).await;
             } else {
-                debug!("Session {} does not win over current session (ghost_diff={} us, just_started={}), staying with current",
+                debug!("Session {} does not win over current session (ghost_diff={} us), staying with current",
                        session_id,
-                       ghost_diff.num_microseconds().unwrap(),
-                       just_started);
+                       ghost_diff.num_microseconds().unwrap());
             }
         }
     }
