@@ -72,6 +72,28 @@ out of scope.
 | `ableton/platforms/*/ThreadFactory.hpp` | `src/platform/thread.rs` |
 | `ableton/Link.hpp` | `src/lib.rs`, `src/link/mod.rs` (`BasicLink` public API) |
 
+**LinkAudio** — ported behind the optional, off-by-default `audio` cargo feature. The
+Rust module is `src/link_audio/`:
+
+| Upstream C++ | Rust |
+| --- | --- |
+| `ableton/LinkAudio.hpp`, `LinkAudio.ipp` | `src/link_audio/api.rs` (`LinkAudio`, `LinkAudioSink`, `LinkAudioSource`) |
+| `ableton/link_audio/Messages.hpp` | `src/link_audio/messages.rs` |
+| `ableton/link_audio/PeerInfo.hpp`, `ChannelId.hpp`, `PayloadEntries.hpp` | `src/link_audio/payload.rs` |
+| `ableton/link_audio/Buffer.hpp` | `src/link_audio/buffer.rs` |
+| `ableton/link_audio/Queue.hpp` | `src/link_audio/queue.rs` |
+| `ableton/link_audio/Codec.hpp`, `PcmEncoder.hpp`, `PcmDecoder.hpp` | `src/link_audio/codec.rs` |
+| `ableton/link_audio/Resizer.hpp` | `src/link_audio/resizer.rs` |
+| `ableton/link_audio/BeatTimeMapping.hpp` | `src/link_audio/beat_time_mapping.rs` |
+| `ableton/link_audio/NetworkMetrics.hpp` | `src/link_audio/network_metrics.rs` |
+| `ableton/link_audio/Sink.hpp`, `SinkProcessor.hpp` | `src/link_audio/sink.rs` |
+| `ableton/link_audio/Source.hpp`, `SourceProcessor.hpp` | `src/link_audio/source.rs` |
+| `ableton/link_audio/Receivers.hpp` | `src/link_audio/receivers.rs` |
+| `ableton/link_audio/Channels.hpp` | `src/link_audio/channels.rs` |
+| `ableton/link_audio/Controller.hpp`, `UdpMessenger.hpp`, `MainProcessor.hpp` | `src/link_audio/engine.rs` |
+| `ableton/link/AudioEndpointV4.hpp`, `AudioEndpointV6.hpp` (`aep4`/`aep6`) | `src/link/audio_endpoint.rs` |
+| `examples/linkaudio*` | `examples/link_audio.rs` |
+
 **Deliberately not ported** — changes confined to these are out of scope, and the
 correct action is to note them and move the watermark past them:
 
@@ -84,23 +106,35 @@ correct action is to note them and move the watermark past them:
   and example scaffolding.
 - `ableton/platforms/esp32/**` beyond what `examples/esp32` already needs.
 
-### `link_audio/**` is a separate question
+### `link_audio/**` is ported, behind the `audio` feature
 
-Upstream has added **LinkAudio** — a whole audio-streaming subsystem
-(`include/ableton/link_audio/**`, `ableton/LinkAudio.hpp`, `examples/linkaudio*`).
-It dominates the raw drift numbers and it is not a change to the Link protocol this
-crate implements; it is a new protocol layered beside it.
+Upstream's **LinkAudio** subsystem — an audio-streaming protocol layered beside the
+Link protocol (`include/ableton/link_audio/**`, `ableton/LinkAudio.hpp`,
+`examples/linkaudio*`) — **has been ported** to `src/link_audio/` and is gated behind
+the optional, off-by-default `audio` cargo feature. It is no longer a standing open
+question and it is no longer out of scope.
 
-Do not attempt to port it commit-by-commit. Treat the whole subsystem as one
-design-level decision for the maintainer, raise it once, and do not let it block the
-watermark.
+Triage `link_audio/**` commits **normally**, against the LinkAudio module map above.
+The old guidance to treat the whole subsystem as one design decision for the
+maintainer is obsolete — do not re-raise it, and do not classify a LinkAudio commit as
+"not applicable" merely because it is a LinkAudio commit.
 
-**But scope that narrowly.** "LinkAudio is out of scope" applies to files under
-`link_audio/`, `LinkAudio.hpp`/`.ipp`, and `examples/linkaudio*` — not to every commit
-with LinkAudio in its subject. A lot of the LinkAudio work reaches back into the core
-to make room for it: `PeerState` gained an audio endpoint, `Peers` notifies on
-audio-endpoint changes, `PeerAnnouncement` gained channel announcements, `Optional`
-was replaced with `std::optional`, `Endpoint` and `UnicastSocket` were made reusable.
+Two things about this subsystem specifically:
+
+- **`src/link_audio/` must contain no `unsafe`.** The module carries
+  `#![forbid(unsafe_code)]`, which the compiler enforces. Upstream's design leans on
+  raw pointers and a lock-free ring buffer; the Rust port deliberately replaces those
+  with a channel-based buffer pool (`queue.rs`) and RAII buffer handles that lend
+  `&mut [i16]` (`sink.rs`). A port that reintroduces `unsafe` here will not compile —
+  find the safe equivalent rather than removing the attribute.
+- **The `audio` feature already exists in `Cargo.toml`.** New files under
+  `src/link_audio/` need no manifest change, so the "no new dependencies" rule below
+  is not an obstacle to porting LinkAudio work.
+
+**The core still needs narrow scoping.** A lot of the LinkAudio work reaches back into
+the core: `PeerState` gained an audio endpoint, `Peers` notifies on audio-endpoint
+changes, `PeerAnnouncement` gained channel announcements, `Optional` was replaced with
+`std::optional`, `Endpoint` and `UnicastSocket` were made reusable.
 
 Anything touching `ableton/link/**`, `ableton/discovery/**`, payload keys, peer state,
 or message encoding is **in scope and must be triaged normally**, however the upstream
@@ -108,24 +142,40 @@ commit message frames it. Those are exactly the changes that decide whether this
 still interoperates with a current Ableton Live or Bitwig, and they are the easiest
 ones to wave through by mistake.
 
+The `aep4` peer-state payload entry (`src/link/audio_endpoint.rs`) is how LinkAudio
+peers find each other through ordinary Link discovery, so it is core wire format, not
+audio-only. Note one deliberate divergence to preserve if you touch it: this crate
+emits `aep4` **only when an audio endpoint is set**, whereas upstream always emits it
+with an unspecified-address fallback.
+
 ## Porting rules
 
 1. **Behavior over transliteration.** Match upstream's observable protocol and
    timing behavior. Do not import C++ structure (templates, CRTP, `Injected<>`,
    header-only inheritance) where idiomatic Rust is clearer.
 2. **Wire compatibility is non-negotiable.** Anything touching
-   `src/discovery/messages.rs`, `src/link/payload.rs`, or `src/encoding.rs` changes
-   bytes on the network. Preserve field order, endianness, and sizes exactly as
-   upstream encodes them, and say in the PR body which upstream encoder you matched.
+   `src/discovery/messages.rs`, `src/link/payload.rs`, `src/link/audio_endpoint.rs`,
+   or `src/encoding.rs` changes bytes on the Link Classic network. The LinkAudio
+   protocol has its own wire files — `src/link_audio/{messages,payload,encoding,codec}.rs` —
+   and the same rule applies to them. Preserve field order, endianness, and sizes
+   exactly as upstream encodes them, and say in the PR body which upstream encoder you
+   matched. Note that LinkAudio length-prefixes strings and vectors with a **u32**,
+   unlike Link Classic.
 3. **Respect `no_std`.** `src/link/{beats,tempo,timeline,ghostxform,state,node,phase}.rs`
    and `src/encoding.rs` must keep compiling without the `std` feature. Use `alloc`,
-   not `std`, in those modules.
+   not `std`, in those modules. `src/link_audio/**` is exempt — the `audio` feature
+   implies `std` — but it must not break the `no_std` build of anything else.
 4. **Keep the public API stable** unless the upstream change genuinely requires
    breaking it. If it does, call that out prominently — this crate is published.
 5. **No new dependencies.** The port workflow cannot modify `Cargo.toml` at all. If an
    upstream change genuinely needs one, raise it as an issue rather than working
-   around it.
-6. **One upstream concern per PR.** A reviewer should be able to hold the whole
+   around it. The `audio` feature is already declared, so LinkAudio ports do not need
+   a manifest change.
+6. **No `unsafe` in `src/link_audio/`.** The module is `#![forbid(unsafe_code)]`.
+   Where upstream uses raw pointers or a lock-free ring, use the safe equivalents
+   already established in `queue.rs` and `sink.rs`. Never remove the attribute to make
+   a port fit.
+7. **One upstream concern per PR.** A reviewer should be able to hold the whole
    change in their head.
 
 ## Verification
@@ -136,13 +186,20 @@ These mirror `.github/workflows/ci.yml` and must all pass before you propose a c
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --all-targets --all-features
-cargo test --all -- --nocapture --test-threads=1
+cargo test --all --all-features -- --nocapture --test-threads=1
 cargo check --lib --no-default-features
+cargo check --all-targets
 ```
 
-Two things to know:
+Some things to know:
 
 - Tests **must** run with `--test-threads=1`. Many bind the Link multicast port
   20808 and collide when run in parallel.
+- `--all-features` on the test run is required to exercise LinkAudio. `audio` is
+  off by default, so a bare `cargo test --all` silently skips every
+  `src/link_audio/` test, including the end-to-end sink-to-source test in
+  `engine.rs`.
+- `cargo check --all-targets` (no `--all-features`) confirms the default,
+  audio-less build still compiles — that is the configuration most users get.
 - `libasound2-dev` is installed by a setup step for `rodio`; you do not need to
   install it yourself.

@@ -105,12 +105,18 @@ the actual diff for anything that lands in a mapped path. Put each commit in exa
 one bucket:
 
 - **Port** — changes behavior, wire format, timing, or the public API in a module the
-  Rust port has. This is the bucket the port workflow consumes.
+  Rust port has. This is the bucket the port workflow consumes. `link_audio/**` now
+  falls here too — the subsystem has been ported to `src/link_audio/` behind the
+  `audio` feature, so bucket its commits like any other mapped path.
 - **Not applicable** — confined to the "deliberately not ported" paths (ASIO, Catch2
   tests, CMake, C++ examples, DI plumbing). The watermark can move straight past these.
 - **Needs a decision** — a new subsystem or an architectural change where the right
-  Rust answer is not obvious. LinkAudio is the standing example. Say what the open
-  question is; do not guess at an answer.
+  Rust answer is not obvious. Say what the open question is; do not guess at an
+  answer. LinkAudio *used* to be the standing example and no longer is: it is ported.
+  Do not re-raise it, and do not park a `link_audio/**` commit here just because it is
+  audio-related — reserve this bucket for changes that genuinely have no clear Rust
+  answer, such as one that would need a new dependency or an `unsafe` construct that
+  `src/link_audio/`'s `#![forbid(unsafe_code)]` rules out.
 
 Group aggressively. Upstream frequently splits one behavioral change across several
 commits (`Add link_audio::Messages`, `Add link_audio::PeerInfo`, ...). A backlog item
@@ -177,9 +183,10 @@ the first time the pin moved past them.
   order from `git log --reverse`. Do not order them by theme or by how related they
   feel — the port workflow takes the earliest one and moves a monotonic watermark, so
   a backlog whose order disagrees with ancestry causes ports to happen out of order.
-- Flag anything touching `src/discovery/messages.rs`, `src/link/payload.rs`, or
-  `src/encoding.rs` as `risk: wire-format`. Those change bytes on the network and need
-  a human before they ship.
+- Flag anything touching `src/discovery/messages.rs`, `src/link/payload.rs`,
+  `src/link/audio_endpoint.rs`, `src/encoding.rs`, or
+  `src/link_audio/{messages,payload,encoding,codec}.rs` as `risk: wire-format`. Those
+  change bytes on the network and need a human before they ship.
 - If the backlog issue already has more than 25 open **Port** items, stop adding to it.
   Comment saying the backlog is saturated and that porting needs to catch up first.
 

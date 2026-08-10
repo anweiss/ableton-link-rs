@@ -2,6 +2,8 @@
 
 #[cfg(feature = "std")]
 pub mod atomic_session_state;
+#[cfg(feature = "std")]
+pub mod audio_endpoint;
 pub mod beats;
 #[cfg(feature = "std")]
 pub mod clock;
@@ -204,6 +206,12 @@ impl BasicLink {
         self.clock
     }
 
+    /// The underlying controller. Exposed so the LinkAudio subsystem can read
+    /// peer state and announce its audio endpoint.
+    pub fn controller(&self) -> &Controller {
+        &self.controller
+    }
+
     pub fn capture_audio_session_state(&self) -> SessionState {
         // Real-time safe capture using atomic session state
         let current_time = self.clock.micros();
@@ -372,6 +380,12 @@ impl SessionState {
 
     pub fn tempo(&self) -> f64 {
         self.state.timeline.tempo.bpm()
+    }
+
+    /// The timeline this session state was captured with. Used by the
+    /// LinkAudio subsystem to map buffers onto the session beat grid.
+    pub fn timeline(&self) -> Timeline {
+        self.state.timeline
     }
 
     pub fn set_tempo(&mut self, bpm: f64, at_time: Duration) {

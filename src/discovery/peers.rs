@@ -26,6 +26,7 @@ pub struct PeerStateMessageType {
     pub node_state: NodeState,
     pub ttl: u8,
     pub measurement_endpoint: Option<SocketAddrV4>,
+    pub audio_endpoint: Option<SocketAddrV4>,
 }
 
 pub enum PeerEvent {
@@ -125,6 +126,7 @@ impl GatewayObserver {
 pub struct PeerState {
     pub node_state: NodeState,
     pub measurement_endpoint: Option<SocketAddrV4>,
+    pub audio_endpoint: Option<SocketAddrV4>,
 }
 
 impl PeerState {
@@ -246,6 +248,7 @@ async fn saw_peer(
     let ps = PeerState {
         node_state: peer_seen_peer_state.node_state,
         measurement_endpoint: peer_seen_peer_state.measurement_endpoint,
+        audio_endpoint: peer_seen_peer_state.audio_endpoint,
     };
 
     let peer_session = ps.session_id();
@@ -445,6 +448,7 @@ mod tests {
                     },
                 },
                 measurement_endpoint: None,
+                audio_endpoint: None,
             },
             PeerState {
                 node_state: NodeState {
@@ -458,6 +462,7 @@ mod tests {
                     start_stop_state: StartStopState::default(),
                 },
                 measurement_endpoint: None,
+                audio_endpoint: None,
             },
             PeerState {
                 node_state: NodeState {
@@ -471,6 +476,7 @@ mod tests {
                     start_stop_state: StartStopState::default(),
                 },
                 measurement_endpoint: None,
+                audio_endpoint: None,
             },
         )
     }
@@ -516,6 +522,7 @@ mod tests {
                 Arc::new(Mutex::new(PeerState {
                     node_state: node_1,
                     measurement_endpoint: None,
+                    audio_endpoint: None,
                 })),
                 Arc::new(Mutex::new(SessionState::default())),
                 Clock::default(),

@@ -268,6 +268,7 @@ pub async fn on_peer_state(
         .send(PeerEvent::SawPeer(PeerState {
             node_state: msg.node_state,
             measurement_endpoint: msg.measurement_endpoint,
+            audio_endpoint: msg.audio_endpoint,
         }))
         .await
     {
@@ -497,6 +498,7 @@ mod tests {
             Arc::new(Mutex::new(PeerState {
                 node_state: node_1,
                 measurement_endpoint: None,
+                audio_endpoint: None,
             })),
             Arc::new(Mutex::new(SessionState::default())),
             Clock::default(),

@@ -80,6 +80,7 @@ impl Controller {
                 start_stop_state: StartStopState::default(),
             },
             measurement_endpoint: None,
+            audio_endpoint: None,
         }));
 
         let ip = list_afinet_netifas()
@@ -635,6 +636,36 @@ impl Controller {
             .try_lock()
             .map(|counter| counter.session_peer_count)
             .unwrap_or(0) // Return 0 if lock is contended
+    }
+
+    /// The peers this node currently knows about. Used by the LinkAudio
+    /// subsystem to learn peers' announced audio endpoints.
+    pub fn peers(&self) -> Arc<Mutex<Vec<ControllerPeer>>> {
+        self.peers.clone()
+    }
+
+    /// This node's identifier.
+    pub fn node_id(&self) -> NodeId {
+        self.peer_state
+            .try_lock()
+            .map(|peer_state| peer_state.ident())
+            .unwrap_or_default()
+    }
+
+    /// The session this node currently belongs to.
+    pub fn session_id(&self) -> SessionId {
+        self.peer_state
+            .try_lock()
+            .map(|peer_state| peer_state.session_id())
+            .unwrap_or_default()
+    }
+
+    /// Announces a LinkAudio endpoint in this node's peer state, so that peers
+    /// can discover where to send audio traffic.
+    pub fn set_audio_endpoint(&self, endpoint: Option<SocketAddrV4>) {
+        if let Ok(mut peer_state) = self.peer_state.try_lock() {
+            peer_state.audio_endpoint = endpoint;
+        }
     }
 }
 

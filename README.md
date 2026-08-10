@@ -14,6 +14,7 @@ A native Rust implementation of [Ableton Link](https://ableton.github.io/link), 
 * **Session Management**: Automatic peer discovery, session state synchronization, and tempo change callbacks
 * **Start/Stop Sync**: Synchronization of play/stop states across devices
 * **Memory Safe**: Leverages Rust's ownership system for safe concurrent networking
+* **LinkAudio (optional)**: Stream PCM audio between Link peers, aligned to the shared beat grid, behind the optional `audio` feature — a fully safe-Rust port of the upstream LinkAudio subsystem
 
 ## License
 
@@ -38,6 +39,15 @@ ableton-link-rs = { version = "0.2.0", default-features = false }
 ```
 
 This gives you access to core types like `Beats`, `Tempo`, `Timeline`, `GhostXForm`, `StartStopState`, and `NodeId` without pulling in networking dependencies. Requires `alloc`.
+
+### LinkAudio Usage
+
+Audio sharing is opt-in via the `audio` feature, which implies `std`:
+
+```toml
+[dependencies]
+ableton-link-rs = { version = "0.2.0", features = ["audio"] }
+```
 
 ### Basic Usage
 
@@ -89,6 +99,9 @@ cargo build
 
 # Run the RustHut example
 cargo run --example rusthut
+
+# Run the LinkAudio example (requires the optional audio feature)
+cargo run --features audio --example link_audio -- my-peer-name
 
 # Run the platform optimizations demo
 cargo run --example platform_demo
@@ -183,6 +196,54 @@ state.set_is_playing(true, current_time);
 let is_playing = state.is_playing();
 ```
 
+### LinkAudio (`feature = "audio"`)
+
+`LinkAudio` derefs to `BasicLink`, so the entire Link API remains available. On top of that it publishes
+audio channels (sinks) and subscribes to channels published by peers (sources). Audio is interleaved
+16-bit signed PCM, and buffers carry the beat time and tempo needed to align them across peers.
+
+```rust
+use ableton_link_rs::link_audio::LinkAudio;
+
+let mut link = LinkAudio::new(120.0, "my-app").await?;
+link.enable().await;
+link.enable_link_audio(true);
+
+// Publish a channel. max_num_samples = frames per callback * channels.
+let sink = link.add_sink("drums", 256 * 2);
+
+link.set_channels_changed_callback(|| println!("channels changed"));
+
+// Discover channels published by other peers.
+for channel in link.channels() {
+    println!("{} from {}", channel.name, channel.peer_name);
+}
+
+// Subscribe to one.
+let source = link.add_source(channel_id, move |handle| {
+    let samples: &[i16] = handle.samples;
+    let begin = handle.begin_beats(&session_state, 4.0); // None if from another session
+});
+
+// Send audio. Returns None when no peer is listening or no buffer is free.
+if let Some(mut buffer) = sink.buffer() {
+    buffer.samples_mut()[..num_samples].copy_from_slice(&rendered);
+    buffer.commit_with_session_state(
+        &session_state,
+        link.controller().session_id().0,
+        beats_at_buffer_begin,
+        4.0,   // quantum
+        256,   // frames
+        2,     // channels
+        44100, // sample rate
+    );
+}
+```
+
+LinkAudio runs its own UDP protocol (`"chnnlsv" + 1`) on a dedicated unicast socket. Peers discover each
+other's audio endpoints through the `aep4` entry of the standard Link `PeerState` payload, so LinkAudio
+peers are found via ordinary Link discovery. The subsystem contains no `unsafe` code.
+
 ### Core Types (available in `no_std`)
 
 | Type | Description |
@@ -240,6 +301,23 @@ ableton-link-rs
 │   ├── messages.rs          # Protocol messages
 │   ├── messenger.rs         # UDP messaging
 │   └── peers.rs             # Peer tracking
+├── link_audio/              # LinkAudio subsystem (feature = "audio", no unsafe code)
+│   ├── mod.rs               # Module docs and re-exports
+│   ├── api.rs               # LinkAudio, LinkAudioSink, LinkAudioSource
+│   ├── engine.rs            # UDP messenger, sink/source/main processors
+│   ├── messages.rs          # v1 message framing ("chnnlsv" + 1)
+│   ├── payload.rs           # Payload entries (__pi, chid, auca, aucb, _abu, sess, __ht)
+│   ├── encoding.rs          # LinkAudio byte stream primitives
+│   ├── channels.rs          # Discovered channel registry
+│   ├── receivers.rs         # Peers requesting a sink's channel
+│   ├── sink.rs              # Published channel + buffer handles
+│   ├── source.rs            # Channel subscription
+│   ├── codec.rs             # PCM encode/decode
+│   ├── resizer.rs           # Chunking into message-sized buffers
+│   ├── queue.rs             # Safe SPSC buffer pool
+│   ├── buffer.rs            # Audio buffers and metadata
+│   ├── beat_time_mapping.rs # Local ↔ session-global beat mapping
+│   └── network_metrics.rs   # Ping/pong link quality filter
 └── platform/                # Platform abstractions (std)
 ```
 
@@ -248,6 +326,7 @@ ableton-link-rs
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `std` | ✅ | Full functionality including networking, async, and peer discovery |
+| `audio` | ❌ | LinkAudio: publish and receive PCM audio channels over the Link session. Implies `std`. |
 
 Without `std`, only core types and math are available (requires `alloc`).
 
@@ -273,10 +352,14 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 
 # Test (must be serial — tests share multicast port 20808)
-cargo test --all -- --nocapture --test-threads=1
+# --all-features is required to exercise the optional `audio` (LinkAudio) module
+cargo test --all --all-features -- --nocapture --test-threads=1
 
 # Verify no_std
 cargo check --lib --no-default-features
+
+# Verify the default build (audio off) still compiles
+cargo check --all-targets
 ```
 
 All CI checks must pass before merging to `main`.

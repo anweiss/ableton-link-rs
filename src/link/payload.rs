@@ -7,6 +7,7 @@ use crate::{
     discovery::peers::PeerState,
     encoding::{self, Decode},
     link::{
+        audio_endpoint::{AudioEndpointV4, AUDIO_ENDPOINT_V4_HEADER_KEY, AUDIO_ENDPOINT_V4_SIZE},
         encoding::{PayloadEntryHeader, PAYLOAD_ENTRY_HEADER_SIZE},
         measurement::{
             MeasurementEndpointV4, MEASUREMENT_ENDPOINT_V4_HEADER_KEY, MEASUREMENT_ENDPOINT_V4_SIZE,
@@ -88,6 +89,13 @@ impl From<PeerState> for Payload {
             .push(PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
                 endpoint: value.measurement_endpoint,
             }));
+        if value.audio_endpoint.is_some() {
+            payload
+                .entries
+                .push(PayloadEntry::AudioEndpointV4(AudioEndpointV4 {
+                    endpoint: value.audio_endpoint,
+                }));
+        }
         payload
     }
 }
@@ -160,6 +168,17 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
                 .push(PayloadEntry::MeasurementEndpointV4(entry));
             decode(payload, &data[decode_len..])?;
         }
+        AUDIO_ENDPOINT_V4_HEADER_KEY => {
+            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + AUDIO_ENDPOINT_V4_SIZE as usize;
+            let (entry, _) = encoding::decode_from_slice::<AudioEndpointV4>(
+                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
+            )?;
+
+            debug!("decoded payload entry {:?}", entry);
+
+            payload.entries.push(PayloadEntry::AudioEndpointV4(entry));
+            decode(payload, &data[decode_len..])?;
+        }
         GHOST_TIME_HEADER_KEY => {
             let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + GHOST_TIME_SIZE as usize;
             let (entry, _) = encoding::decode_from_slice::<GhostTime>(
@@ -203,6 +222,7 @@ pub enum PayloadEntry {
     SessionMembership(SessionMembership),
     StartStopState(StartStopState),
     MeasurementEndpointV4(MeasurementEndpointV4),
+    AudioEndpointV4(AudioEndpointV4),
 }
 
 impl PayloadEntry {
@@ -215,6 +235,7 @@ impl PayloadEntry {
             PayloadEntry::SessionMembership(_) => SESSION_MEMBERSHIP_SIZE,
             PayloadEntry::StartStopState(_) => START_STOP_STATE_SIZE,
             PayloadEntry::MeasurementEndpointV4(_) => MEASUREMENT_ENDPOINT_V4_SIZE,
+            PayloadEntry::AudioEndpointV4(_) => AUDIO_ENDPOINT_V4_SIZE,
         }
     }
 
@@ -229,6 +250,7 @@ impl PayloadEntry {
             PayloadEntry::MeasurementEndpointV4(measurement_endpoint_v4) => {
                 measurement_endpoint_v4.encode()
             }
+            PayloadEntry::AudioEndpointV4(audio_endpoint_v4) => audio_endpoint_v4.encode(),
         }
     }
 }

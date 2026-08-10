@@ -7,5 +7,7 @@ pub mod encoding;
 #[cfg(feature = "std")]
 pub mod discovery;
 pub mod link;
+#[cfg(feature = "audio")]
+pub mod link_audio;
 #[cfg(feature = "std")]
 pub mod platform;

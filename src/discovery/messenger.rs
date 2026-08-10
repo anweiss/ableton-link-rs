@@ -671,6 +671,14 @@ pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf:
         }
     });
 
+    let audio_endpoint = payload.entries.iter().find_map(|e| {
+        if let PayloadEntry::AudioEndpointV4(ae) = e {
+            ae.endpoint
+        } else {
+            None
+        }
+    });
+
     let node_state: NodeState = NodeState::from_payload(header.ident, &payload);
 
     debug!("sending peer state to gateway {}", node_state.ident());
@@ -679,6 +687,7 @@ pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf:
             node_state,
             ttl: header.ttl,
             measurement_endpoint,
+            audio_endpoint,
         }))
         .await;
 
