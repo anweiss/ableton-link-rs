@@ -181,10 +181,12 @@ Otherwise, take the next item off the backlog:
 
 ## Wire-format changes need byte-level proof
 
-A change to `src/discovery/messages.rs`, `src/link/payload.rs`, or `src/encoding.rs`
-moves bytes on a live network shared with Ableton Live, Bitwig, and hardware. `cargo
-test` passing proves nothing about interoperability — the Rust tests and the Rust
-encoder can agree with each other and both be wrong.
+A change to `src/discovery/messages.rs`, `src/link/payload.rs`,
+`src/link/audio_endpoint.rs`, `src/encoding.rs`, or
+`src/link_audio/{messages,payload,encoding,codec}.rs` moves bytes on a live network
+shared with Ableton Live, Bitwig, and hardware. `cargo test` passing proves nothing
+about interoperability — the Rust tests and the Rust encoder can agree with each other
+and both be wrong.
 
 So for those files: only open a pull request if you can port concrete expected-byte
 assertions from upstream's own tests, or derive them by hand from the upstream encoder
@@ -201,8 +203,13 @@ fine outcome; a run that ports something nobody asked for is not.
 ## When the whole range is out of scope
 
 If every commit between the pin and upstream is genuinely not applicable — ASIO,
-CMake, C++ examples, Catch2 tests, LinkAudio-only files — the watermark would
-otherwise stall forever and the drift report would repeat itself every week.
+CMake, C++ examples, Catch2 tests — the watermark would otherwise stall forever and
+the drift report would repeat itself every week.
+
+**LinkAudio-only files no longer qualify.** `link_audio/**`, `LinkAudio.hpp`/`.ipp`,
+and `examples/linkaudio*` are mapped to `src/link_audio/` now that the subsystem is
+ported, so a commit confined to them is portable work, not an out-of-scope commit to
+wave the watermark past.
 
 In that case, and only that case, open a **watermark-only pull request**: no Rust
 changes, just the submodule pin advanced to the newest commit in the not-applicable
@@ -232,12 +239,23 @@ cargo fmt --all
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --all-targets --all-features
-cargo test --all -- --nocapture --test-threads=1
+cargo test --all --all-features -- --nocapture --test-threads=1
 cargo check --lib --no-default-features
+cargo check --all-targets
 ```
 
 `--test-threads=1` is required — the tests bind multicast port 20808 and collide in
 parallel.
+
+`--all-features` on the test run is required to exercise LinkAudio. `audio` is off by
+default, so a bare `cargo test --all` compiles none of `src/link_audio/` and reports
+success without having run a single audio test. The final `cargo check --all-targets`
+covers the opposite risk: that a change compiles only *with* `audio` enabled and
+breaks the default build everyone else gets.
+
+If your change touches `src/link_audio/`, also confirm the module still has no
+`unsafe` — it is `#![forbid(unsafe_code)]`, so a violation shows up as a compile
+error under `--all-features` rather than as a lint.
 
 If you cannot get them green, **do not open a pull request**. Open an issue instead
 describing the upstream change, what you tried, and the exact failure. A red PR costs

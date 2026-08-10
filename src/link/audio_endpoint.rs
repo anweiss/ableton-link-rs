@@ -12,7 +12,10 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
 };
 
-use crate::{link::encoding::PayloadEntryHeader, ENCODING_CONFIG};
+use crate::{
+    encoding::{self, Decode, Encode},
+    link::encoding::PayloadEntryHeader,
+};
 
 use super::Result;
 
@@ -34,37 +37,39 @@ pub struct AudioEndpointV4 {
     pub endpoint: Option<SocketAddrV4>,
 }
 
-impl bincode::Encode for AudioEndpointV4 {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
+impl Encode for AudioEndpointV4 {
+    fn encode_to(&self, out: &mut Vec<u8>) {
         let endpoint = self
             .endpoint
             .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        bincode::Encode::encode(&(u32::from(*endpoint.ip()), endpoint.port()), encoder)
+        u32::from(*endpoint.ip()).encode_to(out);
+        endpoint.port().encode_to(out);
+    }
+
+    fn encoded_size(&self) -> usize {
+        AUDIO_ENDPOINT_V4_SIZE as usize
     }
 }
 
-impl bincode::Decode<()> for AudioEndpointV4 {
-    fn decode<D: bincode::de::Decoder>(
-        decoder: &mut D,
-    ) -> std::result::Result<Self, bincode::error::DecodeError> {
-        let (ip, port): (Ipv4Addr, u16) = bincode::Decode::decode(decoder)?;
+impl Decode for AudioEndpointV4 {
+    fn decode_from(bytes: &[u8]) -> std::result::Result<(Self, usize), encoding::DecodeError> {
+        let (ip_raw, n1) = u32::decode_from(bytes)?;
+        let (port, n2) = u16::decode_from(&bytes[n1..])?;
+        let ip = Ipv4Addr::from(ip_raw);
         // Upstream announces an unspecified address when audio is disabled.
         let endpoint = if ip.is_unspecified() || port == 0 {
             None
         } else {
             Some(SocketAddrV4::new(ip, port))
         };
-        Ok(Self { endpoint })
+        Ok((Self { endpoint }, n1 + n2))
     }
 }
 
 impl AudioEndpointV4 {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = AUDIO_ENDPOINT_V4_HEADER.encode()?;
-        encoded.append(&mut bincode::encode_to_vec(self, ENCODING_CONFIG)?);
+        encoded.append(&mut encoding::encode_to_vec(self)?);
         Ok(encoded)
     }
 }
@@ -87,9 +92,7 @@ mod tests {
         let encoded = entry.encode().unwrap();
         assert_eq!(encoded.len(), 8 + AUDIO_ENDPOINT_V4_SIZE as usize);
 
-        let (decoded, _) =
-            bincode::decode_from_slice::<AudioEndpointV4, _>(&encoded[8..], ENCODING_CONFIG)
-                .unwrap();
+        let (decoded, _) = encoding::decode_from_slice::<AudioEndpointV4>(&encoded[8..]).unwrap();
         assert_eq!(decoded, entry);
     }
 
@@ -97,9 +100,7 @@ mod tests {
     fn unspecified_endpoint_decodes_to_none() {
         let entry = AudioEndpointV4 { endpoint: None };
         let encoded = entry.encode().unwrap();
-        let (decoded, _) =
-            bincode::decode_from_slice::<AudioEndpointV4, _>(&encoded[8..], ENCODING_CONFIG)
-                .unwrap();
+        let (decoded, _) = encoding::decode_from_slice::<AudioEndpointV4>(&encoded[8..]).unwrap();
         assert_eq!(decoded.endpoint, None);
     }
 }

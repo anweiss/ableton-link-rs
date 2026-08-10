@@ -170,9 +170,8 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
         }
         AUDIO_ENDPOINT_V4_HEADER_KEY => {
             let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + AUDIO_ENDPOINT_V4_SIZE as usize;
-            let (entry, _) = bincode::decode_from_slice::<AudioEndpointV4, _>(
+            let (entry, _) = encoding::decode_from_slice::<AudioEndpointV4>(
                 &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-                ENCODING_CONFIG,
             )?;
 
             debug!("decoded payload entry {:?}", entry);

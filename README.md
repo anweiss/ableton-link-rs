@@ -352,10 +352,14 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 
 # Test (must be serial — tests share multicast port 20808)
-cargo test --all -- --nocapture --test-threads=1
+# --all-features is required to exercise the optional `audio` (LinkAudio) module
+cargo test --all --all-features -- --nocapture --test-threads=1
 
 # Verify no_std
 cargo check --lib --no-default-features
+
+# Verify the default build (audio off) still compiles
+cargo check --all-targets
 ```
 
 All CI checks must pass before merging to `main`.

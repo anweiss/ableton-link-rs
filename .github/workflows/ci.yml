@@ -83,8 +83,26 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       # Run tests serially — many tests bind the Link multicast port (20808)
-      # and will collide when run in parallel
-      - run: cargo test --all -- --nocapture --test-threads=1
+      # and will collide when run in parallel.
+      # --all-features is required to compile and run the optional `audio`
+      # (LinkAudio) module; without it none of src/link_audio/ is exercised.
+      - run: cargo test --all --all-features -- --nocapture --test-threads=1
+
+  default-build:
+    name: Default feature build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+        with:
+          toolchain: stable
+      - name: Install ALSA dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # `audio` is off by default. Verify the configuration most users get still
+      # compiles, so an audio-only change cannot break the default build.
+      - run: cargo check --all-targets
 
   no-std:
     name: no_std check
