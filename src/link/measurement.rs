@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
     io, mem,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
 
 use chrono::Duration;
+use local_ip_address::list_afinet_netifas;
 use tokio::{
     net::UdpSocket,
     select,
@@ -17,7 +18,7 @@ use tokio::{
 use tracing::{debug, info};
 
 use crate::{
-    discovery::{messages::parse_payload, peers::PeerState},
+    discovery::{messages::parse_payload, messenger::new_udp_reuseport, peers::PeerState},
     encoding::{self, Decode, Encode},
     link::{
         payload::PrevGhostTime,
@@ -118,7 +119,7 @@ impl MeasurementService {
             loop {
                 let event = rx_measure_peer_state.recv().await;
                 if let Some(MeasurePeerEvent::PeerState(session_id, peer)) = event {
-                    measure_peer(
+                    measure_peer_with_socket(
                         clock,
                         m_map.clone(),
                         t_peer.clone(),
@@ -160,6 +161,26 @@ pub async fn measure_peer(
     session_id: SessionId,
     state: PeerState,
     notifier: Arc<Notify>,
+) {
+    measure_peer_with_socket(
+        clock,
+        measurement_map,
+        tx_measure_peer_result,
+        session_id,
+        state,
+        notifier,
+        new_unicast_socket(),
+    )
+    .await
+}
+
+pub async fn measure_peer_with_socket(
+    clock: Clock,
+    measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
+    tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    session_id: SessionId,
+    state: PeerState,
+    notifier: Arc<Notify>,
     socket: Arc<UdpSocket>,
 ) {
     info!(
@@ -173,7 +194,8 @@ pub async fn measure_peer(
 
     let (tx_measurement, mut rx_measurement) = mpsc::channel(1);
 
-    let measurement = Measurement::new(state, clock, tx_measurement, notifier, socket).await;
+    let measurement =
+        Measurement::with_socket(state, clock, tx_measurement, notifier, socket).await;
     measurement_map
         .try_lock()
         .unwrap()
@@ -230,6 +252,19 @@ pub async fn measure_peer(
 pub const NUMBER_DATA_POINTS: usize = 20;
 pub const NUMBER_MEASUREMENTS: usize = 5;
 
+fn new_unicast_socket() -> Arc<UdpSocket> {
+    let ip = list_afinet_netifas()
+        .unwrap()
+        .iter()
+        .find_map(|(_, ip)| match ip {
+            IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
+            _ => None,
+        })
+        .unwrap();
+
+    Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap())
+}
+
 #[derive(Debug)]
 pub struct Measurement {
     pub unicast_socket: Option<Arc<UdpSocket>>,
@@ -245,6 +280,15 @@ pub struct Measurement {
 
 impl Measurement {
     pub async fn new(
+        state: PeerState,
+        clock: Clock,
+        tx_measurement: Sender<Vec<(f64, f64)>>,
+        notifier: Arc<Notify>,
+    ) -> Self {
+        Self::with_socket(state, clock, tx_measurement, notifier, new_unicast_socket()).await
+    }
+
+    pub async fn with_socket(
         state: PeerState,
         clock: Clock,
         tx_measurement: Sender<Vec<(f64, f64)>>,
@@ -641,7 +685,7 @@ mod tests {
 
         let shared_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
 
-        let measurement = Measurement::new(
+        let measurement = Measurement::with_socket(
             PeerState {
                 measurement_endpoint: Some(
                     shared_socket
