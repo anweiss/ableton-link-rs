@@ -58,7 +58,13 @@ safe-outputs:
   create-issue:
     title-prefix: "[upstream-sync] "
     labels: [upstream-sync, automation]
-    max: 2
+    # Exactly one issue: the backlog. This workflow triages, it does not open per-item
+    # issues. An extra issue here shares the `upstream-sync` label with the port
+    # workflow's stranded-port detector, and used to halt porting entirely (#71 blocked
+    # run 31667043733). The port workflow now checks tracker-id provenance rather than
+    # the label alone, but there is no reason for this workflow to emit a second issue
+    # in the first place.
+    max: 1
     deduplicate-by-title: true
   add-comment:
     target: "*"
@@ -96,6 +102,13 @@ gh issue list --state open --label upstream-sync --search "Porting backlog in:ti
   `commits.txt` already appears in the issue, say so in one line and stop.
 - **If it does not exist**, create it, titled exactly
   `Porting backlog: upstream Ableton Link`.
+
+**Never open a second issue.** Not for a single commit, not for something urgent, not
+for an item you think deserves its own tracking. Everything you produce goes in the
+backlog issue or a comment on it. A second open issue carrying the `upstream-sync`
+label is indistinguishable at a glance from a port whose push failed, and #71 — a
+per-item issue for `5bf14d9` opened by this workflow — stalled the port workflow on run
+31667043733. Your budget is one issue and it is spoken for.
 
 ## How to triage
 

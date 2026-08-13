@@ -145,12 +145,37 @@ Otherwise, take the next item off the backlog:
    open one to merge.
 
    **Then check for a stranded port.** Run
-   `gh issue list --state open --label upstream-sync`. Ignore the backlog issue
-   (`Porting backlog: upstream Ableton Link`). If any *other* open issue is there, it
-   is a port whose push failed and got turned into an issue instead of a pull request,
-   and it holds work that is not on `main` yet. **Stop** and comment on that issue
-   saying the port is still stranded and needs a maintainer. Redoing the port would
-   just produce a second copy of the same change.
+   `gh issue list --state open --label upstream-sync`. A stranded port is a port whose
+   push failed and got turned into an issue instead of a pull request, so it holds work
+   that is not on `main` yet. Redoing it would just produce a second copy of the same
+   change, so if one exists, **stop** and comment on it saying the port is still
+   stranded and needs a maintainer.
+
+   **The label alone does not identify one.** `upstream-sync` is shared by both
+   workflows, so read each candidate issue's body with `gh issue view <n> --json body`
+   and treat it as a stranded port **only if both** of these hold:
+
+   - it contains `<!-- gh-aw-tracker-id: link-upstream-port -->`, meaning this workflow
+     produced it rather than the watch workflow, **and**
+   - it contains the push-failure marker
+     `This was originally intended as a pull request, but the git push operation failed`.
+
+   Everything else is **not** a blocker and you must carry on past it:
+
+   - the backlog issue (`Porting backlog: upstream Ableton Link`);
+   - anything carrying `<!-- gh-aw-tracker-id: link-upstream-watch -->` — that is
+     triage output from the watch workflow describing work still to be done, not work
+     already done and stranded. Ignore it entirely and port from the backlog as normal.
+
+   This precision is the whole point. Treating any open `upstream-sync` issue as a
+   stranded port deadlocked this workflow: on run 31667043733 it halted on #71 — a
+   watch-authored triage issue for `5bf14d9` that had never been pushed — and posted
+   "this port is still stranded" on an issue that held no work at all. Nothing could
+   ever close that issue, so every subsequent run would have stopped in the same place
+   while still reporting success.
+
+   If you find no stranded port under that definition, **continue to step 3**. Do not
+   stop, and do not comment.
 3. Find the backlog issue:
    `gh issue list --state open --label upstream-sync --search "Porting backlog in:title"`
 4. Take the **first `Port` item whose SHA still appears in
@@ -199,6 +224,17 @@ own new code.
 
 If nothing is portable, say why in one line and stop. A run that ports nothing is a
 fine outcome; a run that ports something nobody asked for is not.
+
+## Every early stop must be announced
+
+Whenever you stop without opening a pull request — an open port PR, a genuine stranded
+port, nothing portable, a blocked wire-format item, a failing build — record the reason
+with the `noop` tool, naming the specific blocker and the issue or PR number that
+caused it.
+
+The run exits `success` either way, so an unannounced stop is indistinguishable from a
+healthy week. Five consecutive green runs hid the #71 deadlock precisely because a
+stopped run looked exactly like a completed one.
 
 ## When the whole range is out of scope
 
