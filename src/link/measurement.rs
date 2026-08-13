@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io, mem,
-    net::{IpAddr, Ipv4Addr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
 
@@ -11,7 +11,7 @@ use tokio::{
     net::UdpSocket,
     select,
     sync::{
-        mpsc::{self, Sender},
+        mpsc::{self, Receiver, Sender},
         Notify,
     },
 };
@@ -22,7 +22,10 @@ use crate::{
     encoding::{self, Decode, Encode},
     link::{
         payload::PrevGhostTime,
-        pingresponder::{parse_message_header, MAX_MESSAGE_SIZE, PONG},
+        pingresponder::{
+            parse_message_header, MessageType, MAX_MESSAGE_SIZE, PONG, PROTOCOL_HEADER,
+            PROTOCOL_HEADER_SIZE,
+        },
         Result,
     },
 };
@@ -34,7 +37,7 @@ use super::{
     linear_regression::linear_regression,
     node::NodeId,
     payload::{HostTime, Payload, PayloadEntry},
-    pingresponder::{encode_message, PingResponder, PING},
+    pingresponder::{encode_message, PingResponder, MESSAGE_HEADER_SIZE, PING},
     sessions::SessionId,
     state::SessionState,
 };
@@ -90,6 +93,13 @@ pub enum MeasurePeerEvent {
     XForm(SessionId, GhostXForm),
 }
 
+/// A datagram received on the shared unicast socket, along with its sender.
+pub type PongMessage = (Vec<u8>, SocketAddr);
+
+/// Routing table mapping a peer's measurement endpoint to the measurement
+/// currently expecting PONG messages from it.
+pub type PongDispatch = Arc<Mutex<HashMap<SocketAddr, Sender<PongMessage>>>>;
+
 #[derive(Debug, Clone)]
 pub struct MeasurementService {
     pub measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
@@ -97,6 +107,7 @@ pub struct MeasurementService {
     pub ping_responder: PingResponder,
     pub tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     pub shared_socket: Arc<UdpSocket>,
+    pong_dispatch: PongDispatch,
 }
 
 impl MeasurementService {
@@ -110,10 +121,12 @@ impl MeasurementService {
         mut rx_measure_peer_state: tokio::sync::mpsc::Receiver<MeasurePeerEvent>,
     ) -> MeasurementService {
         let measurement_map = Arc::new(Mutex::new(HashMap::new()));
+        let pong_dispatch: PongDispatch = Arc::new(Mutex::new(HashMap::new()));
 
         let m_map = measurement_map.clone();
         let t_peer = tx_measure_peer_result.clone();
         let socket_loop = ping_responder_unicast_socket.clone();
+        let dispatch_loop = pong_dispatch.clone();
 
         tokio::spawn(async move {
             loop {
@@ -127,6 +140,7 @@ impl MeasurementService {
                         peer,
                         notifier.clone(),
                         socket_loop.clone(),
+                        dispatch_loop.clone(),
                     )
                     .await;
                 }
@@ -144,7 +158,43 @@ impl MeasurementService {
             ),
             tx_measure_peer: tx_measure_peer_result,
             shared_socket: ping_responder_unicast_socket,
+            pong_dispatch,
         }
+    }
+
+    /// Start the single receive loop for the shared unicast socket. Every
+    /// datagram is dispatched from here: PING messages go to the ping
+    /// responder, PONG messages go to the measurement registered for the
+    /// sending peer.
+    pub async fn listen(&self, _notifier: Arc<Notify>) {
+        let socket = self.shared_socket.clone();
+        let ping_responder = self.ping_responder.clone();
+        let pong_dispatch = self.pong_dispatch.clone();
+
+        info!(
+            "listening for ping and pong messages on {}",
+            socket.local_addr().unwrap()
+        );
+
+        tokio::spawn(async move {
+            loop {
+                let mut buf = [0; MAX_MESSAGE_SIZE];
+
+                let (amt, src) = match socket.recv_from(&mut buf).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        debug!("failed to receive from measurement socket: {}", e);
+                        break;
+                    }
+                };
+
+                match message_type(&buf[..amt], src) {
+                    Some(PING) => ping_responder.handle_ping(&buf[..amt], src).await,
+                    Some(PONG) => dispatch_pong(&pong_dispatch, &buf[..amt], src),
+                    _ => debug!("received invalid message from {}", src),
+                }
+            }
+        });
     }
 
     pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
@@ -154,6 +204,7 @@ impl MeasurementService {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn measure_peer(
     clock: Clock,
     measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
@@ -162,6 +213,10 @@ pub async fn measure_peer(
     state: PeerState,
     notifier: Arc<Notify>,
 ) {
+    let socket = new_unicast_socket();
+    let pong_dispatch: PongDispatch = Arc::new(Mutex::new(HashMap::new()));
+    spawn_pong_dispatch(socket.clone(), pong_dispatch.clone());
+
     measure_peer_with_socket(
         clock,
         measurement_map,
@@ -169,11 +224,13 @@ pub async fn measure_peer(
         session_id,
         state,
         notifier,
-        new_unicast_socket(),
+        socket,
+        pong_dispatch,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn measure_peer_with_socket(
     clock: Clock,
     measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
@@ -182,6 +239,7 @@ pub async fn measure_peer_with_socket(
     state: PeerState,
     notifier: Arc<Notify>,
     socket: Arc<UdpSocket>,
+    pong_dispatch: PongDispatch,
 ) {
     info!(
         "measuring peer {} at {} for session {}",
@@ -191,11 +249,15 @@ pub async fn measure_peer_with_socket(
     );
 
     let node_id = state.node_state.node_id;
+    let endpoint = SocketAddr::V4(state.measurement_endpoint.unwrap());
 
     let (tx_measurement, mut rx_measurement) = mpsc::channel(1);
+    let (tx_pong, rx_pong) = mpsc::channel(NUMBER_DATA_POINTS);
+
+    pong_dispatch.lock().unwrap().insert(endpoint, tx_pong);
 
     let measurement =
-        Measurement::with_socket(state, clock, tx_measurement, notifier, socket).await;
+        Measurement::with_socket(state, clock, tx_measurement, notifier, socket, rx_pong).await;
     measurement_map
         .try_lock()
         .unwrap()
@@ -244,6 +306,7 @@ pub async fn measure_peer_with_socket(
                 }
 
                 measurement_map.try_lock().unwrap().remove(&node_id);
+                pong_dispatch.lock().unwrap().remove(&endpoint);
             }
         }
     });
@@ -263,6 +326,69 @@ fn new_unicast_socket() -> Arc<UdpSocket> {
         .unwrap();
 
     Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap())
+}
+
+/// Determine the message type of a datagram received on a measurement socket,
+/// returning `None` when it is not a well formed Link message.
+fn message_type(data: &[u8], src: SocketAddr) -> Option<MessageType> {
+    if data.len() < PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE
+        || !data.starts_with(&PROTOCOL_HEADER)
+    {
+        debug!("protocol header mismatch from {}", src);
+        return None;
+    }
+
+    match parse_message_header(data) {
+        Ok((header, _)) => Some(header.message_type),
+        Err(e) => {
+            debug!("failed to parse message header from {}: {}", src, e);
+            None
+        }
+    }
+}
+
+/// Hand a PONG datagram to the measurement registered for the peer that sent
+/// it. `try_send` is used so that a slow or already finished measurement cannot
+/// stall the dispatch of datagrams destined for other peers.
+fn dispatch_pong(pong_dispatch: &PongDispatch, data: &[u8], src: SocketAddr) {
+    let tx_pong = pong_dispatch.lock().unwrap().get(&src).cloned();
+
+    match tx_pong {
+        Some(tx_pong) => match tx_pong.try_send((data.to_vec(), src)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!("dropping pong from {}: measurement is busy", src)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                pong_dispatch.lock().unwrap().remove(&src);
+            }
+        },
+        None => debug!("no measurement registered for pong from {}", src),
+    }
+}
+
+/// Run the receive loop for a privately owned measurement socket, dispatching
+/// PONG messages to the measurement registered for the sending peer.
+/// `MeasurementService::listen` performs the same dispatch for the socket it
+/// shares with the ping responder.
+fn spawn_pong_dispatch(socket: Arc<UdpSocket>, pong_dispatch: PongDispatch) {
+    tokio::spawn(async move {
+        loop {
+            let mut buf = [0; MAX_MESSAGE_SIZE];
+
+            let (amt, src) = match socket.recv_from(&mut buf).await {
+                Ok(result) => result,
+                Err(e) => {
+                    debug!("failed to receive from measurement socket: {}", e);
+                    break;
+                }
+            };
+
+            if let Some(PONG) = message_type(&buf[..amt], src) {
+                dispatch_pong(&pong_dispatch, &buf[..amt], src);
+            }
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -285,7 +411,20 @@ impl Measurement {
         tx_measurement: Sender<Vec<(f64, f64)>>,
         notifier: Arc<Notify>,
     ) -> Self {
-        Self::with_socket(state, clock, tx_measurement, notifier, new_unicast_socket()).await
+        let socket = new_unicast_socket();
+        let pong_dispatch: PongDispatch = Arc::new(Mutex::new(HashMap::new()));
+        let (tx_pong, rx_pong) = mpsc::channel(NUMBER_DATA_POINTS);
+
+        if let Some(endpoint) = state.measurement_endpoint {
+            pong_dispatch
+                .lock()
+                .unwrap()
+                .insert(SocketAddr::V4(endpoint), tx_pong);
+        }
+
+        spawn_pong_dispatch(socket.clone(), pong_dispatch);
+
+        Self::with_socket(state, clock, tx_measurement, notifier, socket, rx_pong).await
     }
 
     pub async fn with_socket(
@@ -294,6 +433,7 @@ impl Measurement {
         tx_measurement: Sender<Vec<(f64, f64)>>,
         notifier: Arc<Notify>,
         unicast_socket: Arc<UdpSocket>,
+        rx_pong: Receiver<PongMessage>,
     ) -> Self {
         let (tx_timer, mut rx_timer) = mpsc::channel(1);
 
@@ -348,7 +488,7 @@ impl Measurement {
             }
         });
 
-        measurement.listen().await;
+        measurement.listen(rx_pong).await;
 
         info!("sending initial host time ping {:?}", ht);
 
@@ -378,51 +518,38 @@ impl Measurement {
         measurement
     }
 
-    pub async fn listen(&mut self) {
+    pub async fn listen(&mut self, mut rx_pong: Receiver<PongMessage>) {
         let socket = self.unicast_socket.as_ref().unwrap().clone();
         let endpoint = *self.measurement_endpoint.as_ref().unwrap();
-
-        // Handle connection failure gracefully
-        if let Err(e) = socket.connect(endpoint).await {
-            debug!(
-                "Failed to connect to measurement endpoint {}: {}",
-                endpoint, e
-            );
-            return;
-        }
 
         let clock = self.clock;
         let s_id = self.session_id;
         let data = self.data.clone();
         let tx_timer = self.tx_timer.clone();
 
-        info!(
-            "listening for pong messages on {}",
-            socket.local_addr().unwrap()
-        );
+        info!("listening for pong messages from {}", endpoint);
 
         tokio::spawn(async move {
             let mut pong_received = false;
-            loop {
-                let mut buf = [0; MAX_MESSAGE_SIZE];
 
-                // Handle receive failure gracefully - peer may have disconnected
-                let (amt, src) = match socket.recv_from(&mut buf).await {
-                    Ok(result) => result,
+            // Pongs are dispatched to this measurement by the single receive
+            // loop owned by `MeasurementService`.
+            while let Some((buf, src)) = rx_pong.recv().await {
+                let (header, header_len) = match parse_message_header(&buf) {
+                    Ok(header) => header,
                     Err(e) => {
-                        debug!("Failed to receive from measurement socket: {}", e);
-                        break;
+                        debug!("failed to parse pong message header from {}: {}", src, e);
+                        continue;
                     }
                 };
 
-                let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
                 if header.message_type == PONG {
                     if !pong_received {
                         info!("received pong message from {}", src);
                         pong_received = true;
                     }
 
-                    let payload = parse_payload(&buf[header_len..amt]).unwrap();
+                    let payload = parse_payload(&buf[header_len..]).unwrap();
 
                     let mut session_id = SessionId::default();
                     let mut ghost_time = Duration::zero();
@@ -564,7 +691,7 @@ pub async fn send_ping(
         measurement_endpoint
     );
 
-    socket.send(&message).await
+    socket.send_to(&message, measurement_endpoint).await
 }
 
 pub fn median(mut numbers: Vec<f64>) -> f64 {
@@ -684,6 +811,7 @@ mod tests {
             .unwrap();
 
         let shared_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
+        let (_tx_pong, rx_pong) = mpsc::channel::<PongMessage>(NUMBER_DATA_POINTS);
 
         let measurement = Measurement::with_socket(
             PeerState {
@@ -701,6 +829,7 @@ mod tests {
             tx_measurement,
             notifier,
             shared_socket,
+            rx_pong,
         )
         .await;
 

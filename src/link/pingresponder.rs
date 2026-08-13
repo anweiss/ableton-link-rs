@@ -1,8 +1,14 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
 
 use crate::encoding::{self, Decode, Encode};
 
-use tokio::{net::UdpSocket, sync::Notify};
+use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
 use crate::{
@@ -57,6 +63,7 @@ pub struct PingResponder {
     pub ghost_x_form: Arc<Mutex<GhostXForm>>,
     pub clock: Clock,
     pub unicast_socket: Option<Arc<UdpSocket>>,
+    ping_message_received: Arc<AtomicBool>,
 }
 
 impl PingResponder {
@@ -71,87 +78,90 @@ impl PingResponder {
             session_id: Arc::new(Mutex::new(session_id)),
             ghost_x_form: Arc::new(Mutex::new(ghost_x_form)),
             clock,
+            ping_message_received: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub async fn listen(&self, _notifier: Arc<Notify>) {
-        let unicast_socket = self.unicast_socket.as_ref().unwrap().clone();
-        let session_id = self.session_id.clone();
-        let ghost_x_form = self.ghost_x_form.clone();
-        let clock = self.clock;
+    /// Handle a single PING datagram received on the shared unicast socket and
+    /// reply with a PONG. Datagrams are dispatched by the receive loop owned by
+    /// `MeasurementService`, which is the only reader of the shared socket.
+    pub async fn handle_ping(&self, data: &[u8], src: SocketAddr) {
+        let unicast_socket = match self.unicast_socket.as_ref() {
+            Some(socket) => socket,
+            None => return,
+        };
 
-        info!(
-            "listening for ping messages on {}",
-            unicast_socket.local_addr().unwrap()
-        );
-
-        let mut ping_message_received = false;
-
-        tokio::spawn(async move {
-            loop {
-                let mut buf = [0; MAX_MESSAGE_SIZE];
-
-                if let Ok((amt, src)) = unicast_socket.recv_from(&mut buf).await {
-                    if !buf.starts_with(&PROTOCOL_HEADER) {
-                        info!("protocol header mismatch");
-                        continue;
-                    }
-
-                    let (header, header_len) = parse_message_header(&buf[..amt]).unwrap();
-                    let payload_size = buf[header_len..amt].len();
-                    let max_payload_size = 40;
-
-                    if header.message_type == PING && payload_size <= max_payload_size as usize {
-                        if !ping_message_received {
-                            info!("received ping message from {}", src);
-                        }
-
-                        let payload = parse_payload(&buf[header_len..amt]).unwrap();
-
-                        let mut payload_entries = vec![];
-                        for entry in payload.entries.into_iter() {
-                            if matches!(
-                                entry,
-                                PayloadEntry::HostTime(_) | PayloadEntry::PrevGhostTime(_)
-                            ) {
-                                payload_entries.push(entry);
-                            }
-                        }
-
-                        let id = SessionMembership {
-                            session_id: *session_id.try_lock().unwrap(),
-                        };
-                        let current_gt = GhostTime {
-                            time: ghost_x_form
-                                .try_lock()
-                                .unwrap()
-                                .host_to_ghost(clock.micros()),
-                        };
-
-                        payload_entries.push(PayloadEntry::SessionMembership(id));
-                        payload_entries.push(PayloadEntry::GhostTime(current_gt));
-
-                        let pong_payload = Payload {
-                            entries: payload_entries,
-                        };
-
-                        if !ping_message_received {
-                            debug!("pong_payload {:?}", pong_payload);
-                        }
-
-                        let pong_message = encode_message(PONG, &pong_payload).unwrap();
-                        unicast_socket.send_to(&pong_message, src).await.unwrap();
-                        if !ping_message_received {
-                            debug!("sent pong message to {}", src);
-                        }
-
-                        ping_message_received = true;
-                    } else {
-                        debug!("received invalid message from {}", src);
-                    }
-                }
+        let (_, header_len) = match parse_message_header(data) {
+            Ok(header) => header,
+            Err(e) => {
+                debug!("failed to parse ping message header from {}: {}", src, e);
+                return;
             }
-        });
+        };
+
+        let payload_size = data[header_len..].len();
+        let max_payload_size = 40;
+
+        if payload_size > max_payload_size {
+            debug!("received invalid message from {}", src);
+            return;
+        }
+
+        let ping_message_received = self.ping_message_received.swap(true, Ordering::Relaxed);
+
+        if !ping_message_received {
+            info!("received ping message from {}", src);
+        }
+
+        let payload = match parse_payload(&data[header_len..]) {
+            Ok(payload) => payload,
+            Err(e) => {
+                debug!("failed to parse ping payload from {}: {}", src, e);
+                return;
+            }
+        };
+
+        let mut payload_entries = vec![];
+        for entry in payload.entries.into_iter() {
+            if matches!(
+                entry,
+                PayloadEntry::HostTime(_) | PayloadEntry::PrevGhostTime(_)
+            ) {
+                payload_entries.push(entry);
+            }
+        }
+
+        let id = SessionMembership {
+            session_id: *self.session_id.try_lock().unwrap(),
+        };
+        let current_gt = GhostTime {
+            time: self
+                .ghost_x_form
+                .try_lock()
+                .unwrap()
+                .host_to_ghost(self.clock.micros()),
+        };
+
+        payload_entries.push(PayloadEntry::SessionMembership(id));
+        payload_entries.push(PayloadEntry::GhostTime(current_gt));
+
+        let pong_payload = Payload {
+            entries: payload_entries,
+        };
+
+        if !ping_message_received {
+            debug!("pong_payload {:?}", pong_payload);
+        }
+
+        let pong_message = encode_message(PONG, &pong_payload).unwrap();
+        if let Err(e) = unicast_socket.send_to(&pong_message, src).await {
+            debug!("failed to send pong message to {}: {}", src, e);
+            return;
+        }
+
+        if !ping_message_received {
+            debug!("sent pong message to {}", src);
+        }
     }
 
     pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {

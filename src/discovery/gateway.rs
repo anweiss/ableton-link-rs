@@ -169,10 +169,7 @@ impl PeerGateway {
         let tx_peer_event = self.tx_peer_event.clone();
         let epoch = self.epoch;
 
-        self.measurement_service
-            .ping_responder
-            .listen(notifier.clone())
-            .await;
+        self.measurement_service.listen(notifier.clone()).await;
 
         tokio::spawn(async move {
             tokio::signal::ctrl_c().await.unwrap();
