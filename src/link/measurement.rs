@@ -351,19 +351,25 @@ fn message_type(data: &[u8], src: SocketAddr) -> Option<MessageType> {
 /// it. `try_send` is used so that a slow or already finished measurement cannot
 /// stall the dispatch of datagrams destined for other peers.
 fn dispatch_pong(pong_dispatch: &PongDispatch, data: &[u8], src: SocketAddr) {
-    let tx_pong = pong_dispatch.lock().unwrap().get(&src).cloned();
+    let mut dispatch = pong_dispatch.lock().unwrap();
 
-    match tx_pong {
+    let closed = match dispatch.get(&src) {
         Some(tx_pong) => match tx_pong.try_send((data.to_vec(), src)) {
-            Ok(()) => {}
+            Ok(()) => false,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                debug!("dropping pong from {}: measurement is busy", src)
+                debug!("dropping pong from {}: measurement is busy", src);
+                false
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                pong_dispatch.lock().unwrap().remove(&src);
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => true,
         },
-        None => debug!("no measurement registered for pong from {}", src),
+        None => {
+            debug!("no measurement registered for pong from {}", src);
+            false
+        }
+    };
+
+    if closed {
+        dispatch.remove(&src);
     }
 }
 
