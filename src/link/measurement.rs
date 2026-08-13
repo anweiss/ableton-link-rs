@@ -1,12 +1,11 @@
 use std::{
     collections::HashMap,
     io, mem,
-    net::{IpAddr, Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
 
 use chrono::Duration;
-use local_ip_address::list_afinet_netifas;
 use tokio::{
     net::UdpSocket,
     select,
@@ -18,7 +17,7 @@ use tokio::{
 use tracing::{debug, info};
 
 use crate::{
-    discovery::{messages::parse_payload, messenger::new_udp_reuseport, peers::PeerState},
+    discovery::{messages::parse_payload, peers::PeerState},
     encoding::{self, Decode, Encode},
     link::{
         payload::PrevGhostTime,
@@ -96,6 +95,7 @@ pub struct MeasurementService {
     pub clock: Clock,
     pub ping_responder: PingResponder,
     pub tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    pub shared_socket: Arc<UdpSocket>,
 }
 
 impl MeasurementService {
@@ -112,6 +112,7 @@ impl MeasurementService {
 
         let m_map = measurement_map.clone();
         let t_peer = tx_measure_peer_result.clone();
+        let socket_loop = ping_responder_unicast_socket.clone();
 
         tokio::spawn(async move {
             loop {
@@ -124,6 +125,7 @@ impl MeasurementService {
                         session_id,
                         peer,
                         notifier.clone(),
+                        socket_loop.clone(),
                     )
                     .await;
                 }
@@ -134,12 +136,13 @@ impl MeasurementService {
             measurement_map,
             clock,
             ping_responder: PingResponder::new(
-                ping_responder_unicast_socket,
+                ping_responder_unicast_socket.clone(),
                 peer_state.try_lock().unwrap().session_id(),
                 session_state.try_lock().unwrap().ghost_x_form,
                 clock,
             ),
             tx_measure_peer: tx_measure_peer_result,
+            shared_socket: ping_responder_unicast_socket,
         }
     }
 
@@ -157,6 +160,7 @@ pub async fn measure_peer(
     session_id: SessionId,
     state: PeerState,
     notifier: Arc<Notify>,
+    socket: Arc<UdpSocket>,
 ) {
     info!(
         "measuring peer {} at {} for session {}",
@@ -169,7 +173,7 @@ pub async fn measure_peer(
 
     let (tx_measurement, mut rx_measurement) = mpsc::channel(1);
 
-    let measurement = Measurement::new(state, clock, tx_measurement, notifier).await;
+    let measurement = Measurement::new(state, clock, tx_measurement, notifier, socket).await;
     measurement_map
         .try_lock()
         .unwrap()
@@ -245,21 +249,12 @@ impl Measurement {
         clock: Clock,
         tx_measurement: Sender<Vec<(f64, f64)>>,
         notifier: Arc<Notify>,
+        unicast_socket: Arc<UdpSocket>,
     ) -> Self {
         let (tx_timer, mut rx_timer) = mpsc::channel(1);
 
-        let ip = list_afinet_netifas()
-            .unwrap()
-            .iter()
-            .find_map(|(_, ip)| match ip {
-                IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
-                _ => None,
-            })
-            .unwrap();
-
-        let unicast_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
         info!(
-            "initiating new unicast socket {} for measurement_endpoint {:?}",
+            "initiating measurement using socket {} for measurement_endpoint {:?}",
             unicast_socket.local_addr().unwrap(),
             state.measurement_endpoint
         );
@@ -551,6 +546,7 @@ mod tests {
     use crate::{
         discovery::{
             gateway::{OnEvent, PeerGateway},
+            messenger::new_udp_reuseport,
             peers::PeerStateChange,
         },
         link::{controller::SessionPeerCounter, node::NodeState},
@@ -643,16 +639,24 @@ mod tests {
             })
             .unwrap();
 
-        let s = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
+        let shared_socket = Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap());
 
         let measurement = Measurement::new(
             PeerState {
-                measurement_endpoint: Some(s.local_addr().unwrap().to_string().parse().unwrap()),
+                measurement_endpoint: Some(
+                    shared_socket
+                        .local_addr()
+                        .unwrap()
+                        .to_string()
+                        .parse()
+                        .unwrap(),
+                ),
                 ..Default::default()
             },
             Clock::default(),
             tx_measurement,
             notifier,
+            shared_socket,
         )
         .await;
 
