@@ -416,6 +416,19 @@ The porting rules and the C++ header to Rust module map both live in
 [`.github/workflows/shared/link-upstream-context.md`](.github/workflows/shared/link-upstream-context.md).
 Edit that file to change how either workflow reasons about a change.
 
+**The backlog issue.** `link-upstream-watch` is the only writer. Each run rewrites the
+issue body to the current state — ticking off items whose SHAs have dropped out of the
+drift report, and refreshing the pinned/upstream SHA header — and adds one comment
+describing what changed. It can edit only that issue: the safe output is gated on the
+title prefix `[upstream-sync] Porting backlog` **and** the `upstream-sync` and
+`automation` labels, and it is permitted to change the body only, so it cannot rename
+or close the issue. The workflow itself still runs with `issues: read`; the write
+happens in a separate job.
+
+The checkboxes are bookkeeping for humans. `link-upstream-port` picks its next item by
+whether a SHA is still present in `commits.txt`, never by checkbox state, so a missed
+tick cannot cause the same commit to be ported twice or skipped.
+
 **Reviewing a port PR.** These are opened by `github-actions[bot]`, so their CI runs
 can land in the `action_required` state waiting on a maintainer to approve them. If a
 port PR shows only the CodeQL checks, approve the runs from the PR's Checks tab (or
