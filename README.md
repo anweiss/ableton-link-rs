@@ -475,6 +475,34 @@ gh aw compile
 
 Both the `.md` source and the generated `.lock.yml` are committed.
 
+### Release PRs and the approval gate
+
+release-please opens its release PR from a branch in this repository. If it opens that
+PR with `GITHUB_TOKEN`, GitHub creates the PR's workflow runs in the `action_required`
+state, so every release needs someone to click **Approve workflows to run** before CI
+starts. This is intended GitHub behavior for automation-authored pull requests, not a
+misconfiguration, and it cannot be switched off with a repository setting — the
+fork-PR approval policy governs pull requests *from forks* and does not apply here.
+
+To make release PRs run CI unattended, give release-please an identity other than
+`GITHUB_TOKEN`. Either works, and
+[`release-please.yml`](.github/workflows/release-please.yml) picks the first one that
+is configured:
+
+```bash
+# Preferred: a GitHub App — no expiry, not tied to a person.
+# Grant it Contents: write and Pull requests: write, install it on this repo.
+gh variable set RELEASE_PLEASE_APP_ID --body "<app id>"
+gh secret   set RELEASE_PLEASE_APP_PRIVATE_KEY < private-key.pem
+
+# Or a fine-grained PAT with the same two permissions. Simpler, but expires.
+gh secret set RELEASE_PLEASE_PAT --body "<token>"
+```
+
+With neither configured the release is still proposed correctly; it just needs the
+approval click, and the workflow logs a warning saying so rather than leaving you to
+work out why the PR has no checks.
+
 ## Documentation
 
 * [Official Ableton Link Documentation](https://ableton.github.io/link)

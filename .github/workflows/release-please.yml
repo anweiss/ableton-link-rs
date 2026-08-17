@@ -16,14 +16,51 @@ jobs:
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
     steps:
+      # Why this exists
+      # ===============
+      # A pull request opened with GITHUB_TOKEN gets CI runs that sit in
+      # `action_required` until a maintainer clicks "Approve workflows to run",
+      # every single time release-please updates the PR. That is deliberate on
+      # GitHub's side, it is not a misconfiguration here, and it cannot be turned
+      # off with a repository setting — the fork-PR approval policy does not apply
+      # to same-repo pull requests like release-please's.
+      #
+      # The documented way out is to open the PR as some identity other than
+      # GITHUB_TOKEN. Either works; pick one and the fallback chain below does the
+      # rest. If neither is configured the release still gets proposed, it just
+      # needs the manual approval click, and the final step says so out loud.
+      #
+      #   1. GitHub App (preferred — no expiry, not tied to a person)
+      #      Register an App with Contents: write + Pull requests: write, install
+      #      it on this repo, then set:
+      #        gh variable set RELEASE_PLEASE_APP_ID --body "<app id>"
+      #        gh secret   set RELEASE_PLEASE_APP_PRIVATE_KEY < private-key.pem
+      #
+      #   2. Fine-grained PAT (simpler, but expires and must be rotated)
+      #      Contents: write + Pull requests: write on this repo, then:
+      #        gh secret set RELEASE_PLEASE_PAT --body "<token>"
+      - name: Mint a GitHub App token
+        id: app-token
+        if: vars.RELEASE_PLEASE_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
           release-type: rust
-          # Prefer a PAT so the resulting PR triggers downstream workflows
-          # (CI, Security Audit, Conventional Commits). GITHUB_TOKEN is
-          # subject to the anti-recursion rule and won't fire those
-          # workflows. The retrigger-ci workflow provides a fallback but
-          # also requires a PAT to work. Set RELEASE_PLEASE_PAT with
-          # pull-requests: write access to wire this up.
-          token: ${{ secrets.RELEASE_PLEASE_PAT || secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_PAT || secrets.GITHUB_TOKEN }}
+
+      # Without this, falling back to GITHUB_TOKEN is silent: the release PR just
+      # sits there with no checks and nothing explains why. v0.3.1 was stranded
+      # that way for a week.
+      - name: Warn when the release PR will need manual approval
+        if: steps.app-token.outputs.token == ''
+        env:
+          HAS_PAT: ${{ secrets.RELEASE_PLEASE_PAT != '' }}
+        run: |
+          if [ "$HAS_PAT" != "true" ]; then
+            echo "::warning title=Release PR CI needs manual approval::Opened with GITHUB_TOKEN, so its checks are held in action_required. Approve them on the PR, or configure RELEASE_PLEASE_APP_ID or RELEASE_PLEASE_PAT (see comments in release-please.yml)."
+          fi
