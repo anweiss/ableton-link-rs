@@ -1,0 +1,256 @@
+name: Auto-merge upstream port PRs
+
+# Why this workflow exists
+# ========================
+# `Link Upstream Port` (link-upstream-port.md) opens exactly one pull request per
+# run, and then refuses to open another until that PR is merged. So an unattended
+# port PR does not just sit there: it halts the whole porting pipeline. This
+# workflow closes that loop by putting qualifying port PRs into GitHub's native
+# auto-merge queue, so they land on their own once every required check on `main`
+# has passed.
+#
+# What this does NOT do
+# =====================
+# It does not bypass, weaken, or approve anything. Auto-merge is GitHub's own
+# mechanism: the PR merges only when branch protection on `main` is fully
+# satisfied. If a check fails, the PR stays open exactly as it does today.
+#
+# Why the labels are NOT tested in the job-level `if`
+# ==================================================
+# They arrive too late. On PR #76 the pull request was created at 15:13:00Z and
+# its labels were applied at 15:13:01Z and 15:13:02Z — one to two seconds later.
+# A job-level `contains(...labels...)` guard therefore evaluates an `opened`
+# payload that has no labels yet, skips the job, and the careful re-read below
+# never runs. The event payload is used only for a cheap author/base/fork guard;
+# every real qualification decision is made against a freshly fetched PR, with a
+# short poll to absorb that race.
+#
+# Wire-format changes are deliberately excluded
+# =============================================
+# `link-upstream-port.md` instructs the agent to tag anything touching the
+# on-the-wire modules as `risk: wire-format` because those "change bytes on the
+# network and need a human before they ship". `main` requires zero approving
+# reviews, so auto-merge would be the only thing standing between such a change
+# and `main`. This workflow refuses to queue those PRs and says so on the PR.
+#
+# That check reads the PR body, which is prose written by an agent. Prose is not
+# trustworthy enough to *grant* an exemption, but it is fine to *withhold* one:
+# the check fails closed. A body the agent malformed, or a match on an unrelated
+# mention of the phrase, costs a human merge click — never an unreviewed merge.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, labeled, synchronize]
+  # A merge to `main` can leave an already-queued port PR out of date, and
+  # `main` requires branches to be up to date (`strict: true`). Re-examine open
+  # port PRs whenever `main` moves so that situation is reported rather than
+  # silently stalling the pipeline.
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: auto-merge-upstream-port-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    # Cheap guard only. For pull_request events, drop anything that obviously is
+    # not a bot PR from this repository. Labels are NOT tested here (see above).
+    if: >-
+      github.event_name != 'pull_request' || (
+        github.event.pull_request.base.ref == 'main' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.user.login == 'github-actions[bot]'
+      )
+    steps:
+      - name: Enable auto-merge for qualifying port PRs
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
+            const labelsOf = pr => pr.labels.map(l => l.name);
+
+            // Labels are applied a second or two after the PR is created, so a
+            // single read of an `opened` event races them. Poll briefly.
+            async function fetchQualifying(number) {
+              const attempts = 6;
+              let pr;
+              for (let i = 0; i < attempts; i++) {
+                ({ data: pr } = await github.rest.pulls.get({
+                  owner, repo, pull_number: number,
+                }));
+                if (labelsOf(pr).includes('upstream-sync')) break;
+                if (i < attempts - 1) await sleep(5000);
+              }
+              return pr;
+            }
+
+            function disqualify(pr) {
+              const labels = labelsOf(pr);
+              if (pr.state !== 'open') return `state is ${pr.state}`;
+              if (pr.base.ref !== 'main') return `base is ${pr.base.ref}`;
+              if (!pr.head.repo || pr.head.repo.full_name !== `${owner}/${repo}`) {
+                return 'head branch is not in this repository';
+              }
+              if (pr.user.login !== 'github-actions[bot]') {
+                return `author is ${pr.user.login}`;
+              }
+              // The port workflow branches as `port/<slug>-<sha>`. Author plus
+              // labels alone would also match any other repository automation
+              // that acquires the same labels.
+              if (!pr.head.ref.startsWith('port/')) {
+                return `head branch ${pr.head.ref} is not a port/ branch`;
+              }
+              if (!labels.includes('upstream-sync') || !labels.includes('automation')) {
+                return `labels are [${labels.join(', ')}]`;
+              }
+              if (labels.includes('autorelease: pending')) return 'it is a release PR';
+              if (/risk:\s*wire-format/i.test(pr.body || '')) {
+                return 'it is tagged risk: wire-format and needs a human reviewer';
+              }
+              return null;
+            }
+
+            async function process(number) {
+              const pr = await fetchQualifying(number);
+              const reason = disqualify(pr);
+
+              if (reason) {
+                core.info(`PR #${number} does not qualify: ${reason}. Doing nothing.`);
+                // Wire-format ports are the one rejection a human must know
+                // about, because the PR will otherwise sit waiting on nobody.
+                if (reason.startsWith('it is tagged risk: wire-format')) {
+                  const marker = '<!-- auto-merge-upstream-port: wire-format-hold -->';
+                  const { data: comments } = await github.rest.issues.listComments({
+                    owner, repo, issue_number: number, per_page: 100,
+                  });
+                  if (!comments.some(c => c.body && c.body.includes(marker))) {
+                    await github.rest.issues.createComment({
+                      owner, repo, issue_number: number,
+                      body:
+                        `${marker}\n**Auto-merge withheld.** This port is tagged ` +
+                        '`risk: wire-format`, meaning it changes bytes on the ' +
+                        'network. `main` requires zero approving reviews, so ' +
+                        'auto-merging it would put a protocol change on `main` ' +
+                        'with no human having read it.\n\nReview it and merge by ' +
+                        'hand.',
+                    });
+                  }
+                }
+                return;
+              }
+
+              if (pr.draft) {
+                core.info(`PR #${number} is a draft; marking it ready for review.`);
+                await github.graphql(
+                  `mutation($id: ID!) {
+                     markPullRequestReadyForReview(input: { pullRequestId: $id }) {
+                       pullRequest { number }
+                     }
+                   }`,
+                  { id: pr.node_id }
+                );
+              }
+
+              // Idempotency: ask before telling, so a re-run is a no-op rather
+              // than an error swallowed by a catch block.
+              const { repository } = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!) {
+                   repository(owner: $owner, name: $repo) {
+                     pullRequest(number: $number) {
+                       autoMergeRequest { enabledAt }
+                       mergeable
+                     }
+                   }
+                 }`,
+                { owner, repo, number }
+              );
+              const state = repository.pullRequest;
+
+              if (state.autoMergeRequest) {
+                core.info(
+                  `Auto-merge already enabled on PR #${number} at ` +
+                  `${state.autoMergeRequest.enabledAt}. Nothing to do.`
+                );
+              } else {
+                try {
+                  await github.graphql(
+                    `mutation($id: ID!) {
+                       enablePullRequestAutoMerge(
+                         input: { pullRequestId: $id, mergeMethod: SQUASH }
+                       ) {
+                         pullRequest { number }
+                       }
+                     }`,
+                    { id: pr.node_id }
+                  );
+                  core.notice(
+                    `Auto-merge (squash) enabled on PR #${number}. It will merge ` +
+                    'once every required check on main passes.'
+                  );
+                } catch (error) {
+                  const message = String(error.message || error);
+                  // GitHub refuses to queue a PR that is already mergeable right
+                  // now. Swallowing that leaves a green run and an open PR, which
+                  // is exactly the stall this workflow exists to prevent - so
+                  // merge it instead.
+                  if (/clean status|not in the correct state/i.test(message)) {
+                    core.info(
+                      `PR #${number} cannot be queued (${message}); it is already ` +
+                      'mergeable. Merging directly.'
+                    );
+                    await github.rest.pulls.merge({
+                      owner, repo, pull_number: number, merge_method: 'squash',
+                    });
+                    core.notice(`PR #${number} squash-merged.`);
+                    return;
+                  }
+                  throw error;
+                }
+              }
+
+              // `main` requires branches to be up to date. Auto-merge does not
+              // reliably update a stale branch, and updating it here would push a
+              // commit with GITHUB_TOKEN, whose events do not start workflows -
+              // the PR would end up with no checks on its new head and could
+              // never satisfy protection. Report it and let a human update.
+              const { data: fresh } = await github.rest.pulls.get({
+                owner, repo, pull_number: number,
+              });
+              if (fresh.mergeable_state === 'behind') {
+                core.warning(
+                  `PR #${number} is behind main and main requires branches to be ` +
+                  'up to date. Auto-merge is queued but cannot complete until the ' +
+                  'branch is updated. Click "Update branch" on the PR.'
+                );
+              }
+            }
+
+            if (context.eventName === 'pull_request') {
+              await process(context.payload.pull_request.number);
+              return;
+            }
+
+            // push to main, or a manual dispatch: reconcile every open port PR.
+            const { data: open } = await github.rest.pulls.list({
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const candidates = open.filter(
+              pr => pr.user.login === 'github-actions[bot]' &&
+                    pr.base.ref === 'main' &&
+                    pr.head.ref.startsWith('port/')
+            );
+            if (candidates.length === 0) {
+              core.info('No open port PRs to reconcile.');
+              return;
+            }
+            for (const pr of candidates) {
+              await process(pr.number);
+            }

@@ -401,6 +401,7 @@ that list is the highest-value part of reviewing one of these PRs.
 | --- | --- | --- |
 | `link-upstream-watch.md` | Weekly, Monday | Triages upstream commits landed since the pin and maintains the `Porting backlog: upstream Ableton Link` issue |
 | `link-upstream-port.md` | Weekly, Thursday | Takes the next backlog item, ports it, runs the full CI suite, and opens a draft PR |
+| `auto-merge-upstream-port.yml` | On every port PR event | Marks a qualifying port PR ready for review and enables auto-merge, so it lands once branch protection is satisfied |
 
 Both compute their input with `.github/scripts/link-upstream-drift.sh`, which is
 plain shell and runnable locally:
@@ -420,6 +421,34 @@ can land in the `action_required` state waiting on a maintainer to approve them.
 port PR shows only the CodeQL checks, approve the runs from the PR's Checks tab (or
 `gh api -X POST repos/anweiss/ableton-link-rs/actions/runs/<id>/approve`) to get the
 full suite. Nothing is wrong with the PR when this happens.
+
+**Auto-merge.** Port PRs are merged for you.
+[`auto-merge-upstream-port.yml`](.github/workflows/auto-merge-upstream-port.yml)
+watches for a pull request that targets `main`, comes from a `port/` branch in this
+repository, was opened by `github-actions[bot]`, and carries **both** the
+`upstream-sync` and `automation` labels — which is exactly the shape
+`link-upstream-port.md` produces and nothing else. release-please PRs
+(`autorelease: pending`) and Dependabot PRs do not match. For a PR that matches, it
+marks the draft ready for review and turns on squash auto-merge.
+
+**A port tagged `risk: wire-format` is never auto-merged.** Those change bytes on
+the network, and `main` requires zero approving reviews, so auto-merging one would
+put a protocol change on `main` with nobody having read it. The workflow refuses,
+comments on the PR saying so, and leaves it for you.
+
+This grants no exemption from review otherwise. Auto-merge is GitHub's own queue: the
+PR merges only after every required status check on `main` passes, and not before. If
+CI fails, or the runs are still parked in `action_required`, the PR simply stays open
+the way it does today. It exists because the port workflow refuses to open a second PR
+while one is already open, so an unattended port PR stalls the entire porting pipeline
+rather than just itself.
+
+Two known limitations, both reported in the run log rather than papered over. If
+`main` moves ahead, the port branch must be updated by hand before a queued PR can
+merge — `main` requires branches to be up to date, and updating the branch from the
+workflow would push with `GITHUB_TOKEN`, whose events do not start the CI the PR then
+needs. And labels arrive a second or two after the PR is created, so the workflow
+polls for them rather than trusting the `opened` payload.
 
 **Setup.** These need a `COPILOT_GITHUB_TOKEN` repository secret — a fine-grained PAT
 with the *Copilot Requests* permission. Organization-owned repositories can drop the
