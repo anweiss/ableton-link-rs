@@ -69,6 +69,21 @@ safe-outputs:
   add-comment:
     target: "*"
     max: 1
+  update-issue:
+    # The backlog body is this workflow's own output artifact, so it is allowed to
+    # rewrite it wholesale — but only it. Without this, the workflow could comment and
+    # never edit, so checkboxes were never ticked (20 unchecked / 0 checked) and the
+    # drift header in the body went stale: it read `a729fd4c` while the real pin was
+    # `e233c676`. Retired items also kept counting toward the 25-item saturation cut-off
+    # below, which would eventually freeze triage over work that was already done.
+    body:
+    target: "*"
+    max: 1
+    # Both filters must hold, and together they match exactly one issue: the backlog.
+    # The per-item issue #71 carries the same two labels, so the labels alone are not
+    # enough — the title prefix is what excludes it.
+    required-title-prefix: "[upstream-sync] Porting backlog"
+    required-labels: [upstream-sync, automation]
   missing-tool:
 
 imports:
@@ -97,9 +112,12 @@ There is exactly one backlog issue for this repo. Find it:
 gh issue list --state open --label upstream-sync --search "Porting backlog in:title"
 ```
 
-- **If it exists**, add a comment covering only upstream commits that are not already
-  listed in it. Do not restate the whole backlog. If every commit in
-  `commits.txt` already appears in the issue, say so in one line and stop.
+- **If it exists**, do two things: rewrite its body to the current state of the world
+  (see "Maintaining the backlog body"), and add a comment covering only upstream
+  commits that are not already listed in it. Do not restate the whole backlog in the
+  comment — the body is where the full picture lives. If every commit in
+  `commits.txt` already appears in the issue and nothing retired since the last run,
+  say so in one line and stop.
 - **If it does not exist**, create it, titled exactly
   `Porting backlog: upstream Ableton Link`.
 
@@ -154,6 +172,45 @@ watermark has a paper trail) and a **Needs a decision** section.
 End the issue body with the drift header from `summary.md` — pinned SHA, upstream SHA,
 commit count — so the numbers are checkable without re-running anything.
 
+## Maintaining the backlog body
+
+The body is the canonical state of the backlog; comments are just the running
+narrative of what each triage run noticed. So rewrite the body every run with
+`update_issue` (`operation: "replace"`, `issue_number` = the backlog issue), rather
+than only commenting and letting the body rot.
+
+Three things have to be true of the body you write:
+
+1. **Retired items are checked off, not deleted.** `commits.txt` only lists commits
+   ahead of the pin, so a `Port` item whose SHAs have *all* disappeared from it is
+   already behind the watermark — it either shipped or was skipped as not applicable.
+   Mark it `- [x]` and append ` — retired at pin <short-sha>`. Keep it in the body:
+   the checklist doubles as the paper trail for which upstream commits this port has
+   accounted for, and deleting an entry destroys that.
+2. **The drift header matches this run.** Take pinned SHA, upstream SHA and commit
+   count from `summary.md` every time. This is the line that went stale before: the
+   body advertised pin `a729fd4c` for a week after the real pin had moved to
+   `e233c676`, so anyone reading the issue got a wrong answer about what was left.
+3. **Unfinished work keeps its original wording.** Do not re-triage or re-phrase a
+   `Port` item that is still live just because you are rewriting the body. Carry it
+   across verbatim, ancestry order intact. The port workflow reads these; churn in
+   their wording is noise at best and a reordering bug at worst.
+
+Compute step 1 rather than eyeballing it — the same discipline as the coverage check:
+
+```bash
+# Every SHA the backlog currently claims is outstanding
+grep -oE '`[0-9a-f]{7,40}`' body.md | tr -d '`' | while read sha; do
+  grep -qiF "${sha:0:7}" /tmp/gh-aw/agent/upstream/commits.txt || echo "RETIRED $sha"
+done
+```
+
+Note that ticking a checkbox is bookkeeping for humans, not a signal to the port
+workflow: it selects work by whether a SHA is still in `commits.txt`, not by checkbox
+state, and is explicitly told to skip an item that is behind the watermark whether or
+not the box got ticked. That independence is deliberate — do not introduce logic that
+depends on the boxes being correct.
+
 ## Every commit gets a bucket
 
 The port workflow advances the submodule pin, and once the pin moves past a commit
@@ -200,8 +257,12 @@ the first time the pin moved past them.
   `src/link/audio_endpoint.rs`, `src/encoding.rs`, or
   `src/link_audio/{messages,payload,encoding,codec}.rs` as `risk: wire-format`. Those
   change bytes on the network and need a human before they ship.
-- If the backlog issue already has more than 25 open **Port** items, stop adding to it.
-  Comment saying the backlog is saturated and that porting needs to catch up first.
+- If the backlog issue has more than 25 **outstanding** `Port` items, stop adding to
+  it. Comment saying the backlog is saturated and that porting needs to catch up
+  first. Count only items still live by the rule above — unchecked *and* still present
+  in `commits.txt`. Do not count retired ones: five of the twenty items in the backlog
+  were already behind the watermark when this check was last relevant, so counting raw
+  checklist lines overstates the queue and can freeze triage over finished work.
 
 ## Watch the watermark itself
 
@@ -215,5 +276,10 @@ ported them, and it is silent — the drift report will simply never mention the
 Recovering that range depends on somebody noticing here.
 
 Separately, if `commits.txt` contains a security fix or a crash fix (upstream subjects
-like "Fix a rare crash during initialization"), file that as its own issue with a
-`Port` classification rather than burying it in the backlog checklist.
+like "Fix a rare crash during initialization"), it still goes in the backlog checklist
+like everything else — put it **first** and mark it `risk: behavior` with a leading
+`**URGENT:**`, and call it out at the top of your comment so it is visible without
+opening the backlog. Do not file it as its own issue. This paragraph used to say the
+opposite, directly contradicting "Never open a second issue" above, and that
+contradiction is what produced #71 (`5bf14d9`) on run 31417683862 and stalled the port
+workflow on run 31667043733.
