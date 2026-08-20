@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use triple_buffer::{Input, Output, TripleBuffer};
 
 use super::{
+    sessions::SessionId,
     state::{ClientStartStopState, ClientState},
     timeline::Timeline,
 };
@@ -13,6 +14,10 @@ use crate::link::IncomingClientState;
 #[derive(Clone, Debug, Default)]
 pub struct RtClientState {
     pub timeline: Timeline,
+    /// The session `timeline` was captured from; mirrored from
+    /// [`ClientState::timeline_session_id`] so grace-period handling can
+    /// detect a session change even when the timeline value is unchanged.
+    pub timeline_session_id: SessionId,
     pub start_stop_state: ClientStartStopState,
     pub timeline_timestamp: Duration,
     pub start_stop_state_timestamp: Duration,
@@ -22,6 +27,7 @@ impl From<ClientState> for RtClientState {
     fn from(client_state: ClientState) -> Self {
         Self {
             timeline: client_state.timeline,
+            timeline_session_id: client_state.timeline_session_id,
             start_stop_state: client_state.start_stop_state,
             timeline_timestamp: Duration::zero(),
             start_stop_state_timestamp: Duration::zero(),
@@ -33,6 +39,7 @@ impl From<RtClientState> for ClientState {
     fn from(rt_state: RtClientState) -> Self {
         Self {
             timeline: rt_state.timeline,
+            timeline_session_id: rt_state.timeline_session_id,
             start_stop_state: rt_state.start_stop_state,
         }
     }
@@ -109,13 +116,16 @@ impl SafeRtSessionStateHandler {
 
                     // Try to update the cached state (non-blocking)
                     if let Ok(mut cached_state) = self.cached_rt_state.try_write() {
-                        if timeline_grace_expired && new_state.timeline != cached_state.timeline {
+                        // Update unconditionally once the grace period has
+                        // expired: comparing only the timeline value would
+                        // miss a session change whose timeline happens to be
+                        // numerically identical to the previous session's.
+                        if timeline_grace_expired {
                             cached_state.timeline = new_state.timeline;
+                            cached_state.timeline_session_id = new_state.timeline_session_id;
                         }
 
-                        if start_stop_grace_expired
-                            && new_state.start_stop_state != cached_state.start_stop_state
-                        {
+                        if start_stop_grace_expired {
                             cached_state.start_stop_state = new_state.start_stop_state;
                         }
                     }
@@ -243,6 +253,7 @@ mod tests {
                 beat_origin: Beats::new(0.0),
                 time_origin: Duration::zero(),
             },
+            timeline_session_id: SessionId::default(),
             start_stop_state: ClientStartStopState {
                 is_playing: false,
                 time: Duration::zero(),

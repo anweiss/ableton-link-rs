@@ -47,6 +47,7 @@ use self::{
     clock::Clock,
     controller::Controller,
     phase::{force_beat_at_time_impl, from_phase_encoded_beats, phase, to_phase_encoded_beats},
+    sessions::SessionId,
     state::{ClientStartStopState, ClientState},
     tempo::Tempo,
     timeline::{clamp_tempo, Timeline},
@@ -93,6 +94,7 @@ impl BasicLink {
                         beat_origin: Beats::new(0.0),
                         time_origin: Duration::zero(),
                     },
+                    timeline_session_id: SessionId::default(),
                     start_stop_state: ClientStartStopState {
                         is_playing: false,
                         time: Duration::zero(),
@@ -283,6 +285,7 @@ pub fn to_session_state(state: &ClientState, _is_connected: bool) -> SessionStat
     SessionState::new(
         ApiState {
             timeline: state.timeline,
+            timeline_session_id: state.timeline_session_id,
             start_stop_state: ApiStartStopState {
                 is_playing: state.start_stop_state.is_playing,
                 time: state.start_stop_state.time,
@@ -333,6 +336,11 @@ pub fn to_incoming_client_state(
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ApiState {
     timeline: Timeline,
+    // Mirrors upstream's `ApiState::timelineSessionId` (SessionState.hpp). Not yet
+    // consumed by a public getter in this port; kept for parity with upstream's
+    // struct layout and to preserve provenance of the pinned session/timeline.
+    #[allow(dead_code)]
+    timeline_session_id: SessionId,
     start_stop_state: ApiStartStopState,
 }
 
