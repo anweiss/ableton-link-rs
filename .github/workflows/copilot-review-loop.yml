@@ -376,7 +376,13 @@ jobs:
               await setLabel(pr, false);
             }
 
-            async function process(number) {
+            // NOTE: this is `reconcile`, not `process`. A local function named
+            // `process` hoists over Node's global `process` inside
+            // github-script's eval scope, so `process.env.PIPELINE_PAT` above
+            // reads a property of `undefined` and the whole run dies before it
+            // touches a single pull request. Confirmed the hard way in run
+            // 32383137359.
+            async function reconcile(number) {
               const { data: pr } = await github.rest.pulls.get({
                 owner, repo, pull_number: number,
               });
@@ -613,7 +619,7 @@ jobs:
             let failed = [];
             for (const number of numbers) {
               try {
-                await process(number);
+                await reconcile(number);
               } catch (err) {
                 failed.push(number);
                 core.error(`PR #${number}: ${err.message}`);
