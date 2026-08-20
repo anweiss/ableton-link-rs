@@ -109,6 +109,16 @@ jobs:
           script: |
             const { owner, repo } = context.repo;
 
+            // Two different names for the same reviewer, and they are NOT
+            // interchangeable. Requesting the review must use `Copilot`:
+            // passing the bot login to the requested_reviewers endpoint returns
+            // HTTP 200 and silently does nothing, so the review is never
+            // requested and the loop sits here until the stall timer fires.
+            // Verified against PR #84 - `copilot-pull-request-reviewer[bot]`
+            // gave 200 with no `review_requested` event, `Copilot` gave 201 and
+            // the event appeared. Reviews and review comments, however, come
+            // back authored by the bot login, so matching must use that.
+            const REVIEW_REQUEST_LOGIN = 'Copilot';
             const REVIEWER = 'copilot-pull-request-reviewer[bot]';
             const DONE_LABEL = 'copilot-reviewed';
             // One round is: comments dispatched to the agent, agent pushes, and
@@ -307,7 +317,9 @@ jobs:
               const { data } = await github.rest.pulls.listRequestedReviewers({
                 owner, repo, pull_number: number,
               });
-              return (data.users || []).some(u => u.login === REVIEWER || u.login === 'Copilot');
+              return (data.users || []).some(
+                u => u.login === REVIEWER || u.login === REVIEW_REQUEST_LOGIN,
+              );
             }
 
             // Comments belonging to the reviews for the current head. Tying
@@ -429,7 +441,8 @@ jobs:
               if (reviews.length === 0) {
                 if (!await reviewerPending(number)) {
                   await github.rest.pulls.requestReviewers({
-                    owner, repo, pull_number: number, reviewers: [REVIEWER],
+                    owner, repo, pull_number: number,
+                    reviewers: [REVIEW_REQUEST_LOGIN],
                   });
                   await writeState(number, handle, {
                     phase: `awaiting-review:${head}`,
