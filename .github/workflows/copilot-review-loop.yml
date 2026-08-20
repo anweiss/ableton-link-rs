@@ -161,7 +161,32 @@ jobs:
             }
 
             const labelsOf = pr => pr.labels.map(l => l.name);
-            const isWireFormat = pr => /risk:\s*wire-format/i.test(pr.body || '');
+            // The body tag is written by an agent, so it is a fail-closed hint
+            // rather than the source of truth. The authoritative signal is the
+            // file list: link-upstream-port.md names these paths as the ones
+            // that "move bytes on a live network shared with Ableton Live,
+            // Bitwig, and hardware". Checking files as well as the body matters
+            // because the coding agent can pull a wire-format file into a PR
+            // that started out as an ordinary port, and the body would never
+            // say so.
+            const WIRE_FORMAT_PATHS = [
+              'src/discovery/messages.rs',
+              'src/link/payload.rs',
+              'src/link/audio_endpoint.rs',
+              'src/encoding.rs',
+              'src/link_audio/messages.rs',
+              'src/link_audio/payload.rs',
+              'src/link_audio/encoding.rs',
+              'src/link_audio/codec.rs',
+            ];
+
+            async function isWireFormat(pr) {
+              if (/risk:\s*wire-format/i.test(pr.body || '')) return true;
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: pr.number, per_page: 100,
+              });
+              return files.some(f => WIRE_FORMAT_PATHS.includes(f.filename));
+            }
 
             // ---- Durable per-PR state -------------------------------------
             // One status comment per pull request, rewritten in place. A single
@@ -476,7 +501,7 @@ jobs:
               const outstanding = await commentsForReviews(number, reviews.map(r => r.id));
 
               if (outstanding.length === 0) {
-                if (isWireFormat(pr)) {
+                if (await isWireFormat(pr)) {
                   // The tag can be added to the body after a sign-off, so this
                   // revokes rather than merely declining to grant.
                   await revoke(pr);
@@ -517,7 +542,7 @@ jobs:
                 return;
               }
 
-              if (isWireFormat(pr)) {
+              if (await isWireFormat(pr)) {
                 await revoke(pr);
                 await writeState(number, handle, {
                   phase: 'human-hold',
@@ -583,10 +608,33 @@ jobs:
               // only; the agent reads the comments itself.
               const digest = outstanding.map(c => `- ${c.html_url}`).join('\n');
 
+              // The POST can succeed while the `writeState` after it fails, or
+              // its response can be lost. Recording the dispatch only in state
+              // would then let the next sweep post a second `@copilot`
+              // instruction for the same head - a second paid agent session for
+              // one round. So the marker lives in the dispatch comment itself
+              // and is reconciled from the comment list before posting.
+              const dispatchMarker = `<!-- copilot-review-loop:dispatch ${head} -->`;
+              const priorComments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: number, per_page: 100,
+              });
+              if (priorComments.some(c => (c.body || '').includes(dispatchMarker))) {
+                core.info(`PR #${number}: already dispatched for ${head}; recording it.`);
+                await writeState(number, handle, {
+                  phase: `awaiting-agent:${head}`,
+                  dispatchedSha: head,
+                  rounds: Math.max(handle.value.rounds, 1),
+                  note: `Handed ${outstanding.length} review comment(s) on \`${short}\` ` +
+                        'to the Copilot coding agent.',
+                });
+                return;
+              }
+
               await userRequest(
                 'POST', `/repos/${owner}/${repo}/issues/${number}/comments`,
                 {
                   body:
+                    `${dispatchMarker}\n` +
                     `@copilot please address the ${outstanding.length} Copilot code ` +
                     `review comment(s) on commit \`${short}\` of this pull request, ` +
                     'listed below, and push the fixes to this branch.\n\n' +

@@ -502,6 +502,15 @@ comments on the PR saying so, and leaves it for you. The review loop still asks
 Copilot to review it — a second opinion on a protocol change is worth having — but
 never hands it to the coding agent and never signs it off.
 
+Detection does not trust the body tag alone. That tag is prose written by an agent, so
+it is treated as a fail-closed hint; the authoritative signal is the PR's file list
+checked against the wire-format paths named in `link-upstream-port.md`
+(`src/discovery/messages.rs`, `src/link/payload.rs`, `src/link/audio_endpoint.rs`,
+`src/encoding.rs`, `src/link_audio/{messages,payload,encoding,codec}.rs`). A PR that
+started as an ordinary port and *acquired* one of those files in a later commit is
+caught, and both workflows revoke an existing sign-off rather than merely declining to
+grant one.
+
 This grants no exemption from review otherwise. Auto-merge is GitHub's own queue: the
 PR merges only after every required status check on `main` passes, and not before. If
 CI fails, or the runs are still parked in `action_required`, the PR simply stays open

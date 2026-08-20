@@ -92,7 +92,7 @@ jobs:
               return pr;
             }
 
-            function disqualify(pr) {
+            function disqualify(pr, wire) {
               const labels = labelsOf(pr);
               if (pr.state !== 'open') return `state is ${pr.state}`;
               if (pr.base.ref !== 'main') return `base is ${pr.base.ref}`;
@@ -112,7 +112,7 @@ jobs:
                 return `labels are [${labels.join(', ')}]`;
               }
               if (labels.includes('autorelease: pending')) return 'it is a release PR';
-              if (/risk:\s*wire-format/i.test(pr.body || '')) {
+              if (wire) {
                 return 'it is tagged risk: wire-format and needs a human reviewer';
               }
               // Nothing in branch protection makes a port PR wait for review:
@@ -184,14 +184,58 @@ jobs:
               core.notice(`PR #${pr.number}: auto-merge disarmed.`);
             }
 
+            // The body tag is agent-written prose, so it is a fail-closed hint,
+            // not the source of truth. The authoritative signal is the file
+            // list: link-upstream-port.md names these as the paths that "move
+            // bytes on a live network shared with Ableton Live, Bitwig, and
+            // hardware". A PR that started as an ordinary port can acquire one
+            // of them from a later commit without the body ever saying so.
+            const WIRE_FORMAT_PATHS = [
+              'src/discovery/messages.rs',
+              'src/link/payload.rs',
+              'src/link/audio_endpoint.rs',
+              'src/encoding.rs',
+              'src/link_audio/messages.rs',
+              'src/link_audio/payload.rs',
+              'src/link_audio/encoding.rs',
+              'src/link_audio/codec.rs',
+            ];
+
+            async function isWireFormat(pr) {
+              if (/risk:\s*wire-format/i.test(pr.body || '')) return true;
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: pr.number, per_page: 100,
+              });
+              return files.some(f => WIRE_FORMAT_PATHS.includes(f.filename));
+            }
+
+            async function revoke(pr) {
+              await disableAutoMerge(pr);
+              try {
+                await github.rest.issues.removeLabel({
+                  owner, repo, issue_number: pr.number, name: 'copilot-reviewed',
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
+
             async function process(number) {
               const pr = await fetchQualifying(number);
-              const reason = disqualify(pr);
+              const wire = await isWireFormat(pr);
+              const reason = disqualify(pr, wire);
               if (reason) {
                 core.info(`PR #${number} does not qualify: ${reason}. Doing nothing.`);
                 // Wire-format ports are the one rejection a human must know
                 // about, because the PR will otherwise sit waiting on nobody.
                 if (reason.startsWith('it is tagged risk: wire-format')) {
+                  // Revoke, do not merely decline. The tag can be added, or a
+                  // wire-format file pulled in, after a sign-off - and an
+                  // auto-merge request already enabled stays armed regardless.
+                  // Doing this here as well as in the review loop means this
+                  // workflow fails closed on its own, without depending on the
+                  // other one having run.
+                  await revoke(pr);
                   const marker = '<!-- auto-merge-upstream-port: wire-format-hold -->';
                   const comments = await github.paginate(github.rest.issues.listComments, {
                     owner, repo, issue_number: number, per_page: 100,
@@ -248,19 +292,31 @@ jobs:
               }
 
               // Idempotency: ask before telling, so a re-run is a no-op rather
-              // than an error swallowed by a catch block.
+              // than an error swallowed by a catch block. This also re-reads the
+              // head: several API calls have happened since the sign-off SHA was
+              // checked, and everything below acts on `main` - the direct merge
+              // in particular is immediate.
               const { repository } = await github.graphql(
                 `query($owner: String!, $repo: String!, $number: Int!) {
                    repository(owner: $owner, name: $repo) {
                      pullRequest(number: $number) {
                        autoMergeRequest { enabledAt }
                        mergeable
+                       headRefOid
                      }
                    }
                  }`,
                 { owner, repo, number }
               );
               const state = repository.pullRequest;
+
+              if (state.headRefOid !== reviewed) {
+                core.info(
+                  `PR #${number} head moved to ${state.headRefOid} during this run, ` +
+                  `past the signed-off ${reviewed}. Doing nothing.`
+                );
+                return;
+              }
 
               if (state.autoMergeRequest) {
                 core.info(
@@ -296,6 +352,10 @@ jobs:
                     );
                     await github.rest.pulls.merge({
                       owner, repo, pull_number: number, merge_method: 'squash',
+                      // Refuse rather than merge if the head moved since it was
+                      // signed off. This merge is immediate, so it is the one
+                      // call with no later gate to catch a concurrent push.
+                      sha: reviewed,
                     });
                     core.notice(`PR #${number} squash-merged.`);
                     return;
