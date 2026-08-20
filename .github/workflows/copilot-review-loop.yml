@@ -351,14 +351,22 @@ jobs:
             // this to review IDs rather than to a timestamp window is what
             // stops "the agent pushed" from counting as "the comments were
             // addressed".
+            // Filtered by review ID alone, deliberately NOT by comment author.
+            // The identities differ per endpoint: the review is authored by
+            // `copilot-pull-request-reviewer[bot]` while its comments come back
+            // authored by `Copilot`. Filtering comments on the bot login
+            // matched nothing, so a PR with outstanding comments looked clean
+            // and was signed off - that is how PR #83 merged with two
+            // unaddressed comments. The review ID is the stronger check anyway:
+            // those IDs come from reviews already verified to be the reviewer's
+            // and at the current head, so provenance is established without
+            // depending on which display name an endpoint happens to use.
             async function commentsForReviews(number, reviewIds) {
               const all = await github.paginate(github.rest.pulls.listReviewComments, {
                 owner, repo, pull_number: number, per_page: 100,
               });
               const ids = new Set(reviewIds);
-              return all.filter(
-                c => c.user && c.user.login === REVIEWER && ids.has(c.pull_request_review_id),
-              );
+              return all.filter(c => ids.has(c.pull_request_review_id));
             }
 
             async function disableAutoMerge(pr) {
