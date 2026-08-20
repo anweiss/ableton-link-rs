@@ -402,6 +402,7 @@ that list is the highest-value part of reviewing one of these PRs.
 | `link-upstream-watch.md` | Weekly, Monday | Triages upstream commits landed since the pin and maintains the `Porting backlog: upstream Ableton Link` issue |
 | `link-upstream-port.md` | Weekly, Thursday | Takes the next backlog item, ports it, runs the full CI suite, and opens a draft PR |
 | `auto-merge-upstream-port.yml` | On every port PR event | Marks a qualifying port PR ready for review and enables auto-merge, so it lands once branch protection is satisfied |
+| `copilot-review-loop.yml` | On port PR events, plus a 30-minute sweep | Approves held CI runs, requests Copilot code review, batches its comments to the Copilot cloud agent, and marks the PR `copilot-reviewed` when the loop finishes |
 
 Both compute their input with `.github/scripts/link-upstream-drift.sh`, which is
 plain shell and runnable locally:
@@ -430,24 +431,76 @@ whether a SHA is still present in `commits.txt`, never by checkbox state, so a m
 tick cannot cause the same commit to be ported twice or skipped.
 
 **Reviewing a port PR.** These are opened by `github-actions[bot]`, so their CI runs
-can land in the `action_required` state waiting on a maintainer to approve them. If a
-port PR shows only the CodeQL checks, approve the runs from the PR's Checks tab (or
-`gh api -X POST repos/anweiss/ableton-link-rs/actions/runs/<id>/approve`) to get the
-full suite. Nothing is wrong with the PR when this happens.
+land in the `action_required` state waiting on a maintainer to approve them.
+[`copilot-review-loop.yml`](.github/workflows/copilot-review-loop.yml) clears that for
+you when the `PIPELINE_PAT` secret is set (see below); without it, approve the runs
+from the PR's Checks tab or with
+`gh api -X POST repos/anweiss/ableton-link-rs/actions/runs/<id>/approve`. Nothing is
+wrong with the PR when this happens.
+
+**The Copilot review loop.** Before a port PR is allowed to merge it goes through
+`copilot-review-loop.yml`, which on each qualifying PR:
+
+1. approves any workflow runs held in `action_required`, so the required checks
+   actually report;
+2. requests a review from Copilot code review of the **current head commit**;
+3. when Copilot has reviewed that exact commit, hands every comment from that review
+   to the Copilot cloud agent as a single `@copilot` instruction, so it fixes them in
+   one pass;
+4. when the agent pushes, the head moves, so step 2 runs again against the new commit
+   — the agent's own work gets reviewed rather than assumed correct;
+5. applies the `copilot-reviewed` label once Copilot has reviewed the current head and
+   left nothing outstanding, after at most two agent passes.
+
+**Everything is bound to a commit SHA, not to a timestamp.** A review counts only if
+its `commit_id` is the current head, and comments count only if they belong to such a
+review. That matters in both directions. A push does not imply the comments were
+addressed, so the loop cannot sign off on work nobody reviewed. And a *maintainer's*
+push is handled identically to the agent's — fixing the comments by hand is a
+first-class path, not a stall — which is what makes the loop usable before the
+`PIPELINE_PAT` secret below exists.
+
+Sign-off is likewise granted to a SHA. If new commits land after the label was
+applied, the workflow removes it **and cancels the queued auto-merge**, because GitHub
+keeps auto-merge armed regardless of what happens to labels afterwards. Without that,
+anything pushed after sign-off could merge unreviewed.
+
+**Why the `copilot-reviewed` label exists.** Nothing in branch protection makes a port
+PR wait for review. Copilot code review always leaves a *comment* review, never an
+approval or a change request, and comment reviews do not block merging; `main` also
+requires zero approving reviews. So auto-merge would otherwise fire the moment the
+required checks went green — typically before Copilot had read the diff, leaving the
+review to land on an already-merged PR. The label is an additional gate layered on top
+of the required checks, not a replacement for any of them.
+
+It is also withheld on every failure. The workflow keeps one status comment per PR,
+rewritten in place, naming the phase it is in. If the `PIPELINE_PAT` secret is
+missing, if Copilot never reviews, if the agent never pushes, or if Copilot still has
+comments after two agent passes, that comment says so and the label stays off, so the
+PR parks visibly instead of merging unreviewed. Stalls are called out after six hours.
 
 **Auto-merge.** Port PRs are merged for you.
 [`auto-merge-upstream-port.yml`](.github/workflows/auto-merge-upstream-port.yml)
 watches for a pull request that targets `main`, comes from a `port/` branch in this
-repository, was opened by `github-actions[bot]`, and carries **both** the
-`upstream-sync` and `automation` labels — which is exactly the shape
-`link-upstream-port.md` produces and nothing else. release-please PRs
-(`autorelease: pending`) and Dependabot PRs do not match. For a PR that matches, it
-marks the draft ready for review and turns on squash auto-merge.
+repository, was opened by `github-actions[bot]`, and carries the `upstream-sync`,
+`automation` and `copilot-reviewed` labels — which is exactly the shape
+`link-upstream-port.md` produces once the review loop has signed off, and nothing
+else. release-please PRs (`autorelease: pending`) and Dependabot PRs do not match. For
+a PR that matches, it marks the draft ready for review and turns on squash auto-merge.
+
+It also cross-checks the SHA. The label says a sign-off happened, not *which* commit
+was signed off, so before queuing anything auto-merge reads the review loop's status
+comment and requires the recorded `reviewedSha` to equal the current head. Both
+workflows fire on the same `synchronize`, and without that check auto-merge could
+qualify a new head against a label the review loop was in the middle of revoking. It
+fails closed: unreadable state means no auto-merge.
 
 **A port tagged `risk: wire-format` is never auto-merged.** Those change bytes on
 the network, and `main` requires zero approving reviews, so auto-merging one would
 put a protocol change on `main` with nobody having read it. The workflow refuses,
-comments on the PR saying so, and leaves it for you.
+comments on the PR saying so, and leaves it for you. The review loop still asks
+Copilot to review it — a second opinion on a protocol change is worth having — but
+never hands it to the coding agent and never signs it off.
 
 This grants no exemption from review otherwise. Auto-merge is GitHub's own queue: the
 PR merges only after every required status check on `main` passes, and not before. If
@@ -474,6 +527,33 @@ gh aw compile
 ```
 
 Both the `.md` source and the generated `.lock.yml` are committed.
+
+`copilot-review-loop.yml` additionally wants a `PIPELINE_PAT` repository secret, a
+classic or fine-grained PAT owned by a maintainer with `repo` / *Actions: write*,
+*Pull requests: write* and *Contents: read* on this repository. Two of its steps
+cannot use `GITHUB_TOKEN` at all:
+
+- **Approving held runs.** `GITHUB_TOKEN` cannot clear the `action_required` state on
+  runs belonging to a PR it created.
+- **Dispatching the cloud agent.** The agent tasks API accepts only user-to-server
+  tokens; `GITHUB_TOKEN` is a GitHub App installation token, which it rejects. Posting
+  the `@copilot` comment as a real user also guarantees the commenter has the write
+  access the trigger requires.
+
+The PAT is used *only* for those two calls. Port PRs are still created by gh-aw with
+`GITHUB_TOKEN`, so they stay authored by `github-actions[bot]` and keep matching the
+auto-merge author gate. Requesting the Copilot reviewer uses `GITHUB_TOKEN`, so the
+review half of the loop works without the secret: Copilot still reviews, the workflow
+reports on the PR that it cannot approve runs or dispatch the agent, and a maintainer
+fixes the comments by hand. Because progress is tracked by head SHA, that manual push
+is picked up and re-reviewed exactly as an agent push would be.
+
+Copilot code review requires a paid Copilot plan, and the Copilot coding agent's
+tasks API is in public preview. Separately, agent pushes to a PR are themselves gated
+by default: turn that off under **Settings → Copilot → Coding agent → Actions workflow
+approval**. That setting covers the agent's own pushes only — it does not affect the
+runs on gh-aw's `GITHUB_TOKEN`-authored PRs, which is why the approval step above
+still exists.
 
 ### Release PRs and the approval gate
 

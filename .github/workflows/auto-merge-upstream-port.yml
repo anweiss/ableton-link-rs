@@ -115,20 +115,85 @@ jobs:
               if (/risk:\s*wire-format/i.test(pr.body || '')) {
                 return 'it is tagged risk: wire-format and needs a human reviewer';
               }
+              // Nothing in branch protection makes a port PR wait for review:
+              // Copilot only ever leaves a COMMENT review, which does not block
+              // merging, and `main` requires zero approving reviews. Without
+              // this label the PR would merge the instant the 15 checks went
+              // green, usually before Copilot had looked at it. The label is
+              // applied by copilot-review-loop.yml when the review-and-fix loop
+              // finishes, and is withheld when it stalls, so a broken loop
+              // parks the PR instead of merging it unreviewed.
+              //
+              // It is tested AFTER the wire-format check on purpose. A
+              // wire-format PR never earns the label, so testing it first would
+              // shadow the wire-format branch below and the hold comment - the
+              // one rejection a human must be told about - would never be
+              // posted.
+              if (!labels.includes('copilot-reviewed')) {
+                return 'the Copilot review loop has not completed (no copilot-reviewed label)';
+              }
               return null;
+            }
+
+            // The `copilot-reviewed` label says a sign-off happened; it does not
+            // say WHICH commit was signed off. copilot-review-loop.yml records
+            // that in a state comment on the PR. Both workflows fire on the same
+            // `synchronize`, so relying on the label alone allows this race: this
+            // workflow qualifies the new head while the stale label is still
+            // present, the review loop then revokes it, and this workflow
+            // re-enables auto-merge on a head nobody reviewed. Checking the SHA
+            // closes that, and fails closed if the state cannot be read.
+            const STATE_MARKER = '<!-- copilot-review-loop:state -->';
+
+            async function signedOffSha(number) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: number, per_page: 100,
+              });
+              const found = comments.find(
+                c => (c.body || '').includes(STATE_MARKER) &&
+                     c.user && c.user.login === 'github-actions[bot]',
+              );
+              if (!found) return null;
+              const match = /```json\n([\s\S]*?)\n```/.exec(found.body || '');
+              if (!match) return null;
+              try {
+                return JSON.parse(match[1]).reviewedSha || null;
+              } catch (err) {
+                return null;
+              }
+            }
+
+            async function disableAutoMerge(pr) {
+              const { repository } = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!) {
+                   repository(owner: $owner, name: $repo) {
+                     pullRequest(number: $number) { autoMergeRequest { enabledAt } }
+                   }
+                 }`,
+                { owner, repo, number: pr.number }
+              );
+              if (!repository.pullRequest.autoMergeRequest) return;
+              await github.graphql(
+                `mutation($id: ID!) {
+                   disablePullRequestAutoMerge(input: { pullRequestId: $id }) {
+                     pullRequest { number }
+                   }
+                 }`,
+                { id: pr.node_id }
+              );
+              core.notice(`PR #${pr.number}: auto-merge disarmed.`);
             }
 
             async function process(number) {
               const pr = await fetchQualifying(number);
               const reason = disqualify(pr);
-
               if (reason) {
                 core.info(`PR #${number} does not qualify: ${reason}. Doing nothing.`);
                 // Wire-format ports are the one rejection a human must know
                 // about, because the PR will otherwise sit waiting on nobody.
                 if (reason.startsWith('it is tagged risk: wire-format')) {
                   const marker = '<!-- auto-merge-upstream-port: wire-format-hold -->';
-                  const { data: comments } = await github.rest.issues.listComments({
+                  const comments = await github.paginate(github.rest.issues.listComments, {
                     owner, repo, issue_number: number, per_page: 100,
                   });
                   if (!comments.some(c => c.body && c.body.includes(marker))) {
@@ -147,9 +212,32 @@ jobs:
                 return;
               }
 
+              const reviewed = await signedOffSha(number);
+              if (reviewed !== pr.head.sha) {
+                core.info(
+                  `PR #${number} carries the copilot-reviewed label, but the review ` +
+                  `loop signed off ${reviewed || 'nothing'} and the head is ` +
+                  `${pr.head.sha}. Disarming.`
+                );
+                // Declining is not enough. GitHub keeps an auto-merge request
+                // armed once enabled, no matter what happens to the labels or
+                // the head afterwards, so a PR queued against an older head
+                // would still merge unreviewed when its checks finished. Drop
+                // the stale label too - re-adding it later is what produces the
+                // `labeled` event that brings this workflow back.
+                await disableAutoMerge(pr);
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number: number, name: 'copilot-reviewed',
+                  });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+                return;
+              }
+
               if (pr.draft) {
-                core.info(`PR #${number} is a draft; marking it ready for review.`);
-                await github.graphql(
+                core.info(`PR #${number} is a draft; marking it ready for review.`);                await github.graphql(
                   `mutation($id: ID!) {
                      markPullRequestReadyForReview(input: { pullRequestId: $id }) {
                        pullRequest { number }
