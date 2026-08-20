@@ -54,7 +54,7 @@ impl Controller {
         let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
         let session_id = SessionId(node_id);
         let s_state = init_session_state(tempo, clock);
-        let client_state = Arc::new(Mutex::new(init_client_state(s_state)));
+        let client_state = Arc::new(Mutex::new(init_client_state(s_state, session_id)));
 
         let enabled = Arc::new(Mutex::new(false));
         let start_stop_sync_enabled = Arc::new(Mutex::new(false));
@@ -268,6 +268,7 @@ impl Controller {
                                     clock,
                                     s_stop_sync_enabled_loop.clone(),
                                     tempo_cb_loop.clone(),
+                                    *peer_session,
                                 );
 
                                 update_discovery(
@@ -554,6 +555,7 @@ impl Controller {
                 self.clock,
                 self.start_stop_sync_enabled.clone(),
                 self.tempo_callback.clone(),
+                peer_session_id,
             );
 
             must_update_discovery = true;
@@ -708,6 +710,7 @@ pub async fn join_session(
         clock,
         start_stop_sync_enabled.clone(),
         tempo_callback.clone(),
+        session.session_id,
     );
 
     // Verify that client state was actually updated
@@ -827,6 +830,7 @@ pub async fn reset_state(
         clock,
         start_stop_sync_enabled,
         tempo_callback,
+        s_id,
     );
 
     update_discovery(session_state.clone(), peer_state.clone(), discovery.clone()).await;
@@ -898,6 +902,7 @@ pub fn update_session_timing(
     clock: Clock,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
     tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
+    session_id: SessionId,
 ) {
     let new_timeline = clamp_tempo(new_timeline);
 
@@ -917,6 +922,7 @@ pub fn update_session_timing(
                     clock.micros(),
                     new_x_form,
                 );
+                client_state_guard.timeline_session_id = session_id;
 
                 if let Ok(start_stop_enabled) = start_stop_sync_enabled.try_lock() {
                     if *start_stop_enabled
@@ -968,7 +974,7 @@ fn init_session_state(tempo: tempo::Tempo, clock: Clock) -> SessionState {
     }
 }
 
-fn init_client_state(session_state: SessionState) -> ClientState {
+fn init_client_state(session_state: SessionState, session_id: SessionId) -> ClientState {
     let host_time = session_state
         .ghost_x_form
         .ghost_to_host(Duration::microseconds(0));
@@ -979,6 +985,7 @@ fn init_client_state(session_state: SessionState) -> ClientState {
             beat_origin: session_state.timeline.beat_origin,
             time_origin: host_time,
         },
+        timeline_session_id: session_id,
         start_stop_state: ClientStartStopState {
             is_playing: session_state.start_stop_state.is_playing,
             time: host_time,

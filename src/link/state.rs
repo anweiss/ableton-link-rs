@@ -101,6 +101,16 @@ pub struct SessionState {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ClientState {
     pub timeline: Timeline,
+    /// The session that `timeline` was captured from. Used to detect when the
+    /// local peer has joined a new session even if the timeline value itself
+    /// happens to be numerically unchanged, so grace-period handling for
+    /// local modifications isn't fooled by a coincidental timeline match.
+    ///
+    /// `SessionId` lives in the `std`-only `sessions` module, so this field
+    /// is only present when the `std` feature is enabled; `no_std` builds
+    /// never construct session-tracked client state.
+    #[cfg(feature = "std")]
+    pub timeline_session_id: super::sessions::SessionId,
     pub start_stop_state: ClientStartStopState,
 }
 

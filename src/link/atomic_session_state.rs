@@ -8,7 +8,7 @@ use std::sync::Arc;
 use super::{safe_rt_session_state::SafeRtSessionStateHandler, state::ClientState};
 
 #[cfg(test)]
-use super::{state::ClientStartStopState, timeline::Timeline};
+use super::{sessions::SessionId, state::ClientStartStopState, timeline::Timeline};
 use crate::link::IncomingClientState;
 
 /// Atomic session state that provides lock-free access for real-time threads
@@ -119,6 +119,7 @@ mod tests {
                 beat_origin: Beats::new(0.0),
                 time_origin: Duration::zero(),
             },
+            timeline_session_id: SessionId::default(),
             start_stop_state: ClientStartStopState {
                 is_playing: false,
                 time: Duration::zero(),

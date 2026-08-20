@@ -395,6 +395,7 @@ mod tests {
     use super::*;
     use crate::link::{
         node::NodeId,
+        sessions::SessionId,
         state::{ClientStartStopState, ClientState},
         tempo::Tempo,
         timeline::Timeline,
@@ -410,6 +411,7 @@ mod tests {
                     beat_origin: Beats::new(0.0),
                     time_origin: Duration::zero(),
                 },
+                timeline_session_id: SessionId::default(),
                 start_stop_state: ClientStartStopState {
                     is_playing: false,
                     time: Duration::zero(),
