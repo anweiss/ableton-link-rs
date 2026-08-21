@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.0](https://github.com/anweiss/ableton-link-rs/compare/v0.3.0...v0.4.0) (2026-08-21)
+
+
+### Features
+
+* **agentics:** let the watch workflow maintain the backlog issue body ([#79](https://github.com/anweiss/ableton-link-rs/issues/79)) ([c358937](https://github.com/anweiss/ableton-link-rs/commit/c35893797e7bf53d26f18fc4125abd2e15ef98cb))
+* **ci:** gate port PR auto-merge behind a Copilot review loop ([#84](https://github.com/anweiss/ableton-link-rs/issues/84)) ([6f45585](https://github.com/anweiss/ableton-link-rs/commit/6f4558577359df1110342fc382feea9203c327f7))
+
+
+### Bug Fixes
+
+* add SessionId to ClientState for correct grace-period propagation ([#83](https://github.com/anweiss/ableton-link-rs/issues/83)) ([fd6fdd4](https://github.com/anweiss/ableton-link-rs/commit/fd6fdd41f316e1dd06e9ccc5aab07565cfbbbd86))
+* **audio:** decode Ableton Live audio buffers and stabilize playback ([#72](https://github.com/anweiss/ableton-link-rs/issues/72)) ([10f0725](https://github.com/anweiss/ableton-link-rs/commit/10f0725da4d9530b372142ab2304cdd644b7b15a))
+* **ci:** stop release PRs from needing a manual workflow approval every time ([#80](https://github.com/anweiss/ableton-link-rs/issues/80)) ([55a7fbf](https://github.com/anweiss/ableton-link-rs/commit/55a7fbffd36ed65de8d821fa9653cd97cfbc5f5d))
+* scope the stranded-port detector to this workflow's own output ([#75](https://github.com/anweiss/ableton-link-rs/issues/75)) ([53f97b9](https://github.com/anweiss/ableton-link-rs/commit/53f97b911a26fb74334780c43e308cd564925ea1))
+
 ## [0.3.0](https://github.com/anweiss/ableton-link-rs/compare/v0.2.0...v0.3.0) (2026-08-10)
 
 
