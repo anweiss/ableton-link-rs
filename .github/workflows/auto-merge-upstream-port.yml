@@ -393,8 +393,7 @@ jobs:
             // Coarse pre-filter by author only; `disqualify` names every other
             // exclusion out loud rather than dropping PRs silently.
             const candidates = open.filter(
-              pr => pr.user.login === 'github-actions[bot]' &&
-                    pr.base.ref === 'main'
+              pr => pr.user.login === 'github-actions[bot]'
             );
             if (candidates.length === 0) {
               core.info('No open port PRs to reconcile.');
