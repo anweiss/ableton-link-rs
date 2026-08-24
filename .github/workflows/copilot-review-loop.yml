@@ -45,7 +45,7 @@ name: Copilot review loop for port PRs
 #
 # Why a PAT is required, and what happens without one
 # ===================================================
-# Two steps here cannot use GITHUB_TOKEN:
+# Three steps here cannot use GITHUB_TOKEN:
 #
 #   * Approving `action_required` runs. PRs created with GITHUB_TOKEN get their
 #     workflow runs held for approval, and GITHUB_TOKEN cannot clear that.
@@ -55,10 +55,16 @@ name: Copilot review loop for port PRs
 #     installation access token. Posting the `@copilot` comment as a real user
 #     also settles the otherwise undocumented question of whether a bot comment
 #     trips the agent's write-access trigger gate.
+#   * Requesting the Copilot reviewer. The GraphQL `requestReviews` mutation
+#     reports success and attaches nobody under GITHUB_TOKEN - isolated on
+#     PR #89, where the identical mutation attached the bot with a user token
+#     and nothing with the installation token.
 #
-# Requesting the Copilot reviewer is fine with GITHUB_TOKEN (`pull-requests:
-# write`), so the review half works without the secret; a maintainer then fixes
-# the comments by hand, and the SHA-bound logic above picks that up on its own.
+# So without the secret this workflow cannot do any part of its job. The review
+# request does not degrade to a GITHUB_TOKEN path, because that path is the
+# silent no-op above; it raises instead, which fails the run with the reason in
+# the log. A maintainer then requests the review and fixes the comments by hand,
+# and the SHA-bound logic above picks that up on its own.
 #
 # Nothing here fails silently. That is the failure mode that left a release
 # stuck for a week behind a quiet GITHUB_TOKEN fallback in release-please.yml.
