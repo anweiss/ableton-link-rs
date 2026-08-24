@@ -345,7 +345,22 @@ jobs:
                   // now. Swallowing that leaves a green run and an open PR, which
                   // is exactly the stall this workflow exists to prevent - so
                   // merge it instead.
-                  if (/clean status|not in the correct state/i.test(message)) {
+                  //
+                  // `unstable` belongs here too, and cost PR #89 a failed run
+                  // (32763292178) before it was covered. It means "mergeable per
+                  // branch protection, but some **non-required** check is failing
+                  // or pending" - on #89 all 19 required checks were green and the
+                  // only red mark was this repository's own review-loop check,
+                  // which is not in the required set. GitHub's refusal is the same
+                  // statement in both cases: there is nothing left to wait for, so
+                  // there is nothing to queue.
+                  //
+                  // Merging here does not weaken the gate. Branch protection still
+                  // decides what "required" means, `disqualify` has already
+                  // established provenance and the `copilot-reviewed` sign-off,
+                  // and `sha: reviewed` below refuses the merge outright if the
+                  // head moved after that sign-off.
+                  if (/clean status|unstable status|not in the correct state/i.test(message)) {
                     core.info(
                       `PR #${number} cannot be queued (${message}); it is already ` +
                       'mergeable. Merging directly.'
