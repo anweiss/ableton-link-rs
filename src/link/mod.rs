@@ -333,7 +333,7 @@ pub fn to_incoming_client_state(
 }
 
 #[cfg(feature = "std")]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ApiState {
     timeline: Timeline,
     // Mirrors upstream's `ApiState::timelineSessionId` (SessionState.hpp). Not yet
@@ -369,7 +369,7 @@ impl ApiStartStopState {
 }
 
 #[cfg(feature = "std")]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SessionState {
     original_state: ApiState,
     state: ApiState,
@@ -802,5 +802,23 @@ mod tests {
         let tempo_before = state.tempo();
         state.request_beat_at_start_playing_time(0.0, 4.0);
         assert_eq!(state.tempo(), tempo_before);
+    }
+
+    #[tokio::test]
+    async fn test_session_state_equality() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let link = BasicLink::new(120.0).await.unwrap();
+        let state_a = link.capture_app_session_state();
+        let state_b = link.capture_app_session_state();
+
+        // Two captures of the same underlying session state must compare equal.
+        assert_eq!(state_a, state_b);
+
+        let mut state_c = link.capture_app_session_state();
+        state_c.set_tempo(130.0, link.clock().micros());
+
+        // A mutated copy must no longer compare equal to the original.
+        assert_ne!(state_a, state_c);
     }
 }
