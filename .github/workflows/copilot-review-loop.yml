@@ -604,11 +604,25 @@ jobs:
 
             async function dispatchFixWorkflow(number, head) {
               const before = new Date(Date.now() - 30_000).toISOString();
+              // Must match `run-name:` in copilot-review-fix.md exactly. It is
+              // the only positive correlation available: the dispatch API names
+              // no run, and "newest dispatch run of this workflow" would let a
+              // run created for a different pull request stand in for this one.
+              const runName = `Copilot Review Fix - PR #${number} @ ${head}`;
               await userRequest(
                 'POST',
                 `/repos/${owner}/${repo}/actions/workflows/${FIX_WORKFLOW}/dispatches`,
                 { ref: 'main', inputs: {
-                    pull_request_number: String(number), head_sha: head } },
+                    pull_request_number: String(number),
+                    head_sha: head,
+                    // gh-aw's own input, and not optional. The compiled workflow
+                    // gates its "Checkout PR branch" step on
+                    // `aw_context.item_type == 'pull_request'`; without it the
+                    // agent starts from `main`, reads none of the pull request's
+                    // code, and has nothing coherent to push back to the branch.
+                    aw_context: JSON.stringify({
+                      item_type: 'pull_request', item_number: number }),
+                  } },
               );
 
               // A dispatched run does not appear instantly, so this polls rather
@@ -623,14 +637,16 @@ jobs:
                   `/repos/${owner}/${repo}/actions/workflows/${FIX_WORKFLOW}` +
                   `/runs?event=workflow_dispatch&created=%3E${before}&per_page=20`,
                 );
-                // The `created` query parameter is not trusted to have been
-                // honoured. If the API were to ignore it, the newest dispatch
-                // run of this workflow would come back regardless of age and a
-                // stale run would read as proof - the exact false positive this
-                // assertion exists to rule out. So the timestamp is re-checked
-                // here, where it cannot be ignored.
+                // Both conditions are required. The title identifies the
+                // pull request and head, so a run dispatched for a different
+                // pull request in the same sweep cannot stand in for this one.
+                // The timestamp rules out a run left over from an earlier
+                // dispatch for the same head - a retry after a failed round
+                // would otherwise match its own previous run instantly. The
+                // `created` query parameter is deliberately not trusted to have
+                // been honoured, so it is re-checked here in code.
                 const run = (runs.workflow_runs || [])
-                  .find(r => r.created_at >= before);
+                  .find(r => r.display_title === runName && r.created_at >= before);
                 if (run) {
                   core.info(`PR #${number}: Copilot Review Fix run ${run.id} started.`);
                   return run.id;
@@ -810,8 +826,10 @@ jobs:
                   note: `Copilot left ${outstanding.length} comment(s) on \`${short}\`, ` +
                         'but they cannot be handed to Copilot Review Fix because ' +
                         'the `PIPELINE_PAT` secret is not set - the agent tasks API ' +
-                        'accepts only user-to-server tokens, so `GITHUB_TOKEN` cannot ' +
-                        'do it.\n\nAddress them by hand and push; the loop re-reviews ' +
+                        'workflow dispatches API needs a token that can trigger ' +
+                        'workflow runs, and `GITHUB_TOKEN` cannot: a run it starts ' +
+                        'raises no further runs, so the fix push would report no ' +
+                        'checks.\n\nAddress them by hand and push; the loop re-reviews ' +
                         'the new head on its own.',
                 });
                 core.warning(`PR #${number}: cannot dispatch agent without PIPELINE_PAT.`);

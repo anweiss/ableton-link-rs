@@ -410,7 +410,8 @@ that list is the highest-value part of reviewing one of these PRs.
 | `link-upstream-watch.md` | Weekly, Monday | Triages upstream commits landed since the pin and maintains the `Porting backlog: upstream Ableton Link` issue |
 | `link-upstream-port.md` | Weekly, Thursday | Takes the next backlog item, ports it, runs the full CI suite, and opens a draft PR |
 | `auto-merge-upstream-port.yml` | On every port PR event | Marks a qualifying port PR ready for review and enables auto-merge, so it lands once branch protection is satisfied |
-| `copilot-review-loop.yml` | On port PR events, plus a 30-minute sweep | Approves held CI runs, requests Copilot code review, batches its comments to the Copilot cloud agent, and marks the PR `copilot-reviewed` when the loop finishes |
+| `copilot-review-loop.yml` | On port PR events, plus a periodic sweep | Approves held CI runs, requests Copilot code review, batches its comments to `Copilot Review Fix`, and marks the PR `copilot-reviewed` when the loop finishes |
+| `copilot-review-fix.md` | Dispatched by the review loop only | Fixes a batch of Copilot review comments on Opus 5 and pushes to the port PR's branch. Never picks its own PR; the loop owns that decision |
 
 Both compute their input with `.github/scripts/link-upstream-drift.sh`, which is
 plain shell and runnable locally:
@@ -453,8 +454,10 @@ wrong with the PR when this happens.
    actually report;
 2. requests a review from Copilot code review of the **current head commit**;
 3. when Copilot has reviewed that exact commit, hands every comment from that review
-   to the Copilot cloud agent as a single `@copilot` instruction, so it fixes them in
-   one pass;
+   to `Copilot Review Fix` as a single dispatch, so it fixes them in one pass. That
+   workflow is a gh-aw agent pinned to `claude-opus-5` - the fixing model is chosen
+   deliberately rather than left to the cloud agent's default, because most comments
+   here are about whether a decode path is faithful to the upstream C++;
 4. when the agent pushes, the head moves, so step 2 runs again against the new commit
    — the agent's own work gets reviewed rather than assumed correct;
 5. applies the `copilot-reviewed` label once Copilot has reviewed the current head and
@@ -552,16 +555,16 @@ cannot use `GITHUB_TOKEN` at all:
 
 - **Approving held runs.** `GITHUB_TOKEN` cannot clear the `action_required` state on
   runs belonging to a PR it created.
-- **Dispatching the cloud agent.** The agent tasks API accepts only user-to-server
-  tokens; `GITHUB_TOKEN` is a GitHub App installation token, which it rejects. Posting
-  the `@copilot` comment as a real user also guarantees the commenter has the write
-  access the trigger requires.
+- **Dispatching `Copilot Review Fix`.** A workflow run started with `GITHUB_TOKEN`
+  cannot itself trigger further workflow runs. The fix push would therefore raise no
+  checks at all, leaving the PR unmergeable for want of the very checks the loop is
+  waiting on.
 
-The PAT is used *only* for those two calls. Port PRs are still created by gh-aw with
+The PAT is used *only* for those calls. Port PRs are still created by gh-aw with
 `GITHUB_TOKEN`, so they stay authored by `github-actions[bot]` and keep matching the
 auto-merge author gate. Requesting the Copilot reviewer uses `GITHUB_TOKEN`, so the
 review half of the loop works without the secret: Copilot still reviews, the workflow
-reports on the PR that it cannot approve runs or dispatch the agent, and a maintainer
+reports on the PR that it cannot approve runs or dispatch the fixer, and a maintainer
 fixes the comments by hand. Because progress is tracked by head SHA, that manual push
 is picked up and re-reviewed exactly as an agent push would be.
 

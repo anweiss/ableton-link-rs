@@ -4,6 +4,14 @@ description: Applies the batch of outstanding Copilot code review comments on a 
 emoji: "🩹"
 tracker-id: copilot-review-fix
 
+# Carries the pull request and head into the run title. The dispatch API names
+# no run, so the review loop has to find the run it just created by looking -
+# and "the newest dispatch run" is not the same statement as "the run for this
+# pull request". With this, the loop matches on an exact title instead of on
+# recency, so a run dispatched for another pull request cannot be mistaken for
+# this one.
+run-name: "Copilot Review Fix - PR #${{ github.event.inputs.pull_request_number }} @ ${{ github.event.inputs.head_sha }}"
+
 # Dispatch-only, and deliberately so. This workflow must not decide for itself
 # which pull request to touch or when. `Copilot review loop for port PRs` owns
 # that decision: it is the thing that knows which reviews are outstanding, which
@@ -135,9 +143,23 @@ better outcome than a change made only to clear a comment.
 
 ## Before you push
 
-Run `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`.
-All three must pass. `main` requires those checks and a push that fails them just
-sends the pull request round the loop again with nothing gained.
+Run exactly what `main` requires, not an approximation of it. A push that fails a
+required check spends a review round and gains nothing:
+
+```
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --all-targets --all-features
+cargo test --all --all-features -- --nocapture --test-threads=1
+cargo check --lib --no-default-features
+cargo check --all-targets
+```
+
+`--all-features` is not optional: it is what compiles the optional `audio` code, so
+without it a change that breaks that code passes locally and fails on CI.
+`--test-threads=1` is not optional either - many tests bind the Link multicast port
+(20808) and run non-deterministically in parallel. `--no-default-features` is the
+`no_std` check.
 
 Push the fixes to the pull request's branch, then leave one comment summarising - per
 comment - what you changed, what you deliberately did not change, and why. If you
