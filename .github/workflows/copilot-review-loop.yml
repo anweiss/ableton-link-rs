@@ -45,7 +45,7 @@ name: Copilot review loop for port PRs
 #
 # Why a PAT is required, and what happens without one
 # ===================================================
-# Two steps here cannot use GITHUB_TOKEN:
+# Three steps here cannot use GITHUB_TOKEN:
 #
 #   * Approving `action_required` runs. PRs created with GITHUB_TOKEN get their
 #     workflow runs held for approval, and GITHUB_TOKEN cannot clear that.
@@ -55,10 +55,16 @@ name: Copilot review loop for port PRs
 #     installation access token. Posting the `@copilot` comment as a real user
 #     also settles the otherwise undocumented question of whether a bot comment
 #     trips the agent's write-access trigger gate.
+#   * Requesting the Copilot reviewer. The GraphQL `requestReviews` mutation
+#     reports success and attaches nobody under GITHUB_TOKEN - isolated on
+#     PR #89, where the identical mutation attached the bot with a user token
+#     and nothing with the installation token.
 #
-# Requesting the Copilot reviewer is fine with GITHUB_TOKEN (`pull-requests:
-# write`), so the review half works without the secret; a maintainer then fixes
-# the comments by hand, and the SHA-bound logic above picks that up on its own.
+# So without the secret this workflow cannot do any part of its job. The review
+# request does not degrade to a GITHUB_TOKEN path, because that path is the
+# silent no-op above; it raises instead, which fails the run with the reason in
+# the log. A maintainer then requests the review and fixes the comments by hand,
+# and the SHA-bound logic above picks that up on its own.
 #
 # Nothing here fails silently. That is the failure mode that left a release
 # stuck for a week behind a quiet GITHUB_TOKEN fallback in release-please.yml.
@@ -158,6 +164,37 @@ jobs:
               }
               if (res.status === 204) return null;
               return res.json().catch(() => null);
+            }
+
+            // GraphQL as a real user. Same reason as `userRequest`, plus one
+            // specific to reviewer requests: `requestReviews` with `botIds`
+            // returns success under `GITHUB_TOKEN` and attaches nobody.
+            // Isolated on PR #89 - the identical mutation, same pull request,
+            // same minute, no bot with the installation token and
+            // `Bot:copilot-pull-request-reviewer` with a user token. GraphQL
+            // also reports errors in a 200 body, so those are surfaced here.
+            async function userGraphql(query, variables) {
+              const res = await fetch('https://api.github.com/graphql', {
+                method: 'POST',
+                headers: {
+                  authorization: `Bearer ${pat}`,
+                  accept: 'application/vnd.github+json',
+                  'content-type': 'application/json',
+                  'user-agent': 'copilot-review-loop',
+                },
+                body: JSON.stringify({ query, variables }),
+              });
+              const text = await res.text();
+              if (!res.ok) {
+                throw new Error(`GraphQL -> ${res.status} ${text.slice(0, 300)}`);
+              }
+              const payload = JSON.parse(text);
+              if (payload.errors && payload.errors.length > 0) {
+                throw new Error(
+                  `GraphQL -> ${payload.errors.map(e => e.message).join('; ').slice(0, 300)}`,
+                );
+              }
+              return payload.data;
             }
 
             const labelsOf = pr => pr.labels.map(l => l.name);
@@ -370,31 +407,48 @@ jobs:
               );
             }
 
-            // REST cannot request Copilot. `POST .../requested_reviewers` with
-            // `reviewers: ["Copilot"]` returns **201 Created** and silently
-            // adds nobody - verified on PR #86 with a full `repo`-scoped user
-            // token, so it is not a permissions problem and it cannot be
-            // detected from the response. The loop logged "requested Copilot
-            // review" for a request that never existed, then sat in
-            // `awaiting-review` until the stall timer.
+            // Requesting Copilot needs BOTH the right API and the right token,
+            // and each was a separate silent no-op.
             //
-            // Copilot is a Bot, and bots must be requested through the GraphQL
-            // `requestReviews` mutation via `botIds`. `union: true` preserves
-            // reviewers already on the PR (CODEOWNERS puts a human there).
+            // 1. REST. `POST .../requested_reviewers` with
+            //    `reviewers: ["Copilot"]` returns **201 Created** and adds
+            //    nobody, even with a `repo`-scoped user token (PR #86). Copilot
+            //    is a Bot, and bots can only be requested via the GraphQL
+            //    `requestReviews` mutation with `botIds`.
+            // 2. Token. That mutation *also* reports success and attaches
+            //    nobody under `GITHUB_TOKEN`. Isolated on PR #89: identical
+            //    mutation, same pull request, same minute - no bot with the
+            //    installation token, `Bot:copilot-pull-request-reviewer` with a
+            //    user token. Hence `userGraphql`.
             //
-            // The node ID is resolved at run time rather than hardcoded, and
-            // this is also where the confusing three names reconcile: the REST
-            // user endpoint for `copilot-pull-request-reviewer[bot]` reports
-            // `login: "Copilot"` with `node_id: BOT_...`. One identity, three
-            // presentations.
+            // Neither failure is visible in a response, so the result is
+            // asserted below rather than assumed.
+            //
+            // `union: true` preserves reviewers already on the PR (CODEOWNERS
+            // puts a human there). The node ID is resolved at run time rather
+            // than hardcoded, and that call is also where the three confusing
+            // names reconcile: the REST user endpoint for
+            // `copilot-pull-request-reviewer[bot]` reports `login: "Copilot"`
+            // with `node_id: BOT_...`, while GraphQL reports the login without
+            // the `[bot]` suffix. One identity, three presentations.
             async function requestCopilotReview(number) {
+              // Must be the PAT. Under `GITHUB_TOKEN` the mutation below reports
+              // success and attaches nobody, so without a user credential this
+              // step can only fail silently - say so plainly instead.
+              if (!hasPat) {
+                throw new Error(
+                  `cannot request Copilot review of PR #${number}: the ` +
+                  '`PIPELINE_PAT` secret is not set, and `GITHUB_TOKEN` cannot ' +
+                  'attach a bot reviewer',
+                );
+              }
               const { data: bot } = await github.rest.users.getByUsername({
                 username: `${REVIEWER}`,
               });
               const { data: pr } = await github.rest.pulls.get({
                 owner, repo, pull_number: number,
               });
-              const result = await github.graphql(
+              const result = await userGraphql(
                 `mutation($pr: ID!, $bots: [ID!]!) {
                    requestReviews(input: {
                      pullRequestId: $pr, botIds: $bots, union: true
