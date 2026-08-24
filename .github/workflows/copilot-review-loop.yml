@@ -285,9 +285,12 @@ jobs:
                 return 'head branch is not in this repository';
               }
               if (pr.user.login !== 'github-actions[bot]') return `author is ${pr.user.login}`;
-              if (!pr.head.ref.startsWith('port/')) {
-                return `head branch ${pr.head.ref} is not a port/ branch`;
-              }
+              // No branch-name check. The port workflow's branch name is chosen
+              // by the model per run, not fixed by link-upstream-port.md: #69,
+              // #76 and #83 happened to use `port/`, but #86 used
+              // `chore/advance-submodule-...` and was skipped entirely. The
+              // `upstream-sync` + `automation` label pair below is the actual
+              // contract, and it is applied only by the port workflow.
               if (!labels.includes('upstream-sync') || !labels.includes('automation')) {
                 return `labels are [${labels.join(', ')}]`;
               }
@@ -676,10 +679,13 @@ jobs:
             const open = await github.paginate(github.rest.pulls.list, {
               owner, repo, state: 'open', per_page: 100,
             });
+            // Deliberately a coarse pre-filter: author only. Anything finer
+            // here silently drops a pull request before `disqualify` can name
+            // a reason, which is how PR #86 vanished from the sweep with no
+            // log line at all. Let `disqualify` be the single place that
+            // decides, so every exclusion is stated out loud.
             const numbers = open
-              .filter(pr =>
-                pr.user.login === 'github-actions[bot]' &&
-                pr.head.ref.startsWith('port/'))
+              .filter(pr => pr.user.login === 'github-actions[bot]')
               .map(pr => pr.number);
             const triggering = context.payload.pull_request &&
               context.payload.pull_request.number;

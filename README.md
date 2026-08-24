@@ -481,7 +481,7 @@ PR parks visibly instead of merging unreviewed. Stalls are called out after six 
 
 **Auto-merge.** Port PRs are merged for you.
 [`auto-merge-upstream-port.yml`](.github/workflows/auto-merge-upstream-port.yml)
-watches for a pull request that targets `main`, comes from a `port/` branch in this
+watches for a pull request that targets `main`, comes from a branch in this
 repository, was opened by `github-actions[bot]`, and carries the `upstream-sync`,
 `automation` and `copilot-reviewed` labels — which is exactly the shape
 `link-upstream-port.md` produces once the review loop has signed off, and nothing

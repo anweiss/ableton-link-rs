@@ -102,12 +102,12 @@ jobs:
               if (pr.user.login !== 'github-actions[bot]') {
                 return `author is ${pr.user.login}`;
               }
-              // The port workflow branches as `port/<slug>-<sha>`. Author plus
-              // labels alone would also match any other repository automation
-              // that acquires the same labels.
-              if (!pr.head.ref.startsWith('port/')) {
-                return `head branch ${pr.head.ref} is not a port/ branch`;
-              }
+              // No branch-name check. The port workflow's branch name is chosen
+              // by the model per run, not fixed by link-upstream-port.md: #69,
+              // #76 and #83 happened to use `port/`, but #86 used
+              // `chore/advance-submodule-...` and was skipped entirely. The
+              // `upstream-sync` + `automation` label pair below is the actual
+              // contract, and it is applied only by the port workflow.
               if (!labels.includes('upstream-sync') || !labels.includes('automation')) {
                 return `labels are [${labels.join(', ')}]`;
               }
@@ -390,10 +390,10 @@ jobs:
             const { data: open } = await github.rest.pulls.list({
               owner, repo, state: 'open', per_page: 100,
             });
+            // Coarse pre-filter by author only; `disqualify` names every other
+            // exclusion out loud rather than dropping PRs silently.
             const candidates = open.filter(
-              pr => pr.user.login === 'github-actions[bot]' &&
-                    pr.base.ref === 'main' &&
-                    pr.head.ref.startsWith('port/')
+              pr => pr.user.login === 'github-actions[bot]'
             );
             if (candidates.length === 0) {
               core.info('No open port PRs to reconcile.');
