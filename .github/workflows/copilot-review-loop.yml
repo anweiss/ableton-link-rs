@@ -109,16 +109,16 @@ jobs:
           script: |
             const { owner, repo } = context.repo;
 
-            // Two different names for the same reviewer, and they are NOT
-            // interchangeable. Requesting the review must use `Copilot`:
-            // passing the bot login to the requested_reviewers endpoint returns
-            // HTTP 200 and silently does nothing, so the review is never
-            // requested and the loop sits here until the stall timer fires.
-            // Verified against PR #84 - `copilot-pull-request-reviewer[bot]`
-            // gave 200 with no `review_requested` event, `Copilot` gave 201 and
-            // the event appeared. Reviews and review comments, however, come
-            // back authored by the bot login, so matching must use that.
-            const REVIEW_REQUEST_LOGIN = 'Copilot';
+            // One reviewer, three presentations, and none of them can request
+            // the review: Copilot is a Bot, so the request has to go through the
+            // GraphQL `requestReviews` mutation with `botIds` (see
+            // `requestCopilotReview` below). REST `POST .../requested_reviewers`
+            // reports success and attaches nobody whichever login it is given.
+            // The names still matter for *matching* what comes back: reviews are
+            // authored by `copilot-pull-request-reviewer[bot]`, review comments
+            // by `Copilot`, and a requested Bot node in GraphQL reports the bare
+            // `copilot-pull-request-reviewer`.
+            const COPILOT_LOGIN = 'Copilot';
             const REVIEWER = 'copilot-pull-request-reviewer[bot]';
             const DONE_LABEL = 'copilot-reviewed';
             // One round is: comments dispatched to the agent, agent pushes, and
@@ -458,9 +458,9 @@ jobs:
                 // without the `[bot]` suffix REST reports, so match on type and
                 // prefix rather than on an exact string.
                 if (r.__typename === 'Bot') {
-                  return REVIEWER.startsWith(r.login) || r.login === REVIEW_REQUEST_LOGIN;
+                  return REVIEWER.startsWith(r.login) || r.login === COPILOT_LOGIN;
                 }
-                return r.login === REVIEWER || r.login === REVIEW_REQUEST_LOGIN;
+                return r.login === REVIEWER || r.login === COPILOT_LOGIN;
               });
             }
 
