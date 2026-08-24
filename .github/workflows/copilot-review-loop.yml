@@ -825,8 +825,8 @@ jobs:
                   phase: 'needs-pat',
                   note: `Copilot left ${outstanding.length} comment(s) on \`${short}\`, ` +
                         'but they cannot be handed to Copilot Review Fix because ' +
-                        'the `PIPELINE_PAT` secret is not set - the agent tasks API ' +
-                        'workflow dispatches API needs a token that can trigger ' +
+                        'the `PIPELINE_PAT` secret is not set - the workflow ' +
+                        'dispatches API needs a token that can trigger ' +
                         'workflow runs, and `GITHUB_TOKEN` cannot: a run it starts ' +
                         'raises no further runs, so the fix push would report no ' +
                         'checks.\n\nAddress them by hand and push; the loop re-reviews ' +
