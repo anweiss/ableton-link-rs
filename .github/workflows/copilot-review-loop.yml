@@ -82,6 +82,19 @@ on:
   # type - and delivery of `pull_request_review` for an App reviewer is not
   # something the docs promise. The sweep is the guaranteed path; the events
   # above only make the common case fast.
+  # `Link Upstream Port` opens its PR as `github-actions[bot]`, so every
+  # `pull_request` run that PR triggers is held for approval - including the
+  # `opened` run of THIS workflow. The events above therefore make nothing
+  # fast for the case that matters: they are held by the same gate they exist
+  # to clear. `workflow_run` is the way out. It runs on `main` in the base
+  # repo, so it is never held, and it fires as soon as the port workflow
+  # finishes - by which point the PR and its held runs already exist. Without
+  # it a port PR waits up to 30 minutes for the sweep purely because of when
+  # in the cron window it happened to open (PR #92 opened at 18:59, twelve
+  # minutes after the 18:48 sweep, and sat).
+  workflow_run:
+    workflows: ["Link Upstream Port"]
+    types: [completed]
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
