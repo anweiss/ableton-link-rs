@@ -7,7 +7,10 @@ use crate::{
     discovery::peers::PeerState,
     encoding::{self, Decode},
     link::{
-        audio_endpoint::{AudioEndpointV4, AUDIO_ENDPOINT_V4_HEADER_KEY, AUDIO_ENDPOINT_V4_SIZE},
+        audio_endpoint::{
+            AudioEndpointV4, AUDIO_ENDPOINT_V4_HEADER_KEY, AUDIO_ENDPOINT_V4_SIZE,
+            AUDIO_ENDPOINT_V6_HEADER_KEY, AUDIO_ENDPOINT_V6_SIZE,
+        },
         encoding::{PayloadEntryHeader, PAYLOAD_ENTRY_HEADER_SIZE},
         measurement::{
             MeasurementEndpointV4, MEASUREMENT_ENDPOINT_V4_HEADER_KEY, MEASUREMENT_ENDPOINT_V4_SIZE,
@@ -178,6 +181,28 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
 
             payload.entries.push(PayloadEntry::AudioEndpointV4(entry));
             decode(payload, &data[decode_len..])?;
+        }
+        AUDIO_ENDPOINT_V6_HEADER_KEY => {
+            // A peer whose audio endpoint is IPv6 announces it as an `aep6`
+            // entry (PeerState::toPayload, Ableton/link@5226d02, where the
+            // entry for the opposite address family has size zero and is
+            // therefore omitted). This crate only tracks IPv4 audio endpoints
+            // (see `link::audio_endpoint`), so the `aep6` entry is recognized
+            // here and skipped explicitly rather than falling through to the
+            // generic "unknown key" branch below, matching the "peers that
+            // don't understand this entry skip it" behavior described upstream.
+            if payload_entry_header.size != AUDIO_ENDPOINT_V6_SIZE {
+                warn!(
+                    "unexpected aep6 payload entry size {}, expected {}",
+                    payload_entry_header.size, AUDIO_ENDPOINT_V6_SIZE
+                );
+            }
+
+            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + payload_entry_header.size as usize;
+            if decode_len <= data.len() {
+                debug!("skipping unsupported aep6 (IPv6 audio endpoint) payload entry");
+                decode(payload, &data[decode_len..])?;
+            }
         }
         GHOST_TIME_HEADER_KEY => {
             let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + GHOST_TIME_SIZE as usize;
@@ -585,6 +610,87 @@ mod tests {
         decode(&mut decoded_payload, &data).unwrap();
 
         // Should have decoded the HostTime and GhostTime, skipping the unknown entry
+        assert_eq!(decoded_payload.entries.len(), 2);
+        assert!(matches!(
+            &decoded_payload.entries[0],
+            PayloadEntry::HostTime(_)
+        ));
+        assert!(matches!(
+            &decoded_payload.entries[1],
+            PayloadEntry::GhostTime(_)
+        ));
+    }
+
+    #[test]
+    fn aep6_entry_is_skipped_explicitly() {
+        // Upstream (Ableton/link@5226d02, PeerState::toPayload) emits an
+        // `aep6` entry for a peer whose audio endpoint is IPv6 (the entry for
+        // the other address family has size zero and is omitted). This crate
+        // only models IPv4 audio endpoints, so an `aep6` entry from a
+        // peer must be recognized by its key and skipped without treating the
+        // rest of the payload as corrupt. Build a real payload entry header
+        // (key "aep6", size = 16-byte IPv6 address + 2-byte port = 18) followed
+        // by 18 zero bytes, sandwiched between two HostTime entries to prove
+        // decoding resumes correctly afterwards.
+        let ht = HostTime::new(Duration::microseconds(11));
+        let gt = GhostTime::new(Duration::microseconds(22));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&ht.encode().unwrap());
+
+        let aep6_header = PayloadEntryHeader {
+            key: AUDIO_ENDPOINT_V6_HEADER_KEY,
+            size: AUDIO_ENDPOINT_V6_SIZE,
+        };
+        assert_eq!(
+            AUDIO_ENDPOINT_V6_HEADER_KEY, 0x61657036,
+            "unexpected byte order"
+        );
+        assert_eq!(AUDIO_ENDPOINT_V6_SIZE, 18, "unexpected size");
+        data.extend_from_slice(&aep6_header.encode().unwrap());
+        data.extend_from_slice(&[0u8; AUDIO_ENDPOINT_V6_SIZE as usize]);
+
+        data.extend_from_slice(&gt.encode().unwrap());
+
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &data).unwrap();
+
+        assert_eq!(decoded_payload.entries.len(), 2);
+        assert!(matches!(
+            &decoded_payload.entries[0],
+            PayloadEntry::HostTime(_)
+        ));
+        assert!(matches!(
+            &decoded_payload.entries[1],
+            PayloadEntry::GhostTime(_)
+        ));
+    }
+
+    #[test]
+    fn aep6_entry_with_unexpected_size_is_skipped_by_declared_size() {
+        // The wire framing is authoritative: an `aep6` entry whose declared
+        // size differs from the size this crate knows about must still be
+        // skipped by the declared size so decoding resumes on the next entry.
+        let ht = HostTime::new(Duration::microseconds(33));
+        let gt = GhostTime::new(Duration::microseconds(44));
+
+        let unexpected_size = AUDIO_ENDPOINT_V6_SIZE + 4;
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&ht.encode().unwrap());
+
+        let aep6_header = PayloadEntryHeader {
+            key: AUDIO_ENDPOINT_V6_HEADER_KEY,
+            size: unexpected_size,
+        };
+        data.extend_from_slice(&aep6_header.encode().unwrap());
+        data.extend_from_slice(&vec![0u8; unexpected_size as usize]);
+
+        data.extend_from_slice(&gt.encode().unwrap());
+
+        let mut decoded_payload = Payload::default();
+        decode(&mut decoded_payload, &data).unwrap();
+
         assert_eq!(decoded_payload.entries.len(), 2);
         assert!(matches!(
             &decoded_payload.entries[0],
