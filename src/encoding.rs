@@ -5,6 +5,7 @@
 //! `bincode::config::standard().with_big_endian().with_fixed_int_encoding()`.
 
 extern crate alloc;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -28,6 +29,7 @@ impl fmt::Display for EncodeError {
 pub enum DecodeError {
     UnexpectedEnd,
     InvalidBool(u8),
+    InvalidUtf8,
 }
 
 impl fmt::Display for DecodeError {
@@ -35,6 +37,7 @@ impl fmt::Display for DecodeError {
         match self {
             DecodeError::UnexpectedEnd => write!(f, "unexpected end of input"),
             DecodeError::InvalidBool(v) => write!(f, "invalid bool value: {}", v),
+            DecodeError::InvalidUtf8 => write!(f, "invalid utf-8 in string"),
         }
     }
 }
@@ -110,6 +113,24 @@ impl Decode for u16 {
             return Err(DecodeError::UnexpectedEnd);
         }
         Ok((u16::from_be_bytes([bytes[0], bytes[1]]), 2))
+    }
+}
+
+impl Encode for i16 {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_be_bytes());
+    }
+    fn encoded_size(&self) -> usize {
+        2
+    }
+}
+
+impl Decode for i16 {
+    fn decode_from(bytes: &[u8]) -> Result<(Self, usize), DecodeError> {
+        if bytes.len() < 2 {
+            return Err(DecodeError::UnexpectedEnd);
+        }
+        Ok((i16::from_be_bytes([bytes[0], bytes[1]]), 2))
     }
 }
 
@@ -303,6 +324,34 @@ impl Decode for std::net::Ipv4Addr {
     }
 }
 
+// ---------------------------------------------------------------------------
+// String (u32-length-prefixed UTF-8 bytes)
+// ---------------------------------------------------------------------------
+
+impl Encode for String {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        (self.len() as u32).encode_to(out);
+        out.extend_from_slice(self.as_bytes());
+    }
+    fn encoded_size(&self) -> usize {
+        4 + self.len()
+    }
+}
+
+impl Decode for String {
+    fn decode_from(bytes: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let (len, len_size) = u32::decode_from(bytes)?;
+        let len = len as usize;
+        let str_bytes = bytes
+            .get(len_size..len_size + len)
+            .ok_or(DecodeError::UnexpectedEnd)?;
+        let s = core::str::from_utf8(str_bytes)
+            .map_err(|_| DecodeError::InvalidUtf8)?
+            .into();
+        Ok((s, len_size + len))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +372,16 @@ mod tests {
         let enc = encode_to_vec(&v).unwrap();
         assert_eq!(enc, [0x12, 0x34]);
         let (dec, n) = decode_from_slice::<u16>(&enc).unwrap();
+        assert_eq!(dec, v);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn i16_roundtrip() {
+        let v: i16 = -1234;
+        let enc = encode_to_vec(&v).unwrap();
+        assert_eq!(enc, [0xFB, 0x2E]);
+        let (dec, n) = decode_from_slice::<i16>(&enc).unwrap();
         assert_eq!(dec, v);
         assert_eq!(n, 2);
     }
@@ -387,6 +446,17 @@ mod tests {
         let enc = encode_to_vec(&v).unwrap();
         let (dec, _) = decode_from_slice::<(u8, u16, u32)>(&enc).unwrap();
         assert_eq!(dec, v);
+    }
+
+    #[test]
+    fn string_roundtrip() {
+        let v = String::from("Oh, wie schoen ist Panama!");
+        let enc = encode_to_vec(&v).unwrap();
+        assert_eq!(enc.len(), 4 + v.len());
+        assert_eq!(&enc[..4], [0x00, 0x00, 0x00, v.len() as u8]);
+        let (dec, n) = decode_from_slice::<String>(&enc).unwrap();
+        assert_eq!(dec, v);
+        assert_eq!(n, enc.len());
     }
 
     #[test]
