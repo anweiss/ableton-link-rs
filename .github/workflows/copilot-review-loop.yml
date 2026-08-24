@@ -303,12 +303,30 @@ jobs:
             // "no PAT" from "the PAT was rejected" matters: reporting an expired
             // token as a missing secret sends the maintainer to fix the wrong
             // thing.
+            // `/approve` only serves runs GitHub considers approvable through
+            // it: fork PRs, and runs queued by the Actions bot. Anything else
+            // gets a 403 that no credential can satisfy - it is a statement
+            // about the run, not about the token.
+            const UNAPPROVABLE = /not from a fork pull request or queued by the Actions bot/i;
+
             async function unblockRuns(pr) {
               const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
                 owner, repo, head_sha: pr.head.sha, per_page: 100,
               });
               const held = runs.workflow_runs.filter(
-                r => r.status === 'action_required' || r.conclusion === 'action_required',
+                r => (r.status === 'action_required' || r.conclusion === 'action_required') &&
+                     // Never wait on this workflow's own runs. Copilot submitting
+                     // a review fires `pull_request_review`, which queues another
+                     // review-loop run; that run is held, is not a required
+                     // check, and is unapprovable because Copilot is not the
+                     // Actions bot. Left in, the loop parks itself in
+                     // `blocked-runs` on the very event it is waiting for - which
+                     // is what happened to PR #86 while all 20 required checks
+                     // were already green. The scheduled sweep is the authority,
+                     // so these runs are redundant as well as harmful.
+                     // `context.workflow` is this workflow's own `name:`, so the
+                     // match holds without hardcoding it in two places.
+                     r.name !== context.workflow,
               );
               if (held.length === 0) return null;
               if (!hasPat) {
@@ -323,6 +341,17 @@ jobs:
                   );
                   core.info(`Approved held run ${run.id} (${run.name}).`);
                 } catch (err) {
+                  if (UNAPPROVABLE.test(err.message)) {
+                    // Not blocking. Branch protection is the real gate: if this
+                    // run does gate a required check, auto-merge simply waits and
+                    // the pull request fails closed. Blocking the review here
+                    // would only add a second, permanent stall on top of it.
+                    core.notice(
+                      `Run ${run.id} (${run.name}) cannot be approved through the API; ` +
+                      'leaving it to the required checks.',
+                    );
+                    continue;
+                  }
                   core.warning(`Could not approve run ${run.id}: ${err.message}`);
                   return `approving run ${run.id} failed (\`${err.message}\`), which ` +
                          'usually means `PIPELINE_PAT` lacks Actions write access or ' +
