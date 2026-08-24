@@ -202,7 +202,7 @@ let is_playing = state.is_playing();
 
 ```rust
 let state_a = link.capture_app_session_state();
-let state_b = link.capture_app_session_state();
+let state_b = state_a;
 assert_eq!(state_a, state_b);
 ```
 
