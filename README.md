@@ -198,6 +198,14 @@ state.set_is_playing(true, current_time);
 let is_playing = state.is_playing();
 ```
 
+`SessionState` and `ApiState` implement `PartialEq`, so captured states can be compared directly:
+
+```rust
+let state_a = link.capture_app_session_state();
+let state_b = state_a;
+assert_eq!(state_a, state_b);
+```
+
 ### LinkAudio (`feature = "audio"`)
 
 `LinkAudio` derefs to `BasicLink`, so the entire Link API remains available. On top of that it publishes
