@@ -95,8 +95,18 @@ on:
   workflow_run:
     workflows: ["Link Upstream Port"]
     types: [completed]
+  # Every OTHER trigger on this workflow is held for approval on a
+  # `github-actions[bot]` PR - `pull_request` and `pull_request_review`
+  # alike - so the sweep is not a backstop here, it is the primary path for
+  # every hop after the PR opens. Observed on PR #92: Copilot submitted its
+  # review at 19:08 and the resulting `pull_request_review` run
+  # (32766434580) went straight to `action_required`. At `*/30` each of
+  # review-submitted, agent-push and re-review could wait a full window,
+  # stacking into more than an hour of pure scheduling latency on one PR.
+  # `*/5` bounds it. The run is one github-script step over open PRs, and
+  # reconciliation is idempotent, so the extra frequency costs nothing.
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
