@@ -550,7 +550,7 @@ Both the `.md` source and the generated `.lock.yml` are committed.
 
 `copilot-review-loop.yml` additionally wants a `PIPELINE_PAT` repository secret, a
 classic or fine-grained PAT owned by a maintainer with `repo` / *Actions: write*,
-*Pull requests: write* and *Contents: read* on this repository. Two of its steps
+*Pull requests: write* and *Contents: read* on this repository. Three of its steps
 cannot use `GITHUB_TOKEN` at all:
 
 - **Approving held runs.** `GITHUB_TOKEN` cannot clear the `action_required` state on
@@ -559,21 +559,23 @@ cannot use `GITHUB_TOKEN` at all:
   cannot itself trigger further workflow runs. The fix push would therefore raise no
   checks at all, leaving the PR unmergeable for want of the very checks the loop is
   waiting on.
+- **Requesting the Copilot reviewer.** Under `GITHUB_TOKEN` the GraphQL
+  `requestReviews` mutation reports success and attaches nobody.
 
-The PAT is used *only* for those calls. Port PRs are still created by gh-aw with
-`GITHUB_TOKEN`, so they stay authored by `github-actions[bot]` and keep matching the
-auto-merge author gate. Requesting the Copilot reviewer uses `GITHUB_TOKEN`, so the
-review half of the loop works without the secret: Copilot still reviews, the workflow
-reports on the PR that it cannot approve runs or dispatch the fixer, and a maintainer
-fixes the comments by hand. Because progress is tracked by head SHA, that manual push
-is picked up and re-reviewed exactly as an agent push would be.
+Port PRs are still created by gh-aw with `GITHUB_TOKEN`, so they stay authored by
+`github-actions[bot]` and keep matching the auto-merge author gate. Without the secret
+the loop cannot do any part of its job, and says so rather than degrading silently —
+the review request raises instead of taking the `GITHUB_TOKEN` path that quietly
+attaches nobody, and every other stall writes its reason into the PR's status comment.
+A maintainer then requests the review and fixes the comments by hand. Because progress
+is tracked by head SHA, that manual push is picked up and re-reviewed exactly as an
+agent push would be.
 
-Copilot code review requires a paid Copilot plan, and the Copilot coding agent's
-tasks API is in public preview. Separately, agent pushes to a PR are themselves gated
-by default: turn that off under **Settings → Copilot → Coding agent → Actions workflow
-approval**. That setting covers the agent's own pushes only — it does not affect the
-runs on gh-aw's `GITHUB_TOKEN`-authored PRs, which is why the approval step above
-still exists.
+Copilot code review requires a paid Copilot plan. Separately, agent pushes to a PR are
+themselves gated by default: turn that off under **Settings → Copilot → Coding agent →
+Actions workflow approval**. That setting covers the agent's own pushes only — it does
+not affect the runs on gh-aw's `GITHUB_TOKEN`-authored PRs, which is why the approval
+step above still exists.
 
 ### Release PRs and the approval gate
 
