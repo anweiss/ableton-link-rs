@@ -341,13 +341,98 @@ jobs:
               );
             }
 
-            async function reviewerPending(number) {
-              const { data } = await github.rest.pulls.listRequestedReviewers({
+            // REST cannot request Copilot. `POST .../requested_reviewers` with
+            // `reviewers: ["Copilot"]` returns **201 Created** and silently
+            // adds nobody - verified on PR #86 with a full `repo`-scoped user
+            // token, so it is not a permissions problem and it cannot be
+            // detected from the response. The loop logged "requested Copilot
+            // review" for a request that never existed, then sat in
+            // `awaiting-review` until the stall timer.
+            //
+            // Copilot is a Bot, and bots must be requested through the GraphQL
+            // `requestReviews` mutation via `botIds`. `union: true` preserves
+            // reviewers already on the PR (CODEOWNERS puts a human there).
+            //
+            // The node ID is resolved at run time rather than hardcoded, and
+            // this is also where the confusing three names reconcile: the REST
+            // user endpoint for `copilot-pull-request-reviewer[bot]` reports
+            // `login: "Copilot"` with `node_id: BOT_...`. One identity, three
+            // presentations.
+            async function requestCopilotReview(number) {
+              const { data: bot } = await github.rest.users.getByUsername({
+                username: `${REVIEWER}`,
+              });
+              const { data: pr } = await github.rest.pulls.get({
                 owner, repo, pull_number: number,
               });
-              return (data.users || []).some(
-                u => u.login === REVIEWER || u.login === REVIEW_REQUEST_LOGIN,
+              const result = await github.graphql(
+                `mutation($pr: ID!, $bots: [ID!]!) {
+                   requestReviews(input: {
+                     pullRequestId: $pr, botIds: $bots, union: true
+                   }) {
+                     pullRequest {
+                       reviewRequests(first: 20) {
+                         nodes { requestedReviewer { __typename ... on Bot { login } } }
+                       }
+                     }
+                   }
+                 }`,
+                { pr: pr.node_id, bots: [bot.node_id] },
               );
+              // Confirm rather than assume. A silent no-op here is exactly the
+              // failure this function exists to replace, so it must be loud.
+              const landed = (result.requestReviews.pullRequest.reviewRequests.nodes || [])
+                .some(n => n.requestedReviewer &&
+                           n.requestedReviewer.__typename === 'Bot');
+              if (!landed) {
+                throw new Error(
+                  `requested Copilot review of PR #${number} but no bot reviewer is ` +
+                  'attached; the request did not take effect',
+                );
+              }
+            }
+
+
+            // Must be GraphQL. REST `listRequestedReviewers` returns only
+            // `users` and `teams` - a requested **Bot** is invisible to it,
+            // verified on PR #86 while GraphQL simultaneously confirmed the bot
+            // was attached. Asking REST would therefore always answer "no
+            // reviewer pending", and the loop would re-request a Copilot review
+            // on every 30-minute sweep for the entire life of the PR.
+            async function reviewerPending(number) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner, repo, pull_number: number,
+              });
+              const result = await github.graphql(
+                `query($id: ID!) {
+                   node(id: $id) {
+                     ... on PullRequest {
+                       reviewRequests(first: 20) {
+                         nodes {
+                           requestedReviewer {
+                             __typename
+                             ... on Bot { login }
+                             ... on User { login }
+                           }
+                         }
+                       }
+                     }
+                   }
+                 }`,
+                { id: pr.node_id },
+              );
+              const nodes = (result.node && result.node.reviewRequests.nodes) || [];
+              return nodes.some(n => {
+                const r = n.requestedReviewer;
+                if (!r) return false;
+                // A Bot's `login` here is the bare `copilot-pull-request-reviewer`,
+                // without the `[bot]` suffix REST reports, so match on type and
+                // prefix rather than on an exact string.
+                if (r.__typename === 'Bot') {
+                  return REVIEWER.startsWith(r.login) || r.login === REVIEW_REQUEST_LOGIN;
+                }
+                return r.login === REVIEWER || r.login === REVIEW_REQUEST_LOGIN;
+              });
             }
 
             // Comments belonging to the reviews for the current head. Tying
@@ -476,10 +561,7 @@ jobs:
 
               if (reviews.length === 0) {
                 if (!await reviewerPending(number)) {
-                  await github.rest.pulls.requestReviewers({
-                    owner, repo, pull_number: number,
-                    reviewers: [REVIEW_REQUEST_LOGIN],
-                  });
+                  await requestCopilotReview(number);
                   await writeState(number, handle, {
                     phase: `awaiting-review:${head}`,
                     // Explicit, because a re-request can land in the same phase
