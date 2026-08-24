@@ -29,7 +29,6 @@ impl fmt::Display for EncodeError {
 pub enum DecodeError {
     UnexpectedEnd,
     InvalidBool(u8),
-    InvalidUtf8,
 }
 
 impl fmt::Display for DecodeError {
@@ -37,7 +36,6 @@ impl fmt::Display for DecodeError {
         match self {
             DecodeError::UnexpectedEnd => write!(f, "unexpected end of input"),
             DecodeError::InvalidBool(v) => write!(f, "invalid bool value: {}", v),
-            DecodeError::InvalidUtf8 => write!(f, "invalid utf-8 in string"),
         }
     }
 }
@@ -339,16 +337,19 @@ impl Encode for String {
 }
 
 impl Decode for String {
+    /// Invalid UTF-8 is replaced rather than rejected so that a peer with a
+    /// non-UTF-8 name does not invalidate an otherwise well-formed message,
+    /// matching `link_audio::encoding::ByteStreamReader::read_string`.
     fn decode_from(bytes: &[u8]) -> Result<(Self, usize), DecodeError> {
         let (len, len_size) = u32::decode_from(bytes)?;
         let len = len as usize;
-        let str_bytes = bytes
-            .get(len_size..len_size + len)
+        // `len` comes off the wire, so the end offset can overflow `usize` on
+        // 32-bit targets before the slice lookup gets a chance to reject it.
+        let end = len_size
+            .checked_add(len)
             .ok_or(DecodeError::UnexpectedEnd)?;
-        let s = core::str::from_utf8(str_bytes)
-            .map_err(|_| DecodeError::InvalidUtf8)?
-            .into();
-        Ok((s, len_size + len))
+        let str_bytes = bytes.get(len_size..end).ok_or(DecodeError::UnexpectedEnd)?;
+        Ok((String::from_utf8_lossy(str_bytes).into_owned(), end))
     }
 }
 
@@ -457,6 +458,25 @@ mod tests {
         let (dec, n) = decode_from_slice::<String>(&enc).unwrap();
         assert_eq!(dec, v);
         assert_eq!(n, enc.len());
+    }
+
+    #[test]
+    fn string_invalid_utf8_is_lossy() {
+        let enc = [0x00, 0x00, 0x00, 0x02, 0xFF, 0xFE];
+        let (dec, n) = decode_from_slice::<String>(&enc).unwrap();
+        assert_eq!(dec, "\u{FFFD}\u{FFFD}");
+        assert_eq!(n, enc.len());
+    }
+
+    #[test]
+    fn string_max_length_prefix_does_not_overflow() {
+        // A `u32::MAX` length prefix overflows `usize` on 32-bit targets if the
+        // end offset is computed without a checked add.
+        let enc = [0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(matches!(
+            decode_from_slice::<String>(&enc),
+            Err(DecodeError::UnexpectedEnd)
+        ));
     }
 
     #[test]

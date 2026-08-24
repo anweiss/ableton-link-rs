@@ -26,7 +26,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ableton-link-rs = "0.2.0"
+ableton-link-rs = "0.3.0"
 ```
 
 ### `no_std` Usage
@@ -35,10 +35,10 @@ For embedded or `no_std` environments, disable the default `std` feature to acce
 
 ```toml
 [dependencies]
-ableton-link-rs = { version = "0.2.0", default-features = false }
+ableton-link-rs = { version = "0.3.0", default-features = false }
 ```
 
-This gives you access to core types like `Beats`, `Tempo`, `Timeline`, `GhostXForm`, `StartStopState`, and `NodeId` without pulling in networking dependencies. Requires `alloc`.
+This gives you access to core types like `Beats`, `Tempo`, `Timeline`, `GhostXForm`, `StartStopState`, and `NodeId` without pulling in networking dependencies, along with the wire encoding layer in `src/encoding.rs` (`Encode`/`Decode`, `encode_to_vec`, `decode_from_slice`). Requires `alloc`.
 
 ### LinkAudio Usage
 
@@ -46,7 +46,7 @@ Audio sharing is opt-in via the `audio` feature, which implies `std`:
 
 ```toml
 [dependencies]
-ableton-link-rs = { version = "0.2.0", features = ["audio"] }
+ableton-link-rs = { version = "0.3.0", features = ["audio"] }
 ```
 
 ### Basic Usage
@@ -279,6 +279,15 @@ values underrun audibly.
 | `StartStopState` | Play/stop state with beat and timestamp |
 | `NodeId` | 8-byte peer identifier |
 
+### Wire Encoding (available in `no_std`)
+
+`src/encoding.rs` is a hand-rolled, big-endian fixed-int layer exposing the `Encode`/`Decode`
+traits plus `encode_to_vec` / `decode_from_slice`. Implementations are provided for `bool`,
+`u8`, `u16`, `i16`, `u32`, `u64`, `i64`, `f64`, `[u8; N]`, 2- and 3-tuples, and `String`
+(plus `Ipv4Addr` with `std`). Strings are encoded as a `u32` big-endian byte length followed
+by the raw UTF-8 bytes; on decode, invalid UTF-8 is replaced rather than rejected, so a peer
+with a non-UTF-8 name does not invalidate an otherwise well-formed message.
+
 ## Time and Clocks
 
 The Link implementation uses platform-specific high-resolution clocks:
@@ -300,6 +309,7 @@ let current_time = clock.micros(); // chrono::Duration
 
 ```
 ableton-link-rs
+├── encoding.rs              # Wire encoding traits and primitives (no_std)
 ├── link/                    # Core Link types and API
 │   ├── mod.rs               # BasicLink, SessionState, ApiState
 │   ├── beats.rs             # Beat position type (no_std)
