@@ -454,7 +454,7 @@ mod tests {
         let v = String::from("Oh, wie schoen ist Panama!");
         let enc = encode_to_vec(&v).unwrap();
         assert_eq!(enc.len(), 4 + v.len());
-        assert_eq!(&enc[..4], [0x00, 0x00, 0x00, v.len() as u8]);
+        assert_eq!(&enc[..4], (v.len() as u32).to_be_bytes());
         let (dec, n) = decode_from_slice::<String>(&enc).unwrap();
         assert_eq!(dec, v);
         assert_eq!(n, enc.len());
