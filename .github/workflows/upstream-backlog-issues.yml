@@ -1,0 +1,245 @@
+name: Upstream backlog issues
+
+# Reconciles one tracking issue per outstanding backlog item from
+# `.github/upstream-backlog.toml`, so that a port pull request can say
+# `Closes #N` and the item closes itself when the port lands.
+#
+# Deliberately NOT an agentic workflow. Opening and closing issues from a file
+# that has already been reviewed is mechanical; handing it to a model adds a
+# way for it to go wrong and nothing else. The agentic workflows propose
+# changes to the file, a human reviews the diff, and this reconciles GitHub to
+# match.
+#
+# The label is the load-bearing detail
+# ====================================
+# These issues carry `upstream-item`, never `upstream-sync`. `upstream-sync` is
+# the port workflow's blocker signal: it stops if an open issue with that label
+# looks like a stranded port. A per-item issue carrying it deadlocked run
+# 31667043733, where the workflow halted on #71 and posted "this port is still
+# stranded" on an issue that held no work at all — and nothing could ever close
+# it, so every later run would have stopped in the same place while reporting
+# success. Per-item issues therefore live in their own label namespace and are
+# invisible to that check.
+#
+# State lives in one place
+# ========================
+# The file records `id`; the issue records `<!-- upstream-backlog-id: <id> -->`.
+# The issue number is never written back into the file. A number stored in the
+# file would be a second copy of state that nothing keeps in sync — the same
+# defect as the checkboxes this whole change exists to remove.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/upstream-backlog.toml"
+      - ".github/workflows/upstream-backlog-issues.yml"
+  workflow_dispatch:
+  # Backstop. A push-triggered run that failed transiently would otherwise
+  # leave GitHub out of step with the file until the next edit, which could be
+  # weeks.
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-backlog-issues
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate the backlog before acting on it
+        run: python3 .github/scripts/validate-upstream-backlog.py
+
+      - name: Parse the backlog
+        id: parse
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, tomllib
+          d = tomllib.load(open('.github/upstream-backlog.toml', 'rb'))
+          items = [{
+              'id': p['id'],
+              'title': p['title'],
+              'upstream': p['upstream'],
+              'rust': p['rust'],
+              'risk': p['risk'],
+              'status': p['status'],
+              'why': p['why'],
+              'note': p.get('note', ''),
+              'retired_at_pin': p['retired_at_pin'],
+          } for p in d['port']]
+          print('items=' + json.dumps(items))
+          PY
+
+      - name: Reconcile tracking issues
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ITEMS: ${{ steps.parse.outputs.items }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const items = JSON.parse(process.env.ITEMS);
+            const LABEL = 'upstream-item';
+            const marker = id => `<!-- upstream-backlog-id: ${id} -->`;
+
+            for (const name of [LABEL, 'automation']) {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+                await github.rest.issues.createLabel({
+                  owner, repo, name,
+                  color: name === LABEL ? '5319e7' : 'ededed',
+                  description: name === LABEL
+                    ? 'One upstream porting backlog item'
+                    : 'Opened by automation',
+                });
+                core.info(`Created label ${name}.`);
+              }
+            }
+
+            // Every issue this workflow has ever opened, open or closed, so a
+            // retired item can be found and closed and a reopened one is not
+            // duplicated. Matching is on the marker, never on the title: titles
+            // are edited by humans and would silently fork into a second issue.
+            const all = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, labels: LABEL, state: 'all', per_page: 100,
+            });
+            const byId = new Map();
+            for (const issue of all) {
+              const m = (issue.body || '').match(/<!-- upstream-backlog-id: (\S+) -->/);
+              if (!m) continue;
+              if (byId.has(m[1])) {
+                core.warning(`Duplicate tracking issues for \`${m[1]}\`: ` +
+                             `#${byId.get(m[1]).number} and #${issue.number}.`);
+                continue;
+              }
+              byId.set(m[1], issue);
+            }
+
+            const body = it => [
+              `**Upstream:** ${it.upstream.map(s => `\`${s}\``).join(', ')}`,
+              `**Rust:** ${it.rust.map(p => `\`${p}\``).join(', ') || '_unmapped_'}`,
+              `**Risk:** \`${it.risk}\``,
+              '',
+              it.why,
+              ...(it.note ? ['', `_${it.note}_`] : []),
+              '',
+              '---',
+              '',
+              'Tracked in [`.github/upstream-backlog.toml`](' +
+                `https://github.com/${owner}/${repo}/blob/main/.github/upstream-backlog.toml)` +
+                ` as \`${it.id}\`. That file is the backlog; this issue exists so a port ` +
+                'pull request can close it. Edit the file, not this issue — the next ' +
+                'reconcile overwrites this body.',
+              '',
+              marker(it.id),
+            ].join('\n');
+
+            let created = 0, updated = 0, closed = 0, reopened = 0;
+
+            for (const it of items) {
+              const existing = byId.get(it.id);
+              const want = it.status === 'outstanding';
+
+              if (!existing) {
+                if (!want) continue;   // retired before it ever had an issue
+                const { data } = await github.rest.issues.create({
+                  owner, repo,
+                  title: `[upstream-item] ${it.title}`,
+                  body: body(it),
+                  labels: [LABEL, 'automation'],
+                });
+                core.info(`Opened #${data.number} for \`${it.id}\`.`);
+                created++;
+                continue;
+              }
+
+              if (want && existing.state === 'closed') {
+                await github.rest.issues.update({
+                  owner, repo, issue_number: existing.number, state: 'open',
+                });
+                core.info(`Reopened #${existing.number} for \`${it.id}\`.`);
+                reopened++;
+              }
+
+              if (!want && existing.state === 'open') {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `Retired at pin \`${it.retired_at_pin}\` in ` +
+                        '`.github/upstream-backlog.toml`. Closing.',
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: existing.number,
+                  state: 'closed', state_reason: 'completed',
+                });
+                core.info(`Closed #${existing.number} for \`${it.id}\`.`);
+                closed++;
+                continue;
+              }
+
+              const wantTitle = `[upstream-item] ${it.title}`;
+              const wantBody = body(it);
+              if (existing.title !== wantTitle || existing.body !== wantBody) {
+                await github.rest.issues.update({
+                  owner, repo, issue_number: existing.number,
+                  title: wantTitle, body: wantBody,
+                });
+                updated++;
+              }
+            }
+
+            // A 2xx is not evidence. Re-read and assert the end state matches
+            // the file, rather than trusting that the calls above did what they
+            // said. GitHub APIs return success while doing nothing often
+            // enough that this check has already caught it elsewhere in this
+            // repository.
+            const after = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, labels: LABEL, state: 'all', per_page: 100,
+            });
+            const stateById = new Map();
+            for (const issue of after) {
+              const m = (issue.body || '').match(/<!-- upstream-backlog-id: (\S+) -->/);
+              if (m) stateById.set(m[1], issue);
+            }
+
+            const problems = [];
+            for (const it of items) {
+              const issue = stateById.get(it.id);
+              if (it.status === 'outstanding') {
+                if (!issue) problems.push(`\`${it.id}\` is outstanding but has no tracking issue`);
+                else if (issue.state !== 'open')
+                  problems.push(`\`${it.id}\` is outstanding but #${issue.number} is ${issue.state}`);
+              } else if (issue && issue.state === 'open') {
+                problems.push(`\`${it.id}\` is retired but #${issue.number} is still open`);
+              }
+            }
+
+            const ids = new Set(items.map(i => i.id));
+            for (const [id, issue] of stateById) {
+              if (!ids.has(id) && issue.state === 'open') {
+                problems.push(`#${issue.number} tracks \`${id}\`, which is no longer ` +
+                              'in the backlog file');
+              }
+            }
+
+            core.summary.addRaw(
+              `Reconciled backlog issues: ${created} opened, ${reopened} reopened, ` +
+              `${closed} closed, ${updated} updated.`);
+            await core.summary.write();
+
+            if (problems.length > 0) {
+              core.setFailed('Reconcile did not converge:\n' + problems.join('\n'));
+            } else {
+              core.info(`Converged: ${created} opened, ${reopened} reopened, ` +
+                        `${closed} closed, ${updated} updated.`);
+            }

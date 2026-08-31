@@ -116,6 +116,22 @@ jobs:
           toolchain: stable
       - run: cargo check --lib --no-default-features
 
+  upstream-backlog:
+    name: Upstream backlog check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The submodule pin is the port watermark, and the interesting half of
+          # this check is whether the backlog file still agrees with it. Without
+          # the submodule the validator degrades to a schema check and says so.
+          submodules: recursive
+          fetch-depth: 0
+      - name: Fetch upstream master for the drift range
+        run: git -C vendor/ableton-link fetch --unshallow origin master || git -C vendor/ableton-link fetch origin master
+      - name: Validate .github/upstream-backlog.toml
+        run: python3 .github/scripts/validate-upstream-backlog.py
+
   esp32-example-check:
     name: ESP32 example structure check
     runs-on: ubuntu-latest
