@@ -656,7 +656,16 @@ pub async fn send_message(
     socket.set_multicast_ttl_v4(2).unwrap();
     socket.set_multicast_loop_v4(true).unwrap();
 
-    let message = encode_message(from, ttl, message_type, payload, group_id).unwrap();
+    // Matches upstream's `sendUdpMessage`: encoding is inside the fallible
+    // path so an oversized/unencodable payload is logged and dropped instead
+    // of taking down the caller.
+    let message = match encode_message(from, ttl, message_type, payload, group_id) {
+        Ok(message) => message,
+        Err(err) => {
+            debug!("Failed to encode message: {}", err);
+            return Ok(());
+        }
+    };
 
     socket.send_to(&message, to).await?;
     Ok(())

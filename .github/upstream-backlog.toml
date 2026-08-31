@@ -251,11 +251,11 @@ why = "`IP_MULTICAST_ALL=0` restricts multicast reception to the joined interfac
 id = "catch-message-encode-exceptions-in-sendudpmessage"
 title = "Catch message-encode exceptions in sendUdpMessage"
 upstream = ["e9a2e414d63f"]
-rust = ["src/discovery/messenger.rs"]
+rust = ["src/discovery/messenger.rs", "src/discovery/messages.rs", "src/link/error.rs"]
 risk = "behavior"
-status = "outstanding"
-retired_at_pin = ""
-why = "`encodeMessage` is now inside the `try` block so encoding errors (e.g. oversized payload) are caught and logged instead of propagating; previously only the `send()` call was guarded"
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
+why = "`encodeMessage` is now inside the `try` block so encoding errors (e.g. oversized payload) are caught and logged instead of propagating; previously only the `send()` call was guarded. Ported: `encode_message` now returns `Error::MessageTooLarge` instead of panicking, and `send_message` logs and returns `Ok(())` on that error instead of unwrapping. The submodule pin was not advanced past this commit because several outstanding backlog items (e.g. `have-peers-notify-on-audioendpoint-changes`, `increase-thread-priority-on-link-io-thread`) sit earlier in upstream ancestry and remain unaudited."
 
 # ---------------------------------------------------------------------------
 # Commits seen and consciously parked. Kept so that coverage stays provable:
