@@ -287,9 +287,13 @@ traits plus `encode_to_vec` / `decode_from_slice`. Implementations are provided 
 (plus `Ipv4Addr` with `std`). Strings are encoded as a `u32` big-endian byte length followed
 by the raw UTF-8 bytes; on decode, invalid UTF-8 is replaced rather than rejected, so a peer
 with a non-UTF-8 name does not invalidate an otherwise well-formed message. `Encode::encode_to`
-returns `Result<(), EncodeError>`; the only failure today is `EncodeError::StringTooLong`, raised
+returns `Result<(), EncodeError>`; the only failure `encode_to` itself raises is
+`EncodeError::StringTooLong`, raised
 when a string is longer than its `u32` length prefix can describe, so a truncated prefix can never
-desynchronize the rest of the stream.
+desynchronize the rest of the stream. `encode_message` additionally returns
+`EncodeError::MessageTooLarge { size, max }` when a message's total encoded size — protocol
+header plus message header plus payload — would exceed the protocol's maximum datagram size;
+the send path logs and drops such a message rather than failing the caller.
 
 > **Breaking change in 0.3.0:** `Encode::encode_to` previously returned `()`. It now returns
 > `Result<(), EncodeError>`, and `EncodeError` — previously an uninhabited enum — has its first
