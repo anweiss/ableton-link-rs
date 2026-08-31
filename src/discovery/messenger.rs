@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -111,6 +111,11 @@ pub struct Messenger {
     pub notifier: Arc<Notify>,
     pub enabled: Arc<Mutex<bool>>,
     pub group_id: SessionGroupId,
+    /// Counts how many times the set of per-interface gateways has changed,
+    /// i.e. an interface was added or removed. Mirrors upstream's
+    /// `GatewayFactory::gatewaysChanged()` notification
+    /// (`PeerGateways::enable` and the periodic interface scan).
+    pub gateways_changed: Arc<AtomicUsize>,
 }
 
 impl Messenger {
@@ -139,6 +144,7 @@ impl Messenger {
         socket.set_multicast_loop_v4(true)?;
 
         let interface_sockets: InterfaceSockets = Arc::new(Mutex::new(HashMap::new()));
+        let gateways_changed = Arc::new(AtomicUsize::new(0));
 
         for addr in usable_interfaces_v4() {
             match add_interface(&socket, &interface_sockets, addr) {
@@ -156,6 +162,13 @@ impl Messenger {
             add_interface(&socket, &interface_sockets, Ipv4Addr::UNSPECIFIED)?;
         }
 
+        // Mirrors upstream's `GatewayFactory::gatewaysChanged()` notification, which
+        // fires once from `PeerGateways::enable` (unconditionally) and once more from
+        // the initial interface scan if it found any gateways. Since construction and
+        // enabling are not separate steps here, count the initial population as a
+        // single change.
+        gateways_changed.fetch_add(1, Ordering::Relaxed);
+
         Ok(Messenger {
             interface: Some(socket),
             interface_sockets,
@@ -167,6 +180,7 @@ impl Messenger {
             notifier,
             enabled,
             group_id: 0,
+            gateways_changed,
         })
     }
 
@@ -190,6 +204,7 @@ impl Messenger {
             last_broadcast_time: last_broadcast_time.clone(),
             enabled: enabled.clone(),
             group_id,
+            gateways_changed: self.gateways_changed.clone(),
         };
 
         // The shared multicast socket receives the multicast traffic of every
@@ -232,6 +247,7 @@ struct ReceiveContext {
     last_broadcast_time: Arc<Mutex<Instant>>,
     enabled: Arc<Mutex<bool>>,
     group_id: SessionGroupId,
+    gateways_changed: Arc<AtomicUsize>,
 }
 
 /// All IPv4 interfaces that can be used for Link discovery.
@@ -344,11 +360,22 @@ fn spawn_interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContex
             })
             .unwrap_or_default();
 
-            for addr in known.iter().filter(|addr| !current.contains(addr)) {
+            let stale_addrs: Vec<Ipv4Addr> = known
+                .iter()
+                .filter(|addr| !current.contains(addr))
+                .copied()
+                .collect();
+            let new_addrs: Vec<Ipv4Addr> = current
+                .iter()
+                .filter(|addr| !known.contains(addr))
+                .copied()
+                .collect();
+
+            for addr in &stale_addrs {
                 remove_interface(&multicast_socket, &context.interface_sockets, *addr);
             }
 
-            for addr in current.iter().filter(|addr| !known.contains(addr)) {
+            for addr in &new_addrs {
                 match add_interface(&multicast_socket, &context.interface_sockets, *addr) {
                     Ok(entry) => {
                         info!("joined Ableton Link multicast group on interface {}", addr);
@@ -360,6 +387,13 @@ fn spawn_interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContex
                     }
                     Err(e) => warn!("failed to set up interface {}: {}", addr, e),
                 }
+            }
+
+            // Mirrors upstream's `PeerGateways::Callback::operator()`, which fires
+            // `gatewaysChanged()` once per scan pass (not once per interface) when
+            // the interface set actually changed.
+            if !stale_addrs.is_empty() || !new_addrs.is_empty() {
+                context.gateways_changed.fetch_add(1, Ordering::Relaxed);
             }
         }
     });
@@ -787,5 +821,29 @@ mod tests {
         ];
 
         assert_eq!(only_ipv4(addrs), vec![Ipv4Addr::new(192, 168, 1, 10)]);
+    }
+
+    // Mirrors upstream's `tst_PeerGateways.cpp` `CallGatewaysChangedOnEnable` /
+    // `EmptyIfNoInterfaces` sections, which assert `changedCount == 1` right after
+    // `PeerGateways::enable(true)` populates its initial gateway set.
+    #[tokio::test]
+    async fn new_counts_initial_gateway_population_as_one_change() {
+        let peer_state = Arc::new(Mutex::new(PeerState {
+            node_state: NodeState::default(),
+            measurement_endpoint: None,
+            audio_endpoint: None,
+        }));
+        let (tx_event, _rx_event) = tokio::sync::mpsc::channel(16);
+
+        let messenger = Messenger::new(
+            peer_state,
+            tx_event,
+            Instant::now(),
+            Arc::new(Notify::new()),
+            Arc::new(Mutex::new(true)),
+        )
+        .unwrap();
+
+        assert_eq!(messenger.gateways_changed.load(Ordering::Relaxed), 1);
     }
 }
