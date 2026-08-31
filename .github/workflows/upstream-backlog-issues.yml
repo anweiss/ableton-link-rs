@@ -147,6 +147,16 @@ jobs:
 
             let created = 0, updated = 0, closed = 0, reopened = 0;
 
+            // Issue number for every item we touched. Verification below reads
+            // these back by number rather than re-listing by label: a
+            // label-filtered list is served from an index that lags creation by
+            // seconds, and the first real run of this workflow opened all ten
+            // issues correctly and then failed because the re-list came back
+            // empty. Reading by number is strongly consistent, so a failure
+            // there is a real failure.
+            const seen = new Map();
+            for (const [id, issue] of byId) seen.set(id, issue.number);
+
             for (const it of items) {
               const existing = byId.get(it.id);
               const want = it.status === 'outstanding';
@@ -160,6 +170,7 @@ jobs:
                   labels: [LABEL, 'automation'],
                 });
                 core.info(`Opened #${data.number} for \`${it.id}\`.`);
+                seen.set(it.id, data.number);
                 created++;
                 continue;
               }
@@ -200,36 +211,41 @@ jobs:
 
             // A 2xx is not evidence. Re-read and assert the end state matches
             // the file, rather than trusting that the calls above did what they
-            // said. GitHub APIs return success while doing nothing often
-            // enough that this check has already caught it elsewhere in this
-            // repository.
+            // said. GitHub APIs return success while doing nothing often enough
+            // that this check has already caught it elsewhere in this repository.
+            const problems = [];
+
+            for (const it of items) {
+              const number = seen.get(it.id);
+              if (!number) {
+                if (it.status === 'outstanding')
+                  problems.push(`\`${it.id}\` is outstanding but has no tracking issue`);
+                continue;
+              }
+              const { data } = await github.rest.issues.get({
+                owner, repo, issue_number: number,
+              });
+              const want = it.status === 'outstanding' ? 'open' : 'closed';
+              if (data.state !== want)
+                problems.push(`\`${it.id}\` is ${it.status} but #${number} is ${data.state}`);
+              if (!(data.body || '').includes(marker(it.id)))
+                problems.push(`#${number} no longer carries the \`${it.id}\` marker`);
+              if (!data.labels.some(l => (l.name || l) === LABEL))
+                problems.push(`#${number} lost the \`${LABEL}\` label`);
+            }
+
+            // Orphans: an issue tracking an id the file no longer has. Listing is
+            // fine here — lag can only make this miss a warning on one run, never
+            // fail a good one.
+            const ids = new Set(items.map(i => i.id));
             const after = await github.paginate(github.rest.issues.listForRepo, {
-              owner, repo, labels: LABEL, state: 'all', per_page: 100,
+              owner, repo, labels: LABEL, state: 'open', per_page: 100,
             });
-            const stateById = new Map();
             for (const issue of after) {
               const m = (issue.body || '').match(/<!-- upstream-backlog-id: (\S+) -->/);
-              if (m) stateById.set(m[1], issue);
-            }
-
-            const problems = [];
-            for (const it of items) {
-              const issue = stateById.get(it.id);
-              if (it.status === 'outstanding') {
-                if (!issue) problems.push(`\`${it.id}\` is outstanding but has no tracking issue`);
-                else if (issue.state !== 'open')
-                  problems.push(`\`${it.id}\` is outstanding but #${issue.number} is ${issue.state}`);
-              } else if (issue && issue.state === 'open') {
-                problems.push(`\`${it.id}\` is retired but #${issue.number} is still open`);
-              }
-            }
-
-            const ids = new Set(items.map(i => i.id));
-            for (const [id, issue] of stateById) {
-              if (!ids.has(id) && issue.state === 'open') {
-                problems.push(`#${issue.number} tracks \`${id}\`, which is no longer ` +
+              if (m && !ids.has(m[1]))
+                problems.push(`#${issue.number} tracks \`${m[1]}\`, which is no longer ` +
                               'in the backlog file');
-              }
             }
 
             core.summary.addRaw(
