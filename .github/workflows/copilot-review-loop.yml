@@ -100,8 +100,12 @@ on:
   # PR and its held runs already exist. Without it a port PR waits up to a
   # full cron window purely because of when it happened to open (PR #92
   # opened at 18:59, twelve minutes after the 18:48 sweep, and sat).
+  # `Copilot Review Fix` is the other half of the loop, and until it was listed
+  # here its failure was invisible until the next sweep. Both are safe: a
+  # `workflow_run` run executes on `main` in the base repo, so it is never held
+  # for approval the way a `pull_request` run on a bot PR is.
   workflow_run:
-    workflows: ["Link Upstream Port"]
+    workflows: ["Link Upstream Port", "Copilot Review Fix"]
     types: [completed]
   # The sweep is not a backstop here, it is the primary path for every hop
   # after the PR opens, because the event triggers that would have driven
@@ -794,6 +798,37 @@ jobs:
                 'within 60s - the dispatch did not take.');
             }
 
+            // What the dispatched `Copilot Review Fix` run did, or null if no
+            // run for this exact pull request and head can be found.
+            //
+            // The loop used to treat "dispatched" as "in progress" until the
+            // 6h stall timer expired, so a run that failed two minutes in still
+            // parked the pull request for six hours with a note saying it was
+            // waiting. Observed on PR #121: the agent wrote a correct fix and
+            // the push was rejected because `PIPELINE_PAT` lacks
+            // `contents: write`, and the loop reported "waiting on the coding
+            // agent" for the next hour. A dead run is knowable immediately, so
+            // it should be said immediately.
+            async function fixRunOutcome(number, head) {
+              const runName = `Copilot Review Fix - PR #${number} @ ${head}`;
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForWorkflow,
+                { owner, repo, workflow_id: FIX_WORKFLOW, per_page: 50 },
+                res => res.data,
+              ).catch(err => {
+                // A read failure must not be reported as a dead run - that
+                // would park a pull request whose agent is still working.
+                core.warning(`PR #${number}: could not list ${FIX_WORKFLOW} runs: ${err.message}`);
+                return null;
+              });
+              if (!runs) return null;
+              const matching = runs.filter(r => r.display_title === runName);
+              if (matching.length === 0) return null;
+              // Newest first: a retry for the same head is the one that counts.
+              matching.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              return matching[0];
+            }
+
             async function reconcile(number) {
               const { data: pr } = await github.rest.pulls.get({
                 owner, repo, pull_number: number,
@@ -929,6 +964,36 @@ jobs:
               }
 
               if (handle.value.dispatchedSha === head) {
+                // The head has not moved since the dispatch. That is either
+                // "still running" or "the run is over and nothing landed", and
+                // those deserve very different notes.
+                const run = await fixRunOutcome(number, head);
+                if (run && run.status === 'completed') {
+                  const ok = run.conclusion === 'success';
+                  await writeState(number, handle, {
+                    phase: 'agent-failed',
+                    note: ok
+                      ? `**Nothing landed.** Copilot Review Fix ` +
+                        `([run](${run.html_url})) finished successfully for ` +
+                        `\`${short}\` but pushed no commit, so the ` +
+                        `${outstanding.length} outstanding comment(s) are ` +
+                        'unchanged. Usually this means the agent judged the ' +
+                        'comments wrong and refused them - read its summary ' +
+                        'comment above. Nothing further is dispatched; ' +
+                        '`copilot-reviewed` is withheld.'
+                      : `**The coding agent run failed** ` +
+                        `(\`${run.conclusion}\`, [run](${run.html_url})) for ` +
+                        `\`${short}\`, so the ${outstanding.length} outstanding ` +
+                        'comment(s) were never fixed. The loop is not retrying: ' +
+                        'a failing run fails the same way twice. Fix the cause ' +
+                        'or address the comments by hand - the loop re-reviews ' +
+                        'whatever you push. `copilot-reviewed` is withheld.',
+                  });
+                  core.warning(
+                    `PR #${number}: Copilot Review Fix run ${run.id} ended ` +
+                    `'${run.conclusion}' without moving the head.`);
+                  return;
+                }
                 const st = await writeState(number, handle, {
                   note: `Waiting on the coding agent to push fixes for \`${short}\`.`,
                 });
