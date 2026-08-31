@@ -115,7 +115,11 @@ pub struct Messenger {
     /// i.e. an interface was added or removed. Mirrors upstream's
     /// `GatewayFactory::gatewaysChanged()` notification
     /// (`PeerGateways::enable` and the periodic interface scan).
-    pub gateways_changed: Arc<AtomicUsize>,
+    ///
+    /// Crate-internal: upstream's notification is consumed inside the library
+    /// (`SessionController::gatewaysChangedCallback`), never by an embedder, so
+    /// exposing this would add public API with no upstream counterpart.
+    pub(crate) gateways_changed: Arc<AtomicUsize>,
 }
 
 impl Messenger {
