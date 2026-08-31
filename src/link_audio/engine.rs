@@ -178,7 +178,7 @@ pub struct AudioEngine {
     /// against a `JoinHandle::abort()` that has not taken effect yet.
     sync_epoch: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl AudioEngine {
@@ -220,7 +220,7 @@ impl AudioEngine {
             channels_changed: Arc::new(Mutex::new(None)),
             sync_epoch: Arc::new(AtomicU64::new(1)),
             shutdown: Arc::new(AtomicBool::new(false)),
-            tasks: Vec::new(),
+            tasks: Arc::new(Mutex::new(Vec::new())),
         };
 
         engine.spawn_tasks();
@@ -244,7 +244,16 @@ impl AudioEngine {
 
     /// Updates the Link node and session identity the engine announces.
     pub fn set_identity(&self, node_id: NodeId, session_id: SessionId) {
+        self.set_identity_at(self.sync_epoch(), node_id, session_id);
+    }
+
+    /// As [`AudioEngine::set_identity`], but ignored unless `epoch` is still the
+    /// current peer-sync epoch.
+    pub fn set_identity_at(&self, epoch: u64, node_id: NodeId, session_id: SessionId) {
         self.with_state(|state| {
+            if !self.epoch_is_current(epoch) {
+                return;
+            }
             state.node_id = node_id;
             state.session_id = session_id;
         });
@@ -335,6 +344,11 @@ impl AudioEngine {
     /// Starts a run of peer synchronisation, returning the epoch that run must
     /// quote. Any earlier run is invalidated.
     pub fn begin_peer_sync(&self) -> u64 {
+        if self.shutdown.load(AtomicOrdering::Acquire) {
+            // Epochs start at 1, so 0 is never current: a caller that races
+            // shutdown gets an epoch whose writes are all discarded.
+            return 0;
+        }
         self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel) + 1
     }
 
@@ -363,12 +377,19 @@ impl AudioEngine {
         if self.shutdown.swap(true, AtomicOrdering::AcqRel) {
             return;
         }
+        // Stop the engine's own tasks first. Without this, a `LinkAudioSink` or
+        // `LinkAudioSource` holding the engine alive past `LinkAudio` would let
+        // the receive task keep servicing channel requests — repopulating a
+        // sink's receivers and resuming audio long after teardown.
+        self.abort_tasks();
         let ids: Vec<Id> = self.with_state(|state| {
             self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel);
             state.sinks.iter().map(|s| s.sink.id()).collect()
         });
         if !ids.is_empty() {
-            self.send_channel_byes(&ids);
+            // The only caller that may retry: this is the last chance to get
+            // the byes out, and no async task is left to starve.
+            self.send_channel_byes_inner(&ids, Retry::Yes);
         }
         self.end_peer_sync();
     }
@@ -461,6 +482,10 @@ impl AudioEngine {
     }
 
     fn send_channel_byes(&self, ids: &[Id]) {
+        self.send_channel_byes_inner(ids, Retry::No);
+    }
+
+    fn send_channel_byes_inner(&self, ids: &[Id], retry: Retry) {
         let (node_id, endpoints) = self.with_state(|state| {
             (
                 state.node_id,
@@ -471,13 +496,14 @@ impl AudioEngine {
         for byes in split_byes(ids) {
             let payload = byes.to_payload();
             for endpoint in &endpoints {
-                send_message(
+                send_message_with(
                     &self.socket,
                     node_id,
                     CHANNEL_BYES,
                     TTL,
                     &payload,
                     *endpoint,
+                    retry,
                 );
             }
         }
@@ -541,13 +567,31 @@ impl AudioEngine {
     }
 
     fn spawn_tasks(&mut self) {
-        self.tasks.push(self.spawn_receive_task());
-        self.tasks.push(self.spawn_announce_task());
-        self.tasks.push(self.spawn_process_task());
-        self.tasks.push(self.spawn_request_task());
+        let handles = vec![
+            self.spawn_receive_task(),
+            self.spawn_announce_task(),
+            self.spawn_process_task(),
+            self.spawn_request_task(),
+        ];
+        if let Ok(mut tasks) = self.tasks.lock() {
+            *tasks = handles;
+        }
+    }
+
+    /// Aborts the engine's own tasks. Called from `shutdown`, so it must be
+    /// safe to call more than once.
+    fn abort_tasks(&self) {
+        let handles = match self.tasks.lock() {
+            Ok(mut tasks) => std::mem::take(&mut *tasks),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        for task in handles {
+            task.abort();
+        }
     }
 
     fn spawn_receive_task(&self) -> JoinHandle<()> {
+        let shutdown = self.shutdown.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
         let api_channels = self.api_channels.clone();
@@ -559,6 +603,9 @@ impl AudioEngine {
                 let (num_bytes, from) = match socket.recv_from(&mut buffer).await {
                     Ok(result) => result,
                     Err(e) => {
+                        if shutdown.load(AtomicOrdering::Acquire) {
+                            return;
+                        }
                         debug!("link audio socket error: {}", e);
                         continue;
                     }
@@ -569,6 +616,15 @@ impl AudioEngine {
                     SocketAddr::V6(_) => continue,
                 };
 
+                // A datagram that was already in the socket buffer when the
+                // engine shut down must not be allowed to resurrect receivers
+                // or channels: `receive_channel_request` repopulates a sink's
+                // receivers without consulting `state.peers`, so the epoch
+                // gate does not cover this path.
+                if shutdown.load(AtomicOrdering::Acquire) {
+                    return;
+                }
+
                 let changed = handle_message(&socket, &state, &buffer[..num_bytes], from);
                 if changed {
                     publish(&state, &api_channels, &channels_changed);
@@ -578,6 +634,7 @@ impl AudioEngine {
     }
 
     fn spawn_announce_task(&self) -> JoinHandle<()> {
+        let shutdown = self.shutdown.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
 
@@ -587,6 +644,10 @@ impl AudioEngine {
 
             loop {
                 interval.tick().await;
+
+                if shutdown.load(AtomicOrdering::Acquire) {
+                    return;
+                }
 
                 let (node_id, announcements, endpoints, byes) = {
                     let mut state = match state.lock() {
@@ -650,6 +711,7 @@ impl AudioEngine {
     }
 
     fn spawn_process_task(&self) -> JoinHandle<()> {
+        let shutdown = self.shutdown.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
         let api_channels = self.api_channels.clone();
@@ -661,6 +723,10 @@ impl AudioEngine {
 
             loop {
                 interval.tick().await;
+
+                if shutdown.load(AtomicOrdering::Acquire) {
+                    return;
+                }
 
                 let (node_id, messages, channels_changed_now) = {
                     let mut state = match state.lock() {
@@ -732,6 +798,7 @@ impl AudioEngine {
     }
 
     fn spawn_request_task(&self) -> JoinHandle<()> {
+        let shutdown = self.shutdown.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
 
@@ -741,6 +808,10 @@ impl AudioEngine {
 
             loop {
                 interval.tick().await;
+
+                if shutdown.load(AtomicOrdering::Acquire) {
+                    return;
+                }
 
                 let (node_id, requests) = {
                     let state = match state.lock() {
@@ -781,10 +852,9 @@ impl AudioEngine {
 
 impl Drop for AudioEngine {
     fn drop(&mut self) {
+        // `shutdown` aborts the engine tasks; calling it again here is a no-op
+        // when `LinkAudio::drop` already ran.
         self.shutdown();
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
     }
 }
 
@@ -821,18 +891,31 @@ impl EngineSocket {
         self.rx.recv_from(buf).await
     }
 
-    /// Sends a datagram, retrying briefly if the kernel's send buffer is full.
+    /// Sends a datagram. Never blocks: a `WouldBlock` here is real kernel
+    /// backpressure and the datagram is dropped, as it was before.
     fn send_to(&self, buf: &[u8], to: SocketAddrV4) -> std::io::Result<usize> {
-        const SEND_RETRIES: u32 = 8;
-        for attempt in 0..SEND_RETRIES {
-            match self.tx.send_to(buf, SocketAddr::V4(to)) {
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(StdDuration::from_micros(100 << attempt));
+        self.send_to_with(buf, to, Retry::No)
+    }
+
+    fn send_to_with(&self, buf: &[u8], to: SocketAddrV4, retry: Retry) -> std::io::Result<usize> {
+        const SEND_RETRIES: u32 = 6;
+        const SEND_BACKOFF: StdDuration = StdDuration::from_micros(200);
+
+        let mut result = self.tx.send_to(buf, SocketAddr::V4(to));
+        if retry == Retry::No {
+            return result;
+        }
+        // Teardown only, and strictly bounded at ~1.2ms total.
+        for _ in 0..SEND_RETRIES {
+            match result {
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(SEND_BACKOFF);
+                    result = self.tx.send_to(buf, SocketAddr::V4(to));
                 }
-                result => return result,
+                _ => break,
             }
         }
-        self.tx.send_to(buf, SocketAddr::V4(to))
+        result
     }
 }
 
@@ -843,6 +926,15 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether a send may block the calling thread to retry. Only teardown may:
+/// every other send happens inside a tokio task, where sleeping would stall a
+/// worker — and, on the pong path, would do so while holding the state lock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    Yes,
+    No,
+}
+
 fn send_message(
     socket: &EngineSocket,
     node_id: NodeId,
@@ -851,9 +943,22 @@ fn send_message(
     payload: &[u8],
     to: SocketAddrV4,
 ) {
+    send_message_with(socket, node_id, message_type, ttl, payload, to, Retry::No);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_message_with(
+    socket: &EngineSocket,
+    node_id: NodeId,
+    message_type: u8,
+    ttl: u8,
+    payload: &[u8],
+    to: SocketAddrV4,
+    retry: Retry,
+) {
     match encode_message(node_id, ttl, message_type, payload) {
         Ok(message) => {
-            if let Err(e) = socket.send_to(&message, to) {
+            if let Err(e) = socket.send_to_with(&message, to, retry) {
                 debug!("failed to send link audio message: {}", e);
             }
         }
@@ -1424,14 +1529,30 @@ mod tests {
         let engine = engine("rust").await;
         let epoch = engine.begin_peer_sync();
         let peer_id = NodeId::new();
-        engine.saw_link_audio_endpoint_at(epoch, peer_id, Some(SocketAddrV4::new(addr(), 20809)));
+        let endpoint = Some(SocketAddrV4::new(addr(), 20809));
+        engine.saw_link_audio_endpoint_at(epoch, peer_id, endpoint);
+        assert!(!engine.tasks.lock().unwrap().is_empty());
 
         engine.shutdown();
         engine.shutdown();
         assert!(engine.with_state(|s| s.peers.is_empty()));
+
+        // The engine's own tasks are stopped, so a channel request arriving
+        // late cannot repopulate a sink's receivers.
+        assert!(engine.tasks.lock().unwrap().is_empty());
 
         // The pre-shutdown epoch stays invalid.
-        engine.saw_link_audio_endpoint_at(epoch, peer_id, Some(SocketAddrV4::new(addr(), 20809)));
+        engine.saw_link_audio_endpoint_at(epoch, peer_id, endpoint);
         assert!(engine.with_state(|s| s.peers.is_empty()));
+
+        // And a *new* run cannot be started to work around that.
+        let fresh = engine.begin_peer_sync();
+        engine.saw_link_audio_endpoint_at(fresh, peer_id, endpoint);
+        engine.update_session_peers_at(fresh, &[peer_id]);
+        assert!(
+            engine.with_state(|s| s.peers.is_empty()),
+            "peer sync was restarted after shutdown"
+        );
+        engine.set_identity_at(fresh, NodeId::new(), SessionId(NodeId::new()));
     }
 }

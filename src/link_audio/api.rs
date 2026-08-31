@@ -175,7 +175,7 @@ impl LinkAudio {
                 }
 
                 if let Ok(peer_state) = controller_peer_state.try_lock() {
-                    engine.set_identity(peer_state.ident(), peer_state.session_id());
+                    engine.set_identity_at(epoch, peer_state.ident(), peer_state.session_id());
                 }
 
                 let discovered: Vec<(crate::link::node::NodeId, Option<SocketAddrV4>)> =
