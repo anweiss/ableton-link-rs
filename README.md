@@ -455,13 +455,24 @@ repository. It replaced an issue whose body was a checkbox list: an issue body c
 edited by anyone, in any direction, with no review and no history that anybody reads,
 and its checkboxes drifted out of agreement with reality within one run.
 
-Every upstream commit ahead of the pin lands in exactly one bucket:
+Every upstream commit that has been triaged gets a bucket:
 
 | Bucket | Meaning |
 | --- | --- |
 | `[[port]]` | Real work, one *idea* per item with every SHA that makes it up. Carries a stable `id`, a `risk`, and `status = "outstanding"` or `"retired"` |
 | `[[undecided]]` | The right Rust answer is not obvious yet. The pin may **not** advance past these |
 | `[[not_applicable]]` | Confined to deliberately unported paths (ASIO, Catch2, CMake, C++ examples), with a required `reason` |
+
+Two caveats on "gets a bucket". Commits that landed upstream *after*
+`[watermark].upstream` — the point triage last reached — are expected to be
+unclassified until the next watch run, and only warn; erroring on them would turn every
+unrelated pull request red the moment Ableton pushes. And a commit may legitimately
+appear in more than one bucket when it touches both a mapped and an unmapped path
+(`7f222b559678` currently does), which also only warns: `[[port]]` outranks
+`[[undecided]]` outranks `[[not_applicable]]`, so a commit cannot be hidden by adding a
+weaker second classification. What is strictly enforced is that a commit in the triaged
+range has *at least* one bucket, and that the pin never crosses one that is
+unclassified, undecided, or outstanding.
 
 `link-upstream-watch` proposes edits as a pull request (label `upstream-triage`); it
 can touch no other file. `link-upstream-port` takes the earliest outstanding
@@ -499,8 +510,13 @@ item is still outstanding, closes it when the item retires, and fails if it cann
 converge.
 
 These issues intentionally do **not** carry `upstream-sync`. That label is a blocker
-signal — the port workflow halts while an issue or PR carrying it is open — and a
-per-item issue carrying it once deadlocked the pipeline.
+signal: an open *pull request* carrying it always halts the port workflow, since a
+second port would branch from the same base and conflict on the gitlink. An open
+*issue* carrying it halts porting only when it is a **stranded port** — one whose push
+failed and became an issue, identified by both the `link-upstream-port` tracker marker
+and the push-failure marker in its body, not by the label alone. That narrowing exists
+because a per-item issue carrying `upstream-sync` once deadlocked the pipeline on the
+label match alone.
 
 **Reviewing a port PR.** These are opened by `github-actions[bot]`, so their CI runs
 land in the `action_required` state waiting on a maintainer to approve them.
