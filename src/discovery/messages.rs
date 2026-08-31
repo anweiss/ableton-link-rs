@@ -94,9 +94,11 @@ pub fn encode_message(
         // Matches upstream's `sendUdpMessage`, which moved the encode call
         // inside its `try` block so this failure is caught and logged by the
         // caller instead of aborting the process.
-        return Err(crate::link::error::Error::MessageTooLarge(
-            message_size,
-            MAX_MESSAGE_SIZE,
+        return Err(crate::link::error::Error::Encoding(
+            encoding::EncodeError::MessageTooLarge {
+                size: message_size,
+                max: MAX_MESSAGE_SIZE,
+            },
         ));
     }
 
@@ -198,11 +200,17 @@ mod tests {
         }
 
         let result = encode_message(node_id, 5, ALIVE, &payload, 0);
+        // Match only on the error; never debug-print the `Ok` arm, which
+        // would write the encoded wire payload into the test log.
         match result {
-            Err(crate::link::error::Error::MessageTooLarge(_, max)) => {
-                assert_eq!(max, MAX_MESSAGE_SIZE)
+            Err(crate::link::error::Error::Encoding(
+                crate::encoding::EncodeError::MessageTooLarge { size, max },
+            )) => {
+                assert_eq!(max, MAX_MESSAGE_SIZE);
+                assert!(size > MAX_MESSAGE_SIZE);
             }
-            other => panic!("expected MessageTooLarge, got {:?}", other),
+            Err(other) => panic!("expected MessageTooLarge, got error {}", other),
+            Ok(_) => panic!("expected MessageTooLarge, got a successfully encoded message"),
         }
     }
 

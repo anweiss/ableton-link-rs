@@ -836,6 +836,75 @@ mod tests {
         assert_eq!(only_ipv4(addrs), vec![Ipv4Addr::new(192, 168, 1, 10)]);
     }
 
+    // Covers the send path itself, not just `encode_message`. Upstream's
+    // `sendUdpMessage` moved the encode call inside its `try` block so an
+    // unencodable payload is logged and dropped rather than propagating out
+    // of the send. If this branch ever regresses to `unwrap()`, the oversized
+    // case below panics and this test fails.
+    #[tokio::test]
+    async fn send_message_drops_an_oversized_payload_instead_of_panicking() {
+        use crate::discovery::messages::{ALIVE, MAX_MESSAGE_SIZE};
+        use crate::link::beats::Beats;
+        use crate::link::payload::PayloadEntry;
+        use crate::link::tempo::Tempo;
+        use crate::link::timeline::{Timeline, TIMELINE_SIZE};
+
+        let socket = interface_socket().socket;
+        // A real receiver, so the "well-formed payload still sends" half of
+        // this test cannot be satisfied by an unconditional early return.
+        let receiver = new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let to = match receiver.local_addr().unwrap() {
+            SocketAddr::V4(addr) => addr,
+            other => panic!("expected an IPv4 receiver address, got {}", other),
+        };
+        let from = NodeId::from_array([1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::new(0.0),
+            time_origin: chrono::Duration::zero(),
+        };
+        let mut oversized = Payload::default();
+        for _ in 0..(MAX_MESSAGE_SIZE / TIMELINE_SIZE as usize + 1) {
+            oversized.entries.push(PayloadEntry::Timeline(timeline));
+        }
+
+        let result = send_message(socket.clone(), from, 5, ALIVE, &oversized, to, 0).await;
+        assert!(
+            result.is_ok(),
+            "an oversized payload must be dropped, not surfaced as an error"
+        );
+
+        // Guard against the inverse regression: an unconditional early return
+        // would also satisfy the assertion above, so prove a well-formed
+        // payload actually reaches the wire.
+        let small = Payload::default();
+        assert!(send_message(socket, from, 5, ALIVE, &small, to, 0)
+            .await
+            .is_ok());
+
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("a well-formed message should have been sent")
+        .expect("receiving the well-formed message should succeed")
+        .0;
+        assert!(received > 0);
+        // Exactly one datagram: the oversized message must not have been sent.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                receiver.recv_from(&mut buf),
+            )
+            .await
+            .is_err(),
+            "the oversized message must be dropped, not transmitted"
+        );
+    }
+
     // Mirrors upstream's `tst_PeerGateways.cpp` `CallGatewaysChangedOnEnable` /
     // `EmptyIfNoInterfaces` sections, which assert `changedCount == 1` right after
     // `PeerGateways::enable(true)` populates its initial gateway set.
