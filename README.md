@@ -404,7 +404,7 @@ cargo check --lib --no-default-features
 # Verify the default build (audio off) still compiles
 cargo check --all-targets
 
-# Validate the upstream porting backlog (stdlib only; needs the submodule)
+# Validate the upstream porting backlog (stdlib only; watermark checks need the submodule)
 python3 .github/scripts/validate-upstream-backlog.py
 ```
 
