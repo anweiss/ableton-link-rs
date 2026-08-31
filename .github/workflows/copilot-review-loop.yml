@@ -978,8 +978,9 @@ jobs:
                         `\`${short}\` but pushed no commit, so the ` +
                         `${outstanding.length} outstanding comment(s) are ` +
                         'unchanged. Usually this means the agent judged the ' +
-                        'comments wrong and refused them - read its summary ' +
-                        'comment above. Nothing further is dispatched; ' +
+                        'comments wrong and refused them - read the Copilot ' +
+                        'Review Fix summary comment on this pull request. ' +
+                        'Nothing further is dispatched; ' +
                         '`copilot-reviewed` is withheld.'
                       : `**The coding agent run failed** ` +
                         `(\`${run.conclusion}\`, [run](${run.html_url})) for ` +
