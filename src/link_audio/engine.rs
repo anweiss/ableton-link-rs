@@ -14,7 +14,10 @@
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+        Arc, Mutex,
+    },
     time::{Duration as StdDuration, Instant},
 };
 
@@ -165,11 +168,16 @@ impl EngineState {
 /// The LinkAudio engine: owns the socket, the discovered channels and the
 /// sinks and sources of the local peer.
 pub struct AudioEngine {
-    socket: Arc<UdpSocket>,
+    socket: Arc<EngineSocket>,
     endpoint: SocketAddrV4,
     state: Arc<Mutex<EngineState>>,
     api_channels: Arc<Mutex<Vec<Channel>>>,
     channels_changed: Arc<Mutex<Option<ChannelsChangedCallback>>>,
+    /// Identifies the current run of peer synchronisation. Writes carrying a
+    /// stale epoch are dropped, which is what makes teardown ordering hold
+    /// against a `JoinHandle::abort()` that has not taken effect yet.
+    sync_epoch: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -181,7 +189,7 @@ impl AudioEngine {
         session_id: SessionId,
         peer_name: impl Into<String>,
     ) -> std::io::Result<Self> {
-        let socket = Arc::new(UdpSocket::bind(SocketAddrV4::new(addr, 0)).await?);
+        let socket = Arc::new(EngineSocket::bind(addr).await?);
         let endpoint = match socket.local_addr()? {
             SocketAddr::V4(addr) => addr,
             SocketAddr::V6(_) => {
@@ -210,6 +218,8 @@ impl AudioEngine {
             state,
             api_channels: Arc::new(Mutex::new(Vec::new())),
             channels_changed: Arc::new(Mutex::new(None)),
+            sync_epoch: Arc::new(AtomicU64::new(1)),
+            shutdown: Arc::new(AtomicBool::new(false)),
             tasks: Vec::new(),
         };
 
@@ -257,32 +267,114 @@ impl AudioEngine {
     /// Registers or removes the LinkAudio endpoint of a Link peer. This is fed
     /// from the `aep4` entry of the peer's Link `PeerState`.
     pub fn saw_link_audio_endpoint(&self, peer_id: NodeId, endpoint: Option<SocketAddrV4>) {
-        self.with_state(|state| match endpoint {
-            Some(endpoint) => {
-                if !state.peers.iter().any(|p| p.endpoint == endpoint) {
-                    state.peers.push(PeerReceiver {
-                        peer_id,
-                        endpoint,
-                        metrics: NetworkMetricsFilter::new(),
-                    });
-                }
+        self.saw_link_audio_endpoint_at(self.sync_epoch(), peer_id, endpoint);
+    }
+
+    /// As [`AudioEngine::saw_link_audio_endpoint`], but ignored unless `epoch`
+    /// is still the current peer-sync epoch. Callers that observe the session
+    /// asynchronously should use this so a teardown cannot be undone by a write
+    /// that was already in flight.
+    pub fn saw_link_audio_endpoint_at(
+        &self,
+        epoch: u64,
+        peer_id: NodeId,
+        endpoint: Option<SocketAddrV4>,
+    ) {
+        self.with_state(|state| {
+            if !self.epoch_is_current(epoch) {
+                return;
             }
-            None => state.peers.retain(|p| p.peer_id != peer_id),
+            match endpoint {
+                Some(endpoint) => {
+                    if !state.peers.iter().any(|p| p.endpoint == endpoint) {
+                        state.peers.push(PeerReceiver {
+                            peer_id,
+                            endpoint,
+                            metrics: NetworkMetricsFilter::new(),
+                        });
+                    }
+                }
+                None => state.peers.retain(|p| p.peer_id != peer_id),
+            }
         });
     }
 
     /// Prunes peers and channels that are no longer part of the session.
     pub fn update_session_peers(&self, peers: &[NodeId]) {
+        self.update_session_peers_at(self.sync_epoch(), peers);
+    }
+
+    /// As [`AudioEngine::update_session_peers`], but ignored unless `epoch` is
+    /// still the current peer-sync epoch.
+    pub fn update_session_peers_at(&self, epoch: u64, peers: &[NodeId]) {
         let changed = self.with_state(|state| {
-            state.peers.retain(|p| peers.contains(&p.peer_id));
-            for sink in &mut state.sinks {
-                sink.receivers.retain_peers(peers);
+            if !self.epoch_is_current(epoch) {
+                return false;
             }
-            state.channels.prune_peer_channels(peers)
+            Self::prune_peers(state, peers)
         });
         if changed {
             self.publish_channels();
         }
+    }
+
+    fn prune_peers(state: &mut EngineState, peers: &[NodeId]) -> bool {
+        state.peers.retain(|p| peers.contains(&p.peer_id));
+        for sink in &mut state.sinks {
+            sink.receivers.retain_peers(peers);
+        }
+        state.channels.prune_peer_channels(peers)
+    }
+
+    /// The current peer-sync epoch. Pass it to the `_at` methods from a task
+    /// that observes the Link session on this engine's behalf.
+    pub fn sync_epoch(&self) -> u64 {
+        self.sync_epoch.load(AtomicOrdering::Acquire)
+    }
+
+    /// Starts a run of peer synchronisation, returning the epoch that run must
+    /// quote. Any earlier run is invalidated.
+    pub fn begin_peer_sync(&self) -> u64 {
+        self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel) + 1
+    }
+
+    /// Ends peer synchronisation and forgets the session's peers.
+    ///
+    /// The epoch is bumped before the peers are cleared, and both happen under
+    /// the state lock, so a write from the previous run either lands first or
+    /// is discarded — it can never repopulate peers afterwards.
+    pub fn end_peer_sync(&self) {
+        let changed = self.with_state(|state| {
+            self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+            Self::prune_peers(state, &[])
+        });
+        if changed {
+            self.publish_channels();
+        }
+    }
+
+    /// Withdraws this peer from the audio session: announces channel byes to
+    /// the peers still known, then ends peer synchronisation. Idempotent, and
+    /// called automatically when the engine is dropped.
+    ///
+    /// The byes are sent *before* peers are cleared — clearing first would send
+    /// them to an empty recipient list.
+    pub fn shutdown(&self) {
+        if self.shutdown.swap(true, AtomicOrdering::AcqRel) {
+            return;
+        }
+        let ids: Vec<Id> = self.with_state(|state| {
+            self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+            state.sinks.iter().map(|s| s.sink.id()).collect()
+        });
+        if !ids.is_empty() {
+            self.send_channel_byes(&ids);
+        }
+        self.end_peer_sync();
+    }
+
+    fn epoch_is_current(&self, epoch: u64) -> bool {
+        self.sync_epoch.load(AtomicOrdering::Acquire) == epoch
     }
 
     /// Adds a sink, publishing a new channel to the session.
@@ -627,7 +719,7 @@ impl AudioEngine {
 
                 let _ = node_id;
                 for (message, endpoint) in messages {
-                    if let Err(e) = socket.try_send_to(&message, endpoint.into()) {
+                    if let Err(e) = socket.send_to(&message, endpoint) {
                         debug!("failed to send audio buffer: {}", e);
                     }
                 }
@@ -689,14 +781,58 @@ impl AudioEngine {
 
 impl Drop for AudioEngine {
     fn drop(&mut self) {
-        let ids: Vec<Id> =
-            self.with_state(|state| state.sinks.iter().map(|s| s.sink.id()).collect());
-        if !ids.is_empty() {
-            self.send_channel_byes(&ids);
-        }
+        self.shutdown();
         for task in self.tasks.drain(..) {
             task.abort();
         }
+    }
+}
+
+/// The engine's UDP socket.
+///
+/// Receives are driven by tokio, but sends go straight to the OS through a
+/// clone of the same socket. Tokio's `try_send_to` reports `WouldBlock` until
+/// its driver has established write readiness, and the driver cannot run from a
+/// synchronous context such as `Drop` — so the shutdown channel byes, which are
+/// the whole point of the teardown ordering, were being dropped on the floor
+/// with nothing but a `debug!` to show for it.
+struct EngineSocket {
+    rx: UdpSocket,
+    tx: std::net::UdpSocket,
+}
+
+impl EngineSocket {
+    async fn bind(addr: Ipv4Addr) -> std::io::Result<Self> {
+        let std_socket = std::net::UdpSocket::bind(SocketAddrV4::new(addr, 0))?;
+        std_socket.set_nonblocking(true)?;
+        // A clone of the same socket: same file description, same local port.
+        let tx = std_socket.try_clone()?;
+        Ok(EngineSocket {
+            rx: UdpSocket::from_std(std_socket)?,
+            tx,
+        })
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.tx.local_addr()
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.rx.recv_from(buf).await
+    }
+
+    /// Sends a datagram, retrying briefly if the kernel's send buffer is full.
+    fn send_to(&self, buf: &[u8], to: SocketAddrV4) -> std::io::Result<usize> {
+        const SEND_RETRIES: u32 = 8;
+        for attempt in 0..SEND_RETRIES {
+            match self.tx.send_to(buf, SocketAddr::V4(to)) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(StdDuration::from_micros(100 << attempt));
+                }
+                result => return result,
+            }
+        }
+        self.tx.send_to(buf, SocketAddr::V4(to))
     }
 }
 
@@ -708,7 +844,7 @@ fn now_micros() -> i64 {
 }
 
 fn send_message(
-    socket: &UdpSocket,
+    socket: &EngineSocket,
     node_id: NodeId,
     message_type: u8,
     ttl: u8,
@@ -717,7 +853,7 @@ fn send_message(
 ) {
     match encode_message(node_id, ttl, message_type, payload) {
         Ok(message) => {
-            if let Err(e) = socket.try_send_to(&message, to.into()) {
+            if let Err(e) = socket.send_to(&message, to) {
                 debug!("failed to send link audio message: {}", e);
             }
         }
@@ -784,7 +920,7 @@ fn publish(
 /// Dispatches a received message. Returns `true` if the visible set of
 /// channels changed.
 fn handle_message(
-    socket: &UdpSocket,
+    socket: &EngineSocket,
     state: &Arc<Mutex<EngineState>>,
     data: &[u8],
     from: SocketAddrV4,
@@ -884,7 +1020,7 @@ fn receive_announcement(
     )
 }
 
-fn receive_ping(socket: &UdpSocket, state: &EngineState, payload: &[u8], from: SocketAddrV4) {
+fn receive_ping(socket: &EngineSocket, state: &EngineState, payload: &[u8], from: SocketAddrV4) {
     let mut host_time = None;
     let _ = parse_payload(payload, |key, reader| {
         if key == HOST_TIME_KEY {
@@ -1210,5 +1346,92 @@ mod tests {
             &received[..expected.len().min(received.len())],
             &expected[..received.len().min(expected.len())]
         );
+    }
+
+    /// Regression test for the shutdown-ordering port: `AudioEngine::drop`
+    /// announces channel byes to the peers it still knows about, so anything
+    /// that tears the engine down must not clear peers first. An earlier
+    /// revision of `LinkAudio::drop` did exactly that, which silently sent the
+    /// byes to an empty recipient list.
+    #[tokio::test]
+    async fn shutdown_sends_channel_byes_before_clearing_peers() {
+        let engine = engine("rust").await;
+        let peer = tokio::net::UdpSocket::bind(SocketAddrV4::new(addr(), 0))
+            .await
+            .unwrap();
+        let peer_addr = match peer.local_addr().unwrap() {
+            SocketAddr::V4(a) => a,
+            SocketAddr::V6(_) => unreachable!(),
+        };
+
+        let epoch = engine.begin_peer_sync();
+        let peer_id = NodeId::new();
+        engine.saw_link_audio_endpoint_at(epoch, peer_id, Some(peer_addr));
+        let _sink = engine.add_sink("channel", 1024);
+        assert_eq!(engine.with_state(|s| s.peers.len()), 1);
+        assert_eq!(
+            engine.with_state(|s| s.sinks.len()),
+            1,
+            "sink not registered"
+        );
+
+        engine.shutdown();
+
+        let mut buf = [0u8; 1024];
+        let read = tokio::time::timeout(StdDuration::from_secs(2), peer.recv(&mut buf))
+            .await
+            .expect("no channel bye reached the peer: recipients were cleared first")
+            .unwrap();
+        let (header, _) = parse_message_header(&buf[..read]).unwrap();
+        assert_eq!(header.message_type, CHANNEL_BYES);
+
+        // Peers are only cleared once the byes are out.
+        assert!(engine.with_state(|s| s.peers.is_empty()));
+    }
+
+    /// `JoinHandle::abort()` does not stop a task that is between awaits, so a
+    /// peer-sync pass already in flight can run to completion *after* teardown.
+    /// The epoch is what makes that harmless.
+    #[tokio::test]
+    async fn stale_peer_sync_writes_cannot_repopulate_peers() {
+        let engine = engine("rust").await;
+        let epoch = engine.begin_peer_sync();
+        let peer_id = NodeId::new();
+        let peer_addr = SocketAddrV4::new(addr(), 20808);
+
+        engine.saw_link_audio_endpoint_at(epoch, peer_id, Some(peer_addr));
+        assert_eq!(engine.with_state(|s| s.peers.len()), 1);
+
+        engine.end_peer_sync();
+        assert!(engine.with_state(|s| s.peers.is_empty()));
+
+        // Exactly what an aborted-but-still-running sync pass would do next.
+        engine.saw_link_audio_endpoint_at(epoch, peer_id, Some(peer_addr));
+        engine.update_session_peers_at(epoch, &[peer_id]);
+        assert!(
+            engine.with_state(|s| s.peers.is_empty()),
+            "a stale peer-sync pass repopulated peers after teardown"
+        );
+
+        // A fresh run is accepted again.
+        let epoch = engine.begin_peer_sync();
+        engine.saw_link_audio_endpoint_at(epoch, peer_id, Some(peer_addr));
+        assert_eq!(engine.with_state(|s| s.peers.len()), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent_and_final() {
+        let engine = engine("rust").await;
+        let epoch = engine.begin_peer_sync();
+        let peer_id = NodeId::new();
+        engine.saw_link_audio_endpoint_at(epoch, peer_id, Some(SocketAddrV4::new(addr(), 20809)));
+
+        engine.shutdown();
+        engine.shutdown();
+        assert!(engine.with_state(|s| s.peers.is_empty()));
+
+        // The pre-shutdown epoch stays invalid.
+        engine.saw_link_audio_endpoint_at(epoch, peer_id, Some(SocketAddrV4::new(addr(), 20809)));
+        assert!(engine.with_state(|s| s.peers.is_empty()));
     }
 }

@@ -79,16 +79,17 @@ impl LinkAudio {
         }
 
         if enable {
+            let epoch = self.engine.begin_peer_sync();
             self.link
                 .controller()
                 .set_audio_endpoint(Some(self.engine.endpoint()));
-            self.sync_task = Some(self.spawn_peer_sync());
+            self.sync_task = Some(self.spawn_peer_sync(epoch));
         } else {
             self.link.controller().set_audio_endpoint(None);
             if let Some(task) = self.sync_task.take() {
                 task.abort();
             }
-            self.engine.update_session_peers(&[]);
+            self.engine.end_peer_sync();
         }
     }
 
@@ -154,7 +155,7 @@ impl LinkAudio {
         self.engine.endpoint()
     }
 
-    fn spawn_peer_sync(&self) -> tokio::task::JoinHandle<()> {
+    fn spawn_peer_sync(&self, epoch: u64) -> tokio::task::JoinHandle<()> {
         let engine = self.engine.clone();
         let peers = self.link.controller().peers();
         let controller_peer_state = self.link.controller().peer_state.clone();
@@ -165,6 +166,13 @@ impl LinkAudio {
 
             loop {
                 interval.tick().await;
+
+                // `abort()` cannot interrupt the body below — its only await is
+                // the tick — so teardown is observed here and, authoritatively,
+                // by the epoch the engine checks under its own state lock.
+                if engine.sync_epoch() != epoch {
+                    return;
+                }
 
                 if let Ok(peer_state) = controller_peer_state.try_lock() {
                     engine.set_identity(peer_state.ident(), peer_state.session_id());
@@ -180,12 +188,12 @@ impl LinkAudio {
                     };
 
                 for (peer_id, endpoint) in &discovered {
-                    engine.saw_link_audio_endpoint(*peer_id, *endpoint);
+                    engine.saw_link_audio_endpoint_at(epoch, *peer_id, *endpoint);
                 }
 
                 let peer_ids: Vec<crate::link::node::NodeId> =
                     discovered.iter().map(|(id, _)| *id).collect();
-                engine.update_session_peers(&peer_ids);
+                engine.update_session_peers_at(epoch, &peer_ids);
             }
         })
     }
@@ -208,16 +216,19 @@ impl DerefMut for LinkAudio {
 impl Drop for LinkAudio {
     fn drop(&mut self) {
         // Ported from upstream's shutdown-ordering fix (SessionController):
-        // audio must be torn down (endpoint withdrawn, peers cleared, sync
-        // task stopped) before `link` (our `BasicLink`/`Controller`) is
-        // dropped and its own discovery/session teardown begins. Struct
-        // field order alone doesn't guarantee this since `link` is declared
-        // before `engine`, so we do it explicitly here first.
+        // audio must be torn down — endpoint withdrawn, channel byes sent,
+        // peers cleared, sync task stopped — before `link` (our `BasicLink`/
+        // `Controller`) is dropped and its own discovery/session teardown
+        // begins. Struct field order alone doesn't guarantee this, since
+        // `link` is declared before `engine`, so we do it explicitly here.
+        self.link.controller().set_audio_endpoint(None);
         if let Some(task) = self.sync_task.take() {
             task.abort();
         }
-        self.link.controller().set_audio_endpoint(None);
-        self.engine.update_session_peers(&[]);
+        // `shutdown` sends the byes before it clears peers, and is idempotent,
+        // so it stays correct whether or not a sink or source is still holding
+        // the engine alive past this point.
+        self.engine.shutdown();
     }
 }
 
