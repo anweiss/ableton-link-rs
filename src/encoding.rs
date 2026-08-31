@@ -14,6 +14,7 @@ use core::fmt;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// A string is longer than the `u32` length prefix can describe.
     StringTooLong(usize),

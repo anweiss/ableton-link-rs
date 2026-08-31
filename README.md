@@ -291,6 +291,12 @@ returns `Result<(), EncodeError>`; the only failure today is `EncodeError::Strin
 when a string is longer than its `u32` length prefix can describe, so a truncated prefix can never
 desynchronize the rest of the stream.
 
+> **Breaking change in 0.3.0:** `Encode::encode_to` previously returned `()`. It now returns
+> `Result<(), EncodeError>`, and `EncodeError` — previously an uninhabited enum — has its first
+> constructible variant, `StringTooLong`. Downstream `Encode` implementations must return
+> `Ok(())` (and propagate nested encodes with `?`); downstream callers of `encode_to` must handle
+> the `Result`. `EncodeError` is now `#[non_exhaustive]`, so future variants will not be breaking.
+
 ## Time and Clocks
 
 The Link implementation uses platform-specific high-resolution clocks:
