@@ -100,8 +100,12 @@ on:
   # PR and its held runs already exist. Without it a port PR waits up to a
   # full cron window purely because of when it happened to open (PR #92
   # opened at 18:59, twelve minutes after the 18:48 sweep, and sat).
+  # `Copilot Review Fix` is the other half of the loop, and until it was listed
+  # here its failure was invisible until the next sweep. Both are safe: a
+  # `workflow_run` run executes on `main` in the base repo, so it is never held
+  # for approval the way a `pull_request` run on a bot PR is.
   workflow_run:
-    workflows: ["Link Upstream Port"]
+    workflows: ["Link Upstream Port", "Copilot Review Fix"]
     types: [completed]
   # The sweep is not a backstop here, it is the primary path for every hop
   # after the PR opens, because the event triggers that would have driven
@@ -697,12 +701,58 @@ jobs:
               core.notice(`PR #${pr.number}: auto-merge cancelled, head moved past sign-off.`);
             }
 
+            // Returns true when a *granted* label was applied with the PAT, and
+            // therefore actually raised the `labeled` event auto-merge needs.
+            // Callers that record sign-off must surface a false, or the status
+            // comment claims auto-merge may queue when nothing will trigger it.
             async function setLabel(pr, present) {
               const has = labelsOf(pr).includes(DONE_LABEL);
+              if (present && has) return true;
               if (present && !has) {
-                await github.rest.issues.addLabels({
-                  owner, repo, issue_number: pr.number, labels: [DONE_LABEL],
-                });
+                // Granted with the PAT, and that is load-bearing rather than
+                // incidental. `auto-merge-upstream-port.yml` triggers on
+                // `pull_request: [labeled]`, and an action taken with
+                // GITHUB_TOKEN does not start a workflow run - the same rule
+                // that forces the fix agent to push with a PAT. Labelling with
+                // GITHUB_TOKEN therefore granted sign-off and raised no event,
+                // so auto-merge never re-evaluated and the pull request sat as
+                // an unmerged draft with every check green and the label on it.
+                // Observed on PR #121: labelled 21:38:09, no auto-merge run.
+                //
+                // Without a PAT the label is still granted, because withholding
+                // sign-off that was genuinely earned would be worse; the run
+                // already warns that it is degraded, and the `push` trigger on
+                // the next commit to `main` picks the pull request up.
+                let viaPat = false;
+                if (hasPat) {
+                  try {
+                    await userRequest(
+                      'POST', `/repos/${owner}/${repo}/issues/${pr.number}/labels`,
+                      { labels: [DONE_LABEL] },
+                    );
+                    viaPat = true;
+                  } catch (err) {
+                    // Labels are the issues API, so this needs `issues: write`
+                    // on the PAT - a different scope from the ones the dispatch
+                    // and review request use. If it is missing, fall through to
+                    // GITHUB_TOKEN rather than failing: a sign-off that lands
+                    // without triggering auto-merge is recoverable, and one
+                    // that throws leaves the pull request unlabelled with the
+                    // loop reporting success.
+                    core.warning(
+                      `PR #${pr.number}: PAT could not label (${err.message}); ` +
+                      'falling back to GITHUB_TOKEN.');
+                  }
+                }
+                if (!viaPat) {
+                  await github.rest.issues.addLabels({
+                    owner, repo, issue_number: pr.number, labels: [DONE_LABEL],
+                  });
+                  core.warning(
+                    `PR #${pr.number}: labelled with GITHUB_TOKEN, so auto-merge ` +
+                    'will not be triggered by it. Merge by hand if it parks.');
+                }
+                return viaPat;
               } else if (!present && has) {
                 // Only a 404 is benign here - it means the label was already
                 // gone. Anything else must propagate, because the caller is
@@ -792,6 +842,43 @@ jobs:
               throw new Error(
                 `dispatched ${FIX_WORKFLOW} for PR #${number} but no run appeared ` +
                 'within 60s - the dispatch did not take.');
+            }
+
+            // What the dispatched `Copilot Review Fix` run did, or null if no
+            // run for this exact pull request and head can be found.
+            //
+            // The loop used to treat "dispatched" as "in progress" until the
+            // 6h stall timer expired, so a run that failed two minutes in still
+            // parked the pull request for six hours with a note saying it was
+            // waiting. Observed on PR #121: the agent wrote a correct fix and
+            // the push was rejected because `PIPELINE_PAT` lacks
+            // `contents: write`, and the loop reported "waiting on the coding
+            // agent" for the next hour. A dead run is knowable immediately, so
+            // it should be said immediately.
+            async function fixRunOutcome(number, head) {
+              const runName = `Copilot Review Fix - PR #${number} @ ${head}`;
+              // Deliberately one bounded page, not `paginate`. The Actions
+              // list endpoint returns descending `created_at`, so the run being
+              // looked for is always on the first page; paginating the whole
+              // run history would be pure waste that grows with every run, and
+              // it would be re-spent every 5 minutes for as long as a pull
+              // request sits in the terminal `agent-failed` state below. A miss
+              // degrades to `null`, which is the fail-safe direction.
+              const runs = await github.rest.actions.listWorkflowRunsForWorkflow({
+                owner, repo, workflow_id: FIX_WORKFLOW,
+                event: 'workflow_dispatch', per_page: 100,
+              }).then(res => res.data.workflow_runs || []).catch(err => {
+                // A read failure must not be reported as a dead run - that
+                // would park a pull request whose agent is still working.
+                core.warning(`PR #${number}: could not list ${FIX_WORKFLOW} runs: ${err.message}`);
+                return null;
+              });
+              if (!runs) return null;
+              const matching = runs.filter(r => r.display_title === runName);
+              if (matching.length === 0) return null;
+              // Newest first: a retry for the same head is the one that counts.
+              matching.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              return matching[0];
             }
 
             async function reconcile(number) {
@@ -888,6 +975,17 @@ jobs:
                   core.notice(`PR #${number}: wire-format, held for a human.`);
                   return;
                 }
+                // Sign-off already granted for this exact head, but degraded:
+                // the label went on without raising the event auto-merge needs.
+                // Re-running the grant cannot fix that - the label is already
+                // present, so no event will ever be raised for it - and would
+                // overwrite the note explaining the problem with one claiming
+                // auto-merge may queue. Leave it stated.
+                if (handle.value.phase === 'done-degraded' &&
+                    handle.value.reviewedSha === head) {
+                  core.warning(`PR #${number}: still signed off but degraded at ${head}.`);
+                  return;
+                }
                 // The PR was read at the top of this function and several API
                 // calls ago. Confirm the head has not moved before granting a
                 // sign-off that is only meaningful for that exact commit.
@@ -909,7 +1007,23 @@ jobs:
                         'Auto-merge may now queue this pull request; it still merges ' +
                         'only after every required check passes.',
                 });
-                await setLabel(fresh, true);
+                // A label applied with GITHUB_TOKEN raises no event, so the
+                // note written just above - "auto-merge may now queue this" -
+                // would be false. This file's rule is that every stall writes
+                // its reason into the status comment, so say so there rather
+                // than only in a run annotation nobody reads.
+                if (!(await setLabel(fresh, true))) {
+                  await writeState(number, handle, {
+                    phase: 'done-degraded',
+                    note: `Copilot reviewed \`${short}\` with nothing outstanding, ` +
+                          'but `copilot-reviewed` could not be applied with the PAT, ' +
+                          'so no `labeled` event was raised and **auto-merge will not ' +
+                          'pick this up on its own**. Merge it by hand, or push ' +
+                          'anything to `main` to re-trigger auto-merge.',
+                  });
+                  core.warning(`PR #${number}: signed off, but degraded - auto-merge not triggered.`);
+                  return;
+                }
                 core.notice(`PR #${number}: review loop complete at ${head}.`);
                 return;
               }
@@ -929,6 +1043,45 @@ jobs:
               }
 
               if (handle.value.dispatchedSha === head) {
+                // The head has not moved since the dispatch. That is either
+                // "still running" or "the run is over and nothing landed", and
+                // those deserve very different notes.
+                const run = await fixRunOutcome(number, head);
+                // Already known dead. `fixRunOutcome` returns null when the
+                // runs cannot be listed, so without this a transient list
+                // failure would fall through and overwrite the terminal note
+                // with "waiting on the coding agent" - and, six hours after
+                // `agent-failed` was entered, with the "Stuck" stall note,
+                // pointing the maintainer at a timer instead of at the run
+                // link that is the whole point of this branch.
+                if (!run && handle.value.phase === 'agent-failed') return;
+                if (run && run.status === 'completed') {
+                  const ok = run.conclusion === 'success';
+                  await writeState(number, handle, {
+                    phase: 'agent-failed',
+                    note: ok
+                      ? `**Nothing landed.** Copilot Review Fix ` +
+                        `([run](${run.html_url})) finished successfully for ` +
+                        `\`${short}\` but pushed no commit, so the ` +
+                        `${outstanding.length} outstanding comment(s) are ` +
+                        'unchanged. Usually this means the agent judged the ' +
+                        'comments wrong and refused them - read the Copilot ' +
+                        'Review Fix summary comment on this pull request. ' +
+                        'Nothing further is dispatched; ' +
+                        '`copilot-reviewed` is withheld.'
+                      : `**The coding agent run failed** ` +
+                        `(\`${run.conclusion}\`, [run](${run.html_url})) for ` +
+                        `\`${short}\`, so the ${outstanding.length} outstanding ` +
+                        'comment(s) were never fixed. The loop is not retrying: ' +
+                        'a failing run fails the same way twice. Fix the cause ' +
+                        'or address the comments by hand - the loop re-reviews ' +
+                        'whatever you push. `copilot-reviewed` is withheld.',
+                  });
+                  core.warning(
+                    `PR #${number}: Copilot Review Fix run ${run.id} ended ` +
+                    `'${run.conclusion}' without moving the head.`);
+                  return;
+                }
                 const st = await writeState(number, handle, {
                   note: `Waiting on the coding agent to push fixes for \`${short}\`.`,
                 });
