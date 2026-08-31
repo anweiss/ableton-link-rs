@@ -704,9 +704,33 @@ jobs:
             async function setLabel(pr, present) {
               const has = labelsOf(pr).includes(DONE_LABEL);
               if (present && !has) {
-                await github.rest.issues.addLabels({
-                  owner, repo, issue_number: pr.number, labels: [DONE_LABEL],
-                });
+                // Granted with the PAT, and that is load-bearing rather than
+                // incidental. `auto-merge-upstream-port.yml` triggers on
+                // `pull_request: [labeled]`, and an action taken with
+                // GITHUB_TOKEN does not start a workflow run - the same rule
+                // that forces the fix agent to push with a PAT. Labelling with
+                // GITHUB_TOKEN therefore granted sign-off and raised no event,
+                // so auto-merge never re-evaluated and the pull request sat as
+                // an unmerged draft with every check green and the label on it.
+                // Observed on PR #121: labelled 21:38:09, no auto-merge run.
+                //
+                // Without a PAT the label is still granted, because withholding
+                // sign-off that was genuinely earned would be worse; the run
+                // already warns that it is degraded, and the `push` trigger on
+                // the next commit to `main` picks the pull request up.
+                if (hasPat) {
+                  await userRequest(
+                    'POST', `/repos/${owner}/${repo}/issues/${pr.number}/labels`,
+                    { labels: [DONE_LABEL] },
+                  );
+                } else {
+                  await github.rest.issues.addLabels({
+                    owner, repo, issue_number: pr.number, labels: [DONE_LABEL],
+                  });
+                  core.warning(
+                    `PR #${pr.number}: labelled with GITHUB_TOKEN, so auto-merge ` +
+                    'will not be triggered by it. Merge by hand if it parks.');
+                }
               } else if (!present && has) {
                 // Only a 404 is benign here - it means the label was already
                 // gone. Anything else must propagate, because the caller is
