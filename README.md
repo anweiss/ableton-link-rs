@@ -403,6 +403,9 @@ cargo check --lib --no-default-features
 
 # Verify the default build (audio off) still compiles
 cargo check --all-targets
+
+# Validate the upstream porting backlog (stdlib only; watermark checks need the submodule)
+python3 .github/scripts/validate-upstream-backlog.py
 ```
 
 All CI checks must pass before merging to `main`.
@@ -426,8 +429,9 @@ that list is the highest-value part of reviewing one of these PRs.
 
 | Workflow | Cadence | What it does |
 | --- | --- | --- |
-| `link-upstream-watch.md` | Weekly, Monday | Triages upstream commits landed since the pin and maintains the `Porting backlog: upstream Ableton Link` issue |
-| `link-upstream-port.md` | Weekly, Thursday | Takes the next backlog item, ports it, runs the full CI suite, and opens a draft PR |
+| `link-upstream-watch.md` | Weekly, Monday | Triages upstream commits landed since the pin and proposes a pull request against [`.github/upstream-backlog.toml`](.github/upstream-backlog.toml) |
+| `link-upstream-port.md` | Weekly, Thursday | Takes the earliest outstanding backlog item, ports it, runs the full CI suite, and opens a draft PR |
+| `upstream-backlog-issues.yml` | On pushes touching the backlog file, plus daily | Reconciles one tracking issue per outstanding backlog item from the file. Deterministic `github-script`, not an agent |
 | `auto-merge-upstream-port.yml` | On every port PR event | Marks a qualifying port PR ready for review and enables auto-merge, so it lands once branch protection is satisfied |
 | `copilot-review-loop.yml` | On port PR events, plus a periodic sweep | Approves held CI runs, requests Copilot code review, batches its comments to `Copilot Review Fix`, and marks the PR `copilot-reviewed` when the loop finishes |
 | `copilot-review-fix.md` | Dispatched by the review loop only | Fixes a batch of Copilot review comments on Opus 5 and pushes to the port PR's branch. Never picks its own PR; the loop owns that decision |
@@ -445,18 +449,74 @@ The porting rules and the C++ header to Rust module map both live in
 [`.github/workflows/shared/link-upstream-context.md`](.github/workflows/shared/link-upstream-context.md).
 Edit that file to change how either workflow reasons about a change.
 
-**The backlog issue.** `link-upstream-watch` is the only writer. Each run rewrites the
-issue body to the current state — ticking off items whose SHAs have dropped out of the
-drift report, and refreshing the pinned/upstream SHA header — and adds one comment
-describing what changed. It can edit only that issue: the safe output is gated on the
-title prefix `[upstream-sync] Porting backlog` **and** the `upstream-sync` and
-`automation` labels, and it is permitted to change the body only, so it cannot rename
-or close the issue. The workflow itself still runs with `issues: read`; the write
-happens in a separate job.
+**The backlog file.** The backlog is
+[`.github/upstream-backlog.toml`](.github/upstream-backlog.toml), versioned with the
+repository. It replaced an issue whose body was a checkbox list: an issue body can be
+edited by anyone, in any direction, with no review and no history that anybody reads,
+and its checkboxes drifted out of agreement with reality within one run.
 
-The checkboxes are bookkeeping for humans. `link-upstream-port` picks its next item by
-whether a SHA is still present in `commits.txt`, never by checkbox state, so a missed
-tick cannot cause the same commit to be ported twice or skipped.
+Every upstream commit that has been triaged gets a bucket:
+
+| Bucket | Meaning |
+| --- | --- |
+| `[[port]]` | Real work, one *idea* per item with every SHA that makes it up. Carries a stable `id`, a `risk`, and `status = "outstanding"` or `"retired"` |
+| `[[undecided]]` | The right Rust answer is not obvious yet. The pin may **not** advance past these |
+| `[[not_applicable]]` | Confined to deliberately unported paths (ASIO, Catch2, CMake, C++ examples), with a required `reason` |
+
+Two caveats on "gets a bucket". Commits that landed upstream *after*
+`[watermark].upstream` — the point triage last reached — are expected to be
+unclassified until the next watch run, and only warn; erroring on them would turn every
+unrelated pull request red the moment Ableton pushes. And a commit may legitimately
+appear in more than one bucket when it touches both a mapped and an unmapped path
+(`7f222b559678` currently does), which also only warns: `[[port]]` outranks
+`[[undecided]]` outranks `[[not_applicable]]`, so a commit cannot be hidden by adding a
+weaker second classification. What is strictly enforced is that a commit in the triaged
+range has *at least* one bucket, and that the pin never crosses one that is
+unclassified, undecided, or outstanding.
+
+`link-upstream-watch` proposes edits as a pull request (label `upstream-triage`); it
+can touch no other file. `link-upstream-port` takes the earliest outstanding
+`[[port]]` item, ports it, advances the pin, and flips the item to `retired` in the
+same commit.
+
+Note that `retired` means *the Rust work was done*, not *the pin is past it*. Upstream
+routinely splits one idea across commits that sit far apart — one item here spans
+ancestry positions 0–2 and 75–79 — and the pin only advances as far as the last fully
+handled commit, so a retired item often keeps SHAs ahead of the pin.
+
+**`Upstream backlog check` is a required status.**
+[`.github/scripts/validate-upstream-backlog.py`](.github/scripts/validate-upstream-backlog.py)
+is stdlib-only Python and runs on every PR. It enforces what the checkboxes never
+could:
+
+- every commit in the triaged range is in some bucket, derived only from explicit
+  `upstream` arrays and never from prose;
+- outstanding items are in true upstream ancestry order, because the port workflow
+  moves a monotonic watermark;
+- an `id` is never renamed or deleted, because it is the join key to the tracking
+  issue — checked against the merge base;
+- and the one that actually protects work: **the pin may not advance across a commit
+  that is unclassified, still `[[undecided]]`, or owned by an outstanding item.** That
+  reproduces a real failure, where a pin jumped to upstream position 8 with 1–7
+  unported, silently dropping a crash fix.
+
+**Per-item tracking issues.** `upstream-backlog-issues.yml` opens one issue per
+outstanding item, labelled `upstream-item`, so a port PR can say `Closes #N` and the
+work is tracked per item. Issues are matched to items by a hidden
+`<!-- upstream-backlog-id: ... -->` marker, never by title, and the item's issue number
+is deliberately **not** stored in the TOML — a stored number that nothing syncs is the
+same defect as the checkboxes. The workflow reopens an issue that was closed while its
+item is still outstanding, closes it when the item retires, and fails if it cannot
+converge.
+
+These issues intentionally do **not** carry `upstream-sync`. That label is a blocker
+signal: an open *pull request* carrying it always halts the port workflow, since a
+second port would branch from the same base and conflict on the gitlink. An open
+*issue* carrying it halts porting only when it is a **stranded port** — one whose push
+failed and became an issue, identified by both the `link-upstream-port` tracker marker
+and the push-failure marker in its body, not by the label alone. That narrowing exists
+because a per-item issue carrying `upstream-sync` once deadlocked the pipeline on the
+label match alone.
 
 **Reviewing a port PR.** These are opened by `github-actions[bot]`, so their CI runs
 land in the `action_required` state waiting on a maintainer to approve them.
