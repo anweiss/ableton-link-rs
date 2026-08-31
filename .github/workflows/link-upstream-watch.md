@@ -81,7 +81,16 @@ safe-outputs:
     # CI, or its own prompt. One file is all it needs.
     allowed-files:
       - ".github/upstream-backlog.toml"
-    protected-files: fallback-to-issue
+    # Same protected-file problem as the port workflow: gh-aw protects every
+    # top-level dot directory by default and that check ignores `allowed-files`,
+    # so without this exclusion every triage pull request this workflow ever
+    # produced would fall back to a review issue — the exact failure the move to
+    # a file-based backlog was meant to eliminate. `allowed-files` below permits
+    # nothing else under `.github/`.
+    protected-files:
+      policy: fallback-to-issue
+      exclude:
+        - ".github/"
   create-issue:
     title-prefix: "[upstream-sync] "
     labels: [upstream-sync, automation]
