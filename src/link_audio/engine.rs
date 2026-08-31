@@ -376,11 +376,9 @@ impl AudioEngine {
     /// `end_peer_sync` for the teardown path, which must not block on the state
     /// lock. See `try_with_state`.
     fn try_end_peer_sync(&self) {
+        self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel);
         let changed = self
-            .try_with_state(|state| {
-                self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel);
-                Self::prune_peers(state, &[])
-            })
+            .try_with_state(|state| Self::prune_peers(state, &[]))
             .unwrap_or(false);
         if changed {
             self.publish_channels();
@@ -397,6 +395,11 @@ impl AudioEngine {
         if self.shutdown.swap(true, AtomicOrdering::AcqRel) {
             return;
         }
+        // Invalidate every epoch quoted before now, unconditionally and without
+        // the state lock. The bounded acquires below can time out; if the bump
+        // rode along inside one of them, a timeout would leave the pre-shutdown
+        // epoch current and let a late `*_at` write repopulate peers.
+        self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel);
         // Stop the engine's own tasks first. Without this, a `LinkAudioSink` or
         // `LinkAudioSource` holding the engine alive past `LinkAudio` would let
         // the receive task keep servicing channel requests — repopulating a
@@ -418,10 +421,7 @@ impl AudioEngine {
         // its `LinkAudio` arrives here on a thread that already owns this
         // non-reentrant mutex. Blocking would deadlock teardown outright.
         let ids: Vec<Id> = self
-            .try_with_state(|state| {
-                self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel);
-                state.sinks.iter().map(|s| s.sink.id()).collect::<Vec<Id>>()
-            })
+            .try_with_state(|state| state.sinks.iter().map(|s| s.sink.id()).collect::<Vec<Id>>())
             .unwrap_or_default();
         if !ids.is_empty() {
             // The only caller that may retry: this is the last chance to get
@@ -1719,7 +1719,6 @@ mod tests {
         let epoch = engine.begin_peer_sync();
         engine.saw_link_audio_endpoint_at(epoch, NodeId::new(), Some(peer_addr));
         let sink = engine.add_sink("channel", 1024);
-        let late = engine.add_sink("late", 1024);
 
         engine.shutdown();
 
@@ -1744,8 +1743,31 @@ mod tests {
             })
         });
 
-        // A channel request must be refused...
-        engine.add_source(late.id(), Box::new(|_| {}));
+        // A channel request must be refused. This needs a *remote* channel: a
+        // request is only emitted for a source whose channel resolves to a peer
+        // endpoint, so announce one from the peer first.
+        let remote = Id::new();
+        engine.with_state(|state| {
+            state.channels.saw_announcement(
+                NodeId::new(),
+                "peer",
+                SessionId::default(),
+                &[AnnouncedChannel {
+                    id: remote,
+                    name: "remote".to_string(),
+                }],
+                *peer_addr.ip(),
+                peer_addr,
+                1.0,
+                30,
+                Instant::now(),
+            );
+        });
+        assert!(
+            engine.with_state(|s| s.channels.channel_endpoint(remote).is_some()),
+            "the request half of this test would be vacuous"
+        );
+        engine.add_source(remote, Box::new(|_| {}));
         engine.send_channel_requests();
         assert!(
             tokio::time::timeout(StdDuration::from_millis(250), peer.recv(&mut buf))
@@ -1777,6 +1799,7 @@ mod tests {
             Err(poisoned) => poisoned.into_inner(),
         };
 
+        let stale = engine.live_epoch();
         let started = Instant::now();
         engine.shutdown();
         let waited = started.elapsed();
@@ -1788,6 +1811,19 @@ mod tests {
         );
         assert!(engine.is_shut_down());
         drop(held);
+
+        // Degrading past the bound must not cost finality: an epoch quoted
+        // before shutdown has to stay rejected even if the bounded acquires
+        // timed out.
+        engine.saw_link_audio_endpoint_at(stale, NodeId::new(), Some(peer_endpoint()));
+        assert!(
+            engine.with_state(|state| state.peers.is_empty()),
+            "a pre-shutdown epoch repopulated peers after shutdown"
+        );
+    }
+
+    fn peer_endpoint() -> SocketAddrV4 {
+        SocketAddrV4::new(addr(), 9999)
     }
 
     /// `shutdown` waits for in-flight sends by taking the write side of the
