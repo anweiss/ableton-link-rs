@@ -181,14 +181,28 @@ jobs:
               { owner, repo, status: 'action_required', per_page: 100 },
             );
 
+            // Bounded to the CURRENT head of an open pull request, and that
+            // bound is load-bearing rather than an optimisation. Held runs are
+            // never garbage-collected: this repository had accumulated 40+ of
+            // them on superseded heads of the release-please branch alone.
+            // Approving those would relaunch months-old jobs against dead SHAs
+            // - burning minutes, publishing check runs nobody is waiting on,
+            // and doing it again for every stale head ever pushed. A held run
+            // only matters if a pull request is currently parked behind it.
+            const open = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const liveHeads = new Set(open.map(pr => pr.head.sha));
+
             const held = runs.filter(r =>
               (r.status === 'action_required' || r.conclusion === 'action_required') &&
+              liveHeads.has(r.head_sha) &&
               r.actor && r.actor.login === 'github-actions[bot]' &&
               r.head_repository &&
               r.head_repository.full_name.toLowerCase() === `${owner}/${repo}`.toLowerCase());
 
             if (held.length === 0) {
-              core.info('No held runs on bot branches in this repository.');
+              core.info('No held runs on open bot pull requests in this repository.');
               return;
             }
 
