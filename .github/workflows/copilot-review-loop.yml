@@ -718,12 +718,28 @@ jobs:
                 // sign-off that was genuinely earned would be worse; the run
                 // already warns that it is degraded, and the `push` trigger on
                 // the next commit to `main` picks the pull request up.
+                let viaPat = false;
                 if (hasPat) {
-                  await userRequest(
-                    'POST', `/repos/${owner}/${repo}/issues/${pr.number}/labels`,
-                    { labels: [DONE_LABEL] },
-                  );
-                } else {
+                  try {
+                    await userRequest(
+                      'POST', `/repos/${owner}/${repo}/issues/${pr.number}/labels`,
+                      { labels: [DONE_LABEL] },
+                    );
+                    viaPat = true;
+                  } catch (err) {
+                    // Labels are the issues API, so this needs `issues: write`
+                    // on the PAT - a different scope from the ones the dispatch
+                    // and review request use. If it is missing, fall through to
+                    // GITHUB_TOKEN rather than failing: a sign-off that lands
+                    // without triggering auto-merge is recoverable, and one
+                    // that throws leaves the pull request unlabelled with the
+                    // loop reporting success.
+                    core.warning(
+                      `PR #${pr.number}: PAT could not label (${err.message}); ` +
+                      'falling back to GITHUB_TOKEN.');
+                  }
+                }
+                if (!viaPat) {
                   await github.rest.issues.addLabels({
                     owner, repo, issue_number: pr.number, labels: [DONE_LABEL],
                   });
