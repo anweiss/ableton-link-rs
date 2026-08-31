@@ -550,15 +550,18 @@ Both the `.md` source and the generated `.lock.yml` are committed.
 
 `copilot-review-loop.yml` additionally wants a `PIPELINE_PAT` repository secret, a
 classic or fine-grained PAT owned by a maintainer with `repo` / *Actions: write*,
-*Pull requests: write* and *Contents: read* on this repository. Three of its steps
-cannot use `GITHUB_TOKEN` at all:
+*Pull requests: write* and *Contents: write* on this repository. Four steps across the
+loop and the fixer cannot use `GITHUB_TOKEN` at all:
 
 - **Approving held runs.** `GITHUB_TOKEN` cannot clear the `action_required` state on
   runs belonging to a PR it created.
 - **Dispatching `Copilot Review Fix`.** A workflow run started with `GITHUB_TOKEN`
-  cannot itself trigger further workflow runs. The fix push would therefore raise no
-  checks at all, leaving the PR unmergeable for want of the very checks the loop is
-  waiting on.
+  cannot itself trigger further workflow runs, so the dispatch would silently create
+  no run at all.
+- **Pushing the fixes.** `Copilot Review Fix` pushes with `PIPELINE_PAT` for the same
+  reason (`safe-outputs.push-to-pull-request-branch.github-token` in
+  `copilot-review-fix.md`): a push authenticated as `GITHUB_TOKEN` raises no checks,
+  leaving the PR unmergeable for want of the very checks the loop is waiting on.
 - **Requesting the Copilot reviewer.** Under `GITHUB_TOKEN` the GraphQL
   `requestReviews` mutation reports success and attaches nobody.
 

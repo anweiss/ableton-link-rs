@@ -73,6 +73,15 @@ safe-outputs:
     # Without it, `target: "*"` would let a dispatch aimed at any pull request
     # in the repository push code to it, including release-please's.
     required-labels: [upstream-sync, automation]
+    # The push has to be made by the same PAT the review loop dispatches with.
+    # A push authenticated as `GITHUB_TOKEN` does not start a workflow run, so
+    # the fixed branch would sit with no CI, the loop would never see a green
+    # re-run, and the round would be spent for nothing. `PIPELINE_PAT` is
+    # already a hard requirement of the loop - without it nothing is dispatched
+    # in the first place - so there is no configuration in which this is set
+    # but that is not.
+    github-token: ${{ secrets.PIPELINE_PAT }}
+    github-token-for-extra-empty-commit: ${{ secrets.PIPELINE_PAT }}
   add-comment:
     target: "*"
     max: 1
