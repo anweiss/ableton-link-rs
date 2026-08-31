@@ -16,7 +16,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     time::{Duration as StdDuration, Instant},
 };
@@ -178,6 +178,7 @@ pub struct AudioEngine {
     /// against a `JoinHandle::abort()` that has not taken effect yet.
     sync_epoch: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
+    send_gate: SendGate,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -220,6 +221,7 @@ impl AudioEngine {
             channels_changed: Arc::new(Mutex::new(None)),
             sync_epoch: Arc::new(AtomicU64::new(1)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            send_gate: Arc::new(RwLock::new(())),
             tasks: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -244,7 +246,7 @@ impl AudioEngine {
 
     /// Updates the Link node and session identity the engine announces.
     pub fn set_identity(&self, node_id: NodeId, session_id: SessionId) {
-        self.set_identity_at(self.sync_epoch(), node_id, session_id);
+        self.set_identity_at(self.live_epoch(), node_id, session_id);
     }
 
     /// As [`AudioEngine::set_identity`], but ignored unless `epoch` is still the
@@ -276,7 +278,7 @@ impl AudioEngine {
     /// Registers or removes the LinkAudio endpoint of a Link peer. This is fed
     /// from the `aep4` entry of the peer's Link `PeerState`.
     pub fn saw_link_audio_endpoint(&self, peer_id: NodeId, endpoint: Option<SocketAddrV4>) {
-        self.saw_link_audio_endpoint_at(self.sync_epoch(), peer_id, endpoint);
+        self.saw_link_audio_endpoint_at(self.live_epoch(), peer_id, endpoint);
     }
 
     /// As [`AudioEngine::saw_link_audio_endpoint`], but ignored unless `epoch`
@@ -310,7 +312,7 @@ impl AudioEngine {
 
     /// Prunes peers and channels that are no longer part of the session.
     pub fn update_session_peers(&self, peers: &[NodeId]) {
-        self.update_session_peers_at(self.sync_epoch(), peers);
+        self.update_session_peers_at(self.live_epoch(), peers);
     }
 
     /// As [`AudioEngine::update_session_peers`], but ignored unless `epoch` is
@@ -344,12 +346,16 @@ impl AudioEngine {
     /// Starts a run of peer synchronisation, returning the epoch that run must
     /// quote. Any earlier run is invalidated.
     pub fn begin_peer_sync(&self) -> u64 {
-        if self.shutdown.load(AtomicOrdering::Acquire) {
-            // Epochs start at 1, so 0 is never current: a caller that races
-            // shutdown gets an epoch whose writes are all discarded.
-            return 0;
-        }
-        self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel) + 1
+        // Under the state lock, so this is serialised against the epoch bump in
+        // `shutdown`/`end_peer_sync` rather than racing it.
+        self.with_state(|_| {
+            if self.shutdown.load(AtomicOrdering::Acquire) {
+                // Epochs start at 1, so 0 is never current: a caller that races
+                // shutdown gets an epoch whose writes are all discarded.
+                return 0;
+            }
+            self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel) + 1
+        })
     }
 
     /// Ends peer synchronisation and forgets the session's peers.
@@ -382,6 +388,13 @@ impl AudioEngine {
         // the receive task keep servicing channel requests — repopulating a
         // sink's receivers and resuming audio long after teardown.
         self.abort_tasks();
+        // Waits out any task iteration that started before the flag was set, so
+        // the byes below are the last thing this engine puts on the wire.
+        // `abort()` alone cannot promise that: it only schedules cancellation.
+        let _gate = match self.send_gate.write() {
+            Ok(gate) => gate,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let ids: Vec<Id> = self.with_state(|state| {
             self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel);
             state.sinks.iter().map(|s| s.sink.id()).collect()
@@ -392,6 +405,15 @@ impl AudioEngine {
             self.send_channel_byes_inner(&ids, Retry::Yes);
         }
         self.end_peer_sync();
+    }
+
+    /// The current epoch, or 0 (never current) once shut down — so the
+    /// convenience wrappers cannot quote their way past teardown.
+    fn live_epoch(&self) -> u64 {
+        if self.shutdown.load(AtomicOrdering::Acquire) {
+            return 0;
+        }
+        self.sync_epoch()
     }
 
     fn epoch_is_current(&self, epoch: u64) -> bool {
@@ -592,6 +614,7 @@ impl AudioEngine {
 
     fn spawn_receive_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
         let api_channels = self.api_channels.clone();
@@ -621,9 +644,10 @@ impl AudioEngine {
                 // or channels: `receive_channel_request` repopulates a sink's
                 // receivers without consulting `state.peers`, so the epoch
                 // gate does not cover this path.
-                if shutdown.load(AtomicOrdering::Acquire) {
-                    return;
-                }
+                let _gate = match enter_gate(&send_gate, &shutdown) {
+                    Some(gate) => gate,
+                    None => return,
+                };
 
                 let changed = handle_message(&socket, &state, &buffer[..num_bytes], from);
                 if changed {
@@ -635,6 +659,7 @@ impl AudioEngine {
 
     fn spawn_announce_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
 
@@ -645,9 +670,10 @@ impl AudioEngine {
             loop {
                 interval.tick().await;
 
-                if shutdown.load(AtomicOrdering::Acquire) {
-                    return;
-                }
+                let _gate = match enter_gate(&send_gate, &shutdown) {
+                    Some(gate) => gate,
+                    None => return,
+                };
 
                 let (node_id, announcements, endpoints, byes) = {
                     let mut state = match state.lock() {
@@ -712,6 +738,7 @@ impl AudioEngine {
 
     fn spawn_process_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
         let api_channels = self.api_channels.clone();
@@ -724,9 +751,10 @@ impl AudioEngine {
             loop {
                 interval.tick().await;
 
-                if shutdown.load(AtomicOrdering::Acquire) {
-                    return;
-                }
+                let _gate = match enter_gate(&send_gate, &shutdown) {
+                    Some(gate) => gate,
+                    None => return,
+                };
 
                 let (node_id, messages, channels_changed_now) = {
                     let mut state = match state.lock() {
@@ -799,6 +827,7 @@ impl AudioEngine {
 
     fn spawn_request_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
 
@@ -809,9 +838,10 @@ impl AudioEngine {
             loop {
                 interval.tick().await;
 
-                if shutdown.load(AtomicOrdering::Acquire) {
-                    return;
-                }
+                let _gate = match enter_gate(&send_gate, &shutdown) {
+                    Some(gate) => gate,
+                    None => return,
+                };
 
                 let (node_id, requests) = {
                     let state = match state.lock() {
@@ -856,6 +886,30 @@ impl Drop for AudioEngine {
         // when `LinkAudio::drop` already ran.
         self.shutdown();
     }
+}
+
+/// Orders task activity against teardown.
+///
+/// `JoinHandle::abort()` only schedules cancellation: a task already past its
+/// await runs its whole body, so it can send an announcement or a buffer of
+/// audio *after* the final channel byes. Each task iteration holds the read
+/// side for its entire body; `shutdown` sets the flag and then takes the write
+/// side, so an iteration that already started finishes first, and one that has
+/// not started yet sees the flag and stops.
+type SendGate = Arc<RwLock<()>>;
+
+fn enter_gate<'a>(
+    gate: &'a SendGate,
+    shutdown: &AtomicBool,
+) -> Option<std::sync::RwLockReadGuard<'a, ()>> {
+    let guard = match gate.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if shutdown.load(AtomicOrdering::Acquire) {
+        return None;
+    }
+    Some(guard)
 }
 
 /// The engine's UDP socket.
@@ -1547,12 +1601,28 @@ mod tests {
 
         // And a *new* run cannot be started to work around that.
         let fresh = engine.begin_peer_sync();
+        assert_eq!(fresh, 0, "peer sync was restartable after shutdown");
         engine.saw_link_audio_endpoint_at(fresh, peer_id, endpoint);
         engine.update_session_peers_at(fresh, &[peer_id]);
         assert!(
             engine.with_state(|s| s.peers.is_empty()),
             "peer sync was restarted after shutdown"
         );
-        engine.set_identity_at(fresh, NodeId::new(), SessionId(NodeId::new()));
+
+        // Nor can the unversioned wrappers, which quote an epoch on the
+        // caller's behalf.
+        let identity = engine.with_state(|s| (s.node_id, s.session_id));
+        engine.saw_link_audio_endpoint(peer_id, endpoint);
+        engine.update_session_peers(&[peer_id]);
+        engine.set_identity(NodeId::new(), SessionId(NodeId::new()));
+        assert!(
+            engine.with_state(|s| s.peers.is_empty()),
+            "an unversioned write repopulated peers after shutdown"
+        );
+        assert_eq!(
+            engine.with_state(|s| (s.node_id, s.session_id)),
+            identity,
+            "an unversioned write changed identity after shutdown"
+        );
     }
 }
