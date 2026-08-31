@@ -14,3 +14,24 @@ updates:
     commit-message:
       prefix: "ci"
       include: "scope"
+    ignore:
+      # The `github/gh-aw-actions/*` pins are compiler-owned, not dependencies.
+      # `gh aw compile` writes them into the generated `*.lock.yml` files and
+      # `agentics-maintenance.yml` together with the step bodies that call the
+      # scripts those actions ship, and it records the pin it chose in the
+      # `gh-aw-manifest:` header. Dependabot edits the `uses:` line only, so a
+      # bump desynchronises the action from the body that was compiled against
+      # it while leaving the manifest claiming the old version.
+      #
+      # That is not theoretical. #82 moved setup 0.86.2 -> 0.87.0 on 21 Aug
+      # against a body compiled by v0.86.2 and nothing broke, because 0.87.0
+      # still shipped `setup/sh/install_ripgrep.sh`. v0.87.1 removed that
+      # script, so when #95 moved the pin to 0.87.4 on 31 Aug the still-v0.86.2
+      # body kept running `bash "${RUNNER_TEMP}/gh-aw/actions/install_ripgrep.sh"`
+      # and `Link Upstream Port` died with exit 127 in both the agent and
+      # detection jobs (run 33405025626). The break was latent for ten days and
+      # fired on a patch bump.
+      #
+      # The supported upgrade path is `gh extension upgrade aw` followed by
+      # `gh aw compile`, which moves the pins and the bodies in one step.
+      - dependency-name: "github/gh-aw-actions/*"
