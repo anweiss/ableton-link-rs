@@ -80,7 +80,23 @@ safe-outputs:
     # issue, which is what happened on run 30514772205. Push over plain git
     # instead. Safe here because main has required_signatures disabled.
     signed-commits: false
-    protected-files: fallback-to-issue
+    # `.github/` has to be excluded from protected-file protection, not merely
+    # listed in `allowed-files` below. gh-aw protects every top-level dot
+    # directory by default (ADR 28486), and that check runs independently of the
+    # allowlist — so a correct port that touches the backlog file is refused at
+    # the safe-output step and turned into a review issue instead of a pull
+    # request. That is exactly the stranded-port shape this prompt tells the
+    # agent to stop on, so the first real run under the new backlog
+    # (run 33420103405) blocked the pipeline on its own output.
+    #
+    # Safe because `allowed-files` is an *exclusive* allowlist:
+    # `.github/upstream-backlog.toml` is the only path under `.github/` it
+    # permits, so nothing else in the directory becomes writable. The exclusion
+    # must name the path segment, which is why it is `.github/` and not the file.
+    protected-files:
+      policy: fallback-to-issue
+      exclude:
+        - ".github/"
     # Exclusive allowlist. Anything outside it is refused, so a run cannot quietly
     # add a dependency, rewrite CI, or edit its own prompt to widen its reach.
     allowed-files:
