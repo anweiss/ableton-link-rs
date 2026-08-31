@@ -72,35 +72,41 @@ name: Copilot review loop for port PRs
 # withholds `copilot-reviewed`, so the PR parks visibly with auto-merge
 # disengaged rather than merging unreviewed.
 
+# No `pull_request` or `pull_request_review` trigger, on purpose.
+#
+# Every pull request this workflow cares about is opened by
+# `github-actions[bot]`, so every `pull_request` run it queues is held in
+# `action_required` - and a `pull_request_review` run queued by Copilot
+# submitting its review is held AND unapprovable, because `/approve` only
+# serves runs "from a fork pull request or queued by the Actions bot" and
+# Copilot is neither. Those runs did no work: `unblockRuns` skips this
+# workflow's own held runs by name, and the scheduled sweep below is the
+# authority for every hop anyway.
+#
+# What they did do is put a permanent "1 workflow awaiting your approval"
+# banner on the pull request that no automation could ever clear, so the
+# maintainer was asked to approve a run that would have been a no-op.
+# Observed on PR #92, run 33399328583. Not emitting the run is the only fix;
+# there is no credential that can approve it. The event triggers bought
+# nothing here - they were held by the same gate they existed to clear.
 on:
-  pull_request:
-    types: [opened, reopened, ready_for_review, synchronize, labeled, edited]
-  pull_request_review:
-    types: [submitted]
   # Two reasons this sweep is not optional. There is no event for "a run is
   # waiting for approval" - `workflow_run` has no `action_required` activity
   # type - and delivery of `pull_request_review` for an App reviewer is not
-  # something the docs promise. The sweep is the guaranteed path; the events
-  # above only make the common case fast.
+  # something the docs promise. The sweep is the guaranteed path.
   # `Link Upstream Port` opens its PR as `github-actions[bot]`, so every
-  # `pull_request` run that PR triggers is held for approval - including the
-  # `opened` run of THIS workflow. The events above therefore make nothing
-  # fast for the case that matters: they are held by the same gate they exist
-  # to clear. `workflow_run` is the way out. It runs on `main` in the base
-  # repo, so it is never held, and it fires as soon as the port workflow
-  # finishes - by which point the PR and its held runs already exist. Without
-  # it a port PR waits up to 30 minutes for the sweep purely because of when
-  # in the cron window it happened to open (PR #92 opened at 18:59, twelve
-  # minutes after the 18:48 sweep, and sat).
+  # `pull_request` run that PR triggers is held for approval. `workflow_run`
+  # is the way in: it runs on `main` in the base repo, so it is never held,
+  # and it fires as soon as the port workflow finishes - by which point the
+  # PR and its held runs already exist. Without it a port PR waits up to a
+  # full cron window purely because of when it happened to open (PR #92
+  # opened at 18:59, twelve minutes after the 18:48 sweep, and sat).
   workflow_run:
     workflows: ["Link Upstream Port"]
     types: [completed]
-  # Every OTHER trigger on this workflow is held for approval on a
-  # `github-actions[bot]` PR - `pull_request` and `pull_request_review`
-  # alike - so the sweep is not a backstop here, it is the primary path for
-  # every hop after the PR opens. Observed on PR #92: Copilot submitted its
-  # review at 19:08 and the resulting `pull_request_review` run
-  # (32766434580) went straight to `action_required`. At `*/30` each of
+  # The sweep is not a backstop here, it is the primary path for every hop
+  # after the PR opens, because the event triggers that would have driven
+  # those hops are gone (see the header above). At `*/30` each of
   # review-submitted, agent-push and re-review could wait a full window,
   # stacking into more than an hour of pure scheduling latency on one PR.
   # `*/5` bounds it. The run is one github-script step over open PRs, and
@@ -130,6 +136,100 @@ jobs:
   review-loop:
     runs-on: ubuntu-latest
     steps:
+      # Runs BEFORE the review loop and independently of it, because the loop
+      # only ever looks at pull requests `disqualify` accepts: opened by
+      # `github-actions[bot]`, labelled `upstream-sync` + `automation`, and
+      # explicitly NOT `autorelease: pending`. Held runs are not that narrow.
+      # Every release-please pull request is opened by the same bot and so has
+      # all five of its `pull_request` runs held, and nothing in this repo ever
+      # approved them: the loop skipped the pull request by design, so a
+      # maintainer had to clear them by hand on every single release, and until
+      # they did, the required checks could not report and the release sat.
+      # Observed on `release-please--branches--main--components--ableton-link-rs`
+      # on 21, 24 and 31 Aug.
+      #
+      # Scope is deliberately drawn at "our own bot, on a branch in this
+      # repository". `/approve` also serves fork pull requests, and the
+      # repository's fork policy holds runs from contributors new to GitHub on
+      # purpose; blanket-approving every held run would auto-run unreviewed
+      # code from strangers. Both conditions below are checked, and the fork
+      # check is on `head_repository`, not on the branch name, because a branch
+      # name proves nothing about where the code came from.
+      - name: Approve held runs on our own bot branches
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PIPELINE_PAT: ${{ secrets.PIPELINE_PAT }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pat = process.env.PIPELINE_PAT || '';
+            // GITHUB_TOKEN cannot clear `action_required`, so with no PAT there
+            // is nothing to try. Warn rather than fail: the review loop below
+            // reports the same missing secret on the pull requests it owns, and
+            // failing here would bury that message.
+            if (!pat) {
+              core.warning('PIPELINE_PAT is not set; held runs cannot be approved.');
+              return;
+            }
+
+            // `status=action_required` is the server-side filter for held runs.
+            // Runs also surface it as a *conclusion* once they finish being
+            // held, and the list endpoint does not match those, so the
+            // conclusion is checked client-side too.
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              { owner, repo, status: 'action_required', per_page: 100 },
+            );
+
+            const held = runs.filter(r =>
+              (r.status === 'action_required' || r.conclusion === 'action_required') &&
+              r.actor && r.actor.login === 'github-actions[bot]' &&
+              r.head_repository &&
+              r.head_repository.full_name.toLowerCase() === `${owner}/${repo}`.toLowerCase());
+
+            if (held.length === 0) {
+              core.info('No held runs on bot branches in this repository.');
+              return;
+            }
+
+            // Same statement-about-the-run 403 the review loop knows about: a
+            // run queued by anyone other than the Actions bot is unapprovable
+            // by any credential. It should not reach here given the filter
+            // above, but a skipped run must not abort the rest of the batch.
+            const UNAPPROVABLE = /not from a fork pull request or queued by the Actions bot/i;
+            let failures = [];
+            for (const run of held) {
+              const res = await fetch(
+                `https://api.github.com/repos/${owner}/${repo}/actions/runs/${run.id}/approve`,
+                {
+                  method: 'POST',
+                  headers: {
+                    authorization: `token ${pat}`,
+                    accept: 'application/vnd.github+json',
+                    'x-github-api-version': '2022-11-28',
+                    'user-agent': 'copilot-review-loop',
+                  },
+                },
+              );
+              if (res.ok) {
+                core.info(`Approved held run ${run.id} (${run.name}) on ${run.head_branch}.`);
+                continue;
+              }
+              const text = await res.text();
+              if (UNAPPROVABLE.test(text)) {
+                core.notice(`Run ${run.id} (${run.name}) cannot be approved through the API.`);
+                continue;
+              }
+              failures.push(`${run.id} (${run.name}): ${res.status} ${text.slice(0, 200)}`);
+            }
+
+            // Fail loudly. A held run that silently stayed held is exactly the
+            // quiet stall this file exists to prevent - it looks green here and
+            // parks the pull request behind checks that will never report.
+            if (failures.length > 0) {
+              core.setFailed(`Could not approve held run(s):\n${failures.join('\n')}`);
+            }
+
       - name: Drive the review loop
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -875,9 +975,11 @@ jobs:
             const numbers = open
               .filter(pr => pr.user.login === 'github-actions[bot]')
               .map(pr => pr.number);
-            const triggering = context.payload.pull_request &&
-              context.payload.pull_request.number;
-            if (triggering && !numbers.includes(triggering)) numbers.push(triggering);
+            // There is no triggering pull request to fold in any more: the
+            // `pull_request` and `pull_request_review` triggers were removed
+            // because their runs were held and unapprovable (see the header).
+            // Every remaining trigger is repository-scoped, so the sweep above
+            // is the complete candidate set.
 
             let failed = [];
             for (const number of numbers) {
