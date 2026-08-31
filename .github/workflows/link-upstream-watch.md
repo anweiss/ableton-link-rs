@@ -85,8 +85,8 @@ safe-outputs:
     # top-level dot directory by default and that check ignores `allowed-files`,
     # so without this exclusion every triage pull request this workflow ever
     # produced would fall back to a review issue — the exact failure the move to
-    # a file-based backlog was meant to eliminate. `allowed-files` below permits
-    # nothing else under `.github/`.
+    # a file-based backlog was meant to eliminate. The `allowed-files` allowlist
+    # above permits nothing else under `.github/`.
     protected-files:
       policy: fallback-to-issue
       exclude:
