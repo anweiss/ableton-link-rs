@@ -36,9 +36,9 @@ schema_version = 1
 # Watermark this triage was computed against. Advisory: the real watermark is
 # the submodule pin, and the validator fails if this drifts from it.
 [watermark]
-pinned = "fd30b5048e20136b71046f7dad8a2c29bcd46892"
+pinned = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 upstream = "902aef95bf94af49746fdda5369b42cdcfa1e6d2"
-commits_behind = 114
+commits_behind = 113
 
 # ---------------------------------------------------------------------------
 # Port items, in upstream ancestry order (oldest first). The port workflow
@@ -159,10 +159,10 @@ why = "Extracts a `SessionController` type that owns callback-routing so callbac
 id = "add-gatewayfactory-gatewayschanged-notification"
 title = "Add GatewayFactory::gatewaysChanged() notification"
 upstream = ["334972b404d7"]
-rust = ["src/discovery/gateway.rs"]
+rust = ["src/discovery/gateway.rs", "src/discovery/messenger.rs"]
 risk = "behavior"
-status = "outstanding"
-retired_at_pin = ""
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "`PeerGateways` now calls `factory.gatewaysChanged()` when a gateway is added or removed so callers can react (e.g. update announced endpoints); the Rust `GatewayFactory` trait may need a `gateways_changed` method"
 
 [[port]]
