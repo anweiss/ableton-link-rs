@@ -154,8 +154,21 @@ why = "one line on the observable effect"
 note = "optional"                      # free text; nothing parses it
 ```
 
-Plus `[[undecided]]` and `[[not_applicable]]` tables in the same shape, which exist so
-every SHA has a home.
+Plus `[[undecided]]` and `[[not_applicable]]` tables, which exist so every SHA has a
+home. They are **not** the same shape as `[[port]]` — they carry no `id`, `status`,
+`risk`, `rust` or `retired_at_pin`, and the validator ignores any you invent:
+
+```toml
+[[undecided]]
+upstream = ["<sha>", "..."]
+note = "what the open question is"    # optional, but say it anyway
+
+[[not_applicable]]
+upstream = ["<sha>", "..."]
+reason = "why this can never need porting"   # required, and checked
+```
+
+Only `[[port]]` items get a tracking issue, because only they describe work.
 
 **The submodule pin is still the truth, and this file is metadata about it.** A commit
 is ported when the pin is past it, not when this file says `retired`. That is why the
@@ -278,12 +291,20 @@ either; the validator catches both.
   `src/link/audio_endpoint.rs`, `src/encoding.rs`, or
   `src/link_audio/{messages,payload,encoding,codec}.rs` as `risk = "wire-format"`.
   Those change bytes on the network and need a human before they ship.
-- If the file has more than 25 `[[port]]` items with `status = "outstanding"`, stop
-  adding to it. Open the pull request with only the `[watermark]` update and say in
-  the body that the backlog is saturated and porting needs to catch up first. Count
-  `status = "outstanding"` only — never raw item count. Five of the twenty items in
-  the old backlog were already behind the watermark, so counting every line overstates
-  the queue and can freeze triage over finished work.
+- If the file has more than 25 `[[port]]` items with `status = "outstanding"`, the
+  backlog is saturated and porting needs to catch up before more work is queued.
+  **Still triage every commit into a bucket, and still open the pull request.**
+  Coverage is not optional: a drift commit in no bucket fails the required check, and
+  once the pin passes it, it is gone from every future drift report. What saturation
+  changes is only the *message*, not the triage — say at the top of the pull request
+  body that the backlog is saturated, give the outstanding count, and ask for porting
+  to catch up before the next run. Do not withhold the triage, and in particular do
+  not open a watermark-only pull request: advancing `[watermark].upstream` past
+  commits you did not bucket is exactly the state the validator rejects, so that pull
+  request could never merge.
+  Count `status = "outstanding"` only — never raw item count. Five of the twenty items
+  in the old backlog were already behind the watermark, so counting every line
+  overstates the queue and can freeze triage over finished work.
 
 ## Watch the watermark itself
 

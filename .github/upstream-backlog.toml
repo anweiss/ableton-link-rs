@@ -148,12 +148,12 @@ note = "retired at pin `e233c676`"
 [[port]]
 id = "route-callbacks-through-sessioncontroller-shutdown-ordering-improvements"
 title = "Route callbacks through SessionController / shutdown ordering improvements"
-upstream = ["165c764990b0", "cbc81f057633", "fd30b5048e20", "7f222b559678", "cccaecc9e93b", "53f0627c9cf8"]
-rust = ["src/link/controller.rs"]
+upstream = ["165c764990b0", "cbc81f057633", "fd30b5048e20", "cccaecc9e93b", "53f0627c9cf8", "eb25bb250f2f", "7f222b559678"]
+rust = ["src/link/controller.rs", "src/link_audio/mod.rs"]
 risk = "behavior"
 status = "outstanding"
 retired_at_pin = ""
-why = "Extracts a `SessionController` type that owns the callback-routing and discovery-update logic; makes the `Controller` destructor sequence deterministic (stop dispatcher → disable discovery → teardown)"
+why = "Extracts a `SessionController` type that owns the callback-routing and discovery-update logic; makes the `Controller` destructor sequence deterministic (stop dispatcher → disable discovery → teardown), including tearing audio down before Link's shutdown begins rather than relying on field drop order"
 
 [[port]]
 id = "add-gatewayfactory-gatewayschanged-notification"
@@ -231,7 +231,7 @@ note = "Merged with \"Fix ESP-IDF 6.0 PeerState init + Peers use-after-move (cor
 id = "set-ip-multicast-all-0-on-linux"
 title = "Set IP_MULTICAST_ALL=0 on Linux sockets + remove UdpMessenger subnet filter"
 upstream = ["c5574eee4d03", "d466f42a7b36"]
-rust = ["src/discovery/messenger.rs` (subnet filter)", "platform network setup"]
+rust = ["src/discovery/messenger.rs"]
 risk = "behavior"
 status = "outstanding"
 retired_at_pin = ""
@@ -394,10 +394,6 @@ reason = "Add IPv6 ScanIpIfAddrs comment (`platforms/posix/`, `platforms/windows
 [[not_applicable]]
 upstream = ["082691b46ef1"]
 reason = "Update upstream README.md for LinkAudio (upstream docs only)"
-
-[[not_applicable]]
-upstream = ["eb25bb250f2f"]
-reason = "Stop audio before shutting down Link (`link_audio` only)"
 
 [[not_applicable]]
 upstream = ["7f222b559678"]
