@@ -390,11 +390,20 @@ outstanding, the next run would pick it again as the earliest outstanding item a
 re-port work that is already on `main`.
 
 It must exit 0 before you open the pull request. That validator is a required check,
-and it is the thing that catches the two failure modes this design is exposed to: an
-item left `outstanding` after the watermark has already passed its commits (a port
-that will be attempted forever and never found), and an item marked `retired` whose
-commits are still ahead of the pin (a port silently dropped). Do not edit the file by
-hand and skip the validator — hand edits are precisely what it exists to catch.
+and these are the two failure modes it actually protects against:
+
+- An item left `outstanding` after the watermark has already passed **all** of its
+  commits — a port that would be attempted forever and never found. This is an error.
+- **Advancing the pin across a commit that is unclassified, still `[[undecided]]`, or
+  owned by an `outstanding` `[[port]]` item.** That is the one that loses work, and it
+  is the failure PR #59 produced by hand. This is an error, and it is the check that
+  makes `retired` mean something.
+
+Note what is *not* an error: a `retired` item whose commits are still ahead of the pin
+only warns, because non-contiguous items make that the normal case. Do not rely on
+that warning to catch a dropped port — the pin-advance check above is what catches it.
+Do not edit the file by hand and skip the validator — hand edits are precisely what it
+exists to catch.
 
 ## Open the pull request
 

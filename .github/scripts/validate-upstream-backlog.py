@@ -28,7 +28,10 @@ BACKLOG = Path(sys.argv[1] if len(sys.argv) > 1 else ".github/upstream-backlog.t
 SUBMODULE = Path("vendor/ableton-link")
 ROOT = Path(".")
 
-RISKS = {"behavior", "wire-format", "internal"}
+# Must stay in step with the schema block in link-upstream-watch.md and with the
+# `risk: api-break` branch in link-upstream-port.md. Omitting a risk the watch
+# agent is told to emit produces an item that can never pass the required check.
+RISKS = {"behavior", "wire-format", "api-break", "internal"}
 STATUSES = {"outstanding", "retired"}
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -147,16 +150,14 @@ for key in ("pinned", "upstream"):
     if not re.fullmatch(r"[0-9a-f]{40}", wm.get(key, "")):
         err(f"[watermark] {key} must be a full 40-character SHA")
 
-# Every SHA the file mentions anywhere, including inside prose, so that a commit
-# named only in a note still counts as accounted for.
+# Coverage comes only from the explicit `upstream` arrays. A SHA mentioned in
+# prose used to count too, which meant a drift commit could satisfy coverage
+# while no bucket owned it: the port workflow would never select it, and the
+# pin would eventually cross it unported. Prose is documentation, not a bucket.
 covered = set()
 for bucket in (port, undecided, not_applicable):
     for entry in bucket:
         covered.update(short(s) for s in entry.get("upstream", []))
-for entry in port:
-    for field in ("note", "why"):
-        covered.update(short(s) for s in re.findall(r"`([0-9a-f]{7,40})`",
-                                                    entry.get(field, "")))
 
 # --- watermark agreement ----------------------------------------------------
 # This is the check the old checkbox scheme could not make. The issue body could
@@ -192,11 +193,40 @@ else:
         drift = [s for s in ahead.stdout.split("\n") if s.strip()]
         drift_short = {short(s) for s in drift}
 
+        # The file is accountable for the range it was last triaged against:
+        # pin..[watermark].upstream. Commits that landed upstream *after* that
+        # are not a backlog defect — nobody has had the chance to triage them —
+        # and erroring on them would turn every unrelated pull request red the
+        # moment Ableton pushes, between the 30-day watch runs.
+        #
+        # Nothing is lost by warning instead. The pin-advance check below is the
+        # one that actually protects work, and it refuses to cross an
+        # unclassified commit whether or not it is inside the triaged range.
+        wm_upstream = short(wm.get("upstream", ""))
+        if wm_upstream in {short(s) for s in drift}:
+            cutoff = [short(s) for s in drift].index(wm_upstream) + 1
+        else:
+            # The header names a commit that is not in the range — either it is
+            # the pin itself (nothing triaged yet) or the file is stale in a way
+            # the `pinned` check above did not catch. Hold the file to
+            # everything; a false error here is louder and safer than silence.
+            cutoff = len(drift)
+        triaged = [short(s) for s in drift[:cutoff]]
+        arrived_since = [short(s) for s in drift[cutoff:]]
+
         # Coverage: a commit nobody mentions is not deferred, it is deleted the
         # moment the pin moves past it.
-        for sha in sorted(drift_short - covered):
+        for sha in sorted(set(triaged) - covered):
             err(f"upstream commit {sha} is ahead of the pin but appears nowhere "
                 "in the backlog — triage it into a bucket")
+
+        new_untriaged = sorted(set(arrived_since) - covered)
+        if new_untriaged:
+            warn(f"{len(new_untriaged)} upstream commit(s) landed after "
+                 f"[watermark].upstream ({wm_upstream}) and are not triaged yet: "
+                 f"{', '.join(new_untriaged[:8])}"
+                 f"{' ...' if len(new_untriaged) > 8 else ''}. Run the "
+                 "link-upstream-watch workflow to bucket them.")
 
         # An outstanding item whose commits are all behind the watermark is
         # already done; leaving it outstanding makes the port workflow chase
@@ -334,7 +364,48 @@ for sha, kinds in sorted(multi.items()):
         warn(f"{sha} is classified in more than one bucket ({', '.join(sorted(kinds))}); "
              "port outranks undecided outranks not_applicable when the pin moves past it")
 
-# --- report -----------------------------------------------------------------
+# --- id identity across revisions -------------------------------------------
+# `id` is the join key between this file and its tracking issues: the reconcile
+# workflow matches on `<!-- upstream-backlog-id: ... -->`, never on the title.
+# So an id is a permanent name, not a label. Renaming or deleting one passes
+# every check above — the new document is internally consistent — and then the
+# reconcile workflow opens a fresh issue for the new name and fails on the
+# orphaned old one *after* the merge, on `main`, where it is expensive to undo.
+# Catch it while it is still a pull request by diffing against the merge base.
+def backlog_at(rev):
+    r = subprocess.run(["git", "show", f"{rev}:{BACKLOG}"],
+                       capture_output=True, cwd=ROOT)
+    if r.returncode != 0:
+        return None
+    try:
+        return tomllib.loads(r.stdout.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return None
+
+
+base_rev = ""
+for rev in ("origin/main", "main"):
+    mb = subprocess.run(["git", "merge-base", "HEAD", rev],
+                        capture_output=True, text=True, cwd=ROOT)
+    if mb.returncode == 0 and mb.stdout.strip():
+        base_rev = mb.stdout.strip()
+        break
+
+old_doc = backlog_at(base_rev) if base_rev else None
+if old_doc is None:
+    warn("could not read the previous revision of the backlog; skipped the "
+         "id-stability check")
+else:
+    live_ids = {i.get("id") for i in port}
+    for old in old_doc.get("port", []):
+        oid = old.get("id")
+        if oid and oid not in live_ids:
+            err(f"[[port]] `{oid}` existed at the merge base and is gone from "
+                "this revision. Ids are permanent — the tracking issue for it is "
+                "matched by id and would be orphaned. Retire the item "
+                '(status = "retired") instead of renaming or deleting it.')
+
+
 for w in warnings:
     print(f"warning: {w}")
 for e in errors:

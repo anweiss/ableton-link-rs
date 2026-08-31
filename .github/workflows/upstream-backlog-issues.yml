@@ -115,15 +115,32 @@ jobs:
               owner, repo, labels: LABEL, state: 'all', per_page: 100,
             });
             const byId = new Map();
+            const dupes = [];
             for (const issue of all) {
               const m = (issue.body || '').match(/<!-- upstream-backlog-id: (\S+) -->/);
               if (!m) continue;
-              if (byId.has(m[1])) {
+              const prev = byId.get(m[1]);
+              if (!prev) { byId.set(m[1], issue); continue; }
+              // Two *open* issues for one id genuinely breaks the join key: a pull
+              // request saying `Closes #N` can only close one of them, and the
+              // other is left tracking work that is already done. Fail on that.
+              //
+              // Two closed ones, or one of each, cannot: only the open one is
+              // reachable. Warn instead. This matters because the listing below
+              // is the lagging label index — if it misses an issue, this workflow
+              // opens a second one, and a hard failure on any duplicate would
+              // then redden `main` on every push and every cron run forever, with
+              // no way for the workflow to remediate its own mess.
+              if (prev.state === 'open' && issue.state === 'open') {
+                dupes.push(`\`${m[1]}\` is tracked by two open issues, ` +
+                           `#${prev.number} and #${issue.number} — close one`);
+              } else {
                 core.warning(`Duplicate tracking issues for \`${m[1]}\`: ` +
-                             `#${byId.get(m[1]).number} and #${issue.number}.`);
-                continue;
+                             `#${prev.number} and #${issue.number}.`);
               }
-              byId.set(m[1], issue);
+              // Always keep the open one, so reconciliation acts on the issue
+              // people can actually see.
+              if (prev.state !== 'open' && issue.state === 'open') byId.set(m[1], issue);
             }
 
             const body = it => [
@@ -213,7 +230,7 @@ jobs:
             // the file, rather than trusting that the calls above did what they
             // said. GitHub APIs return success while doing nothing often enough
             // that this check has already caught it elsewhere in this repository.
-            const problems = [];
+            const problems = [...dupes];
 
             for (const it of items) {
               const number = seen.get(it.id);
