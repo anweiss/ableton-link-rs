@@ -88,6 +88,10 @@ safe-outputs:
       - "tests/**"
       - "examples/**"
       - "vendor/ableton-link"
+      # The pin and the backlog file have to move in the same commit, so the file
+      # has to be writable here. Without it a correct port is refused at the push
+      # step and falls back to an issue, which reads as a stranded port.
+      - ".github/upstream-backlog.toml"
   create-issue:
     title-prefix: "[upstream-sync] "
     labels: [upstream-sync, automation, needs-decision]
@@ -135,8 +139,15 @@ Otherwise, take the next item off the backlog:
 1. Read `/tmp/gh-aw/agent/upstream/summary.md`. If the port is level with upstream,
    stop.
 2. **Check for an open port PR first.** Run
-   `gh pr list --state open --label upstream-sync`. If any port pull request from this
-   workflow is already open, **stop** and do nothing else.
+   `gh pr list --state open --label upstream-sync --json number,labels`. If any pull
+   request comes back, **stop** and do nothing else.
+
+   Match on `upstream-sync` and nothing else. The watch workflow's backlog pull
+   requests carry `upstream-triage` instead, precisely so that a triage PR sitting
+   open for review — it may sit for up to 30 days — does not halt porting. Do not
+   "helpfully" widen this check to cover them; that reintroduces the #71 deadlock on
+   the pull request side, where the workflow stops forever on something that holds no
+   port work while still reporting success.
 
    This is not a politeness rule. The watermark advances one step at a time, and every
    port branches off `main`. A second PR opened against the same base would advance
@@ -176,33 +187,51 @@ Otherwise, take the next item off the backlog:
 
    If you find no stranded port under that definition, **continue to step 3**. Do not
    stop, and do not comment.
-3. Find the backlog issue:
-   `gh issue list --state open --label upstream-sync --search "Porting backlog in:title"`
-4. Take the **first `Port` item whose SHA still appears in
-   `/tmp/gh-aw/agent/upstream/commits.txt`**. An item whose SHA is no longer in that
-   file is already behind the watermark and is done, whether or not its checkbox got
-   ticked — skip it and say so.
+3. Read the backlog from **`.github/upstream-backlog.toml`**, which is checked out in
+   the repository you are working in. It is the backlog. Do not look for a backlog
+   issue and do not reconstruct the backlog from issue comments; a backlog issue no
+   longer holds one.
 
-   **`commits.txt` is the ordering authority, not the backlog.** It comes from
-   `git log --reverse`, so it is in true ancestry order, oldest first. The backlog is
-   written by a language model and its list order has already been observed to
-   disagree with ancestry — on issue #56, item 2 (`4d10802c`) sits at upstream
-   position 8 while item 3 (`588fd857`) sits at position 3. So do not "work the
-   backlog front to back". Instead, for every unfinished `Port` item, find its line
-   number in `commits.txt` and take the item with the **lowest** line number. That is
-   the earliest unported commit, which is the only one you may safely port next.
+   Each item is a `[[port]]` table with `id`, `title`, `upstream` (the list of
+   upstream SHAs it covers), `rust`, `risk`, `status`, `retired_at_pin` and `why`.
+4. Consider only items with `status = "outstanding"`. Of those, take the **first item
+   any of whose `upstream` SHAs still appears in
+   `/tmp/gh-aw/agent/upstream/commits.txt`**. An item whose SHAs are all gone from
+   that file is already behind the watermark and is done, whether or not anyone got
+   round to marking it retired — skip it and say so.
+
+   **`commits.txt` is still the ordering authority.** It comes from
+   `git log --reverse`, so it is in true ancestry order, oldest first. The backlog
+   file is now kept in ancestry order and CI enforces that, so front-to-back is
+   normally right — but if the two ever disagree, `commits.txt` wins, because it is
+   derived from the actual commit graph and the file is not. Concretely: for every
+   outstanding item, find the lowest line number any of its SHAs has in
+   `commits.txt`, and take the item with the lowest such number.
 5. Skip an item, and move to the next one, if either holds:
-   - It is `risk: api-break`. Those need a maintainer to decide. Comment on the
-     backlog issue rather than porting it.
+   - It is `risk: api-break`. Those need a maintainer to decide. Comment on that
+     item's tracking issue (see step 7) rather than porting it.
    - It is `risk: wire-format` **and** upstream shipped no test for it that you can
      port as concrete byte-level expectations. See the wire-format rule below.
 
    Skipping an item does **not** let you advance the watermark past it. See
    "Advance the watermark" — a skipped item is an unported commit, so the pin stops
    before it.
-6. If the backlog issue does not exist yet, do not invent a backlog. Read
-   `commits.txt` yourself, take the **oldest** commit that touches a mapped path,
-   and port that.
+6. If `.github/upstream-backlog.toml` does not exist, or every item in it is
+   retired, do not invent a backlog. Read `commits.txt` yourself, take the
+   **oldest** commit that touches a mapped path, and port that.
+7. Find the item's tracking issue so the pull request can close it:
+
+   ```bash
+   gh issue list --state open --label upstream-item --limit 100 \
+     --json number,body \
+     --jq '.[] | select(.body | contains("<!-- upstream-backlog-id: THE_ID -->")) | .number'
+   ```
+
+   Match on that marker, never on the title — titles get edited. If exactly one
+   number comes back, remember it as the item's issue number. If none comes back,
+   carry on with the port and leave `Closes` out of the pull request body; the issue
+   is opened by a separate reconcile workflow and may simply not exist yet. That is
+   not a reason to stop.
 
 ## Wire-format changes need byte-level proof
 
@@ -336,6 +365,37 @@ In the PR body, reproduce that range as the **Watermark** section: one line per 
 moved past, each marked `ported` or `not applicable: <reason>`. If the range is just
 the single commit you ported, say that. Never fast-forward the pin to `origin/master`.
 
+### Retire the item in the same commit
+
+The pin and `.github/upstream-backlog.toml` have to move together. In the same commit
+that advances the gitlink, edit the item you just ported:
+
+```toml
+status = "retired"
+retired_at_pin = "<the new 40-character pin>"
+```
+
+and update `[watermark]` — `pinned` to the new pin, `upstream` to the current
+upstream head, `commits_behind` to what is left. Then run:
+
+```bash
+python3 .github/scripts/validate-upstream-backlog.py
+```
+
+`status = "retired"` means **you ported the work**, not that the pin is past every
+SHA in the item. Upstream routinely splits one idea across commits that sit far apart
+— one item here spans upstream positions 0-2 and 75-79 — and you can only advance the
+pin as far as the last fully handled commit. Retire the item anyway. If you left it
+outstanding, the next run would pick it again as the earliest outstanding item and
+re-port work that is already on `main`.
+
+It must exit 0 before you open the pull request. That validator is a required check,
+and it is the thing that catches the two failure modes this design is exposed to: an
+item left `outstanding` after the watermark has already passed its commits (a port
+that will be attempted forever and never found), and an item marked `retired` whose
+commits are still ahead of the pin (a port silently dropped). Do not edit the file by
+hand and skip the validator — hand edits are precisely what it exists to catch.
+
 ## Open the pull request
 
 Title: a **conventional commit** subject — `<type>: <description>`.
@@ -380,13 +440,16 @@ you matched>
 
 **Verification.** fmt, clippy, build, test, no_std — all passing locally.
 
-Backlog item: #<issue>
+Closes #<issue>
 ```
 
-Reference the backlog issue by number; do not write `Closes #<issue>`. The backlog is
-one long-lived issue covering many items, and closing it because one item shipped
-would throw away the rest. If you have an `add-comment` budget left over, tick the
-item's checkbox by commenting which item this PR covers so the next run skips it.
+`Closes #<issue>` is the tracking issue you found in step 7 — the one carrying
+`<!-- upstream-backlog-id: <id> -->`, not a shared backlog issue. Each backlog item
+now has its own issue, so closing it on merge is exactly right and throws nothing
+away. If step 7 found no issue, leave the `Closes` line out entirely rather than
+guessing a number; closing an unrelated issue is worse than closing nothing.
+
+Never write `Closes` against an issue labelled `upstream-sync`.
 
 Be honest in that body about anything you were unsure of. This is a protocol
 implementation talking to hardware and DAWs on a live network; a reviewer needs to

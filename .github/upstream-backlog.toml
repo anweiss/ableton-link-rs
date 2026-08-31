@@ -1,0 +1,420 @@
+# Canonical porting backlog for the vendored Ableton Link submodule.
+#
+# This file, not a GitHub issue, is the backlog. It is reviewed through pull
+# requests like any other source file, so a change to it has an author, a diff
+# and a review, and cannot be silently overwritten by an agent or a passing
+# click on a checkbox.
+#
+# It is NOT the source of truth for what is outstanding. The submodule pin at
+# vendor/ableton-link is the watermark: a commit at or before the pin is
+# reconciled no matter what this file claims. This file records intent,
+# triage and metadata. Where the two can disagree,
+# .github/scripts/validate-upstream-backlog.py is what catches it.
+#
+# Validate:  python3 .github/scripts/validate-upstream-backlog.py
+
+schema_version = 1
+
+# What this file can and cannot prove
+# ===================================
+# `.github/scripts/validate-upstream-backlog.py` runs on every pull request and
+# proves the *accounting*: that no upstream commit in the drift range is missing,
+# that the pin here matches the real gitlink, that outstanding items are in
+# ancestry order, and — the one that matters most — that a change advancing the
+# submodule pin does not cross a commit still marked outstanding or undecided.
+# That last check is what PR #59 needed and did not have: it advanced the pin to
+# upstream position 8 with positions 1-7 untouched, which would have silently
+# retired a crash fix.
+#
+# It cannot prove that work marked `retired` was actually done. A pull request
+# that flips an item to `retired` and advances the pin in the same commit is
+# self-consistent whether or not any Rust was written. That is what the PR body's
+# Watermark section and human review are for. The validator narrows the failure
+# mode from "silent" to "visible in a diff someone has to approve"; it does not
+# eliminate it.
+
+# Watermark this triage was computed against. Advisory: the real watermark is
+# the submodule pin, and the validator fails if this drifts from it.
+[watermark]
+pinned = "5226d027663e74cadc4741d2699829f1a24d0a4e"
+upstream = "902aef95bf94af49746fdda5369b42cdcfa1e6d2"
+commits_behind = 117
+
+# ---------------------------------------------------------------------------
+# Port items, in upstream ancestry order (oldest first). The port workflow
+# takes the earliest outstanding item and advances a monotonic watermark, so
+# this order is load-bearing: do not reorder by theme.
+# ---------------------------------------------------------------------------
+
+[[port]]
+id = "catch-exception-in-udpmessenger-send-path"
+title = "Catch exception in UdpMessenger send path"
+upstream = ["4d10802c6c91"]
+rust = ["src/discovery/messenger.rs"]
+risk = "behavior"
+status = "retired"
+retired_at_pin = "e233c676"
+why = "`sendPeerState` was not catching `UdpSendException`; a failed send now logs and continues rather than propagating"
+note = "retired at pin `e233c676`"
+
+[[port]]
+id = "fix-message-size-assertion-asio-socket"
+title = "Fix message size assertion (ASIO socket)"
+upstream = ["71cd8351dc70"]
+rust = ["src/discovery/messenger.rs"]
+risk = "behavior"
+status = "retired"
+retired_at_pin = "e233c676"
+why = "Assertion was off-by-one and could fire on valid maximum-size messages; Tokio path should be checked for equivalent over-size guard"
+note = "retired at pin `e233c676`"
+
+[[port]]
+id = "measurement-with-one-socket-shared-unicast-socket"
+title = "Measurement with one socket (shared unicast socket)"
+upstream = ["e233c67621f3"]
+rust = ["src/link/measurement.rs", "src/link/pingresponder.rs"]
+risk = "behavior"
+status = "retired"
+retired_at_pin = "e233c676"
+why = "`Measurement` now receives a shared socket reference instead of opening its own, reducing fd usage and allowing `PingResponder` and `Measurement` to share one socket per gateway"
+note = "retired at pin `e233c676`"
+
+[[port]]
+id = "make-endpoint-reusable-rename-measurementendpointv4-v6-endpointv4"
+title = "Make Endpoint reusable (rename MeasurementEndpointV4/V6 → EndpointV4/V6 with key template)"
+upstream = ["36d75d4e4555"]
+rust = ["src/link/measurement.rs", "src/discovery/peers.rs"]
+risk = "wire-format"
+status = "retired"
+retired_at_pin = "5226d027"
+why = "`MeasurementEndpointV4/V6` renamed to generic `EndpointV4/V6<key>` parameterized by FourCC key; prepares for `audioEndpoint` with different keys"
+note = "retired at pin `5226d027`"
+
+[[port]]
+id = "rename-peerstate-endpoint-to-measurementendpoint"
+title = "Rename PeerState::endpoint() to measurementEndpoint()"
+upstream = ["9f9669875587"]
+rust = ["src/discovery/peers.rs"]
+risk = "internal"
+status = "retired"
+retired_at_pin = "5226d027"
+why = "API rename to make room for `audioEndpoint`; no wire change"
+note = "retired at pin `5226d027`"
+
+[[port]]
+id = "add-audioendpoint-to-peerstate-new-wire-payload"
+title = "Add audioEndpoint to PeerState (new wire payload fields `aep4`/`aep6`)"
+upstream = ["5226d027663e"]
+rust = ["src/discovery/peers.rs", "src/link/payload.rs", "src/encoding.rs"]
+risk = "wire-format"
+status = "retired"
+retired_at_pin = "5226d027"
+why = "PeerState now serializes optional IPv4/IPv6 audio endpoints with FourCC keys `0x61657034` (`aep4`) and `0x61657036` (`aep6`); peers that don't understand them silently skip — but this crate must at least parse them to stay forward-compatible with current Ableton Live/Bitwig"
+note = "retired at pin `5226d027`"
+
+[[port]]
+id = "replace-link-optional-with-std-optional"
+title = "Replace link::Optional with std::optional"
+upstream = ["fc33dfd10874"]
+rust = ["src/link/state.rs"]
+risk = "internal"
+status = "retired"
+retired_at_pin = "5226d027"
+why = "Removes custom `Optional<T>` in favour of `std::optional`; Rust `Option` already matches; check `OptionalTimeline`, `OptionalStartStopState`, `OptionalClientStartStopState` usage in `state.rs`"
+note = "retired at pin `5226d027`"
+
+[[port]]
+id = "add-sessionid-to-clientstates"
+title = "Add SessionId to ClientStates"
+upstream = ["57fcc6e2e1f6"]
+rust = ["src/link/state.rs", "src/link/controller.rs"]
+risk = "behavior"
+status = "retired"
+retired_at_pin = "fd6fdd4"
+why = "`ClientState`, `RtClientState`, and `ApiState` now carry a `timelineSessionId`; used to detect when the local peer has joined a new session so the callback fires correctly"
+note = "retired at pin `fd6fdd4` (PR #83)"
+
+[[port]]
+id = "output-nodeid-bytes-as-hex-in-display"
+title = "Output NodeId bytes as hex in Display/Debug"
+upstream = ["588fd85708d6"]
+rust = ["src/link/node.rs"]
+risk = "internal"
+status = "retired"
+retired_at_pin = "e233c676"
+why = "`NodeId`'s `operator<<` previously wrote raw bytes to the stream; fixed to hex; the Rust `Display`/`Debug` impl should be checked for the same issue"
+note = "retired at pin `e233c676`"
+
+[[port]]
+id = "route-callbacks-through-sessioncontroller-shutdown-ordering-improvements"
+title = "Route callbacks through SessionController / shutdown ordering improvements"
+upstream = ["165c764990b0", "cbc81f057633", "fd30b5048e20", "7f222b559678", "cccaecc9e93b", "53f0627c9cf8"]
+rust = ["src/link/controller.rs"]
+risk = "behavior"
+status = "outstanding"
+retired_at_pin = ""
+why = "Extracts a `SessionController` type that owns the callback-routing and discovery-update logic; makes the `Controller` destructor sequence deterministic (stop dispatcher → disable discovery → teardown)"
+
+[[port]]
+id = "add-gatewayfactory-gatewayschanged-notification"
+title = "Add GatewayFactory::gatewaysChanged() notification"
+upstream = ["334972b404d7"]
+rust = ["src/discovery/gateway.rs"]
+risk = "behavior"
+status = "outstanding"
+retired_at_pin = ""
+why = "`PeerGateways` now calls `factory.gatewaysChanged()` when a gateway is added or removed so callers can react (e.g. update announced endpoints); the Rust `GatewayFactory` trait may need a `gateways_changed` method"
+
+[[port]]
+id = "add-networkbytestreamserializable-for-string-and-int16-t"
+title = "Add NetworkByteStreamSerializable for string and int16_t"
+upstream = ["ef11fe77ad14", "519c7be073ec"]
+rust = ["src/encoding.rs"]
+risk = "wire-format"
+status = "outstanding"
+retired_at_pin = ""
+why = "Adds `std::string` and `int16_t` to the portable byte-stream serialization; needed by LinkAudio peer names on the wire; `int16_t` may be used by audio payload keys in future"
+
+[[port]]
+id = "have-peers-notify-on-audioendpoint-changes"
+title = "Have Peers notify on audioEndpoint changes"
+upstream = ["741390fd8930"]
+rust = ["src/discovery/peers.rs"]
+risk = "behavior"
+status = "outstanding"
+retired_at_pin = ""
+why = "`link::Peers` gained a callback to notify consumers when peer audio endpoints change; the notification plumbing in `peers.rs` should be assessed for the same hook"
+
+[[port]]
+id = "increase-thread-priority-on-link-io-thread"
+title = "Increase thread priority on Link IO thread (Linux, macOS, Windows)"
+upstream = ["7418012c2b2a", "eefe514d1846"]
+rust = ["src/platform/thread.rs"]
+risk = "behavior"
+status = "outstanding"
+retired_at_pin = ""
+why = "The IO thread now requests `SCHED_FIFO`/high-priority scheduling; improves clock-sync quality under load"
+
+[[port]]
+id = "add-operator-for-sessionstate"
+title = "Add `==` operator for SessionState"
+upstream = ["90d6b7c2d3e3"]
+rust = ["src/link/state.rs"]
+risk = "internal"
+status = "outstanding"
+retired_at_pin = ""
+why = "`SessionState` lacked equality; added for use in Link session state comparison logic"
+
+[[port]]
+id = "fix-rare-crash-during-initialization-callbackdispatcher-ordering"
+title = "Fix rare crash during initialization (CallbackDispatcher ordering, remaining shutdown-ordering follow-ups)"
+upstream = ["57b77a8040d3", "44d78f2cf3a4"]
+rust = ["src/link/controller.rs"]
+risk = "behavior"
+status = "outstanding"
+retired_at_pin = ""
+why = "The `RtClientStateSetter`/`CallbackDispatcher` UB fix landed; the follow-up commits add an explicit `start()`/`stop()` pair (`RtClientStateDispatcher`) to make shutdown deterministic and still need porting"
+note = "`5bf14d95471d` retired (ported, see issue #71); `57b77a8040d3`/`44d78f2cf3a4` still outstanding"
+
+[[port]]
+id = "fix-use-after-move-in-peers-sawpeerongateway"
+title = "Fix use-after-move in Peers (sawPeerOnGateway / peerLeftGateway)"
+upstream = ["ef2d1fd99d70", "f5fabf4ac8be"]
+rust = ["src/discovery/peers.rs"]
+risk = "internal"
+status = "outstanding"
+retired_at_pin = ""
+why = "`std::move` on a value that was then read again; Rust's borrow checker would normally catch this at compile time, but the equivalent logic in `peers.rs` should be audited for correctness Also covers: `PeerState::fromPayload` initializer list was missing the third field after `audioEndpoint` was added; also fixes use-after-move in `Peers::GatewayObserver`"
+note = "Merged with \"Fix ESP-IDF 6.0 PeerState init + Peers use-after-move (core portions)\" on migration: both claimed f5fabf4ac8be."
+
+[[port]]
+id = "set-ip-multicast-all-0-on-linux"
+title = "Set IP_MULTICAST_ALL=0 on Linux sockets + remove UdpMessenger subnet filter"
+upstream = ["c5574eee4d03", "d466f42a7b36"]
+rust = ["src/discovery/messenger.rs` (subnet filter)", "platform network setup"]
+risk = "behavior"
+status = "outstanding"
+retired_at_pin = ""
+why = "`IP_MULTICAST_ALL=0` restricts multicast reception to the joined interface on Linux; the subnet filter in `UdpMessenger` that worked around the old behaviour is then removed; together these fix spurious cross-interface packet reception on multi-homed Linux hosts"
+
+[[port]]
+id = "catch-message-encode-exceptions-in-sendudpmessage"
+title = "Catch message-encode exceptions in sendUdpMessage"
+upstream = ["e9a2e414d63f"]
+rust = ["src/discovery/messenger.rs"]
+risk = "behavior"
+status = "outstanding"
+retired_at_pin = ""
+why = "`encodeMessage` is now inside the `try` block so encoding errors (e.g. oversized payload) are caught and logged instead of propagating; previously only the `send()` call was guarded"
+
+# ---------------------------------------------------------------------------
+# Commits seen and consciously parked. Kept so that coverage stays provable:
+# a commit nobody mentions is not deferred, it is deleted the moment the pin
+# moves past it.
+# ---------------------------------------------------------------------------
+
+[[undecided]]
+upstream = [
+  "5f10939170e6",
+  "bdf289c877d7",
+  "dfc04253b0ce",
+  "5a43a7d7373a",
+  "0e5d381d8bcd",
+  "f8bd7b27db80",
+  "5b9b31c84926",
+  "c33a3aab6e6a",
+  "07d7afb52027",
+  "5f871bea5fb2",
+  "62c7f1f5af18",
+  "44d30cb2718c",
+  "adcee8b31d1c",
+  "6b29431cb91a",
+  "3b9f0a9cc5cd",
+  "7af8c24c25aa",
+  "94d21f025f37",
+  "25836a0d4469",
+  "9a566c7fc1f3",
+  "3ac04a216704",
+  "877aedbbeaa6",
+  "be19bcbe9781",
+  "ac1632a3c75e",
+  "f92b9ebc6d30",
+  "9bd1ceb6a84d",
+  "7696750ae5bd",
+  "bde5f28518e9",
+  "f2f4916d9e74",
+  "98e62aacce25",
+  "283adb2c189a",
+  "81f3cc67de90",
+  "e04fe8c450ea",
+  "d30cca016666",
+  "b65933a78413",
+  "8cd961c54381",
+  "7de4e00e92e7",
+  "e0695ca01e64",
+  "2d65a7199aee",
+  "d2da535095b1",
+  "4450f108acaf",
+  "6ffafe0ea2cc",
+  "77fa2baf7d19",
+  "351b64fd6785",
+  "e29bed1a21b8",
+  "8c6e6655ef64",
+  "65365c1e6248",
+  "7663935247de",
+  "8a6d6dc37a51",
+  "eefe514d1846",
+  "c3c950204444",
+  "f406e86560c9",
+  "79063f64b1f1",
+  "e8439124cbf3",
+  "b3b644b9cfe7",
+  "d326fe5ec4d7",
+  "104927dc975f",
+  "b3ccbd8b9e91",
+  "c8b173a28881",
+  "902a4b6e1714",
+  "d7581807c7d2",
+  "08331bfbdc2e",
+  "fcaefc6d3bec",
+  "addb7dae3953",
+  "b8bbd352d348",
+  "939f835af9e1",
+  "2ea60ca085cd",
+  "1676fb8f547a",
+  "ca2dc53ac259",
+  "11b7b87391f5",
+  "1380ccbc7e33",
+  "03ad22cdf69d",
+  "e5c0c78dd3e0",
+  "04ebfef40a48",
+  "be64e5d1fe0c",
+  "f6966f4565ae",
+  "d8a47ba239f6",
+]
+note = """
+Note: these commits predate `src/link_audio/` landing in this crate (PR #70, merged after this list was first drafted). LinkAudio is now ported behind the optional `audio` feature and its commits should be triaged normally against the module map on future runs, not re-parked here. Left verbatim pending a full re-triage pass; no new LinkAudio commits appeared in this run's drift range to reconcile against.
+"""
+
+# Confined to deliberately-not-ported paths (ASIO, ESP32 platform, C++
+# build/CI/examples, clang-tidy config, or the abl_link C API).
+
+[[not_applicable]]
+upstream = ["4c0893746cd1"]
+reason = "Update asio to version 1.36.0 (ASIO submodule + wrapper)"
+
+[[not_applicable]]
+upstream = ["9fb266242ffa"]
+reason = "Change esp32 build over to event-based ASIO (ESP32 platform context only)"
+
+[[not_applicable]]
+upstream = ["45931b8bd2a7"]
+reason = "Add EspLog for ESP32 (`platforms/esp32/Log.hpp` only)"
+
+[[not_applicable]]
+upstream = ["dcd39a886357"]
+reason = "Fix thread/realtime safety documentation errors (`abl_link.h` + `Link.hpp` comments only, no behavior change)"
+
+[[not_applicable]]
+upstream = ["0fc58dc11977"]
+reason = "Use int64_t consistently for time (`extensions/abl_link` C API only, not mapped to Rust)"
+
+[[not_applicable]]
+upstream = ["066ca20b74a5"]
+reason = "Enable C++17 (cmake + `Payload.hpp` C++17 fold-expression cleanup; Rust already uses equivalent features)"
+
+[[not_applicable]]
+upstream = ["1852c0822d7f"]
+reason = "Make UnicastSocket reusable (`platforms/asio/Context.hpp` only)"
+
+[[not_applicable]]
+upstream = ["6c6205e94121"]
+reason = "Move TripleBuffer to util namespace (C++ file reorganization; Rust uses `triple_buffer` crate, no change needed)"
+
+[[not_applicable]]
+upstream = ["93a6f48afeea", "0992c67a5af6", "c6ae458415a3"]
+reason = "Example audio engine changes (linkaudio examples only)"
+
+[[not_applicable]]
+upstream = ["63b45417074b"]
+reason = "Fix conversion warning in `link_audio/Resizer.hpp` (LinkAudio only)"
+
+[[not_applicable]]
+upstream = ["ae72f36e135d", "5424bb46debe", "50a2e263ff0d", "98cde856f653", "8b8d011edbf9", "cd7dbcedbe3d", "e89e398dc4c5", "47c5fbe1acc1", "9d85342ce1bb", "9613c8d46b3c", "f607469c40ad", "2ff7dfb854c2"]
+reason = "clang-tidy CI setup (`.clang-tidy`, `.github/workflows`; C++ tooling only)"
+
+[[not_applicable]]
+upstream = ["b6d5c597a102"]
+reason = "Use latest stable IDF (CI config)"
+
+[[not_applicable]]
+upstream = ["d627a9a4e44e"]
+reason = "Add IPv6 ScanIpIfAddrs comment (`platforms/posix/`, `platforms/windows/` comment only)"
+
+[[not_applicable]]
+upstream = ["082691b46ef1"]
+reason = "Update upstream README.md for LinkAudio (upstream docs only)"
+
+[[not_applicable]]
+upstream = ["eb25bb250f2f"]
+reason = "Stop audio before shutting down Link (`link_audio` only)"
+
+[[not_applicable]]
+upstream = ["7f222b559678"]
+reason = "Cleanup: Remove checks for mpSessionController (covered by SessionController port item above)"
+
+[[not_applicable]]
+upstream = ["902aef95bf94"]
+reason = "Fix Apple Clang warnings in Link examples (`examples/CMakeLists.txt` only)"
+
+[[not_applicable]]
+upstream = ["e5c0c78dd3e0"]
+reason = "Fix conversion warning in `link_audio/PCMCodec.hpp` (LinkAudio only)"
+
+[[not_applicable]]
+upstream = ["04ebfef40a48", "be64e5d1fe0c", "f6966f4565ae"]
+reason = "link_audio_hut example changes (examples only)"
+
+[[not_applicable]]
+upstream = ["f7bae9860a3c"]
+reason = "Refactor: Use structs instead of typedefs in abl_link (`extensions/abl_link/**` C API only, not mapped to Rust)"
