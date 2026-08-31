@@ -36,9 +36,9 @@ schema_version = 1
 # Watermark this triage was computed against. Advisory: the real watermark is
 # the submodule pin, and the validator fails if this drifts from it.
 [watermark]
-pinned = "5226d027663e74cadc4741d2699829f1a24d0a4e"
+pinned = "fd30b5048e20136b71046f7dad8a2c29bcd46892"
 upstream = "902aef95bf94af49746fdda5369b42cdcfa1e6d2"
-commits_behind = 117
+commits_behind = 114
 
 # ---------------------------------------------------------------------------
 # Port items, in upstream ancestry order (oldest first). The port workflow
@@ -147,13 +147,13 @@ note = "retired at pin `e233c676`"
 
 [[port]]
 id = "route-callbacks-through-sessioncontroller-shutdown-ordering-improvements"
-title = "Route callbacks through SessionController / shutdown ordering improvements"
-upstream = ["165c764990b0", "cbc81f057633", "fd30b5048e20", "cccaecc9e93b", "53f0627c9cf8", "eb25bb250f2f", "7f222b559678"]
-rust = ["src/link/controller.rs", "src/link_audio/mod.rs"]
+title = "Add link::SessionController / ApiConfig / route callbacks through it"
+upstream = ["165c764990b0", "cbc81f057633", "fd30b5048e20"]
+rust = ["src/link_audio/api.rs"]
 risk = "behavior"
-status = "outstanding"
-retired_at_pin = ""
-why = "Extracts a `SessionController` type that owns the callback-routing and discovery-update logic; makes the `Controller` destructor sequence deterministic (stop dispatcher → disable discovery → teardown), including tearing audio down before Link's shutdown begins rather than relying on field drop order"
+status = "retired"
+retired_at_pin = "fd30b5048e20136b71046f7dad8a2c29bcd46892"
+why = "Extracts a `SessionController` type that owns callback-routing so callbacks fired during/after partial destruction become safe no-ops, and an `ApiConfig` template split so a differently-shaped controller (channels/audio) can share `Controller`. Rust's ownership model has no raw-pointer-nulling equivalent, and `ApiConfig`'s template split has no analogue since Rust's `AudioEngine` is a separate type composed alongside `BasicLink` rather than a template parameter of `Controller`, so the only observable behavior change ported here is the shutdown-ordering guarantee: `LinkAudio`'s `Drop` impl now explicitly withdraws the audio endpoint, clears session peers, and aborts the peer-sync task *before* `BasicLink`/`Controller` is dropped, rather than relying on struct field drop order (which would have dropped `link` first, backwards from upstream's intent)."
 
 [[port]]
 id = "add-gatewayfactory-gatewayschanged-notification"
@@ -215,6 +215,16 @@ status = "outstanding"
 retired_at_pin = ""
 why = "The `RtClientStateSetter`/`CallbackDispatcher` UB fix landed; the follow-up commits add an explicit `start()`/`stop()` pair (`RtClientStateDispatcher`) to make shutdown deterministic and still need porting"
 note = "`5bf14d95471d` retired (ported, see issue #71); `57b77a8040d3`/`44d78f2cf3a4` still outstanding"
+
+[[port]]
+id = "sessioncontroller-shutdown-ordering-improvements"
+title = "Rename stopIoService to shutdown / LockFreeCallbackDispatcher::stop / stop audio before Link shutdown / remove mpSessionController checks"
+upstream = ["cccaecc9e93b", "53f0627c9cf8", "eb25bb250f2f", "7f222b559678"]
+rust = ["src/link/controller.rs", "src/link_audio/api.rs", "src/link_audio/engine.rs"]
+risk = "behavior"
+status = "outstanding"
+retired_at_pin = ""
+why = "Moves `shutdown()` (renamed from `stopIoService()`) into `~SessionController()` so it runs before base-class teardown; makes `LockFreeCallbackDispatcher::stop()` idempotent and re-checks `mRunning` after waking so no callback fires after stop is requested; has LinkAudio's own `~SessionController` call `stopAudio()` via the IO thread before `this->shutdown()`; and removes now-unnecessary `mpSessionController` null checks. The LinkAudio shutdown-ordering half of the behavior was already addressed in Rust by the sibling `route-callbacks-through-sessioncontroller-shutdown-ordering-improvements` item's `LinkAudio::Drop` change, but the `Controller`/dispatcher half (`shutdown()` rename/move, `LockFreeCallbackDispatcher::stop()` idempotency) still needs a Rust equivalent."
 
 [[port]]
 id = "fix-use-after-move-in-peers-sawpeerongateway"
@@ -394,10 +404,6 @@ reason = "Add IPv6 ScanIpIfAddrs comment (`platforms/posix/`, `platforms/windows
 [[not_applicable]]
 upstream = ["082691b46ef1"]
 reason = "Update upstream README.md for LinkAudio (upstream docs only)"
-
-[[not_applicable]]
-upstream = ["7f222b559678"]
-reason = "Cleanup: Remove checks for mpSessionController (covered by SessionController port item above)"
 
 [[not_applicable]]
 upstream = ["902aef95bf94"]

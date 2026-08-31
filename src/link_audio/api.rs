@@ -207,9 +207,17 @@ impl DerefMut for LinkAudio {
 
 impl Drop for LinkAudio {
     fn drop(&mut self) {
+        // Ported from upstream's shutdown-ordering fix (SessionController):
+        // audio must be torn down (endpoint withdrawn, peers cleared, sync
+        // task stopped) before `link` (our `BasicLink`/`Controller`) is
+        // dropped and its own discovery/session teardown begins. Struct
+        // field order alone doesn't guarantee this since `link` is declared
+        // before `engine`, so we do it explicitly here first.
         if let Some(task) = self.sync_task.take() {
             task.abort();
         }
+        self.link.controller().set_audio_endpoint(None);
+        self.engine.update_session_peers(&[]);
     }
 }
 
