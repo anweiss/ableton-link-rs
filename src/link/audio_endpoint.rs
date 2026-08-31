@@ -38,12 +38,16 @@ pub struct AudioEndpointV4 {
 }
 
 impl Encode for AudioEndpointV4 {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(
+        &self,
+        out: &mut Vec<u8>,
+    ) -> core::result::Result<(), crate::encoding::EncodeError> {
         let endpoint = self
             .endpoint
             .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        u32::from(*endpoint.ip()).encode_to(out);
-        endpoint.port().encode_to(out);
+        u32::from(*endpoint.ip()).encode_to(out)?;
+        endpoint.port().encode_to(out)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {

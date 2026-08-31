@@ -56,10 +56,14 @@ pub struct MeasurementEndpointV4 {
 }
 
 impl Encode for MeasurementEndpointV4 {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(
+        &self,
+        out: &mut Vec<u8>,
+    ) -> core::result::Result<(), crate::encoding::EncodeError> {
         let ep = self.endpoint.unwrap();
-        u32::from(*ep.ip()).encode_to(out);
-        ep.port().encode_to(out);
+        u32::from(*ep.ip()).encode_to(out)?;
+        ep.port().encode_to(out)?;
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         6

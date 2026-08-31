@@ -35,10 +35,14 @@ impl Default for StartStopState {
 }
 
 impl Encode for StartStopState {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        self.is_playing.encode_to(out);
-        self.beats.encode_to(out);
-        self.timestamp.num_microseconds().unwrap().encode_to(out);
+    fn encode_to(
+        &self,
+        out: &mut Vec<u8>,
+    ) -> core::result::Result<(), crate::encoding::EncodeError> {
+        self.is_playing.encode_to(out)?;
+        self.beats.encode_to(out)?;
+        self.timestamp.num_microseconds().unwrap().encode_to(out)?;
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         self.is_playing.encoded_size() + self.beats.encoded_size() + 8

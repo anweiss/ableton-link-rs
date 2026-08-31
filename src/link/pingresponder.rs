@@ -42,8 +42,12 @@ pub struct MessageHeader {
 }
 
 impl Encode for MessageHeader {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        self.message_type.encode_to(out);
+    fn encode_to(
+        &self,
+        out: &mut Vec<u8>,
+    ) -> core::result::Result<(), crate::encoding::EncodeError> {
+        self.message_type.encode_to(out)?;
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         1

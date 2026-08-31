@@ -59,11 +59,15 @@ impl Tempo {
 }
 
 impl crate::encoding::Encode for Tempo {
-    fn encode_to(&self, out: &mut alloc::vec::Vec<u8>) {
+    fn encode_to(
+        &self,
+        out: &mut alloc::vec::Vec<u8>,
+    ) -> core::result::Result<(), crate::encoding::EncodeError> {
         self.micros_per_beat()
             .num_microseconds()
             .unwrap()
-            .encode_to(out);
+            .encode_to(out)?;
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         8

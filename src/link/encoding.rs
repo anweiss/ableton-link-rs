@@ -14,9 +14,13 @@ pub struct PayloadEntryHeader {
 }
 
 impl Encode for PayloadEntryHeader {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        self.key.encode_to(out);
-        self.size.encode_to(out);
+    fn encode_to(
+        &self,
+        out: &mut Vec<u8>,
+    ) -> core::result::Result<(), crate::encoding::EncodeError> {
+        self.key.encode_to(out)?;
+        self.size.encode_to(out)?;
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         8
