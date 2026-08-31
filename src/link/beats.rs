@@ -15,8 +15,12 @@ pub struct Beats {
 }
 
 impl Encode for Beats {
-    fn encode_to(&self, out: &mut alloc::vec::Vec<u8>) {
-        self.micro_beats().encode_to(out);
+    fn encode_to(
+        &self,
+        out: &mut alloc::vec::Vec<u8>,
+    ) -> core::result::Result<(), crate::encoding::EncodeError> {
+        self.micro_beats().encode_to(out)?;
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         8

@@ -22,8 +22,12 @@ pub type NodeIdArray = [u8; 8];
 pub struct NodeId(pub NodeIdArray);
 
 impl Encode for NodeId {
-    fn encode_to(&self, out: &mut alloc::vec::Vec<u8>) {
-        self.0.encode_to(out);
+    fn encode_to(
+        &self,
+        out: &mut alloc::vec::Vec<u8>,
+    ) -> core::result::Result<(), crate::encoding::EncodeError> {
+        self.0.encode_to(out)?;
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         8

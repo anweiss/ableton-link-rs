@@ -15,13 +15,17 @@ use core::fmt;
 
 #[derive(Debug)]
 pub enum EncodeError {
-    // Encoding to a Vec<u8> is infallible in practice, but we keep this type
-    // so call-sites can use `?` uniformly.
+    /// A string is longer than the `u32` length prefix can describe.
+    StringTooLong(usize),
 }
 
 impl fmt::Display for EncodeError {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Ok(())
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EncodeError::StringTooLong(len) => {
+                write!(f, "string of {} bytes exceeds the u32 length prefix", len)
+            }
+        }
     }
 }
 
@@ -51,7 +55,7 @@ impl std::error::Error for EncodeError {}
 // ---------------------------------------------------------------------------
 
 pub trait Encode {
-    fn encode_to(&self, out: &mut Vec<u8>);
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError>;
     fn encoded_size(&self) -> usize;
 }
 
@@ -66,7 +70,7 @@ pub trait Decode: Sized {
 
 pub fn encode_to_vec<T: Encode>(v: &T) -> Result<Vec<u8>, EncodeError> {
     let mut buf = Vec::with_capacity(v.encoded_size());
-    v.encode_to(&mut buf);
+    v.encode_to(&mut buf)?;
     Ok(buf)
 }
 
@@ -79,8 +83,9 @@ pub fn decode_from_slice<T: Decode>(bytes: &[u8]) -> Result<(T, usize), DecodeEr
 // ---------------------------------------------------------------------------
 
 impl Encode for u8 {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.push(*self);
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         1
@@ -97,8 +102,9 @@ impl Decode for u8 {
 }
 
 impl Encode for u16 {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.extend_from_slice(&self.to_be_bytes());
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         2
@@ -115,8 +121,9 @@ impl Decode for u16 {
 }
 
 impl Encode for i16 {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.extend_from_slice(&self.to_be_bytes());
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         2
@@ -133,8 +140,9 @@ impl Decode for i16 {
 }
 
 impl Encode for u32 {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.extend_from_slice(&self.to_be_bytes());
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         4
@@ -154,8 +162,9 @@ impl Decode for u32 {
 }
 
 impl Encode for u64 {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.extend_from_slice(&self.to_be_bytes());
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         8
@@ -173,8 +182,9 @@ impl Decode for u64 {
 }
 
 impl Encode for i64 {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.extend_from_slice(&self.to_be_bytes());
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         8
@@ -192,8 +202,9 @@ impl Decode for i64 {
 }
 
 impl Encode for f64 {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.extend_from_slice(&self.to_be_bytes());
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         8
@@ -211,8 +222,9 @@ impl Decode for f64 {
 }
 
 impl Encode for bool {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.push(if *self { 1 } else { 0 });
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         1
@@ -237,8 +249,9 @@ impl Decode for bool {
 // ---------------------------------------------------------------------------
 
 impl<const N: usize> Encode for [u8; N] {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.extend_from_slice(self);
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         N
@@ -261,9 +274,10 @@ impl<const N: usize> Decode for [u8; N] {
 // ---------------------------------------------------------------------------
 
 impl<A: Encode, B: Encode> Encode for (A, B) {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        self.0.encode_to(out);
-        self.1.encode_to(out);
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        self.0.encode_to(out)?;
+        self.1.encode_to(out)?;
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         self.0.encoded_size() + self.1.encoded_size()
@@ -279,10 +293,11 @@ impl<A: Decode, B: Decode> Decode for (A, B) {
 }
 
 impl<A: Encode, B: Encode, C: Encode> Encode for (A, B, C) {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        self.0.encode_to(out);
-        self.1.encode_to(out);
-        self.2.encode_to(out);
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        self.0.encode_to(out)?;
+        self.1.encode_to(out)?;
+        self.2.encode_to(out)?;
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         self.0.encoded_size() + self.1.encoded_size() + self.2.encoded_size()
@@ -301,8 +316,9 @@ impl<A: Decode, B: Decode, C: Decode> Decode for (A, B, C) {
 // Ipv4Addr: encoded as 4 big-endian bytes (same as u32::from / Ipv4Addr::from)
 #[cfg(feature = "std")]
 impl Encode for std::net::Ipv4Addr {
-    fn encode_to(&self, out: &mut Vec<u8>) {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.extend_from_slice(&self.octets());
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         4
@@ -327,9 +343,14 @@ impl Decode for std::net::Ipv4Addr {
 // ---------------------------------------------------------------------------
 
 impl Encode for String {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        (self.len() as u32).encode_to(out);
+    /// A string that cannot be described by the `u32` length prefix is
+    /// rejected rather than written with a truncated prefix, which would
+    /// desynchronize every value that follows it in the stream.
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let len = u32::try_from(self.len()).map_err(|_| EncodeError::StringTooLong(self.len()))?;
+        len.encode_to(out)?;
         out.extend_from_slice(self.as_bytes());
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         4 + self.len()

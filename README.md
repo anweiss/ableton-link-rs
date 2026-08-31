@@ -286,7 +286,10 @@ traits plus `encode_to_vec` / `decode_from_slice`. Implementations are provided 
 `u8`, `u16`, `i16`, `u32`, `u64`, `i64`, `f64`, `[u8; N]`, 2- and 3-tuples, and `String`
 (plus `Ipv4Addr` with `std`). Strings are encoded as a `u32` big-endian byte length followed
 by the raw UTF-8 bytes; on decode, invalid UTF-8 is replaced rather than rejected, so a peer
-with a non-UTF-8 name does not invalidate an otherwise well-formed message.
+with a non-UTF-8 name does not invalidate an otherwise well-formed message. `Encode::encode_to`
+returns `Result<(), EncodeError>`; the only failure today is `EncodeError::StringTooLong`, raised
+when a string is longer than its `u32` length prefix can describe, so a truncated prefix can never
+desynchronize the rest of the stream.
 
 ## Time and Clocks
 

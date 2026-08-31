@@ -29,8 +29,12 @@ pub const SESSION_MEMBERSHIP_HEADER: PayloadEntryHeader = PayloadEntryHeader {
 pub struct SessionId(pub NodeId);
 
 impl Encode for SessionId {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        self.0.encode_to(out);
+    fn encode_to(
+        &self,
+        out: &mut Vec<u8>,
+    ) -> core::result::Result<(), crate::encoding::EncodeError> {
+        self.0.encode_to(out)?;
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         self.0.encoded_size()
@@ -56,8 +60,12 @@ pub struct SessionMembership {
 }
 
 impl Encode for SessionMembership {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        self.session_id.encode_to(out);
+    fn encode_to(
+        &self,
+        out: &mut Vec<u8>,
+    ) -> core::result::Result<(), crate::encoding::EncodeError> {
+        self.session_id.encode_to(out)?;
+        Ok(())
     }
     fn encoded_size(&self) -> usize {
         self.session_id.encoded_size()
