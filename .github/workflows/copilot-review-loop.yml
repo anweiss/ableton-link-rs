@@ -701,8 +701,13 @@ jobs:
               core.notice(`PR #${pr.number}: auto-merge cancelled, head moved past sign-off.`);
             }
 
+            // Returns true when a *granted* label was applied with the PAT, and
+            // therefore actually raised the `labeled` event auto-merge needs.
+            // Callers that record sign-off must surface a false, or the status
+            // comment claims auto-merge may queue when nothing will trigger it.
             async function setLabel(pr, present) {
               const has = labelsOf(pr).includes(DONE_LABEL);
+              if (present && has) return true;
               if (present && !has) {
                 // Granted with the PAT, and that is load-bearing rather than
                 // incidental. `auto-merge-upstream-port.yml` triggers on
@@ -747,6 +752,7 @@ jobs:
                     `PR #${pr.number}: labelled with GITHUB_TOKEN, so auto-merge ` +
                     'will not be triggered by it. Merge by hand if it parks.');
                 }
+                return viaPat;
               } else if (!present && has) {
                 // Only a 404 is benign here - it means the label was already
                 // gone. Anything else must propagate, because the caller is
@@ -851,11 +857,17 @@ jobs:
             // it should be said immediately.
             async function fixRunOutcome(number, head) {
               const runName = `Copilot Review Fix - PR #${number} @ ${head}`;
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRunsForWorkflow,
-                { owner, repo, workflow_id: FIX_WORKFLOW, per_page: 50 },
-                res => res.data,
-              ).catch(err => {
+              // Deliberately one bounded page, not `paginate`. The Actions
+              // list endpoint returns descending `created_at`, so the run being
+              // looked for is always on the first page; paginating the whole
+              // run history would be pure waste that grows with every run, and
+              // it would be re-spent every 5 minutes for as long as a pull
+              // request sits in the terminal `agent-failed` state below. A miss
+              // degrades to `null`, which is the fail-safe direction.
+              const runs = await github.rest.actions.listWorkflowRunsForWorkflow({
+                owner, repo, workflow_id: FIX_WORKFLOW,
+                event: 'workflow_dispatch', per_page: 100,
+              }).then(res => res.data.workflow_runs || []).catch(err => {
                 // A read failure must not be reported as a dead run - that
                 // would park a pull request whose agent is still working.
                 core.warning(`PR #${number}: could not list ${FIX_WORKFLOW} runs: ${err.message}`);
@@ -963,6 +975,17 @@ jobs:
                   core.notice(`PR #${number}: wire-format, held for a human.`);
                   return;
                 }
+                // Sign-off already granted for this exact head, but degraded:
+                // the label went on without raising the event auto-merge needs.
+                // Re-running the grant cannot fix that - the label is already
+                // present, so no event will ever be raised for it - and would
+                // overwrite the note explaining the problem with one claiming
+                // auto-merge may queue. Leave it stated.
+                if (handle.value.phase === 'done-degraded' &&
+                    handle.value.reviewedSha === head) {
+                  core.warning(`PR #${number}: still signed off but degraded at ${head}.`);
+                  return;
+                }
                 // The PR was read at the top of this function and several API
                 // calls ago. Confirm the head has not moved before granting a
                 // sign-off that is only meaningful for that exact commit.
@@ -984,7 +1007,23 @@ jobs:
                         'Auto-merge may now queue this pull request; it still merges ' +
                         'only after every required check passes.',
                 });
-                await setLabel(fresh, true);
+                // A label applied with GITHUB_TOKEN raises no event, so the
+                // note written just above - "auto-merge may now queue this" -
+                // would be false. This file's rule is that every stall writes
+                // its reason into the status comment, so say so there rather
+                // than only in a run annotation nobody reads.
+                if (!(await setLabel(fresh, true))) {
+                  await writeState(number, handle, {
+                    phase: 'done-degraded',
+                    note: `Copilot reviewed \`${short}\` with nothing outstanding, ` +
+                          'but `copilot-reviewed` could not be applied with the PAT, ' +
+                          'so no `labeled` event was raised and **auto-merge will not ' +
+                          'pick this up on its own**. Merge it by hand, or push ' +
+                          'anything to `main` to re-trigger auto-merge.',
+                  });
+                  core.warning(`PR #${number}: signed off, but degraded - auto-merge not triggered.`);
+                  return;
+                }
                 core.notice(`PR #${number}: review loop complete at ${head}.`);
                 return;
               }
@@ -1008,6 +1047,14 @@ jobs:
                 // "still running" or "the run is over and nothing landed", and
                 // those deserve very different notes.
                 const run = await fixRunOutcome(number, head);
+                // Already known dead. `fixRunOutcome` returns null when the
+                // runs cannot be listed, so without this a transient list
+                // failure would fall through and overwrite the terminal note
+                // with "waiting on the coding agent" - and, six hours after
+                // `agent-failed` was entered, with the "Stuck" stall note,
+                // pointing the maintainer at a timer instead of at the run
+                // link that is the whole point of this branch.
+                if (!run && handle.value.phase === 'agent-failed') return;
                 if (run && run.status === 'completed') {
                   const ok = run.conclusion === 'success';
                   await writeState(number, handle, {
