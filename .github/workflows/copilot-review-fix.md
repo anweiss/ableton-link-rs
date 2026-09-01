@@ -82,6 +82,46 @@ safe-outputs:
     # but that is not.
     github-token: ${{ secrets.PIPELINE_PAT }}
     github-token-for-extra-empty-commit: ${{ secrets.PIPELINE_PAT }}
+    # Same reasoning as `link-upstream-port.md`, and the same bug: gh-aw
+    # protects every top-level dot directory by default (ADR 28486) and that
+    # check runs independently of the allowlist, so without the exclusion a
+    # review comment about `.github/upstream-backlog.toml` cannot be fixed.
+    # The push is refused at the safe-output step and the round is spent for
+    # nothing. Observed on PR #127, run 33508089473: "Cannot push to pull
+    # request branch: patch modifies protected files
+    # (.github/upstream-backlog.toml)".
+    #
+    # Two independent layers have to agree, and `allowed-files` is not one of
+    # them for this purpose: the allowlist only ever *denies*, it never grants
+    # (`checkFileProtection` step 1 vs step 2 in gh-aw's
+    # `manifest_file_helpers.cjs`). So anything in the default protected set
+    # needs an `exclude` here as well as an allowlist entry. `README.md` is in
+    # that default set; without the exclusion, a README fix silently becomes a
+    # fallback issue instead of a commit.
+    #
+    # Safe because `allowed-files` below is an *exclusive* allowlist and
+    # `.github/upstream-backlog.toml` is the only path under `.github/` it
+    # permits - so this agent still cannot rewrite CI or edit its own prompt
+    # to widen its reach. The dot-folder exclusion must name the path segment,
+    # which is why it is `.github/` and not the file.
+    protected-files:
+      policy: fallback-to-issue
+      exclude:
+        - ".github/"
+        - "README.md"
+    # Exclusive allowlist, scoped to what a port pull request can legitimately
+    # contain. Anything outside it is refused.
+    allowed-files:
+      - "src/**"
+      - "tests/**"
+      - "examples/**"
+      - "vendor/ableton-link"
+      - ".github/upstream-backlog.toml"
+      # Required, not optional. Copilot enforces the repository's
+      # README-maintenance policy on any change to the public API and asks for
+      # the README in the same pull request - it did exactly that on PR #124.
+      # Without this the agent can never satisfy that class of comment.
+      - "README.md"
   add-comment:
     target: "*"
     max: 1

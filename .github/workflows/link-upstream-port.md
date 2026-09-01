@@ -97,6 +97,11 @@ safe-outputs:
       policy: fallback-to-issue
       exclude:
         - ".github/"
+        # `README.md` is in gh-aw's *default* protected set, and that check runs
+        # independently of `allowed-files` - the allowlist only ever denies, it
+        # never grants. Listing README.md below without excluding it here would
+        # silently turn a README-touching port into a fallback issue.
+        - "README.md"
     # Exclusive allowlist. Anything outside it is refused, so a run cannot quietly
     # add a dependency, rewrite CI, or edit its own prompt to widen its reach.
     allowed-files:
@@ -108,6 +113,11 @@ safe-outputs:
       # has to be writable here. Without it a correct port is refused at the push
       # step and falls back to an issue, which reads as a stranded port.
       - ".github/upstream-backlog.toml"
+      # A port that changes the public API has to update the README in the same
+      # pull request - the repository's README-maintenance policy, which Copilot
+      # enforces in review (PR #124). Without this the port opens knowing it will
+      # take a review finding it was never able to pre-empt.
+      - "README.md"
   create-issue:
     title-prefix: "[upstream-sync] "
     labels: [upstream-sync, automation, needs-decision]
