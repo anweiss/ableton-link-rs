@@ -218,6 +218,11 @@ pub enum PeerStateChange {
     SessionTimeline(SessionId, Timeline),
     SessionStartStopState(SessionId, StartStopState),
     PeerLeft,
+    /// A peer's discovered audio endpoint changed. Rust analogue of upstream's
+    /// `Peers`' `AudioEndpointCallback`, invoked from `sawPeerOnGateway`. Carries
+    /// `None` when the peer no longer advertises an endpoint (including when the
+    /// peer left).
+    AudioEndpoint(NodeId, Option<SocketAddrV4>),
 }
 
 async fn saw_peer(
@@ -254,6 +259,8 @@ async fn saw_peer(
     let peer_session = ps.session_id();
     let peer_timeline = ps.timeline();
     let peer_start_stop_state = ps.start_stop_state();
+    let peer_ident = ps.ident();
+    let peer_audio_endpoint = ps.audio_endpoint;
 
     let is_new_session_timeline = match peers.try_lock() {
         Ok(guard) => !guard.iter().any(|p| {
@@ -286,6 +293,11 @@ async fn saw_peer(
             None // Assume it's new if we can't check
         }
     };
+
+    let old_audio_endpoint = existing_peer_index.and_then(|index| match peers.try_lock() {
+        Ok(guard) => guard.get(index).map(|p| p.peer_state.audio_endpoint),
+        Err(_) => None,
+    });
 
     let did_session_membership_change = if let Some(index) = existing_peer_index {
         // Update existing peer with new state
@@ -330,6 +342,19 @@ async fn saw_peer(
         peer_state_changes.push(PeerStateChange::SessionStartStopState(
             peer_session,
             peer_start_stop_state,
+        ));
+    }
+
+    let is_new_audio_endpoint = match existing_peer_index {
+        Some(_) => old_audio_endpoint != Some(peer_audio_endpoint),
+        None => true,
+    };
+
+    if is_new_audio_endpoint {
+        debug!("audio endpoint changed");
+        peer_state_changes.push(PeerStateChange::AudioEndpoint(
+            peer_ident,
+            peer_audio_endpoint,
         ));
     }
 
@@ -640,5 +665,67 @@ mod tests {
                 peer_state: bar_peer,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn saw_peer_notifies_on_audio_endpoint_change() {
+        let (mut foo_peer, _, _) = init_peers();
+
+        let peers = Arc::new(Mutex::new(vec![]));
+        let self_peer_state = Arc::new(Mutex::new(PeerState {
+            node_state: NodeState::new(SessionId::default()),
+            measurement_endpoint: None,
+            audio_endpoint: None,
+        }));
+        let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
+        let (tx_peer_state_change, mut rx_peer_state_change) =
+            mpsc::channel::<Vec<PeerStateChange>>(4);
+
+        // First sighting: no audio endpoint yet.
+        saw_peer(
+            foo_peer.clone(),
+            peers.clone(),
+            self_peer_state.clone(),
+            session_peer_counter.clone(),
+            tx_peer_state_change.clone(),
+        )
+        .await;
+
+        let first_changes = rx_peer_state_change.recv().await.unwrap();
+        assert!(first_changes.iter().any(
+            |c| matches!(c, PeerStateChange::AudioEndpoint(id, None) if *id == foo_peer.ident())
+        ));
+
+        // The peer starts advertising an audio endpoint: expect a notification
+        // carrying the new endpoint.
+        let endpoint = SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 12345);
+        foo_peer.audio_endpoint = Some(endpoint);
+
+        saw_peer(
+            foo_peer.clone(),
+            peers.clone(),
+            self_peer_state.clone(),
+            session_peer_counter.clone(),
+            tx_peer_state_change.clone(),
+        )
+        .await;
+
+        let second_changes = rx_peer_state_change.recv().await.unwrap();
+        assert!(second_changes.iter().any(|c| matches!(
+            c,
+            PeerStateChange::AudioEndpoint(id, Some(ep)) if *id == foo_peer.ident() && *ep == endpoint
+        )));
+
+        // Seeing the same peer state again must not re-fire the callback.
+        saw_peer(
+            foo_peer.clone(),
+            peers.clone(),
+            self_peer_state.clone(),
+            session_peer_counter,
+            tx_peer_state_change,
+        )
+        .await;
+
+        assert!(rx_peer_state_change.try_recv().is_err());
     }
 }

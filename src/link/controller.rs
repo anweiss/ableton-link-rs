@@ -26,13 +26,17 @@ use super::{
         clamp_tempo, update_client_timeline_from_session, update_session_timeline_from_client,
         Timeline,
     },
-    IncomingClientState, TempoCallback,
+    AudioEndpointCallback, IncomingClientState, TempoCallback,
 };
 
 pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 
 pub struct Controller {
     pub tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
+    /// Invoked whenever a peer's discovered audio endpoint changes. Rust
+    /// analogue of upstream's `Controller::SawAudioEndpointCallback`, which
+    /// forwards `Peers`' `AudioEndpointCallback` to the session controller.
+    pub audio_endpoint_callback: Arc<Mutex<Option<AudioEndpointCallback>>>,
     pub peer_state: Arc<Mutex<PeerState>>,
     pub session_state: Arc<Mutex<SessionState>>,
     pub client_state: Arc<Mutex<ClientState>>,
@@ -51,6 +55,8 @@ impl Controller {
     pub async fn new(tempo: tempo::Tempo, clock: Clock) -> Result<Self, std::io::Error> {
         let node_id = NodeId::new();
         let tempo_callback: Arc<Mutex<Option<TempoCallback>>> = Arc::new(Mutex::new(None));
+        let audio_endpoint_callback: Arc<Mutex<Option<AudioEndpointCallback>>> =
+            Arc::new(Mutex::new(None));
         let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
         let session_id = SessionId(node_id);
         let s_state = init_session_state(tempo, clock);
@@ -181,6 +187,7 @@ impl Controller {
         let s_peer_counter_loop = session_peer_counter.clone();
         let peer_state_loop = peer_state.clone();
         let tempo_cb_loop = tempo_callback.clone();
+        let audio_endpoint_cb_loop = audio_endpoint_callback.clone();
 
         tokio::spawn(async move {
             loop {
@@ -382,6 +389,19 @@ impl Controller {
                                     .await;
                                 }
                             }
+                            PeerStateChange::AudioEndpoint(peer_id, endpoint) => {
+                                debug!(
+                                    "Controller received AudioEndpoint change for peer {}",
+                                    peer_id
+                                );
+                                if let Ok(callback_guard) = audio_endpoint_cb_loop.try_lock() {
+                                    if let Some(ref callback) = *callback_guard {
+                                        if let Ok(callback) = callback.try_lock() {
+                                            callback(*peer_id, *endpoint);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -390,6 +410,7 @@ impl Controller {
 
         Ok(Self {
             tempo_callback,
+            audio_endpoint_callback,
             peer_state,
             session_state,
             client_state,

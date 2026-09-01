@@ -61,6 +61,17 @@ pub type PeerCountCallback = Arc<Mutex<Box<dyn Fn(usize) + Send>>>;
 pub type TempoCallback = Arc<Mutex<Box<dyn Fn(f64) + Send>>>;
 #[cfg(feature = "std")]
 pub type StartStopCallback = Arc<Mutex<Box<dyn Fn(bool) + Send>>>;
+/// Invoked whenever a peer's discovered audio endpoint changes, i.e. whenever
+/// upstream's `Peers::sawPeerOnGateway`/`peerLeftGateway` would invoke their
+/// `AudioEndpointCallback`. `endpoint` is `None` when the peer no longer
+/// advertises one (including when the peer has left).
+///
+/// Unlike upstream, this callback is not passed a gateway address: this port
+/// has no multi-gateway concept exposed to `Peers`/`Controller` (there is only
+/// ever a single implicit gateway), so that parameter has no analogue here.
+#[cfg(feature = "std")]
+pub type AudioEndpointCallback =
+    Arc<Mutex<Box<dyn Fn(node::NodeId, Option<std::net::SocketAddrV4>) + Send>>>;
 
 #[cfg(feature = "std")]
 pub struct BasicLink {
@@ -201,6 +212,23 @@ impl BasicLink {
                     callback(self.last_is_playing_for_callback);
                 }
             }
+        }
+    }
+
+    /// Registers a callback invoked whenever a peer's discovered audio
+    /// endpoint changes. Rust analogue of upstream's
+    /// `SessionController::sawAudioEndpointCallback`, which the `LinkAudio`
+    /// subsystem uses to learn about peers without polling.
+    ///
+    /// Unlike upstream, the callback is not passed a gateway address: see
+    /// [`AudioEndpointCallback`] for why.
+    pub fn set_audio_endpoint_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(node::NodeId, Option<std::net::SocketAddrV4>) + Send + 'static,
+    {
+        let cb: AudioEndpointCallback = Arc::new(Mutex::new(Box::new(callback)));
+        if let Ok(mut guard) = self.controller.audio_endpoint_callback.try_lock() {
+            *guard = Some(cb);
         }
     }
 
