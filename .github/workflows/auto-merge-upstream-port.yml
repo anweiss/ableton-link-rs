@@ -235,7 +235,20 @@ jobs:
 
             async function process(number) {
               const pr = await fetchQualifying(number);
-              const wire = await isWireFormat(pr);
+              // Threat is settled from labels alone, before any further API
+              // call. `isWireFormat` queries the file list, and a failure there
+              // throws out of `process` before `revoke` ever runs - which on a
+              // flagged pull request would leave an already-armed auto-merge
+              // request armed. This workflow is not a required check, so its
+              // own failure holds nothing back. Deciding the flagged case from
+              // data already in hand removes that dependency entirely.
+              //
+              // `wire` is left false for a flagged pull request: `disqualify`
+              // reports the threat ahead of wire-format anyway, so the value is
+              // never read, and computing it would reintroduce the API call
+              // this ordering exists to avoid.
+              const threat = labelsOf(pr).includes(THREAT_LABEL);
+              const wire = threat ? false : await isWireFormat(pr);
               const reason = disqualify(pr, wire);
               if (reason) {
                 core.info(`PR #${number} does not qualify: ${reason}. Doing nothing.`);
