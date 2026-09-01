@@ -652,6 +652,26 @@ pub async fn send_message(
     to: SocketAddrV4,
     group_id: SessionGroupId,
 ) -> std::io::Result<()> {
+    send_message_reporting(socket, from, ttl, message_type, payload, to, group_id)
+        .await
+        .map(|_| ())
+}
+
+/// Sends a message, reporting whether a datagram actually went out.
+///
+/// Returns `Ok(true)` when the message was transmitted and `Ok(false)` when it
+/// could not be encoded and was therefore dropped. Callers that rate-limit on
+/// "we just broadcast" must not treat a dropped message as a send: upstream
+/// advances its broadcast clock only after `sendUdpMessage` succeeds.
+async fn send_message_reporting(
+    socket: Arc<UdpSocket>,
+    from: NodeId,
+    ttl: u8,
+    message_type: MessageType,
+    payload: &Payload,
+    to: SocketAddrV4,
+    group_id: SessionGroupId,
+) -> std::io::Result<bool> {
     socket.set_broadcast(true).unwrap();
     socket.set_multicast_ttl_v4(2).unwrap();
     socket.set_multicast_loop_v4(true).unwrap();
@@ -663,12 +683,12 @@ pub async fn send_message(
         Ok(message) => message,
         Err(err) => {
             debug!("Failed to encode message: {}", err);
-            return Ok(());
+            return Ok(false);
         }
     };
 
     socket.send_to(&message, to).await?;
-    Ok(())
+    Ok(true)
 }
 
 pub async fn send_peer_state(
@@ -688,7 +708,7 @@ pub async fn send_peer_state(
         }
     };
 
-    if let Err(err) = send_message(
+    match send_message_reporting(
         socket,
         ident,
         ttl,
@@ -699,8 +719,16 @@ pub async fn send_peer_state(
     )
     .await
     {
-        debug!("Failed to send peer state message: {}", err);
-        return;
+        Ok(true) => {}
+        // The message could not be encoded and no datagram went out. Leave the
+        // broadcast clock alone: advancing it here would make the rate limiter
+        // suppress the next real broadcast on the strength of a send that
+        // never happened.
+        Ok(false) => return,
+        Err(err) => {
+            debug!("Failed to send peer state message: {}", err);
+            return;
+        }
     }
 
     if let Ok(mut last_time) = last_broadcast_time.try_lock() {
@@ -874,14 +902,25 @@ mod tests {
             result.is_ok(),
             "an oversized payload must be dropped, not surfaced as an error"
         );
+        // The dropped/sent distinction is what keeps `send_peer_state` from
+        // advancing `last_broadcast_time` for a message that never went out.
+        assert!(
+            !send_message_reporting(socket.clone(), from, 5, ALIVE, &oversized, to, 0)
+                .await
+                .unwrap(),
+            "an oversized payload must report as dropped, not sent"
+        );
 
         // Guard against the inverse regression: an unconditional early return
         // would also satisfy the assertion above, so prove a well-formed
         // payload actually reaches the wire.
         let small = Payload::default();
-        assert!(send_message(socket, from, 5, ALIVE, &small, to, 0)
-            .await
-            .is_ok());
+        assert!(
+            send_message_reporting(socket, from, 5, ALIVE, &small, to, 0)
+                .await
+                .unwrap(),
+            "a well-formed payload must report as sent"
+        );
 
         let mut buf = [0u8; MAX_MESSAGE_SIZE];
         let received = tokio::time::timeout(
