@@ -385,9 +385,25 @@ jobs:
             // the one shown when a pull request is both flagged and
             // wire-format; "the agent output was flagged" is the more urgent of
             // the two.
+            //
+            // The pull request is re-read here rather than trusting the
+            // snapshot `reconcile` took at its start. Several API calls happen
+            // in between - fetching reviews, then their comments - and a label
+            // applied during that window would be missing from the snapshot,
+            // which on this path means granting `copilot-reviewed` to a pull
+            // request that had just been flagged. The fresh object is returned
+            // with the reason so the caller revokes against the same state the
+            // decision was made on.
             async function holdReason(pr) {
-              if (labelsOf(pr).includes(THREAT_LABEL)) return 'threat';
-              if (await isWireFormat(pr)) return 'wire-format';
+              const { data: fresh } = await github.rest.pulls.get({
+                owner, repo, pull_number: pr.number,
+              });
+              if (labelsOf(fresh).includes(THREAT_LABEL)) {
+                return { reason: 'threat', pr: fresh };
+              }
+              if (await isWireFormat(fresh)) {
+                return { reason: 'wire-format', pr: fresh };
+              }
               return null;
             }
 
@@ -1024,13 +1040,13 @@ jobs:
                 if (hold) {
                   // The tag can be added to the body after a sign-off, so this
                   // revokes rather than merely declining to grant.
-                  await revoke(pr);
+                  await revoke(hold.pr);
                   await writeState(number, handle, {
                     phase: 'human-hold',
                     reviewedSha: null,
-                    note: holdNote(hold, 0, short),
+                    note: holdNote(hold.reason, 0, short),
                   });
-                  core.notice(`PR #${number}: ${hold}, held for a human.`);
+                  core.notice(`PR #${number}: ${hold.reason}, held for a human.`);
                   return;
                 }
                 // Sign-off already granted for this exact head, but degraded:
@@ -1088,13 +1104,13 @@ jobs:
 
               const hold = await holdReason(pr);
               if (hold) {
-                await revoke(pr);
+                await revoke(hold.pr);
                 await writeState(number, handle, {
                   phase: 'human-hold',
                   reviewedSha: null,
-                  note: holdNote(hold, outstanding.length, short),
+                  note: holdNote(hold.reason, outstanding.length, short),
                 });
-                core.notice(`PR #${number}: ${hold}, agent dispatch refused.`);
+                core.notice(`PR #${number}: ${hold.reason}, agent dispatch refused.`);
                 return;
               }
 
