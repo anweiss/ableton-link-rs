@@ -76,6 +76,11 @@ jobs:
             const { owner, repo } = context.repo;
             const sleep = ms => new Promise(r => setTimeout(r, ms));
             const labelsOf = pr => pr.labels.map(l => l.name);
+            // Applied by gh-aw's threat detection. In warn mode gh-aw publishes
+            // the pull request anyway and asks in the body for manual review
+            // "before any follow-up automation" - and this workflow is the last
+            // piece of automation before `main`.
+            const THREAT_LABEL = 'agentic-threat-detected';
 
             // Labels are applied a second or two after the PR is created, so a
             // single read of an `opened` event races them. Poll briefly.
@@ -112,6 +117,14 @@ jobs:
                 return `labels are [${labels.join(', ')}]`;
               }
               if (labels.includes('autorelease: pending')) return 'it is a release PR';
+              // Ahead of the wire-format check, and for the same reason that
+              // one sits ahead of `copilot-reviewed`: whichever rejection is
+              // reported is the only one that gets a hold comment, so the more
+              // urgent has to win. Threat detection flagging the agent's own
+              // output is more urgent than the patch touching wire modules.
+              if (labels.includes(THREAT_LABEL)) {
+                return 'it is flagged by threat detection and needs a human reviewer';
+              }
               if (wire) {
                 return 'it is tagged risk: wire-format and needs a human reviewer';
               }
@@ -226,30 +239,52 @@ jobs:
               const reason = disqualify(pr, wire);
               if (reason) {
                 core.info(`PR #${number} does not qualify: ${reason}. Doing nothing.`);
-                // Wire-format ports are the one rejection a human must know
-                // about, because the PR will otherwise sit waiting on nobody.
-                if (reason.startsWith('it is tagged risk: wire-format')) {
-                  // Revoke, do not merely decline. The tag can be added, or a
-                  // wire-format file pulled in, after a sign-off - and an
-                  // auto-merge request already enabled stays armed regardless.
-                  // Doing this here as well as in the review loop means this
-                  // workflow fails closed on its own, without depending on the
-                  // other one having run.
+                // The two rejections a human must know about, because the PR
+                // will otherwise sit waiting on nobody. Both revoke rather than
+                // merely decline: the label or tag can arrive *after* a
+                // sign-off, and an auto-merge request already enabled stays
+                // armed regardless. Doing this here as well as in the review
+                // loop means this workflow fails closed on its own, without
+                // depending on the other one having run - which matters
+                // especially for the threat label, since `labeled` is one of
+                // this workflow's own triggers and fires immediately, while the
+                // loop only sweeps every few minutes.
+                const hold =
+                  reason.startsWith('it is flagged by threat detection')
+                    ? {
+                        marker: '<!-- auto-merge-upstream-port: threat-hold -->',
+                        body:
+                          '**Auto-merge withheld.** gh-aw\'s threat detection ' +
+                          `flagged this pull request (\`${THREAT_LABEL}\`), and its ` +
+                          'own banner requires manual review before any follow-up ' +
+                          'automation. `main` requires zero approving reviews, so ' +
+                          'auto-merging it would put flagged agent output on `main` ' +
+                          'with no human having read it.\n\nRead the detection ' +
+                          'result in the generating workflow run. If it is a false ' +
+                          'positive, remove the label; otherwise close this pull ' +
+                          'request.',
+                      }
+                    : reason.startsWith('it is tagged risk: wire-format')
+                    ? {
+                        marker: '<!-- auto-merge-upstream-port: wire-format-hold -->',
+                        body:
+                          '**Auto-merge withheld.** This port is tagged ' +
+                          '`risk: wire-format`, meaning it changes bytes on the ' +
+                          'network. `main` requires zero approving reviews, so ' +
+                          'auto-merging it would put a protocol change on `main` ' +
+                          'with no human having read it.\n\nReview it and merge by ' +
+                          'hand.',
+                      }
+                    : null;
+                if (hold) {
                   await revoke(pr);
-                  const marker = '<!-- auto-merge-upstream-port: wire-format-hold -->';
                   const comments = await github.paginate(github.rest.issues.listComments, {
                     owner, repo, issue_number: number, per_page: 100,
                   });
-                  if (!comments.some(c => c.body && c.body.includes(marker))) {
+                  if (!comments.some(c => c.body && c.body.includes(hold.marker))) {
                     await github.rest.issues.createComment({
                       owner, repo, issue_number: number,
-                      body:
-                        `${marker}\n**Auto-merge withheld.** This port is tagged ` +
-                        '`risk: wire-format`, meaning it changes bytes on the ' +
-                        'network. `main` requires zero approving reviews, so ' +
-                        'auto-merging it would put a protocol change on `main` ' +
-                        'with no human having read it.\n\nReview it and merge by ' +
-                        'hand.',
+                      body: `${hold.marker}\n${hold.body}`,
                     });
                   }
                 }
