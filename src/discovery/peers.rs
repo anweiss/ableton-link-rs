@@ -342,14 +342,22 @@ async fn saw_peer(
         ));
     }
 
-    if let Some(endpoint) = audio_endpoint_change {
-        debug!("audio endpoint changed");
-        peer_state_changes.push(PeerStateChange::AudioEndpoint(peer_ident, endpoint));
-    }
-
     if did_session_membership_change {
         debug!("session membership changed");
         peer_state_changes.push(PeerStateChange::SessionMembership);
+    }
+
+    // Audio endpoint goes last, after membership, matching upstream's
+    // `sawPeerOnGateway`: it invokes `mSessionMembershipCallback()` and only
+    // then `mAudioEndpointCallback(...)`. The order is load-bearing rather
+    // than incidental - membership is what updates `session_peer_counter` and
+    // triggers any session reset, so an endpoint callback delivered first
+    // would let consumer code observing `BasicLink::num_peers()` or session
+    // state read values that the very same sighting is about to change. That
+    // is most visible on a peer's first sighting, where both fire together.
+    if let Some(endpoint) = audio_endpoint_change {
+        debug!("audio endpoint changed");
+        peer_state_changes.push(PeerStateChange::AudioEndpoint(peer_ident, endpoint));
     }
 
     if !peer_state_changes.is_empty() {
@@ -684,6 +692,26 @@ mod tests {
         assert!(first_changes.iter().any(
             |c| matches!(c, PeerStateChange::AudioEndpoint(id, None) if *id == foo_peer.ident())
         ));
+
+        // Upstream's `sawPeerOnGateway` invokes `mSessionMembershipCallback()`
+        // before `mAudioEndpointCallback(...)`, and that order matters: the
+        // membership change is what updates the peer counter and drives any
+        // session reset, so a consumer reacting to the endpoint must not see
+        // pre-membership state. A first sighting emits both, so it is the case
+        // that pins the order.
+        let membership_at = first_changes
+            .iter()
+            .position(|c| matches!(c, PeerStateChange::SessionMembership))
+            .expect("a first sighting must report session membership");
+        let endpoint_at = first_changes
+            .iter()
+            .position(|c| matches!(c, PeerStateChange::AudioEndpoint(..)))
+            .expect("a first sighting must report the audio endpoint");
+        assert!(
+            membership_at < endpoint_at,
+            "session membership must be queued before the audio endpoint, \
+             got membership at {membership_at} and endpoint at {endpoint_at}"
+        );
 
         // The peer starts advertising an audio endpoint: expect a notification
         // carrying the new endpoint.
