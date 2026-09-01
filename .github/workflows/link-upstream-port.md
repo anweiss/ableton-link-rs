@@ -484,6 +484,13 @@ now has its own issue, so closing it on merge is exactly right and throws nothin
 away. If step 7 found no issue, leave the `Closes` line out entirely rather than
 guessing a number; closing an unrelated issue is worse than closing nothing.
 
+**Carry `Closes` on a bookkeeping-only pull request too.** If you found the work was
+already done and you are only flipping `status` to `retired`, the issue tracks the
+*item*, not the diff — retiring the item is precisely the moment it should close, and
+a pull request that touches no `src/**` still needs the line. This has been got wrong
+once already: #127 retired an item with an otherwise complete body, omitted `Closes`
+because it read as "not a real port", and left #104 open to be closed by hand.
+
 Never write `Closes` against an issue labelled `upstream-sync`.
 
 Be honest in that body about anything you were unsure of. This is a protocol
