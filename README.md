@@ -681,23 +681,39 @@ misconfiguration, and it cannot be switched off with a repository setting — th
 fork-PR approval policy governs pull requests *from forks* and does not apply here.
 
 To make release PRs run CI unattended, give release-please an identity other than
-`GITHUB_TOKEN`. Either works, and
-[`release-please.yml`](.github/workflows/release-please.yml) picks the first one that
-is configured:
+`GITHUB_TOKEN`. [`release-please.yml`](.github/workflows/release-please.yml) tries
+three credentials in order and uses the first one that is configured:
+
+1. **`RELEASE_PLEASE_APP_ID` + `RELEASE_PLEASE_APP_PRIVATE_KEY`** — a GitHub App.
+   Preferred: no expiry, not tied to a person.
+2. **`RELEASE_PLEASE_PAT`** — a fine-grained PAT dedicated to releases. Simpler, but
+   expires and must be rotated.
+3. **`PIPELINE_PAT`** — the token the upstream porting workflows already use. It
+   carries the same two permissions release-please needs, so if you have set up the
+   porting pipeline you get unheld release PRs for free. It is tried last on purpose:
+   a dedicated credential should win over a shared one where both exist.
+
+All three need exactly `Contents: write` and `Pull requests: write` on this repo.
 
 ```bash
-# Preferred: a GitHub App — no expiry, not tied to a person.
-# Grant it Contents: write and Pull requests: write, install it on this repo.
+# Option 1 — GitHub App. Install it on this repo first.
 gh variable set RELEASE_PLEASE_APP_ID --body "<app id>"
 gh secret   set RELEASE_PLEASE_APP_PRIVATE_KEY < private-key.pem
 
-# Or a fine-grained PAT with the same two permissions. Simpler, but expires.
+# Option 2 — a PAT dedicated to releases.
 gh secret set RELEASE_PLEASE_PAT --body "<token>"
+
+# Option 3 — nothing to do if PIPELINE_PAT is already configured for the
+# upstream porting workflows.
 ```
 
-With neither configured the release is still proposed correctly; it just needs the
-approval click, and the workflow logs a warning saying so rather than leaving you to
-work out why the PR has no checks.
+With none of the three configured the release is still proposed correctly; it just
+needs the approval click, and the workflow logs a warning saying so rather than
+leaving you to work out why the PR has no checks.
+
+Changing this does not unhold a release PR that already exists. Whether runs are held
+follows the identity that opened the pull request, so an existing release PR stays
+held until release-please recreates it on the next push to `main`.
 
 ## Documentation
 

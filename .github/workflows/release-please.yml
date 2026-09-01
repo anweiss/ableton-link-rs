@@ -39,6 +39,13 @@ jobs:
       #   2. Fine-grained PAT (simpler, but expires and must be rotated)
       #      Contents: write + Pull requests: write on this repo, then:
       #        gh secret set RELEASE_PLEASE_PAT --body "<token>"
+      #
+      # `PIPELINE_PAT` is tried after those two. It is the token the upstream
+      # porting workflows already use and it carries Contents: write and
+      # Pull requests: write, which is exactly what release-please needs, so a
+      # repo that has configured the porting pipeline gets unheld release PRs
+      # without minting a second token. It is last of the three on purpose: a
+      # dedicated credential should win over a shared one where both exist.
       - name: Mint a GitHub App token
         id: app-token
         if: vars.RELEASE_PLEASE_APP_ID != ''
@@ -51,7 +58,7 @@ jobs:
         id: release
         with:
           release-type: rust
-          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_PAT || secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_PAT || secrets.PIPELINE_PAT || secrets.GITHUB_TOKEN }}
 
       # Without this, falling back to GITHUB_TOKEN is silent: the release PR just
       # sits there with no checks and nothing explains why. v0.3.1 was stranded
@@ -59,8 +66,8 @@ jobs:
       - name: Warn when the release PR will need manual approval
         if: steps.app-token.outputs.token == ''
         env:
-          HAS_PAT: ${{ secrets.RELEASE_PLEASE_PAT != '' }}
+          HAS_PAT: ${{ secrets.RELEASE_PLEASE_PAT != '' || secrets.PIPELINE_PAT != '' }}
         run: |
           if [ "$HAS_PAT" != "true" ]; then
-            echo "::warning title=Release PR CI needs manual approval::Opened with GITHUB_TOKEN, so its checks are held in action_required. Approve them on the PR, or configure RELEASE_PLEASE_APP_ID or RELEASE_PLEASE_PAT (see comments in release-please.yml)."
+            echo "::warning title=Release PR CI needs manual approval::Opened with GITHUB_TOKEN, so its checks are held in action_required. Approve them on the PR, or configure RELEASE_PLEASE_APP_ID, RELEASE_PLEASE_PAT or PIPELINE_PAT (see comments in release-please.yml)."
           fi
