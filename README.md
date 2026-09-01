@@ -291,9 +291,11 @@ returns `Result<(), EncodeError>`; the only failure `encode_to` itself raises is
 `EncodeError::StringTooLong`, raised
 when a string is longer than its `u32` length prefix can describe, so a truncated prefix can never
 desynchronize the rest of the stream. `encode_message` additionally returns
-`EncodeError::MessageTooLarge { size, max }` when a message's total encoded size — protocol
-header plus message header plus payload — would exceed the protocol's maximum datagram size;
-the send path logs and drops such a message rather than failing the caller.
+`Error::Encoding(EncodeError::MessageTooLarge { size, max })` when a message's total encoded
+size — protocol header plus message header plus payload — would exceed the protocol's maximum
+datagram size; the send path logs and drops such a message rather than failing the caller.
+Note the wrapper: `encode_message` yields `link::Result`, so callers match on
+`Error::Encoding(..)` and destructure the `EncodeError` inside it.
 
 > **Breaking change in 0.3.0:** `Encode::encode_to` previously returned `()`. It now returns
 > `Result<(), EncodeError>`, and `EncodeError` — previously an uninhabited enum — has its first
