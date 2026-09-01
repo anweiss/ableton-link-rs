@@ -52,6 +52,13 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # Needed for the merge itself, not for anything this workflow calls. Every
+  # port pull request carries `Closes #NNN` for its `[[port]]` item's tracking
+  # issue, and GitHub closes a linked issue as the merging actor, using the
+  # merging token's permissions. Without `issues: write` the merge succeeds and
+  # the linked issue is left open, silently - which is how #104 and #105
+  # survived their own ports.
+  issues: write
 
 concurrency:
   group: auto-merge-upstream-port-${{ github.event.pull_request.number || github.ref }}
