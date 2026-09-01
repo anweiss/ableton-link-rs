@@ -97,6 +97,44 @@ jobs:
               return pr;
             }
 
+            const THREAT_HOLD = {
+              marker: '<!-- auto-merge-upstream-port: threat-hold -->',
+              body:
+                '**Auto-merge withheld.** gh-aw\'s threat detection ' +
+                'flagged this pull request (`agentic-threat-detected`), and its ' +
+                'own banner requires manual review before any follow-up ' +
+                'automation. `main` requires zero approving reviews, so ' +
+                'auto-merging it would put flagged agent output on `main` ' +
+                'with no human having read it.\n\nRead the detection ' +
+                'result in the generating workflow run. If it is a false ' +
+                'positive, remove the label; otherwise close this pull ' +
+                'request.',
+            };
+            const WIRE_HOLD = {
+              marker: '<!-- auto-merge-upstream-port: wire-format-hold -->',
+              body:
+                '**Auto-merge withheld.** This port is tagged ' +
+                '`risk: wire-format`, meaning it changes bytes on the ' +
+                'network. `main` requires zero approving reviews, so ' +
+                'auto-merging it would put a protocol change on `main` ' +
+                'with no human having read it.\n\nReview it and merge by ' +
+                'hand.',
+            };
+
+            // Posts once per pull request. The marker is the idempotency key,
+            // so a hold reached twice - by two triggers, or by the late check
+            // at the merge boundary - says it once.
+            async function postHold(number, hold) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: number, per_page: 100,
+              });
+              if (comments.some(c => c.body && c.body.includes(hold.marker))) return;
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: number,
+                body: `${hold.marker}\n${hold.body}`,
+              });
+            }
+
             function disqualify(pr, wire) {
               const labels = labelsOf(pr);
               if (pr.state !== 'open') return `state is ${pr.state}`;
@@ -263,43 +301,12 @@ jobs:
                 // this workflow's own triggers and fires immediately, while the
                 // loop only sweeps every few minutes.
                 const hold =
-                  reason.startsWith('it is flagged by threat detection')
-                    ? {
-                        marker: '<!-- auto-merge-upstream-port: threat-hold -->',
-                        body:
-                          '**Auto-merge withheld.** gh-aw\'s threat detection ' +
-                          `flagged this pull request (\`${THREAT_LABEL}\`), and its ` +
-                          'own banner requires manual review before any follow-up ' +
-                          'automation. `main` requires zero approving reviews, so ' +
-                          'auto-merging it would put flagged agent output on `main` ' +
-                          'with no human having read it.\n\nRead the detection ' +
-                          'result in the generating workflow run. If it is a false ' +
-                          'positive, remove the label; otherwise close this pull ' +
-                          'request.',
-                      }
-                    : reason.startsWith('it is tagged risk: wire-format')
-                    ? {
-                        marker: '<!-- auto-merge-upstream-port: wire-format-hold -->',
-                        body:
-                          '**Auto-merge withheld.** This port is tagged ' +
-                          '`risk: wire-format`, meaning it changes bytes on the ' +
-                          'network. `main` requires zero approving reviews, so ' +
-                          'auto-merging it would put a protocol change on `main` ' +
-                          'with no human having read it.\n\nReview it and merge by ' +
-                          'hand.',
-                      }
-                    : null;
+                  reason.startsWith('it is flagged by threat detection') ? THREAT_HOLD
+                  : reason.startsWith('it is tagged risk: wire-format') ? WIRE_HOLD
+                  : null;
                 if (hold) {
                   await revoke(pr);
-                  const comments = await github.paginate(github.rest.issues.listComments, {
-                    owner, repo, issue_number: number, per_page: 100,
-                  });
-                  if (!comments.some(c => c.body && c.body.includes(hold.marker))) {
-                    await github.rest.issues.createComment({
-                      owner, repo, issue_number: number,
-                      body: `${hold.marker}\n${hold.body}`,
-                    });
-                  }
+                  await postHold(number, hold);
                 }
                 return;
               }
@@ -341,9 +348,16 @@ jobs:
 
               // Idempotency: ask before telling, so a re-run is a no-op rather
               // than an error swallowed by a catch block. This also re-reads the
-              // head: several API calls have happened since the sign-off SHA was
-              // checked, and everything below acts on `main` - the direct merge
-              // in particular is immediate.
+              // head and the labels: several API calls have happened since the
+              // sign-off SHA was checked, and everything below acts on `main` -
+              // the direct merge in particular is immediate.
+              //
+              // Labels are re-read here because `concurrency` on this workflow
+              // sets `cancel-in-progress: false`. A `labeled` event carrying the
+              // threat flag queues behind a run already in flight for this pull
+              // request, and that older run holds a snapshot taken before the
+              // label existed. Without this check it would merge the flagged
+              // pull request before the queued run ever reached `revoke`.
               const { repository } = await github.graphql(
                 `query($owner: String!, $repo: String!, $number: Int!) {
                    repository(owner: $owner, name: $repo) {
@@ -351,12 +365,23 @@ jobs:
                        autoMergeRequest { enabledAt }
                        mergeable
                        headRefOid
+                       labels(first: 100) { nodes { name } }
                      }
                    }
                  }`,
                 { owner, repo, number }
               );
               const state = repository.pullRequest;
+
+              if ((state.labels.nodes || []).some(l => l.name === THREAT_LABEL)) {
+                core.warning(
+                  `PR #${number} was flagged by threat detection during this run. ` +
+                  'Disarming instead of merging.'
+                );
+                await revoke(pr);
+                await postHold(number, THREAT_HOLD);
+                return;
+              }
 
               if (state.headRefOid !== reviewed) {
                 core.info(
