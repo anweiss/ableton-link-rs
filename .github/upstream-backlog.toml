@@ -179,11 +179,11 @@ why = "Adds `std::string` and `int16_t` to the portable byte-stream serializatio
 id = "have-peers-notify-on-audioendpoint-changes"
 title = "Have Peers notify on audioEndpoint changes"
 upstream = ["741390fd8930"]
-rust = ["src/discovery/peers.rs"]
+rust = ["src/discovery/peers.rs", "src/link/controller.rs", "src/link/mod.rs"]
 risk = "behavior"
-status = "outstanding"
-retired_at_pin = ""
-why = "`link::Peers` gained a callback to notify consumers when peer audio endpoints change; the notification plumbing in `peers.rs` should be assessed for the same hook"
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
+why = "`link::Peers` gained a callback to notify consumers when peer audio endpoints change; ported as `PeerStateChange::AudioEndpoint` fired from `saw_peer`, delivered through a new `Controller::audio_endpoint_callback` (mirroring `tempo_callback`) and exposed publicly as `BasicLink::set_audio_endpoint_callback`. Diverges from upstream by omitting the gateway address, since this port has no multi-gateway concept."
 
 [[port]]
 id = "increase-thread-priority-on-link-io-thread"

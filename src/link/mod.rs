@@ -61,6 +61,34 @@ pub type PeerCountCallback = Arc<Mutex<Box<dyn Fn(usize) + Send>>>;
 pub type TempoCallback = Arc<Mutex<Box<dyn Fn(f64) + Send>>>;
 #[cfg(feature = "std")]
 pub type StartStopCallback = Arc<Mutex<Box<dyn Fn(bool) + Send>>>;
+/// Invoked when a peer's advertised audio endpoint (LinkAudio) is first seen
+/// or subsequently changes.
+///
+/// The contract is deliberately narrower than upstream's. Upstream invokes
+/// its `AudioEndpointCallback` on *every* `Peers::sawPeerOnGateway`, including
+/// sightings that carry the same endpoint as before. This port fires only on a
+/// transition:
+///
+/// * the first time a peer is seen, always - including with `None` when that
+///   peer advertises no endpoint at all, so a consumer learns the peer's
+///   endpoint state exactly once per peer rather than never;
+/// * on a later sighting, only when the endpoint differs from the last one
+///   recorded for that peer, `Some(_)` to `None` (withdrawn) included.
+///
+/// It is therefore an edge-triggered notification, not a per-message one, and
+/// a consumer must not use its arrival rate to infer peer liveness.
+///
+/// Peer departure does not invoke it, mirroring upstream, which does not call
+/// it from `peerLeftGateway`. A sighting whose peer-list update could not
+/// acquire the lock is dropped rather than queued, so a missed edge is
+/// possible; the next differing sighting re-reports it.
+///
+/// Unlike upstream, this callback is not passed a gateway address: this port
+/// has no multi-gateway concept exposed to `Peers`/`Controller` (there is only
+/// ever a single implicit gateway), so that parameter has no analogue here.
+#[cfg(feature = "std")]
+pub type AudioEndpointCallback =
+    Arc<Mutex<Box<dyn Fn(node::NodeId, Option<std::net::SocketAddrV4>) + Send>>>;
 
 #[cfg(feature = "std")]
 pub struct BasicLink {
@@ -201,6 +229,25 @@ impl BasicLink {
                     callback(self.last_is_playing_for_callback);
                 }
             }
+        }
+    }
+
+    /// Registers a callback invoked when a peer's discovered audio endpoint is
+    /// first seen or subsequently changes. Rust analogue of upstream's
+    /// `SessionController::sawAudioEndpointCallback`, which upstream currently
+    /// leaves as a no-op handler; `LinkAudio` still discovers peers by polling.
+    ///
+    /// This is edge-triggered rather than per-sighting, and is not passed a
+    /// gateway address. See [`AudioEndpointCallback`] for the exact contract
+    /// and for how it diverges from upstream.
+    pub fn set_audio_endpoint_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(node::NodeId, Option<std::net::SocketAddrV4>) + Send + 'static,
+    {
+        let cb: AudioEndpointCallback = Arc::new(Mutex::new(Box::new(callback)));
+        match self.controller.audio_endpoint_callback.lock() {
+            Ok(mut guard) => *guard = Some(cb),
+            Err(mut poisoned) => **poisoned.get_mut() = Some(cb),
         }
     }
 
@@ -775,6 +822,37 @@ mod tests {
         assert!(
             *recorded_playing.lock().unwrap(),
             "Start/stop callback should fire with true"
+        );
+    }
+
+    type RecordedEndpoint = (node::NodeId, Option<std::net::SocketAddrV4>);
+
+    #[tokio::test]
+    async fn test_audio_endpoint_callback_dispatch() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let mut link = BasicLink::new(120.0).await.unwrap();
+
+        let recorded: Arc<Mutex<Option<RecordedEndpoint>>> = Arc::new(Mutex::new(None));
+        let recorded_clone = recorded.clone();
+        link.set_audio_endpoint_callback(move |peer_id, endpoint| {
+            *recorded_clone.lock().unwrap() = Some((peer_id, endpoint));
+        });
+
+        // Registration must be observable immediately, and the controller's
+        // dispatch path must deliver the peer id and endpoint unchanged.
+        let peer_id = node::NodeId::new();
+        let endpoint = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 12345);
+        crate::link::controller::dispatch_audio_endpoint_change(
+            &link.controller().audio_endpoint_callback,
+            peer_id,
+            Some(endpoint),
+        );
+
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some((peer_id, Some(endpoint))),
+            "Audio endpoint callback should fire with the peer id and endpoint"
         );
     }
 

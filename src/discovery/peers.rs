@@ -218,6 +218,16 @@ pub enum PeerStateChange {
     SessionTimeline(SessionId, Timeline),
     SessionStartStopState(SessionId, StartStopState),
     PeerLeft,
+    /// A peer's discovered audio endpoint was seen for the first time or has
+    /// since changed. Rust analogue of upstream's `Peers`' `AudioEndpointCallback`,
+    /// but edge-triggered: emitted once when a peer is first added (carrying
+    /// `None` if it advertises nothing) and thereafter only when the endpoint
+    /// differs from the last one recorded, whereas upstream emits on every
+    /// `sawPeerOnGateway`. Carries `None` when the peer no longer advertises an
+    /// endpoint. Peer departure is reported as `PeerLeft`, not as an endpoint
+    /// change — mirroring upstream, which does not invoke the callback from
+    /// `peerLeftGateway`.
+    AudioEndpoint(NodeId, Option<SocketAddrV4>),
 }
 
 async fn saw_peer(
@@ -254,6 +264,8 @@ async fn saw_peer(
     let peer_session = ps.session_id();
     let peer_timeline = ps.timeline();
     let peer_start_stop_state = ps.start_stop_state();
+    let peer_ident = ps.ident();
+    let peer_audio_endpoint = ps.audio_endpoint;
 
     let is_new_session_timeline = match peers.try_lock() {
         Ok(guard) => !guard.iter().any(|p| {
@@ -277,41 +289,38 @@ async fn saw_peer(
 
     let peer = ControllerPeer { peer_state: ps };
 
-    let existing_peer_index = match peers.try_lock() {
-        Ok(guard) => guard
-            .iter()
-            .position(|p| p.peer_state.ident() == peer.peer_state.ident()),
-        Err(_) => {
-            debug!("Could not acquire peers lock to find existing peer, assuming new");
-            None // Assume it's new if we can't check
-        }
-    };
+    // Read the previously-known audio endpoint and install the new peer state
+    // under a single guard, so the "did the endpoint change" decision is made
+    // against the state we actually replaced. `audio_endpoint_change` is `Some`
+    // only when the peer list was really updated.
+    let (did_session_membership_change, audio_endpoint_change) = match peers.try_lock() {
+        Ok(mut guard) => {
+            let existing_peer_index = guard
+                .iter()
+                .position(|p| p.peer_state.ident() == peer.peer_state.ident());
 
-    let did_session_membership_change = if let Some(index) = existing_peer_index {
-        // Update existing peer with new state
-        match peers.try_lock() {
-            Ok(mut guard) => {
-                let old_session_id = guard[index].peer_state.session_id();
-                guard[index] = peer.clone();
-                // Session membership changed if the session ID changed
-                old_session_id != peer_session
-            }
-            Err(_) => {
-                debug!("Could not acquire peers lock to update existing peer");
-                false // No change if we can't update
+            match existing_peer_index {
+                Some(index) => {
+                    let old_session_id = guard[index].peer_state.session_id();
+                    let old_audio_endpoint = guard[index].peer_state.audio_endpoint;
+                    guard[index] = peer.clone();
+                    let endpoint_change = if old_audio_endpoint != peer_audio_endpoint {
+                        Some(peer_audio_endpoint)
+                    } else {
+                        None
+                    };
+                    // Session membership changed if the session ID changed
+                    (old_session_id != peer_session, endpoint_change)
+                }
+                None => {
+                    guard.push(peer.clone());
+                    (true, Some(peer_audio_endpoint))
+                }
             }
         }
-    } else {
-        // Add new peer
-        match peers.try_lock() {
-            Ok(mut guard) => {
-                guard.push(peer.clone());
-                true
-            }
-            Err(_) => {
-                debug!("Could not acquire peers lock to add new peer");
-                false // No change if we can't add
-            }
+        Err(_) => {
+            debug!("Could not acquire peers lock to update peer list");
+            (false, None) // No change if we can't update
         }
     };
 
@@ -336,6 +345,19 @@ async fn saw_peer(
     if did_session_membership_change {
         debug!("session membership changed");
         peer_state_changes.push(PeerStateChange::SessionMembership);
+    }
+
+    // Audio endpoint goes last, after membership, matching upstream's
+    // `sawPeerOnGateway`: it invokes `mSessionMembershipCallback()` and only
+    // then `mAudioEndpointCallback(...)`. The order is load-bearing rather
+    // than incidental - membership is what updates `session_peer_counter` and
+    // triggers any session reset, so an endpoint callback delivered first
+    // would let consumer code observing `BasicLink::num_peers()` or session
+    // state read values that the very same sighting is about to change. That
+    // is most visible on a peer's first sighting, where both fire together.
+    if let Some(endpoint) = audio_endpoint_change {
+        debug!("audio endpoint changed");
+        peer_state_changes.push(PeerStateChange::AudioEndpoint(peer_ident, endpoint));
     }
 
     if !peer_state_changes.is_empty() {
@@ -640,5 +662,87 @@ mod tests {
                 peer_state: bar_peer,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn saw_peer_notifies_on_audio_endpoint_change() {
+        let (mut foo_peer, _, _) = init_peers();
+
+        let peers = Arc::new(Mutex::new(vec![]));
+        let self_peer_state = Arc::new(Mutex::new(PeerState {
+            node_state: NodeState::new(SessionId::default()),
+            measurement_endpoint: None,
+            audio_endpoint: None,
+        }));
+        let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
+        let (tx_peer_state_change, mut rx_peer_state_change) =
+            mpsc::channel::<Vec<PeerStateChange>>(4);
+
+        // First sighting: no audio endpoint yet.
+        saw_peer(
+            foo_peer.clone(),
+            peers.clone(),
+            self_peer_state.clone(),
+            session_peer_counter.clone(),
+            tx_peer_state_change.clone(),
+        )
+        .await;
+
+        let first_changes = rx_peer_state_change.recv().await.unwrap();
+        assert!(first_changes.iter().any(
+            |c| matches!(c, PeerStateChange::AudioEndpoint(id, None) if *id == foo_peer.ident())
+        ));
+
+        // Upstream's `sawPeerOnGateway` invokes `mSessionMembershipCallback()`
+        // before `mAudioEndpointCallback(...)`, and that order matters: the
+        // membership change is what updates the peer counter and drives any
+        // session reset, so a consumer reacting to the endpoint must not see
+        // pre-membership state. A first sighting emits both, so it is the case
+        // that pins the order.
+        let membership_at = first_changes
+            .iter()
+            .position(|c| matches!(c, PeerStateChange::SessionMembership))
+            .expect("a first sighting must report session membership");
+        let endpoint_at = first_changes
+            .iter()
+            .position(|c| matches!(c, PeerStateChange::AudioEndpoint(..)))
+            .expect("a first sighting must report the audio endpoint");
+        assert!(
+            membership_at < endpoint_at,
+            "session membership must be queued before the audio endpoint, \
+             got membership at {membership_at} and endpoint at {endpoint_at}"
+        );
+
+        // The peer starts advertising an audio endpoint: expect a notification
+        // carrying the new endpoint.
+        let endpoint = SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 12345);
+        foo_peer.audio_endpoint = Some(endpoint);
+
+        saw_peer(
+            foo_peer.clone(),
+            peers.clone(),
+            self_peer_state.clone(),
+            session_peer_counter.clone(),
+            tx_peer_state_change.clone(),
+        )
+        .await;
+
+        let second_changes = rx_peer_state_change.recv().await.unwrap();
+        assert!(second_changes.iter().any(|c| matches!(
+            c,
+            PeerStateChange::AudioEndpoint(id, Some(ep)) if *id == foo_peer.ident() && *ep == endpoint
+        )));
+
+        // Seeing the same peer state again must not re-fire the callback.
+        saw_peer(
+            foo_peer.clone(),
+            peers.clone(),
+            self_peer_state.clone(),
+            session_peer_counter,
+            tx_peer_state_change,
+        )
+        .await;
+
+        assert!(rx_peer_state_change.try_recv().is_err());
     }
 }

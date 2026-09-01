@@ -11,7 +11,7 @@ A native Rust implementation of [Ableton Link](https://ableton.github.io/link), 
 * **Async/Await**: Built on Tokio for efficient asynchronous network operations
 * **Cross-Platform**: Works on macOS, Linux, and Windows with platform-specific optimizations
 * **Platform-Specific Timing**: High-resolution clocks using `mach_absolute_time` (macOS), `clock_gettime` (Linux), and `QueryPerformanceCounter` (Windows)
-* **Session Management**: Automatic peer discovery, session state synchronization, and tempo change callbacks
+* **Session Management**: Automatic peer discovery, session state synchronization, and callbacks for tempo and peer audio-endpoint changes
 * **Start/Stop Sync**: Synchronization of play/stop states across devices
 * **Memory Safe**: Leverages Rust's ownership system for safe concurrent networking
 * **LinkAudio (optional)**: Stream PCM audio between Link peers, aligned to the shared beat grid, behind the optional `audio` feature — a fully safe-Rust port of the upstream LinkAudio subsystem
@@ -167,6 +167,10 @@ let peer_count = link.num_peers();
 link.set_tempo_callback(|bpm| { /* ... */ });
 link.set_num_peers_callback(|count| { /* ... */ });
 link.set_start_stop_callback(|playing| { /* ... */ });
+// Fires when a peer's advertised audio endpoint (LinkAudio) is first seen or
+// later changes — edge-triggered, not once per sighting. Not called when a
+// peer leaves.
+link.set_audio_endpoint_callback(|peer_id, endpoint| { /* ... */ });
 
 // Session state
 let state = link.capture_app_session_state();

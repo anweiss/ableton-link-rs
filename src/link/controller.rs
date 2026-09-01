@@ -26,13 +26,35 @@ use super::{
         clamp_tempo, update_client_timeline_from_session, update_session_timeline_from_client,
         Timeline,
     },
-    IncomingClientState, TempoCallback,
+    AudioEndpointCallback, IncomingClientState, TempoCallback,
 };
 
 pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 
+/// Invokes the registered audio-endpoint callback, if any. The registered
+/// callback is cloned out from under the outer guard so it is never dropped
+/// just because registration is momentarily in flight.
+pub(crate) fn dispatch_audio_endpoint_change(
+    callback: &Arc<Mutex<Option<AudioEndpointCallback>>>,
+    peer_id: NodeId,
+    endpoint: Option<SocketAddrV4>,
+) {
+    let callback = callback.lock().ok().and_then(|guard| guard.clone());
+    if let Some(callback) = callback {
+        if let Ok(callback) = callback.lock() {
+            callback(peer_id, endpoint);
+        }
+    }
+}
+
 pub struct Controller {
     pub tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
+    /// Invoked whenever a peer's discovered audio endpoint changes. Rust
+    /// analogue of upstream's `Controller::SawAudioEndpointCallback`. Set via
+    /// [`crate::link::BasicLink::set_audio_endpoint_callback`] and invoked
+    /// directly from the peer-state-change consumption loop below; this port
+    /// has no separate session-controller component to forward to.
+    pub audio_endpoint_callback: Arc<Mutex<Option<AudioEndpointCallback>>>,
     pub peer_state: Arc<Mutex<PeerState>>,
     pub session_state: Arc<Mutex<SessionState>>,
     pub client_state: Arc<Mutex<ClientState>>,
@@ -51,6 +73,8 @@ impl Controller {
     pub async fn new(tempo: tempo::Tempo, clock: Clock) -> Result<Self, std::io::Error> {
         let node_id = NodeId::new();
         let tempo_callback: Arc<Mutex<Option<TempoCallback>>> = Arc::new(Mutex::new(None));
+        let audio_endpoint_callback: Arc<Mutex<Option<AudioEndpointCallback>>> =
+            Arc::new(Mutex::new(None));
         let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
         let session_id = SessionId(node_id);
         let s_state = init_session_state(tempo, clock);
@@ -181,24 +205,45 @@ impl Controller {
         let s_peer_counter_loop = session_peer_counter.clone();
         let peer_state_loop = peer_state.clone();
         let tempo_cb_loop = tempo_callback.clone();
+        let audio_endpoint_cb_loop = audio_endpoint_callback.clone();
+
+        // An audio-endpoint notification held back because the
+        // `SessionMembership` change it was queued behind could not be applied
+        // - every read in that arm is a `try_lock` that skips the change rather
+        // than block. Dropping the notification instead is not an option:
+        // `saw_peer` has already recorded the new endpoint, so an identical
+        // later sighting is not a transition and will never re-fire the edge.
+        // It is re-emitted the next time membership is applied successfully,
+        // which is also what keeps it behind membership rather than ahead of
+        // it. A newer edge supersedes an older held one; latest wins.
+        let mut deferred_audio_endpoint: Option<(NodeId, Option<SocketAddrV4>)> = None;
 
         tokio::spawn(async move {
             loop {
                 if let Some(peer_state_changes) = rx_peer_state_change.recv().await {
                     debug!("controller received peer state changes");
+                    // Set when a `SessionMembership` change in this batch was
+                    // abandoned. Any audio-endpoint change queued behind it is
+                    // then held back rather than delivered against state the
+                    // abandoned change was supposed to update.
+                    let mut membership_abandoned = false;
                     for peer_state_change in peer_state_changes.iter() {
                         match peer_state_change {
                             PeerStateChange::SessionMembership => {
                                 debug!("Controller received SessionMembership change");
-                                let session_id = if let Ok(ps) = peer_state_loop.try_lock() {
-                                    ps.session_id()
-                                } else {
-                                    continue;
-                                };
-                                let self_node_id = if let Ok(ps) = peer_state_loop.try_lock() {
-                                    ps.ident()
-                                } else {
-                                    continue;
+                                // Both reads come from one guard: taken
+                                // separately they are two chances to bail, and
+                                // two different snapshots of the same state.
+                                let ids = peer_state_loop
+                                    .try_lock()
+                                    .map(|ps| (ps.session_id(), ps.ident()))
+                                    .ok();
+                                let (session_id, self_node_id) = match ids {
+                                    Some(ids) => ids,
+                                    None => {
+                                        membership_abandoned = true;
+                                        continue;
+                                    }
                                 };
 
                                 let count = unique_session_peer_count(
@@ -209,6 +254,7 @@ impl Controller {
                                 let old_count = if let Ok(spc) = s_peer_counter_loop.try_lock() {
                                     spc.session_peer_count
                                 } else {
+                                    membership_abandoned = true;
                                     continue;
                                 };
 
@@ -240,6 +286,23 @@ impl Controller {
                                         tempo_cb_loop.clone(),
                                     )
                                     .await
+                                }
+
+                                // Membership is now applied, so an endpoint
+                                // edge held back by an earlier abandoned
+                                // membership change can be delivered - still
+                                // after membership, which is the point.
+                                if let Some((peer_id, endpoint)) = deferred_audio_endpoint.take() {
+                                    debug!(
+                                        "Controller releasing deferred AudioEndpoint change \
+                                         for peer {}",
+                                        peer_id
+                                    );
+                                    dispatch_audio_endpoint_change(
+                                        &audio_endpoint_cb_loop,
+                                        peer_id,
+                                        endpoint,
+                                    );
                                 }
                             }
                             PeerStateChange::SessionTimeline(peer_session, timeline) => {
@@ -382,6 +445,26 @@ impl Controller {
                                     .await;
                                 }
                             }
+                            PeerStateChange::AudioEndpoint(peer_id, endpoint) => {
+                                debug!(
+                                    "Controller received AudioEndpoint change for peer {}",
+                                    peer_id
+                                );
+                                if membership_abandoned {
+                                    debug!(
+                                        "Deferring AudioEndpoint change for peer {}: the \
+                                         membership change it follows was not applied",
+                                        peer_id
+                                    );
+                                    deferred_audio_endpoint = Some((*peer_id, *endpoint));
+                                    continue;
+                                }
+                                dispatch_audio_endpoint_change(
+                                    &audio_endpoint_cb_loop,
+                                    *peer_id,
+                                    *endpoint,
+                                );
+                            }
                         }
                     }
                 }
@@ -390,6 +473,7 @@ impl Controller {
 
         Ok(Self {
             tempo_callback,
+            audio_endpoint_callback,
             peer_state,
             session_state,
             client_state,
