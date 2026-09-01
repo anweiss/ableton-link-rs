@@ -62,9 +62,10 @@ pub type TempoCallback = Arc<Mutex<Box<dyn Fn(f64) + Send>>>;
 #[cfg(feature = "std")]
 pub type StartStopCallback = Arc<Mutex<Box<dyn Fn(bool) + Send>>>;
 /// Invoked whenever a peer's discovered audio endpoint changes, i.e. whenever
-/// upstream's `Peers::sawPeerOnGateway`/`peerLeftGateway` would invoke their
-/// `AudioEndpointCallback`. `endpoint` is `None` when the peer no longer
-/// advertises one (including when the peer has left).
+/// upstream's `Peers::sawPeerOnGateway` would invoke their
+/// `AudioEndpointCallback`. `endpoint` is `None` when the peer is still seen
+/// but no longer advertises one. Peer departure does not invoke this callback,
+/// mirroring upstream, which does not call it from `peerLeftGateway`.
 ///
 /// Unlike upstream, this callback is not passed a gateway address: this port
 /// has no multi-gateway concept exposed to `Peers`/`Controller` (there is only
@@ -217,8 +218,8 @@ impl BasicLink {
 
     /// Registers a callback invoked whenever a peer's discovered audio
     /// endpoint changes. Rust analogue of upstream's
-    /// `SessionController::sawAudioEndpointCallback`, which the `LinkAudio`
-    /// subsystem uses to learn about peers without polling.
+    /// `SessionController::sawAudioEndpointCallback`, which upstream currently
+    /// leaves as a no-op handler; `LinkAudio` still discovers peers by polling.
     ///
     /// Unlike upstream, the callback is not passed a gateway address: see
     /// [`AudioEndpointCallback`] for why.
@@ -227,8 +228,9 @@ impl BasicLink {
         F: Fn(node::NodeId, Option<std::net::SocketAddrV4>) + Send + 'static,
     {
         let cb: AudioEndpointCallback = Arc::new(Mutex::new(Box::new(callback)));
-        if let Ok(mut guard) = self.controller.audio_endpoint_callback.try_lock() {
-            *guard = Some(cb);
+        match self.controller.audio_endpoint_callback.lock() {
+            Ok(mut guard) => *guard = Some(cb),
+            Err(mut poisoned) => **poisoned.get_mut() = Some(cb),
         }
     }
 
@@ -803,6 +805,37 @@ mod tests {
         assert!(
             *recorded_playing.lock().unwrap(),
             "Start/stop callback should fire with true"
+        );
+    }
+
+    type RecordedEndpoint = (node::NodeId, Option<std::net::SocketAddrV4>);
+
+    #[tokio::test]
+    async fn test_audio_endpoint_callback_dispatch() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let mut link = BasicLink::new(120.0).await.unwrap();
+
+        let recorded: Arc<Mutex<Option<RecordedEndpoint>>> = Arc::new(Mutex::new(None));
+        let recorded_clone = recorded.clone();
+        link.set_audio_endpoint_callback(move |peer_id, endpoint| {
+            *recorded_clone.lock().unwrap() = Some((peer_id, endpoint));
+        });
+
+        // Registration must be observable immediately, and the controller's
+        // dispatch path must deliver the peer id and endpoint unchanged.
+        let peer_id = node::NodeId::new();
+        let endpoint = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 12345);
+        crate::link::controller::dispatch_audio_endpoint_change(
+            &link.controller().audio_endpoint_callback,
+            peer_id,
+            Some(endpoint),
+        );
+
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some((peer_id, Some(endpoint))),
+            "Audio endpoint callback should fire with the peer id and endpoint"
         );
     }
 

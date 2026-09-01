@@ -167,6 +167,9 @@ let peer_count = link.num_peers();
 link.set_tempo_callback(|bpm| { /* ... */ });
 link.set_num_peers_callback(|count| { /* ... */ });
 link.set_start_stop_callback(|playing| { /* ... */ });
+// Fires when a peer's advertised audio endpoint (LinkAudio) appears, changes,
+// or is withdrawn. Not called when a peer leaves.
+link.set_audio_endpoint_callback(|peer_id, endpoint| { /* ... */ });
 
 // Session state
 let state = link.capture_app_session_state();

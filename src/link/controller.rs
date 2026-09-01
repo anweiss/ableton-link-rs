@@ -31,11 +31,29 @@ use super::{
 
 pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 
+/// Invokes the registered audio-endpoint callback, if any. The registered
+/// callback is cloned out from under the outer guard so it is never dropped
+/// just because registration is momentarily in flight.
+pub(crate) fn dispatch_audio_endpoint_change(
+    callback: &Arc<Mutex<Option<AudioEndpointCallback>>>,
+    peer_id: NodeId,
+    endpoint: Option<SocketAddrV4>,
+) {
+    let callback = callback.lock().ok().and_then(|guard| guard.clone());
+    if let Some(callback) = callback {
+        if let Ok(callback) = callback.lock() {
+            callback(peer_id, endpoint);
+        }
+    }
+}
+
 pub struct Controller {
     pub tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
     /// Invoked whenever a peer's discovered audio endpoint changes. Rust
-    /// analogue of upstream's `Controller::SawAudioEndpointCallback`, which
-    /// forwards `Peers`' `AudioEndpointCallback` to the session controller.
+    /// analogue of upstream's `Controller::SawAudioEndpointCallback`. Set via
+    /// [`crate::link::BasicLink::set_audio_endpoint_callback`] and invoked
+    /// directly from the peer-state-change consumption loop below; this port
+    /// has no separate session-controller component to forward to.
     pub audio_endpoint_callback: Arc<Mutex<Option<AudioEndpointCallback>>>,
     pub peer_state: Arc<Mutex<PeerState>>,
     pub session_state: Arc<Mutex<SessionState>>,
@@ -394,13 +412,11 @@ impl Controller {
                                     "Controller received AudioEndpoint change for peer {}",
                                     peer_id
                                 );
-                                if let Ok(callback_guard) = audio_endpoint_cb_loop.try_lock() {
-                                    if let Some(ref callback) = *callback_guard {
-                                        if let Ok(callback) = callback.try_lock() {
-                                            callback(*peer_id, *endpoint);
-                                        }
-                                    }
-                                }
+                                dispatch_audio_endpoint_change(
+                                    &audio_endpoint_cb_loop,
+                                    *peer_id,
+                                    *endpoint,
+                                );
                             }
                         }
                     }

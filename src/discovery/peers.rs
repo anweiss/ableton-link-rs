@@ -220,8 +220,9 @@ pub enum PeerStateChange {
     PeerLeft,
     /// A peer's discovered audio endpoint changed. Rust analogue of upstream's
     /// `Peers`' `AudioEndpointCallback`, invoked from `sawPeerOnGateway`. Carries
-    /// `None` when the peer no longer advertises an endpoint (including when the
-    /// peer left).
+    /// `None` when the peer no longer advertises an endpoint. Peer departure is
+    /// reported as `PeerLeft`, not as an endpoint change — mirroring upstream,
+    /// which does not invoke the callback from `peerLeftGateway`.
     AudioEndpoint(NodeId, Option<SocketAddrV4>),
 }
 
@@ -284,46 +285,38 @@ async fn saw_peer(
 
     let peer = ControllerPeer { peer_state: ps };
 
-    let existing_peer_index = match peers.try_lock() {
-        Ok(guard) => guard
-            .iter()
-            .position(|p| p.peer_state.ident() == peer.peer_state.ident()),
+    // Read the previously-known audio endpoint and install the new peer state
+    // under a single guard, so the "did the endpoint change" decision is made
+    // against the state we actually replaced. `audio_endpoint_change` is `Some`
+    // only when the peer list was really updated.
+    let (did_session_membership_change, audio_endpoint_change) = match peers.try_lock() {
+        Ok(mut guard) => {
+            let existing_peer_index = guard
+                .iter()
+                .position(|p| p.peer_state.ident() == peer.peer_state.ident());
+
+            match existing_peer_index {
+                Some(index) => {
+                    let old_session_id = guard[index].peer_state.session_id();
+                    let old_audio_endpoint = guard[index].peer_state.audio_endpoint;
+                    guard[index] = peer.clone();
+                    let endpoint_change = if old_audio_endpoint != peer_audio_endpoint {
+                        Some(peer_audio_endpoint)
+                    } else {
+                        None
+                    };
+                    // Session membership changed if the session ID changed
+                    (old_session_id != peer_session, endpoint_change)
+                }
+                None => {
+                    guard.push(peer.clone());
+                    (true, Some(peer_audio_endpoint))
+                }
+            }
+        }
         Err(_) => {
-            debug!("Could not acquire peers lock to find existing peer, assuming new");
-            None // Assume it's new if we can't check
-        }
-    };
-
-    let old_audio_endpoint = existing_peer_index.and_then(|index| match peers.try_lock() {
-        Ok(guard) => guard.get(index).map(|p| p.peer_state.audio_endpoint),
-        Err(_) => None,
-    });
-
-    let did_session_membership_change = if let Some(index) = existing_peer_index {
-        // Update existing peer with new state
-        match peers.try_lock() {
-            Ok(mut guard) => {
-                let old_session_id = guard[index].peer_state.session_id();
-                guard[index] = peer.clone();
-                // Session membership changed if the session ID changed
-                old_session_id != peer_session
-            }
-            Err(_) => {
-                debug!("Could not acquire peers lock to update existing peer");
-                false // No change if we can't update
-            }
-        }
-    } else {
-        // Add new peer
-        match peers.try_lock() {
-            Ok(mut guard) => {
-                guard.push(peer.clone());
-                true
-            }
-            Err(_) => {
-                debug!("Could not acquire peers lock to add new peer");
-                false // No change if we can't add
-            }
+            debug!("Could not acquire peers lock to update peer list");
+            (false, None) // No change if we can't update
         }
     };
 
@@ -345,17 +338,9 @@ async fn saw_peer(
         ));
     }
 
-    let is_new_audio_endpoint = match existing_peer_index {
-        Some(_) => old_audio_endpoint != Some(peer_audio_endpoint),
-        None => true,
-    };
-
-    if is_new_audio_endpoint {
+    if let Some(endpoint) = audio_endpoint_change {
         debug!("audio endpoint changed");
-        peer_state_changes.push(PeerStateChange::AudioEndpoint(
-            peer_ident,
-            peer_audio_endpoint,
-        ));
+        peer_state_changes.push(PeerStateChange::AudioEndpoint(peer_ident, endpoint));
     }
 
     if did_session_membership_change {
