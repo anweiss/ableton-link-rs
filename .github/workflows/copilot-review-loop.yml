@@ -864,7 +864,15 @@ jobs:
               // it would be re-spent every 5 minutes for as long as a pull
               // request sits in the terminal `agent-failed` state below. A miss
               // degrades to `null`, which is the fail-safe direction.
-              const runs = await github.rest.actions.listWorkflowRunsForWorkflow({
+              // `listWorkflowRuns`, not `listWorkflowRunsForWorkflow`. Octokit
+              // exposes exactly two names here - `listWorkflowRuns` (one
+              // workflow) and `listWorkflowRunsForRepo` (all of them) - and the
+              // third name reads plausibly enough that it shipped and threw
+              // `is not a function` on every reconcile, failing the whole run
+              // and leaving PR #127 parked in `awaiting-agent` for an hour.
+              // The unit test could not catch it: it stubbed the method by
+              // name, so it asserted against the same typo.
+              const runs = await github.rest.actions.listWorkflowRuns({
                 owner, repo, workflow_id: FIX_WORKFLOW,
                 event: 'workflow_dispatch', per_page: 100,
               }).then(res => res.data.workflow_runs || []).catch(err => {
