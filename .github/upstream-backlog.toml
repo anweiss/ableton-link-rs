@@ -171,8 +171,8 @@ title = "Add NetworkByteStreamSerializable for string and int16_t"
 upstream = ["ef11fe77ad14", "519c7be073ec"]
 rust = ["src/encoding.rs"]
 risk = "wire-format"
-status = "outstanding"
-retired_at_pin = ""
+status = "retired"
+retired_at_pin = "ef11fe77ad140e28f686abe5870f4a0eba410614"
 why = "Adds `std::string` and `int16_t` to the portable byte-stream serialization; needed by LinkAudio peer names on the wire; `int16_t` may be used by audio payload keys in future"
 
 [[port]]
