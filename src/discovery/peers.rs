@@ -218,11 +218,15 @@ pub enum PeerStateChange {
     SessionTimeline(SessionId, Timeline),
     SessionStartStopState(SessionId, StartStopState),
     PeerLeft,
-    /// A peer's discovered audio endpoint changed. Rust analogue of upstream's
-    /// `Peers`' `AudioEndpointCallback`, invoked from `sawPeerOnGateway`. Carries
-    /// `None` when the peer no longer advertises an endpoint. Peer departure is
-    /// reported as `PeerLeft`, not as an endpoint change — mirroring upstream,
-    /// which does not invoke the callback from `peerLeftGateway`.
+    /// A peer's discovered audio endpoint was seen for the first time or has
+    /// since changed. Rust analogue of upstream's `Peers`' `AudioEndpointCallback`,
+    /// but edge-triggered: emitted once when a peer is first added (carrying
+    /// `None` if it advertises nothing) and thereafter only when the endpoint
+    /// differs from the last one recorded, whereas upstream emits on every
+    /// `sawPeerOnGateway`. Carries `None` when the peer no longer advertises an
+    /// endpoint. Peer departure is reported as `PeerLeft`, not as an endpoint
+    /// change — mirroring upstream, which does not invoke the callback from
+    /// `peerLeftGateway`.
     AudioEndpoint(NodeId, Option<SocketAddrV4>),
 }
 

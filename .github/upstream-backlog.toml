@@ -36,9 +36,9 @@ schema_version = 1
 # Watermark this triage was computed against. Advisory: the real watermark is
 # the submodule pin, and the validator fails if this drifts from it.
 [watermark]
-pinned = "741390fd89303d35b8213f91ec7e456b7140f2fc"
+pinned = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 upstream = "902aef95bf94af49746fdda5369b42cdcfa1e6d2"
-commits_behind = 112
+commits_behind = 113
 
 # ---------------------------------------------------------------------------
 # Port items, in upstream ancestry order (oldest first). The port workflow
@@ -182,7 +182,7 @@ upstream = ["741390fd8930"]
 rust = ["src/discovery/peers.rs", "src/link/controller.rs", "src/link/mod.rs"]
 risk = "behavior"
 status = "retired"
-retired_at_pin = "741390fd89303d35b8213f91ec7e456b7140f2fc"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "`link::Peers` gained a callback to notify consumers when peer audio endpoints change; ported as `PeerStateChange::AudioEndpoint` fired from `saw_peer`, delivered through a new `Controller::audio_endpoint_callback` (mirroring `tempo_callback`) and exposed publicly as `BasicLink::set_audio_endpoint_callback`. Diverges from upstream by omitting the gateway address, since this port has no multi-gateway concept."
 
 [[port]]

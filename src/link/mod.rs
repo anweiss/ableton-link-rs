@@ -61,11 +61,27 @@ pub type PeerCountCallback = Arc<Mutex<Box<dyn Fn(usize) + Send>>>;
 pub type TempoCallback = Arc<Mutex<Box<dyn Fn(f64) + Send>>>;
 #[cfg(feature = "std")]
 pub type StartStopCallback = Arc<Mutex<Box<dyn Fn(bool) + Send>>>;
-/// Invoked whenever a peer's discovered audio endpoint changes, i.e. whenever
-/// upstream's `Peers::sawPeerOnGateway` would invoke their
-/// `AudioEndpointCallback`. `endpoint` is `None` when the peer is still seen
-/// but no longer advertises one. Peer departure does not invoke this callback,
-/// mirroring upstream, which does not call it from `peerLeftGateway`.
+/// Invoked when a peer's advertised audio endpoint (LinkAudio) is first seen
+/// or subsequently changes.
+///
+/// The contract is deliberately narrower than upstream's. Upstream invokes
+/// its `AudioEndpointCallback` on *every* `Peers::sawPeerOnGateway`, including
+/// sightings that carry the same endpoint as before. This port fires only on a
+/// transition:
+///
+/// * the first time a peer is seen, always - including with `None` when that
+///   peer advertises no endpoint at all, so a consumer learns the peer's
+///   endpoint state exactly once per peer rather than never;
+/// * on a later sighting, only when the endpoint differs from the last one
+///   recorded for that peer, `Some(_)` to `None` (withdrawn) included.
+///
+/// It is therefore an edge-triggered notification, not a per-message one, and
+/// a consumer must not use its arrival rate to infer peer liveness.
+///
+/// Peer departure does not invoke it, mirroring upstream, which does not call
+/// it from `peerLeftGateway`. A sighting whose peer-list update could not
+/// acquire the lock is dropped rather than queued, so a missed edge is
+/// possible; the next differing sighting re-reports it.
 ///
 /// Unlike upstream, this callback is not passed a gateway address: this port
 /// has no multi-gateway concept exposed to `Peers`/`Controller` (there is only
@@ -216,13 +232,14 @@ impl BasicLink {
         }
     }
 
-    /// Registers a callback invoked whenever a peer's discovered audio
-    /// endpoint changes. Rust analogue of upstream's
+    /// Registers a callback invoked when a peer's discovered audio endpoint is
+    /// first seen or subsequently changes. Rust analogue of upstream's
     /// `SessionController::sawAudioEndpointCallback`, which upstream currently
     /// leaves as a no-op handler; `LinkAudio` still discovers peers by polling.
     ///
-    /// Unlike upstream, the callback is not passed a gateway address: see
-    /// [`AudioEndpointCallback`] for why.
+    /// This is edge-triggered rather than per-sighting, and is not passed a
+    /// gateway address. See [`AudioEndpointCallback`] for the exact contract
+    /// and for how it diverges from upstream.
     pub fn set_audio_endpoint_callback<F>(&mut self, callback: F)
     where
         F: Fn(node::NodeId, Option<std::net::SocketAddrV4>) + Send + 'static,
