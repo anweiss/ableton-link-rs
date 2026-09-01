@@ -18,6 +18,14 @@ use core::fmt;
 pub enum EncodeError {
     /// A string is longer than the `u32` length prefix can describe.
     StringTooLong(usize),
+    /// The total encoded message — protocol header, message header and
+    /// payload combined — is larger than the wire protocol allows.
+    MessageTooLarge {
+        /// Total encoded size, in bytes, of header plus payload.
+        size: usize,
+        /// The maximum total encoded size the protocol permits.
+        max: usize,
+    },
 }
 
 impl fmt::Display for EncodeError {
@@ -25,6 +33,13 @@ impl fmt::Display for EncodeError {
         match self {
             EncodeError::StringTooLong(len) => {
                 write!(f, "string of {} bytes exceeds the u32 length prefix", len)
+            }
+            EncodeError::MessageTooLarge { size, max } => {
+                write!(
+                    f,
+                    "encoded message of {} bytes exceeds the maximum of {}",
+                    size, max
+                )
             }
         }
     }

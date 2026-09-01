@@ -91,7 +91,15 @@ pub fn encode_message(
     let message_size = PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE + payload.size() as usize;
 
     if message_size > MAX_MESSAGE_SIZE {
-        panic!("exceeded maximum message size");
+        // Matches upstream's `sendUdpMessage`, which moved the encode call
+        // inside its `try` block so this failure is caught and logged by the
+        // caller instead of aborting the process.
+        return Err(crate::link::error::Error::Encoding(
+            encoding::EncodeError::MessageTooLarge {
+                size: message_size,
+                max: MAX_MESSAGE_SIZE,
+            },
+        ));
     }
 
     let mut encoded = encoding::encode_to_vec(&PROTOCOL_HEADER)?;
@@ -153,6 +161,7 @@ mod tests {
     use crate::link::{
         beats::Beats,
         node::{NodeId, NodeState},
+        payload::PayloadEntry,
         sessions::SessionId,
         state::StartStopState,
         tempo::Tempo,
@@ -172,6 +181,37 @@ mod tests {
 
         let (decoded_header, _) = parse_message_header(&encoded).unwrap();
         assert_eq!(decoded_header, header);
+    }
+
+    #[test]
+    fn encode_message_rejects_oversized_payload() {
+        // Matches upstream's `sendUdpMessage` fix: an over-limit message is a
+        // recoverable error rather than a panic, so a caller can log it and
+        // move on instead of the whole process aborting.
+        let node_id = NodeId::from_array([1, 2, 3, 4, 5, 6, 7, 8]);
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::new(0.0),
+            time_origin: Duration::zero(),
+        };
+        let mut payload = Payload::default();
+        for _ in 0..(MAX_MESSAGE_SIZE / crate::link::timeline::TIMELINE_SIZE as usize + 1) {
+            payload.entries.push(PayloadEntry::Timeline(timeline));
+        }
+
+        let result = encode_message(node_id, 5, ALIVE, &payload, 0);
+        // Match only on the error; never debug-print the `Ok` arm, which
+        // would write the encoded wire payload into the test log.
+        match result {
+            Err(crate::link::error::Error::Encoding(
+                crate::encoding::EncodeError::MessageTooLarge { size, max },
+            )) => {
+                assert_eq!(max, MAX_MESSAGE_SIZE);
+                assert!(size > MAX_MESSAGE_SIZE);
+            }
+            Err(other) => panic!("expected MessageTooLarge, got error {}", other),
+            Ok(_) => panic!("expected MessageTooLarge, got a successfully encoded message"),
+        }
     }
 
     #[test]

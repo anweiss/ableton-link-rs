@@ -652,14 +652,43 @@ pub async fn send_message(
     to: SocketAddrV4,
     group_id: SessionGroupId,
 ) -> std::io::Result<()> {
+    send_message_reporting(socket, from, ttl, message_type, payload, to, group_id)
+        .await
+        .map(|_| ())
+}
+
+/// Sends a message, reporting whether a datagram actually went out.
+///
+/// Returns `Ok(true)` when the message was transmitted and `Ok(false)` when it
+/// could not be encoded and was therefore dropped. Callers that rate-limit on
+/// "we just broadcast" must not treat a dropped message as a send: upstream
+/// advances its broadcast clock only after `sendUdpMessage` succeeds.
+async fn send_message_reporting(
+    socket: Arc<UdpSocket>,
+    from: NodeId,
+    ttl: u8,
+    message_type: MessageType,
+    payload: &Payload,
+    to: SocketAddrV4,
+    group_id: SessionGroupId,
+) -> std::io::Result<bool> {
     socket.set_broadcast(true).unwrap();
     socket.set_multicast_ttl_v4(2).unwrap();
     socket.set_multicast_loop_v4(true).unwrap();
 
-    let message = encode_message(from, ttl, message_type, payload, group_id).unwrap();
+    // Matches upstream's `sendUdpMessage`: encoding is inside the fallible
+    // path so an oversized/unencodable payload is logged and dropped instead
+    // of taking down the caller.
+    let message = match encode_message(from, ttl, message_type, payload, group_id) {
+        Ok(message) => message,
+        Err(err) => {
+            debug!("Failed to encode message: {}", err);
+            return Ok(false);
+        }
+    };
 
     socket.send_to(&message, to).await?;
-    Ok(())
+    Ok(true)
 }
 
 pub async fn send_peer_state(
@@ -679,7 +708,7 @@ pub async fn send_peer_state(
         }
     };
 
-    if let Err(err) = send_message(
+    match send_message_reporting(
         socket,
         ident,
         ttl,
@@ -690,8 +719,16 @@ pub async fn send_peer_state(
     )
     .await
     {
-        debug!("Failed to send peer state message: {}", err);
-        return;
+        Ok(true) => {}
+        // The message could not be encoded and no datagram went out. Leave the
+        // broadcast clock alone: advancing it here would make the rate limiter
+        // suppress the next real broadcast on the strength of a send that
+        // never happened.
+        Ok(false) => return,
+        Err(err) => {
+            debug!("Failed to send peer state message: {}", err);
+            return;
+        }
     }
 
     if let Ok(mut last_time) = last_broadcast_time.try_lock() {
@@ -825,6 +862,86 @@ mod tests {
         ];
 
         assert_eq!(only_ipv4(addrs), vec![Ipv4Addr::new(192, 168, 1, 10)]);
+    }
+
+    // Covers the send path itself, not just `encode_message`. Upstream's
+    // `sendUdpMessage` moved the encode call inside its `try` block so an
+    // unencodable payload is logged and dropped rather than propagating out
+    // of the send. If this branch ever regresses to `unwrap()`, the oversized
+    // case below panics and this test fails.
+    #[tokio::test]
+    async fn send_message_drops_an_oversized_payload_instead_of_panicking() {
+        use crate::discovery::messages::{ALIVE, MAX_MESSAGE_SIZE};
+        use crate::link::beats::Beats;
+        use crate::link::payload::PayloadEntry;
+        use crate::link::tempo::Tempo;
+        use crate::link::timeline::{Timeline, TIMELINE_SIZE};
+
+        let socket = interface_socket().socket;
+        // A real receiver, so the "well-formed payload still sends" half of
+        // this test cannot be satisfied by an unconditional early return.
+        let receiver = new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let to = match receiver.local_addr().unwrap() {
+            SocketAddr::V4(addr) => addr,
+            other => panic!("expected an IPv4 receiver address, got {}", other),
+        };
+        let from = NodeId::from_array([1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::new(0.0),
+            time_origin: chrono::Duration::zero(),
+        };
+        let mut oversized = Payload::default();
+        for _ in 0..(MAX_MESSAGE_SIZE / TIMELINE_SIZE as usize + 1) {
+            oversized.entries.push(PayloadEntry::Timeline(timeline));
+        }
+
+        let result = send_message(socket.clone(), from, 5, ALIVE, &oversized, to, 0).await;
+        assert!(
+            result.is_ok(),
+            "an oversized payload must be dropped, not surfaced as an error"
+        );
+        // The dropped/sent distinction is what keeps `send_peer_state` from
+        // advancing `last_broadcast_time` for a message that never went out.
+        assert!(
+            !send_message_reporting(socket.clone(), from, 5, ALIVE, &oversized, to, 0)
+                .await
+                .unwrap(),
+            "an oversized payload must report as dropped, not sent"
+        );
+
+        // Guard against the inverse regression: an unconditional early return
+        // would also satisfy the assertion above, so prove a well-formed
+        // payload actually reaches the wire.
+        let small = Payload::default();
+        assert!(
+            send_message_reporting(socket, from, 5, ALIVE, &small, to, 0)
+                .await
+                .unwrap(),
+            "a well-formed payload must report as sent"
+        );
+
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("a well-formed message should have been sent")
+        .expect("receiving the well-formed message should succeed")
+        .0;
+        assert!(received > 0);
+        // Exactly one datagram: the oversized message must not have been sent.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                receiver.recv_from(&mut buf),
+            )
+            .await
+            .is_err(),
+            "the oversized message must be dropped, not transmitted"
+        );
     }
 
     // Mirrors upstream's `tst_PeerGateways.cpp` `CallGatewaysChangedOnEnable` /
