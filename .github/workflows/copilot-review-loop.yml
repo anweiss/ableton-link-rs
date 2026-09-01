@@ -386,24 +386,16 @@ jobs:
             // wire-format; "the agent output was flagged" is the more urgent of
             // the two.
             //
-            // The pull request is re-read here rather than trusting the
-            // snapshot `reconcile` took at its start. Several API calls happen
-            // in between - fetching reviews, then their comments - and a label
-            // applied during that window would be missing from the snapshot,
-            // which on this path means granting `copilot-reviewed` to a pull
-            // request that had just been flagged. The fresh object is returned
-            // with the reason so the caller revokes against the same state the
-            // decision was made on.
+            // Judged from whatever pull request object it is handed, and it is
+            // the caller's job to hand it a fresh one - see the single
+            // `pulls.get` at each decision boundary below. Fetching inside here
+            // instead would be worse: the sign-off path needs a fresh object
+            // anyway for its head check, and two reads mean two different
+            // snapshots, with a window between them in which a label lands and
+            // is seen by neither the hold nor the head check.
             async function holdReason(pr) {
-              const { data: fresh } = await github.rest.pulls.get({
-                owner, repo, pull_number: pr.number,
-              });
-              if (labelsOf(fresh).includes(THREAT_LABEL)) {
-                return { reason: 'threat', pr: fresh };
-              }
-              if (await isWireFormat(fresh)) {
-                return { reason: 'wire-format', pr: fresh };
-              }
+              if (labelsOf(pr).includes(THREAT_LABEL)) return 'threat';
+              if (await isWireFormat(pr)) return 'wire-format';
               return null;
             }
 
@@ -1036,36 +1028,42 @@ jobs:
               const outstanding = await commentsForReviews(number, reviews.map(r => r.id));
 
               if (outstanding.length === 0) {
-                const hold = await holdReason(pr);
-                if (hold) {
-                  // The tag can be added to the body after a sign-off, so this
-                  // revokes rather than merely declining to grant.
-                  await revoke(hold.pr);
-                  await writeState(number, handle, {
-                    phase: 'human-hold',
-                    reviewedSha: null,
-                    note: holdNote(hold.reason, 0, short),
-                  });
-                  core.notice(`PR #${number}: ${hold.reason}, held for a human.`);
-                  return;
-                }
                 // Sign-off already granted for this exact head, but degraded:
                 // the label went on without raising the event auto-merge needs.
                 // Re-running the grant cannot fix that - the label is already
                 // present, so no event will ever be raised for it - and would
                 // overwrite the note explaining the problem with one claiming
-                // auto-merge may queue. Leave it stated.
+                // auto-merge may queue. Leave it stated. Checked before the
+                // read below because it needs no fresh state.
                 if (handle.value.phase === 'done-degraded' &&
                     handle.value.reviewedSha === head) {
                   core.warning(`PR #${number}: still signed off but degraded at ${head}.`);
                   return;
                 }
-                // The PR was read at the top of this function and several API
-                // calls ago. Confirm the head has not moved before granting a
-                // sign-off that is only meaningful for that exact commit.
+                // One read governs this entire decision. `pr` was fetched at
+                // the top of `reconcile`, several API calls ago - reviews, then
+                // their comments - so it is too stale to sign off from. Every
+                // check from here down, and the label application itself, uses
+                // this one object: a second read would reopen the window it
+                // exists to close, letting a label land in between and be seen
+                // by neither check.
                 const { data: fresh } = await github.rest.pulls.get({
                   owner, repo, pull_number: number,
                 });
+                const hold = await holdReason(fresh);
+                if (hold) {
+                  // The tag can be added to the body after a sign-off, so this
+                  // revokes rather than merely declining to grant.
+                  await revoke(fresh);
+                  await writeState(number, handle, {
+                    phase: 'human-hold',
+                    reviewedSha: null,
+                    note: holdNote(hold, 0, short),
+                  });
+                  core.notice(`PR #${number}: ${hold}, held for a human.`);
+                  return;
+                }
+                // A sign-off is only meaningful for the exact commit reviewed.
                 if (fresh.head.sha !== head) {
                   core.info(`PR #${number}: head moved during the run; re-examining next time.`);
                   return;
@@ -1102,15 +1100,20 @@ jobs:
                 return;
               }
 
-              const hold = await holdReason(pr);
+              // Same single-read rule as the sign-off path above: the object
+              // the hold is judged from is the object revoked against.
+              const { data: current } = await github.rest.pulls.get({
+                owner, repo, pull_number: number,
+              });
+              const hold = await holdReason(current);
               if (hold) {
-                await revoke(hold.pr);
+                await revoke(current);
                 await writeState(number, handle, {
                   phase: 'human-hold',
                   reviewedSha: null,
-                  note: holdNote(hold.reason, outstanding.length, short),
+                  note: holdNote(hold, outstanding.length, short),
                 });
-                core.notice(`PR #${number}: ${hold.reason}, agent dispatch refused.`);
+                core.notice(`PR #${number}: ${hold}, agent dispatch refused.`);
                 return;
               }
 
