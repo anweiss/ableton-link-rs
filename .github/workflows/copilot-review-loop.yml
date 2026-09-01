@@ -400,10 +400,15 @@ jobs:
             }
 
             // `outstanding` is 0 when Copilot found nothing, in which case the
-            // note explains why a clean review still is not enough.
+            // note explains why a clean review still is not enough. It is null
+            // at the gate that parks a flagged pull request before any review
+            // is asked for at all.
             function holdNote(reason, outstanding, short) {
               if (reason === 'threat') {
-                const tail = outstanding === 0
+                const tail = outstanding === null
+                  ? `No automation has run against \`${short}\`: this loop stopped before ` +
+                    'approving held workflow runs or asking for a code review.'
+                  : outstanding === 0
                   ? `Copilot reviewed \`${short}\` and left nothing outstanding, but that ` +
                     'is a review of the patch, not of the run that produced it.'
                   : `Copilot left ${outstanding} comment(s) on \`${short}\`, and the coding ` +
@@ -963,6 +968,29 @@ jobs:
               const short = head.slice(0, 7);
               const handle = await readState(number);
 
+              // gh-aw's banner requires manual review before *any* follow-up
+              // automation, and everything below this point is exactly that:
+              // `unblockRuns` approves held workflow runs, and
+              // `requestCopilotReview` attaches an automated reviewer. Neither
+              // may happen on a flagged patch, so the label parks the pull
+              // request here rather than at the sign-off and dispatch
+              // boundaries alone. Those holds stay: this gate judges the
+              // object read at the top of `reconcile`, and a label that lands
+              // later in the run is caught only down there.
+              //
+              // Wire-format is deliberately not checked here. That risk tag
+              // withholds sign-off; it does not forbid reviewing the patch.
+              if (labelsOf(pr).includes(THREAT_LABEL)) {
+                await revoke(pr);
+                await writeState(number, handle, {
+                  phase: 'human-hold',
+                  reviewedSha: null,
+                  note: holdNote('threat', null, short),
+                });
+                core.notice(`PR #${number}: threat-flagged, parked before any automation.`);
+                return;
+              }
+
               // Sign-off is granted to a SHA, not to a pull request. New
               // commits revoke it - and must also cancel auto-merge, because
               // GitHub keeps an enabled auto-merge armed no matter what happens
@@ -1028,18 +1056,6 @@ jobs:
               const outstanding = await commentsForReviews(number, reviews.map(r => r.id));
 
               if (outstanding.length === 0) {
-                // Sign-off already granted for this exact head, but degraded:
-                // the label went on without raising the event auto-merge needs.
-                // Re-running the grant cannot fix that - the label is already
-                // present, so no event will ever be raised for it - and would
-                // overwrite the note explaining the problem with one claiming
-                // auto-merge may queue. Leave it stated. Checked before the
-                // read below because it needs no fresh state.
-                if (handle.value.phase === 'done-degraded' &&
-                    handle.value.reviewedSha === head) {
-                  core.warning(`PR #${number}: still signed off but degraded at ${head}.`);
-                  return;
-                }
                 // One read governs this entire decision. `pr` was fetched at
                 // the top of `reconcile`, several API calls ago - reviews, then
                 // their comments - so it is too stale to sign off from. Every
@@ -1061,6 +1077,21 @@ jobs:
                     note: holdNote(hold, 0, short),
                   });
                   core.notice(`PR #${number}: ${hold}, held for a human.`);
+                  return;
+                }
+                // Sign-off already granted for this exact head, but degraded:
+                // the label went on without raising the event auto-merge needs.
+                // Re-running the grant cannot fix that - the label is already
+                // present, so no event will ever be raised for it - and would
+                // overwrite the note explaining the problem with one claiming
+                // auto-merge may queue. Leave it stated. This sits *below* the
+                // hold, not above it: a hold that appears after a degraded
+                // sign-off must still revoke and clear `reviewedSha`, or the
+                // loop returns from stale state forever and never re-examines
+                // the label.
+                if (handle.value.phase === 'done-degraded' &&
+                    handle.value.reviewedSha === head) {
+                  core.warning(`PR #${number}: still signed off but degraded at ${head}.`);
                   return;
                 }
                 // A sign-off is only meaningful for the exact commit reviewed.
