@@ -267,6 +267,13 @@ jobs:
             const COPILOT_LOGIN = 'Copilot';
             const REVIEWER = 'copilot-pull-request-reviewer[bot]';
             const DONE_LABEL = 'copilot-reviewed';
+            // Applied by gh-aw's threat detection when it flags an agent's own
+            // output (prompt injection, secret leak, or malicious patch). In
+            // warn mode gh-aw publishes the pull request anyway and puts the
+            // banner "Manual review is REQUIRED before any follow-up
+            // automation" in the body. This loop is that follow-up automation,
+            // so it has to honour the banner instead of merging past it.
+            const THREAT_LABEL = 'agentic-threat-detected';
             // One round is: comments dispatched to the agent, agent pushes, and
             // Copilot reviews the result. Two rounds absorb a review plus a
             // follow-up on the agent's own changes. Past that the pull request
@@ -363,6 +370,64 @@ jobs:
                 owner, repo, pull_number: pr.number, per_page: 100,
               });
               return files.some(f => WIRE_FORMAT_PATHS.includes(f.filename));
+            }
+
+            // The single gate for "a human decides this one, not the loop".
+            //
+            // Both reasons withhold sign-off *and* refuse to hand the pull
+            // request to the coding agent, because in both cases letting an
+            // agent rewrite the branch unattended is the specific thing being
+            // guarded against: wire-format changes because the bytes are shared
+            // with Ableton Live, Bitwig and hardware, and threat-flagged output
+            // because the agent that produced it is the thing under suspicion.
+            //
+            // Order matters. The threat flag is checked first so its note is
+            // the one shown when a pull request is both flagged and
+            // wire-format; "the agent output was flagged" is the more urgent of
+            // the two.
+            //
+            // Judged from whatever pull request object it is handed, and it is
+            // the caller's job to hand it a fresh one - see the single
+            // `pulls.get` at each decision boundary below. Fetching inside here
+            // instead would be worse: the sign-off path needs a fresh object
+            // anyway for its head check, and two reads mean two different
+            // snapshots, with a window between them in which a label lands and
+            // is seen by neither the hold nor the head check.
+            async function holdReason(pr) {
+              if (labelsOf(pr).includes(THREAT_LABEL)) return 'threat';
+              if (await isWireFormat(pr)) return 'wire-format';
+              return null;
+            }
+
+            // `outstanding` is 0 when Copilot found nothing, in which case the
+            // note explains why a clean review still is not enough. It is null
+            // at the gate that parks a flagged pull request before any review
+            // is asked for at all.
+            function holdNote(reason, outstanding, short) {
+              if (reason === 'threat') {
+                const tail = outstanding === null
+                  ? `No automation has run against \`${short}\`: this loop stopped before ` +
+                    'approving held workflow runs or asking for a code review.'
+                  : outstanding === 0
+                  ? `Copilot reviewed \`${short}\` and left nothing outstanding, but that ` +
+                    'is a review of the patch, not of the run that produced it.'
+                  : `Copilot left ${outstanding} comment(s) on \`${short}\`, and the coding ` +
+                    'agent is not allowed to address them unattended.';
+                return `${tail} gh-aw's threat detection flagged this pull request ` +
+                       `(\`${THREAT_LABEL}\`) and its own banner requires manual review ` +
+                       'before any follow-up automation - this loop is that automation. ' +
+                       'Read the detection result in the generating workflow run, then ' +
+                       'either remove the label to release it to the loop or close the ' +
+                       'pull request. `copilot-reviewed` is withheld.';
+              }
+              return outstanding === 0
+                ? 'Copilot reviewed this pull request and left nothing outstanding, ' +
+                  'but it is tagged `risk: wire-format`, so it changes bytes on the ' +
+                  'network. Sign-off is deliberately withheld: a human merges this one.'
+                : `Copilot left ${outstanding} comment(s) on \`${short}\`. This pull ` +
+                  'request is tagged `risk: wire-format`, so the coding agent is not ' +
+                  'allowed to change it unattended. Address the comments by hand; the ' +
+                  'loop will re-review whatever you push.';
             }
 
             // ---- Durable per-PR state -------------------------------------
@@ -903,6 +968,29 @@ jobs:
               const short = head.slice(0, 7);
               const handle = await readState(number);
 
+              // gh-aw's banner requires manual review before *any* follow-up
+              // automation, and everything below this point is exactly that:
+              // `unblockRuns` approves held workflow runs, and
+              // `requestCopilotReview` attaches an automated reviewer. Neither
+              // may happen on a flagged patch, so the label parks the pull
+              // request here rather than at the sign-off and dispatch
+              // boundaries alone. Those holds stay: this gate judges the
+              // object read at the top of `reconcile`, and a label that lands
+              // later in the run is caught only down there.
+              //
+              // Wire-format is deliberately not checked here. That risk tag
+              // withholds sign-off; it does not forbid reviewing the patch.
+              if (labelsOf(pr).includes(THREAT_LABEL)) {
+                await revoke(pr);
+                await writeState(number, handle, {
+                  phase: 'human-hold',
+                  reviewedSha: null,
+                  note: holdNote('threat', null, short),
+                });
+                core.notice(`PR #${number}: threat-flagged, parked before any automation.`);
+                return;
+              }
+
               // Sign-off is granted to a SHA, not to a pull request. New
               // commits revoke it - and must also cancel auto-merge, because
               // GitHub keeps an enabled auto-merge armed no matter what happens
@@ -968,19 +1056,27 @@ jobs:
               const outstanding = await commentsForReviews(number, reviews.map(r => r.id));
 
               if (outstanding.length === 0) {
-                if (await isWireFormat(pr)) {
+                // One read governs this entire decision. `pr` was fetched at
+                // the top of `reconcile`, several API calls ago - reviews, then
+                // their comments - so it is too stale to sign off from. Every
+                // check from here down, and the label application itself, uses
+                // this one object: a second read would reopen the window it
+                // exists to close, letting a label land in between and be seen
+                // by neither check.
+                const { data: fresh } = await github.rest.pulls.get({
+                  owner, repo, pull_number: number,
+                });
+                const hold = await holdReason(fresh);
+                if (hold) {
                   // The tag can be added to the body after a sign-off, so this
                   // revokes rather than merely declining to grant.
-                  await revoke(pr);
+                  await revoke(fresh);
                   await writeState(number, handle, {
                     phase: 'human-hold',
                     reviewedSha: null,
-                    note: 'Copilot reviewed this pull request and left nothing ' +
-                          'outstanding, but it is tagged `risk: wire-format`, so it ' +
-                          'changes bytes on the network. Sign-off is deliberately ' +
-                          'withheld: a human merges this one.',
+                    note: holdNote(hold, 0, short),
                   });
-                  core.notice(`PR #${number}: wire-format, held for a human.`);
+                  core.notice(`PR #${number}: ${hold}, held for a human.`);
                   return;
                 }
                 // Sign-off already granted for this exact head, but degraded:
@@ -988,18 +1084,17 @@ jobs:
                 // Re-running the grant cannot fix that - the label is already
                 // present, so no event will ever be raised for it - and would
                 // overwrite the note explaining the problem with one claiming
-                // auto-merge may queue. Leave it stated.
+                // auto-merge may queue. Leave it stated. This sits *below* the
+                // hold, not above it: a hold that appears after a degraded
+                // sign-off must still revoke and clear `reviewedSha`, or the
+                // loop returns from stale state forever and never re-examines
+                // the label.
                 if (handle.value.phase === 'done-degraded' &&
                     handle.value.reviewedSha === head) {
                   core.warning(`PR #${number}: still signed off but degraded at ${head}.`);
                   return;
                 }
-                // The PR was read at the top of this function and several API
-                // calls ago. Confirm the head has not moved before granting a
-                // sign-off that is only meaningful for that exact commit.
-                const { data: fresh } = await github.rest.pulls.get({
-                  owner, repo, pull_number: number,
-                });
+                // A sign-off is only meaningful for the exact commit reviewed.
                 if (fresh.head.sha !== head) {
                   core.info(`PR #${number}: head moved during the run; re-examining next time.`);
                   return;
@@ -1036,17 +1131,20 @@ jobs:
                 return;
               }
 
-              if (await isWireFormat(pr)) {
-                await revoke(pr);
+              // Same single-read rule as the sign-off path above: the object
+              // the hold is judged from is the object revoked against.
+              const { data: current } = await github.rest.pulls.get({
+                owner, repo, pull_number: number,
+              });
+              const hold = await holdReason(current);
+              if (hold) {
+                await revoke(current);
                 await writeState(number, handle, {
                   phase: 'human-hold',
                   reviewedSha: null,
-                  note: `Copilot left ${outstanding.length} comment(s) on \`${short}\`. ` +
-                        'This pull request is tagged `risk: wire-format`, so the coding ' +
-                        'agent is not allowed to change it unattended. Address the ' +
-                        'comments by hand; the loop will re-review whatever you push.',
+                  note: holdNote(hold, outstanding.length, short),
                 });
-                core.notice(`PR #${number}: wire-format, agent dispatch refused.`);
+                core.notice(`PR #${number}: ${hold}, agent dispatch refused.`);
                 return;
               }
 
