@@ -92,8 +92,15 @@ mach2 = "0.6"
 # uses instead of declaring `esp_timer_get_time` as a raw C symbol. Gated to the
 # ESP-IDF target so its build script never runs for hosted targets. Version
 # tracks the one `examples/esp32/Cargo.toml` already pins.
+#
+# `default-features = false` drops esp-idf-svc's default `std` and `binstart`:
+# `std` would cross this crate's own `std` feature boundary, and `binstart`
+# imposes a binary entry point, which a library must not do. `alloc` is not
+# optional — esp-idf-svc gates `pub mod timer` behind
+# `cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))`, so dropping it
+# removes the very module this dependency is here for.
 [target.'cfg(target_os = "espidf")'.dependencies]
-esp-idf-svc = "0.51"
+esp-idf-svc = { version = "0.51", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 console-subscriber = "0.5.0"

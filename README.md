@@ -393,7 +393,7 @@ Without `std`, only core types and math are available (requires `alloc`).
 
 | Requirement | Version |
 |-------------|---------|
-| Rust | 1.70+ |
+| Rust | 1.70+ (**1.77+ when targeting ESP-IDF** — required by `esp-idf-svc` 0.51) |
 | macOS | 10.15+ |
 | Linux | glibc 2.28+, `libasound2-dev` (for `rodio`) |
 | Windows | Windows 10+ |
