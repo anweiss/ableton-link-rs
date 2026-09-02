@@ -46,6 +46,12 @@ pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 #[derive(Debug, Default)]
 pub(crate) struct DispatchGate {
     active: std::sync::atomic::AtomicBool,
+    /// Bumped by every [`DispatchGate::stop`]. A batch records the generation
+    /// current when it was received and is admitted only if that generation is
+    /// still current, so work from a previous lifecycle cannot be dispatched
+    /// after a restart even if its `enter()` was still queued behind `stop()`'s
+    /// write lock when `start()` reopened the gate.
+    generation: std::sync::atomic::AtomicU64,
     in_flight: tokio::sync::RwLock<()>,
 }
 
@@ -53,15 +59,24 @@ impl DispatchGate {
     fn new() -> Self {
         DispatchGate {
             active: std::sync::atomic::AtomicBool::new(true),
+            generation: std::sync::atomic::AtomicU64::new(0),
             in_flight: tokio::sync::RwLock::new(()),
         }
     }
 
+    /// The current lifecycle generation, to be captured as soon as a batch of
+    /// work is received and passed back to [`DispatchGate::enter`].
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Acquires the right to run one batch of dispatch work. Returns `None`
-    /// when the gate is closed, in which case the caller must skip the batch.
-    async fn enter(&self) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+    /// when the gate is closed or when the gate has been stopped since
+    /// `generation` was captured, in which case the caller must skip the batch.
+    async fn enter(&self, generation: u64) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
         let guard = self.in_flight.read().await;
-        if self.active.load(std::sync::atomic::Ordering::Acquire) {
+        if self.active.load(std::sync::atomic::Ordering::Acquire) && self.generation() == generation
+        {
             Some(guard)
         } else {
             None
@@ -76,6 +91,8 @@ impl DispatchGate {
     async fn stop(&self) {
         self.active
             .store(false, std::sync::atomic::Ordering::Release);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         // Waiting for exclusive access drains any batch already in flight.
         let _ = self.in_flight.write().await;
     }
@@ -240,7 +257,8 @@ impl Controller {
         tokio::spawn(async move {
             loop {
                 if let Some(session) = rx_join_session.recv().await {
-                    let Some(_permit) = gate_loop.enter().await else {
+                    let generation = gate_loop.generation();
+                    let Some(_permit) = gate_loop.enter(generation).await else {
                         continue;
                     };
                     join_session(
@@ -288,7 +306,8 @@ impl Controller {
         tokio::spawn(async move {
             loop {
                 if let Some(peer_state_changes) = rx_peer_state_change.recv().await {
-                    let Some(_permit) = gate_loop.enter().await else {
+                    let generation = gate_loop.generation();
+                    let Some(_permit) = gate_loop.enter(generation).await else {
                         continue;
                     };
                     debug!("controller received peer state changes");
@@ -606,18 +625,22 @@ impl Controller {
         // `enable()` can resume dispatching.
         self.dispatch_gate.stop().await;
 
-        // Send bye bye message before disabling to properly notify other peers
+        // Send bye bye message before disabling to properly notify other peers.
+        // On lock contention the bye-bye is skipped - it is best-effort - but
+        // the rest of the teardown must still run, otherwise `enabled` would be
+        // left true while the dispatch gate is already closed.
         use crate::discovery::messenger::send_byebye;
-        let node_id = if let Ok(peer_state) = self.peer_state.try_lock() {
-            peer_state.node_state.node_id
+        if let Ok(peer_state) = self.peer_state.try_lock() {
+            let node_id = peer_state.node_state.node_id;
+            drop(peer_state);
+            info!(
+                "Disabling Link instance, sending bye-bye message for node {}",
+                node_id
+            );
+            send_byebye(node_id);
         } else {
-            return; // If we can't get the node_id, we can't send bye message
-        };
-        info!(
-            "Disabling Link instance, sending bye-bye message for node {}",
-            node_id
-        );
-        send_byebye(node_id);
+            info!("Could not read node id, skipping bye-bye message");
+        }
 
         if let Ok(mut enabled) = self.enabled.try_lock() {
             *enabled = false;
