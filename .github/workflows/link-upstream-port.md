@@ -568,8 +568,22 @@ you matched>
 
 **Verification.** fmt, clippy, build, test, no_std — all passing locally.
 
+<if the port touches `src/**` or `examples/**` but genuinely needs no README
+change — an internal refactor, or a bug fix with no API surface — say so in one
+sentence and then include this line verbatim, on its own line:>
+<!-- docs-not-needed -->
+
 Closes #<issue>
 ```
+
+**That marker is part of the template, not an afterthought.** The `README maintenance`
+check fails any pull request touching `src/**` or `examples/**` that does not also
+touch `README.md`, and the prose sentence alone does not satisfy it — the check greps
+for the literal marker. #147 wrote the justification ("no public API, feature flag,
+dependency, or build-requirement change; this is an internal shutdown-ordering
+reliability fix") and omitted the marker, and the check failed on an otherwise
+complete port that needed a maintainer to unblock by hand. If you write the sentence,
+write the marker.
 
 `Closes #<issue>` is the tracking issue you found in step 7 — the one carrying
 `<!-- upstream-backlog-id: <id> -->`, not a shared backlog issue. Each backlog item
