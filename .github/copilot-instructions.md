@@ -12,6 +12,20 @@ Any time changes to the library warrant a documentation update, the `README.md` 
 - Changes to the minimum supported Rust version (MSRV)
 - Changes to the project status or maturity
 
+This is enforced by CI, not left to review. The **README maintenance** check fails
+any pull request that changes `src/**`, `examples/**` or `Cargo.toml` without changing
+`README.md`. `Cargo.toml` is guarded because feature flags, dependencies and the MSRV
+live there, and `examples/**` because new or changed examples are on the list above.
+Pull requests labelled `autorelease: pending` or `dependencies` are exempt — version
+bumps and dependency bumps are machine-generated and carry no documentation
+obligation. When a change
+genuinely carries no documentation obligation — an internal refactor, or a bug fix
+with no API surface — say so in the pull request body and either apply the
+`docs-not-needed` label or add `<!-- docs-not-needed -->` to the body. The marker is
+honoured only on `automation`-labelled pull requests, because a body marker can be
+self-applied; agent-authored pull requests rely on it, since `safe-outputs` pins their
+labels and they carry `automation` already.
+
 When updating the README:
 
 1. Update the version number in all code examples and dependency snippets
