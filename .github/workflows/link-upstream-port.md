@@ -509,8 +509,9 @@ is refused outright, and the whole patch goes with it.
 README-maintenance policy in `.github/copilot-instructions.md` requires any change
 that adds a feature, alters the public API, or changes build requirements to update
 the README **in the same pull request**, and CI enforces it: the `README maintenance`
-check fails a pull request that touches `src/**` or `Cargo.toml` without touching
-`README.md` — though `Cargo.toml` is outside your writable set anyway. If the
+check fails a pull request that touches `src/**`, `examples/**` or `Cargo.toml`
+without touching `README.md` — though `Cargo.toml` is outside your writable set
+anyway. If the
 port genuinely needs no documentation change — an internal refactor, a bug fix with no
 API surface — say so in the pull request body and add the line `<!-- docs-not-needed -->`
 to it, which is the supported way past that check. You cannot set the `docs-not-needed`
