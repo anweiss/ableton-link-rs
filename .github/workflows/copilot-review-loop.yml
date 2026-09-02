@@ -14,12 +14,20 @@ name: Copilot review loop for port PRs
 #
 # The ordering problem this solves
 # ================================
-# Copilot "always leaves a 'Comment' review, not an 'Approve' review or a
-# 'Request changes' review", and those reviews "will not block merging changes".
-# `main` also requires zero approving reviews. So nothing in branch protection
-# makes a port PR wait for review: auto-merge would fire the moment the 15
-# checks went green, typically before Copilot had finished looking at it, and
-# the review would land on an already-merged PR.
+# Copilot code review auto-approval is enabled on this repository, so the
+# reviewer CAN now submit an `APPROVED` or a `CHANGES_REQUESTED` review rather
+# than returning every verdict as a non-blocking `COMMENTED` one. That still
+# does not make branch protection wait: `main` requires zero approving reviews,
+# so auto-merge would fire the moment the 15 checks went green, typically
+# before Copilot had finished looking at the PR, and the review would land on
+# an already-merged pull request.
+#
+# Sign-off is also deliberately NOT delegated to the approval. Copilot can
+# approve while leaving non-blocking suggestions, and the rule here is that
+# every review finding is resolved before merge - so the gate stays "zero
+# outstanding comments at the current head", and an approval is recorded in the
+# status comment rather than obeyed. `CHANGES_REQUESTED` is honoured in the
+# other direction: it withholds sign-off even when it left no inline comments.
 #
 # The gate is therefore explicit and lives outside branch protection: this
 # workflow applies the `copilot-reviewed` label when the loop has finished, and
@@ -607,8 +615,16 @@ jobs:
               const reviews = await github.paginate(github.rest.pulls.listReviews, {
                 owner, repo, pull_number: number, per_page: 100,
               });
+              // `DISMISSED` reviews stay in the `listReviews` response, and a
+              // dismissed review is precisely the case the fallback re-request
+              // further down exists to recover from - counting one would leave
+              // `reviews.length > 0` and make that path unreachable. `PENDING`
+              // is a review that was started and never submitted: no verdict,
+              // and no comments anyone else can see.
               return reviews.filter(
-                r => r.user && r.user.login === REVIEWER && r.commit_id === headSha,
+                r => r.user && r.user.login === REVIEWER &&
+                     r.commit_id === headSha &&
+                     r.state !== 'DISMISSED' && r.state !== 'PENDING',
               );
             }
 
@@ -1070,8 +1086,23 @@ jobs:
               // `COMMENTED` regardless of verdict, so the only usable signal
               // was "did it leave inline comments". Now it can also submit
               // `APPROVED` or `CHANGES_REQUESTED`, and both need handling.
-              const approved = reviews.some(r => r.state === 'APPROVED');
-              const changesRequested = reviews.some(r => r.state === 'CHANGES_REQUESTED');
+              // Only the LATEST review carries the current verdict. Asking
+              // `some` over every review at this head lets a superseded state
+              // dominate: an early `CHANGES_REQUESTED` would hold the pull
+              // request on `human-hold` forever after a later approval of the
+              // same SHA, and an early approval would let the sign-off note
+              // claim an approval that has since been retracted.
+              //
+              // Comment tracking above deliberately still spans *every* review
+              // at this head - a finding is not resolved just because a newer
+              // review exists - so only the verdict is narrowed here.
+              const latest = reviews
+                .filter(r => r.submitted_at)
+                .sort((a, b) => new Date(a.submitted_at) - new Date(b.submitted_at))
+                .pop();
+              const verdict = latest ? latest.state : null;
+              const approved = verdict === 'APPROVED';
+              const changesRequested = verdict === 'CHANGES_REQUESTED';
 
               // The hole this closes: `CHANGES_REQUESTED` carrying no inline
               // comments used to read as "nothing outstanding" and sign off on
