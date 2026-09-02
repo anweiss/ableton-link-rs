@@ -615,6 +615,15 @@ jobs:
             // Requesting Copilot needs BOTH the right API and the right token,
             // and each was a separate silent no-op.
             //
+            // This is now a *fallback*. The repository ruleset's
+            // `copilot_code_review` rule carries `review_on_push: true`, so
+            // Copilot re-reviews on its own every time the fix agent pushes,
+            // and this path only runs when that did not produce a review for
+            // the current head - a draft edge case, a rule change, or a review
+            // that was dismissed. It is kept because it is the only recovery
+            // available when the ruleset does not fire, and because both of
+            // the failures below are invisible in a response.
+            //
             // 1. REST. `POST .../requested_reviewers` with
             //    `reviewers: ["Copilot"]` returns **201 Created** and adds
             //    nobody, even with a `repo`-scoped user token (PR #86). Copilot
@@ -1055,6 +1064,39 @@ jobs:
 
               const outstanding = await commentsForReviews(number, reviews.map(r => r.id));
 
+              // Review *state* only started carrying information once
+              // auto-approval was enabled (repo Settings > Copilot > Code
+              // review). Before that every Copilot review arrived as
+              // `COMMENTED` regardless of verdict, so the only usable signal
+              // was "did it leave inline comments". Now it can also submit
+              // `APPROVED` or `CHANGES_REQUESTED`, and both need handling.
+              const approved = reviews.some(r => r.state === 'APPROVED');
+              const changesRequested = reviews.some(r => r.state === 'CHANGES_REQUESTED');
+
+              // The hole this closes: `CHANGES_REQUESTED` carrying no inline
+              // comments used to read as "nothing outstanding" and sign off on
+              // a review that had explicitly withheld approval. It cannot be
+              // dispatched either - the fix agent is handed comment URLs, and
+              // there are none - so park it for a human instead.
+              if (changesRequested && outstanding.length === 0) {
+                await revoke(pr);
+                await writeState(number, handle, {
+                  phase: 'human-hold',
+                  reviewedSha: null,
+                  note: `Copilot requested changes on \`${short}\` without leaving any ` +
+                        'inline comments, so there is nothing to hand the fix agent. ' +
+                        'Read the review body and push a fix. `copilot-reviewed` is ' +
+                        'withheld and auto-merge stays disengaged.',
+                });
+                core.warning(`PR #${number}: changes requested with no inline comments.`);
+                return;
+              }
+
+              // Deliberately still gated on `outstanding.length === 0` rather
+              // than on `approved`. Copilot can approve while leaving
+              // non-blocking suggestions, and this repository's standing rule
+              // is that every review finding is resolved before merge. An
+              // approval is therefore recorded, not obeyed.
               if (outstanding.length === 0) {
                 // One read governs this entire decision. `pr` was fetched at
                 // the top of `reconcile`, several API calls ago - reviews, then
@@ -1106,7 +1148,8 @@ jobs:
                 await writeState(number, handle, {
                   phase: 'done',
                   reviewedSha: head,
-                  note: `Copilot reviewed \`${short}\` with nothing outstanding. ` +
+                  note: `Copilot reviewed \`${short}\` with nothing outstanding` +
+                        (approved ? ' and submitted an approving review' : '') + '. ' +
                         'Auto-merge may now queue this pull request; it still merges ' +
                         'only after every required check passes.',
                 });
