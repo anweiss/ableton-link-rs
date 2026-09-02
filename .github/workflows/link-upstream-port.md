@@ -501,12 +501,28 @@ explicitly instead of picking an interpretation silently.
 ## What you cannot change
 
 A pull request from this workflow may only touch `src/**`, `tests/**`, `examples/**`,
-and the `vendor/ableton-link` submodule pin. Anything else — `Cargo.toml`, CI
-configuration, the README, these workflow files — is refused outright, and the whole
-patch goes with it.
+the `vendor/ableton-link` submodule pin, `.github/upstream-backlog.toml`, and
+`README.md`. Anything else — `Cargo.toml`, CI configuration, these workflow files —
+is refused outright, and the whole patch goes with it.
 
-So if your port needs a new dependency, a CI change, or a documentation update, do not
-try to sneak it in and do not work around the restriction. Open an issue instead:
-describe the upstream change, say exactly what needs to change outside `src/`, and why
-nothing already in the tree covers it. A maintainer will make that change by hand and
-the port can land on the next run.
+**`README.md` is inside that set, and updating it is not optional.** The repository's
+README-maintenance policy in `.github/copilot-instructions.md` requires any change
+that adds a feature, alters the public API, or changes build requirements to update
+the README **in the same pull request**, and CI enforces it: the `README maintenance`
+check fails a pull request that touches `src/**`, `examples/**` or `Cargo.toml`
+without touching `README.md` — though `Cargo.toml` is outside your writable set
+anyway. If the
+port genuinely needs no documentation change — an internal refactor, a bug fix with no
+API surface — say so in the pull request body and add the line `<!-- docs-not-needed -->`
+to it, which is the supported way past that check. You cannot set the `docs-not-needed`
+label yourself, because `safe-outputs` pins your label list to `upstream-sync` and
+`automation`; the body marker is the escape hatch you can actually reach, and it works
+precisely *because* your pull requests carry `automation` — the check ignores that
+marker on any pull request that does not, since a body marker can otherwise be
+self-applied by anyone. Do not leave it to review to notice.
+
+So if your port needs a new dependency or a CI change, do not try to sneak it in and do
+not work around the restriction. Open an issue instead: describe the upstream change,
+say exactly what needs to change outside the writable set, and why nothing already in
+the tree covers it. A maintainer will make that change by hand and the port can land on
+the next run.

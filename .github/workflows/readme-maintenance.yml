@@ -1,0 +1,142 @@
+name: README maintenance
+
+# `.github/copilot-instructions.md` requires that any change warranting a
+# documentation update touches `README.md` in the same pull request. That rule
+# was written down, in bold, and still missed - PR #116 had to go back and
+# document the file-based backlog after the fact, and PR #129 shipped a README
+# feature list that no longer matched the code. Prose in an instructions file is
+# a suggestion; a red check is a rule.
+#
+# `edited` is in the trigger list because the escape hatch can be a marker in the
+# pull request body, and `labeled`/`unlabeled` because it can also be a label -
+# without those the check would go stale the moment someone used either.
+
+# `pull_request_target`, not `pull_request`, so the enforcement runs from the
+# definition on `main` rather than the one in the branch being judged. Under
+# `pull_request` a pull request can edit this file, keep the check name, and
+# weaken the guard it is subject to - the check stays green and reports on a
+# rule the pull request rewrote for itself.
+#
+# `pull_request_target` is safe here specifically because this job never checks
+# out or executes pull request code. It reads metadata through the API and its
+# permissions are read-only, so the usual `pull_request_target` hazard - running
+# untrusted code with a privileged token - does not arise.
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: readme-maintenance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  readme:
+    name: README maintenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const ESCAPE_LABEL = 'docs-not-needed';
+            const TRUSTED_LABEL = 'automation';
+            // Machine-generated metadata churn. Both are label-gated, so an outside
+            // contributor cannot reach either. release-please bumps the version in
+            // `Cargo.toml` on every release and Dependabot bumps dependency
+            // requirements; neither carries a documentation obligation, and gating
+            // them would wedge the release train behind a docs check. The residual
+            // risk is a Dependabot bump that raises the MSRV, which review still
+            // has to catch.
+            const EXEMPT_LABELS = ['autorelease: pending', 'dependencies'];
+            const ESCAPE_MARKER = /<!--\s*docs-not-needed\s*-->/;
+
+            const pr = context.payload.pull_request;
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+            // A rename reports its destination in `filename` and its source in
+            // `previous_filename`. Reading only `filename` would let
+            // `src/foo.rs` -> `tests/foo.rs` take the "no src/** changes" path
+            // while the library quietly loses a module - which is precisely the
+            // "module structure changed" case the README policy names.
+            const paths = [
+              ...new Set(files.flatMap(f => [f.filename, f.previous_filename].filter(Boolean))),
+            ];
+
+            // Everything the README policy in `.github/copilot-instructions.md`
+            // actually names: library source, the manifest (feature flags,
+            // dependencies, MSRV) and the examples ("new examples or changed
+            // example behavior"). Test-only and CI-only changes are not on that
+            // list and stay out - the waiver, not a narrower guard, is the way
+            // through for a genuinely documentation-neutral change.
+            const isGuarded = p =>
+              p.startsWith('src/') || p.startsWith('examples/') || p === 'Cargo.toml';
+            const guarded = paths.filter(isGuarded);
+            if (guarded.length === 0) {
+              core.notice('No `src/**`, `examples/**` or `Cargo.toml` changes; README not required.');
+              return;
+            }
+
+            const labels = (pr.labels || []).map(l => l.name);
+
+            const exempt = EXEMPT_LABELS.filter(l => labels.includes(l));
+            if (exempt.length > 0) {
+              core.notice(`Exempt: \`${exempt.join('`, `')}\`.`);
+              return;
+            }
+
+            if (paths.includes('README.md')) {
+              core.notice(`README.md updated alongside ${guarded.length} guarded file(s).`);
+              return;
+            }
+
+            // The label is for humans, and it is the real trust boundary: applying
+            // a label needs write access, so an outside contributor cannot reach
+            // it. The marker exists only because the port workflow cannot set
+            // arbitrary labels - `safe-outputs.create-pull-request` pins its list
+            // to [upstream-sync, automation] - but it does write its own body.
+            //
+            // That makes the marker weaker than the label, because anyone who can
+            // edit a pull request body can write it, including on a fork. So the
+            // marker is honoured ONLY on a pull request that already carries
+            // `automation`, which is itself label-gated and therefore trusted.
+            // Otherwise a drive-by contributor could waive the check on themselves.
+            if (labels.includes(ESCAPE_LABEL)) {
+              core.notice(`Waived by the \`${ESCAPE_LABEL}\` label.`);
+              return;
+            }
+            if (ESCAPE_MARKER.test(pr.body || '')) {
+              if (labels.includes(TRUSTED_LABEL)) {
+                core.notice(
+                  `Waived by the \`${ESCAPE_LABEL}\` marker on a \`${TRUSTED_LABEL}\` pull request.`
+                );
+                return;
+              }
+              core.warning(
+                `Ignoring the \`${ESCAPE_LABEL}\` marker: it is only honoured on a ` +
+                `\`${TRUSTED_LABEL}\`-labelled pull request, because a body marker ` +
+                `can be self-applied. Use the \`${ESCAPE_LABEL}\` label instead.`
+              );
+            }
+
+            const shown = guarded.slice(0, 10).map(p => `  - ${p}`).join('\n');
+            const more = guarded.length > 10 ? `\n  …and ${guarded.length - 10} more` : '';
+            core.setFailed(
+              `This pull request changes ${guarded.length} guarded file(s) ` +
+              `without touching \`README.md\`.\n\n${shown}${more}\n\n` +
+              `\`.github/copilot-instructions.md\` requires the README to be updated ` +
+              `in the same pull request when a change adds a feature or feature flag, ` +
+              `alters the public API, or changes build requirements or MSRV.\n\n` +
+              `If this change genuinely needs no documentation - an internal refactor, ` +
+              `or a bug fix with no API surface - say so in the body and either apply ` +
+              `the \`${ESCAPE_LABEL}\` label, or - on an \`${TRUSTED_LABEL}\`-labelled ` +
+              `pull request - add \`<!-- ${ESCAPE_LABEL} -->\` to the body.`
+            );
