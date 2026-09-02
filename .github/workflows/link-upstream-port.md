@@ -233,15 +233,26 @@ Otherwise, take the next item off the backlog:
    derived from the actual commit graph and the file is not. Concretely: for every
    outstanding item, find the lowest line number any of its SHAs has in
    `commits.txt`, and take the item with the lowest such number.
-5. Skip an item, and move to the next one, if either holds:
+5. Skip an item, and move to the next one, if any of these hold:
    - It is `risk: api-break`. Those need a maintainer to decide. Comment on that
      item's tracking issue (see step 7) rather than porting it.
    - It is `risk: wire-format` **and** upstream shipped no test for it that you can
      port as concrete byte-level expectations. See the wire-format rule below.
+   - It has a non-empty **`blocked_on`** field. That field means the item needs a
+     design decision before any of it can be written, and it names the decision.
+     Comment on its tracking issue as above, then **carry on to the next item** —
+     do not stop the run. One undecidable item must never head-of-line block every
+     item behind it; that is exactly how a crash fix ends up parked behind an
+     architecture question for weeks.
+
+     Do not add `blocked_on` to an item yourself. It is a maintainer's judgement,
+     it is reviewed in a pull request like any other change to this file, and an
+     agent that can mark its own work blocked can mark anything blocked.
 
    Skipping an item does **not** let you advance the watermark past it. See
    "Advance the watermark" — a skipped item is an unported commit, so the pin stops
-   before it.
+   before it. Porting a later item while an earlier one is skipped is fine and
+   expected: flip that later item to `retired` and leave the pin where it was.
 6. If `.github/upstream-backlog.toml` does not exist, or every item in it is
    retired, do not invent a backlog. Read `commits.txt` yourself, take the
    **oldest** commit that touches a mapped path, and port that.
@@ -286,6 +297,22 @@ Whenever you stop without opening a pull request — an open port PR, a genuine 
 port, nothing portable, a blocked wire-format item, a failing build — record the reason
 with the `noop` tool, naming the specific blocker and the issue or PR number that
 caused it.
+
+**`noop` alone is not an announcement.** It writes to a run artifact that nobody opens.
+A `noop`-only run is a green check with no notification, which is precisely the
+"unannounced stop" this section exists to prevent — run 33665748688 stopped on a
+design-blocked item, said so at length, and reached nobody. So whenever you `noop`,
+also do exactly one of these, in this order of preference:
+
+1. If the blocker belongs to a backlog item, `add-comment` on that item's tracking
+   issue (step 7 tells you how to find it), naming the run URL and what has to happen
+   before the next run can get further.
+2. If it belongs to an existing PR or issue, comment there instead.
+3. Only if there is no such issue or PR, `create-issue` — it is configured with the
+   `needs-decision` label for this.
+
+Say nothing twice: if the last comment on that issue already reports this same blocker
+at this same watermark, `noop` alone is right and a second identical comment is noise.
 
 The run exits `success` either way, so an unannounced stop is indistinguishable from a
 healthy week. Five consecutive green runs hid the #71 deadlock precisely because a

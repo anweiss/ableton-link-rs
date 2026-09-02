@@ -136,6 +136,24 @@ for n, item in enumerate(port):
     if pin and not SHA_RE.match(pin):
         err(f"{where}: retired_at_pin {pin!r} is not a hex SHA")
 
+    # `blocked_on` marks an item that cannot be ported mechanically because it
+    # needs a design decision first - not one that is merely risky. The port
+    # agent skips such an item and moves to the next, exactly as it does for
+    # `risk = "api-break"`, so that one undecidable item cannot head-of-line
+    # block every item behind it. The watermark is unaffected: the item is
+    # still `outstanding`, so the pin still cannot cross it.
+    #
+    # It is deliberately free text rather than a flag. The whole point is to
+    # state the decision a human owes, and a bare `blocked = true` records that
+    # someone gave up without recording what they gave up on.
+    if "blocked_on" in item:
+        if item["status"] != "outstanding":
+            err(f"{where}: blocked_on is set but status is {item['status']!r} — "
+                "only an outstanding item can be blocked")
+        if not isinstance(item["blocked_on"], str) or not item["blocked_on"].strip():
+            err(f"{where}: blocked_on must be a non-empty string naming the "
+                "decision that has to be made before this can be ported")
+
 for n, entry in enumerate(undecided):
     if not entry.get("upstream"):
         err(f"[[undecided]] #{n + 1}: no upstream SHAs")
