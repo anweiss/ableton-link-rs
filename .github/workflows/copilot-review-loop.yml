@@ -1168,16 +1168,23 @@ jobs:
                 ? ((overview.body.match(/^###[ \t]+(.+?)[ \t]*$/m) || [])[1] || null)
                 : null;
               // Tri-state on purpose, and it fails CLOSED. `null` means no
-              // overview review exists at this head at all - an older format,
+              // overview review exists at this head AT ALL - an older format,
               // or a review that predates auto-approval - and there the old
               // inference is still the best available signal, so it falls
-              // through. But a heading that is present and simply not green
-              // parks, whatever it says: an unrecognised verdict is far more
-              // likely to be a new non-approving one than a renamed approval,
-              // and the cost of guessing wrong is a merged defect versus a
-              // pull request that waits for me.
-              const overviewClean = overviewVerdict
-                ? overviewVerdict.includes('🟢')
+              // through. Once an overview review exists, anything short of a
+              // green heading parks, including a heading that is missing or
+              // unparseable: an unrecognised verdict is far more likely to be
+              // a new non-approving one than a renamed approval, and the cost
+              // of guessing wrong is a merged defect versus a pull request that
+              // waits for me.
+              //
+              // Deriving this from `overview` rather than from
+              // `overviewVerdict` is the whole point. Keying on the verdict
+              // would collapse "present but unparseable" into the same `null`
+              // as "no overview at all" and sign off through the legacy
+              // fallback - which is exactly the inference this block replaces.
+              const overviewClean = overview
+                ? Boolean(overviewVerdict && overviewVerdict.includes('🟢'))
                 : null;
               const suppressed = overview
                 ? /Suppressed comments \(\d+\)/.test(overview.body)
@@ -1190,7 +1197,7 @@ jobs:
                 await writeState(number, handle, {
                   phase: 'human-hold',
                   reviewedSha: null,
-                  note: `Copilot returned \`${overviewVerdict}\` on \`${short}\` and left ` +
+                  note: `Copilot returned ${overviewVerdict ? `\`${overviewVerdict}\`` : 'an unrecognised verdict'} on \`${short}\` and left ` +
                         'no inline comments' +
                         (suppressed
                           ? ', with its findings in the review body under ' +
@@ -1201,7 +1208,7 @@ jobs:
                         '`copilot-reviewed` is withheld and auto-merge stays disengaged.',
                 });
                 core.warning(
-                  `PR #${number}: '${overviewVerdict}' with no inline comments.`,
+                  `PR #${number}: '${overviewVerdict || "unrecognised verdict"}' with no inline comments.`,
                 );
                 return;
               }
