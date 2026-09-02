@@ -12,6 +12,13 @@ Any time changes to the library warrant a documentation update, the `README.md` 
 - Changes to the minimum supported Rust version (MSRV)
 - Changes to the project status or maturity
 
+This is enforced by CI, not left to review. The **README maintenance** check fails
+any pull request that changes `src/**` without changing `README.md`. When a change
+genuinely carries no documentation obligation — an internal refactor, or a bug fix
+with no API surface — say so in the pull request body and either apply the
+`docs-not-needed` label or add `<!-- docs-not-needed -->` to the body. Agent-authored
+pull requests must use the marker, since `safe-outputs` pins their labels.
+
 When updating the README:
 
 1. Update the version number in all code examples and dependency snippets

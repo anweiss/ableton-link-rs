@@ -1,0 +1,90 @@
+name: README maintenance
+
+# `.github/copilot-instructions.md` requires that any change warranting a
+# documentation update touches `README.md` in the same pull request. That rule
+# was written down, in bold, and still missed - PR #116 had to go back and
+# document the file-based backlog after the fact, and PR #129 shipped a README
+# feature list that no longer matched the code. Prose in an instructions file is
+# a suggestion; a red check is a rule.
+#
+# `edited` is in the trigger list because the escape hatch can be a marker in the
+# pull request body, and `labeled`/`unlabeled` because it can also be a label -
+# without those the check would go stale the moment someone used either.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: readme-maintenance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  readme:
+    name: README maintenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const ESCAPE_LABEL = 'docs-not-needed';
+            const ESCAPE_MARKER = /<!--\s*docs-not-needed\s*-->/;
+
+            const pr = context.payload.pull_request;
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+            const paths = files.map(f => f.filename);
+
+            // Only `src/**` is gated. Test-only, example-only and CI-only changes
+            // do not carry a documentation obligation, and gating them would make
+            // the check something people learn to route around.
+            const src = paths.filter(p => p.startsWith('src/'));
+            if (src.length === 0) {
+              core.notice('No `src/**` changes; README not required.');
+              return;
+            }
+
+            if (paths.includes('README.md')) {
+              core.notice(`README.md updated alongside ${src.length} file(s) under src/.`);
+              return;
+            }
+
+            // The label is for humans. The marker exists because the port workflow
+            // cannot set arbitrary labels - `safe-outputs.create-pull-request`
+            // pins its label list to [upstream-sync, automation] - but it does
+            // write its own body, so the marker is the escape hatch it can
+            // actually reach. Without it an agent-authored refactor would be
+            // permanently stuck behind a check it has no way to satisfy.
+            const labels = (pr.labels || []).map(l => l.name);
+            if (labels.includes(ESCAPE_LABEL)) {
+              core.notice(`Waived by the \`${ESCAPE_LABEL}\` label.`);
+              return;
+            }
+            if (ESCAPE_MARKER.test(pr.body || '')) {
+              core.notice(`Waived by the \`${ESCAPE_LABEL}\` marker in the body.`);
+              return;
+            }
+
+            const shown = src.slice(0, 10).map(p => `  - ${p}`).join('\n');
+            const more = src.length > 10 ? `\n  …and ${src.length - 10} more` : '';
+            core.setFailed(
+              `This pull request changes ${src.length} file(s) under \`src/\` ` +
+              `without touching \`README.md\`.\n\n${shown}${more}\n\n` +
+              `\`.github/copilot-instructions.md\` requires the README to be updated ` +
+              `in the same pull request when a change adds a feature or feature flag, ` +
+              `alters the public API, or changes build requirements or MSRV.\n\n` +
+              `If this change genuinely needs no documentation - an internal refactor, ` +
+              `or a bug fix with no API surface - say so in the body and either apply ` +
+              `the \`${ESCAPE_LABEL}\` label or add \`<!-- ${ESCAPE_LABEL} -->\` to the ` +
+              `pull request body.`
+            );
