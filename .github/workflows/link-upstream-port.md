@@ -246,7 +246,9 @@ Otherwise, take the next item off the backlog:
      port as concrete byte-level expectations. See the wire-format rule below.
    - It has a non-empty **`blocked_on`** field. That field means the item needs a
      design decision before any of it can be written, and it names the decision.
-     Comment on its tracking issue as above, then **carry on to the next item** —
+     Comment on its tracking issue as above — subject to the do-not-repeat rule in
+     "Every early stop must be announced", which applies to these skip comments even
+     when the run goes on to open a pull request — then **carry on to the next item**;
      do not stop the run. One undecidable item must never head-of-line block every
      item behind it; that is exactly how a crash fix ends up parked behind an
      architecture question for weeks.
@@ -325,8 +327,12 @@ answer: there is no decision owed and no failure to report, and opening a
 `needs-decision` issue for it would be noise. The rule above is for a run that wanted
 to make progress and could not.
 
-Say nothing twice: if the last comment on that issue already reports this same blocker
-at this same watermark, `noop` alone is right and a second identical comment is noise.
+Say nothing twice: before commenting anywhere — whether for a skipped item in step 5 or
+for a terminal stop here — check the last comment on that issue. If it already reports
+this same blocker at this same watermark, say nothing and let `noop` (or the pull
+request you are opening) stand. This applies to **every** run, not only ones that end
+in `noop`: a weekly run that skips a blocked item and then successfully opens a port PR
+would otherwise repost the identical blocker comment every week forever.
 
 The run exits `success` either way, so an unannounced stop is indistinguishable from a
 healthy week. Five consecutive green runs hid the #71 deadlock precisely because a
@@ -406,9 +412,23 @@ the maintainer more than no PR.
 
 ## Advance the watermark
 
-The submodule pin at `vendor/ableton-link` records how far upstream this port has been
-reconciled. In the same commit as your change, advance it to the upstream commit you
-just ported:
+**Unless an earlier item is skipped.** If you ported a later item because something
+before it is `blocked_on` a decision, or is a skipped `api-break` or `wire-format`
+item, then **do not touch the pin at all** — leave `vendor/ableton-link` exactly where
+it was and skip the rest of this section. The pin asserts that everything behind it is
+dealt with, and the skipped item is by definition not dealt with, so advancing it even
+to the SHA you just ported would claim work nobody has done and fail the validator.
+
+In that case set the retired item's `retired_at_pin` to the **current, unchanged** pin
+— the same 40-char SHA already in `[watermark].pinned` — not to the upstream commit you
+ported. The validator will emit `retired but <sha> is still ahead of the pin`; that
+warning is expected here and is exactly what a non-contiguous retirement looks like.
+Say in the PR body which item blocked the advance, and that the pin was deliberately
+left alone.
+
+Otherwise: the submodule pin at `vendor/ableton-link` records how far upstream this
+port has been reconciled. In the same commit as your change, advance it to the upstream
+commit you just ported:
 
 ```bash
 git -C vendor/ableton-link checkout <sha>
