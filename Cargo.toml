@@ -2,6 +2,18 @@
 name = "ableton-link-rs"
 version = "0.3.0"
 edition = "2021"
+# Enforced, not just advertised. Four floors were checked and this is the
+# highest that binds library consumers:
+#   - `[lints.rust]` below needs the `lints` table, stabilized in Cargo 1.74.
+#   - `esp-idf-svc` requires 1.77.
+#   - The normal+build dependency graph requires 1.85 (`rand`, `getrandom`).
+#   - This crate's own code calls `u*::is_multiple_of`, stable since 1.87
+#     (`src/link/median.rs`, `src/link/measurement.rs`). Declaring rust-version
+#     is what surfaced this: clippy's `incompatible_msrv` now enforces it.
+# Building the test suite additionally pulls dev-dependencies that require 1.88
+# (`tonic`, `hdrhistogram` via `console-subscriber`); that binds contributors,
+# not consumers, so it is documented in the README rather than set here.
+rust-version = "1.87"
 description = "Native Rust implementation of the Ableton Link protocol"
 license = "GPL-3.0"
 repository = "https://github.com/anweiss/ableton-link-rs"
