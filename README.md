@@ -337,7 +337,7 @@ of the *calling* thread. It is intended to be called from a thread that drives
 time-critical Link work, mirroring upstream's `platform::ThreadPriority`:
 
 ```rust
-use ableton_link::platform::ThreadPriority;
+use ableton_link_rs::platform::ThreadPriority;
 
 let mut priority = ThreadPriority::new();
 priority.set_high(); // capture current params, then raise
@@ -347,18 +347,31 @@ priority.reset();    // restore the captured params
 
 `set_high` captures the thread's current scheduling parameters on the first call
 and is a no-op until `reset` is called; `reset` restores them and is a no-op if
-nothing was captured. The type is `!Send`: the captured state is thread-affine
-and must be used and dropped on the thread that called `set_high`.
+nothing was captured. The captured state is thread-affine: `set_high` and the
+matching `reset` must run on the same thread.
+
+This is implemented over the [`audio_thread_priority`][atp] crate rather than
+hand-written FFI, so it contains no `unsafe`. The crate drives the same three OS
+mechanisms upstream uses:
 
 | Platform | Mechanism | Privileges |
 |----------|-----------|------------|
-| Linux | `pthread_setschedparam` with `SCHED_FIFO`, priority 35 | Requires `CAP_SYS_NICE` or a suitable `RLIMIT_RTPRIO`; silently has no effect otherwise |
+| Linux | `pthread_setschedparam` with `SCHED_FIFO`, priority 35 | Requires `CAP_SYS_NICE` or a suitable `RLIMIT_RTPRIO`; has no effect otherwise |
 | macOS | mach `thread_policy_set` with `THREAD_TIME_CONSTRAINT_POLICY` | None |
-| Windows | MMCSS `AvSetMmThreadCharacteristicsW("Distribution")` + `AVRT_PRIORITY_HIGH` | None |
+| Windows | MMCSS, `Pro Audio` task class | None |
 | Other | No-op | — |
 
+Three parameter-level deviations from upstream are deliberate and documented on
+the type: macOS asks for `computation = period / 2` rather than `0.2 * period`,
+Windows registers the `Pro Audio` MMCSS task rather than `Distribution`, and the
+Linux realtime priority is set explicitly to upstream's 35 rather than the
+crate's default of 10. None is network-visible — this is host-side scheduling
+only.
+
 Failures are not reported: as upstream, both methods are best-effort and never
-panic or return an error.
+panic or return an error. They are logged at `debug` level.
+
+[atp]: https://crates.io/crates/audio_thread_priority
 
 ## Architecture
 
