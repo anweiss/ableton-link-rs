@@ -357,9 +357,10 @@ mechanisms upstream uses:
 | Platform | Mechanism | Privileges |
 |----------|-----------|------------|
 | Linux | `pthread_setschedparam` with `SCHED_FIFO`, priority 10 | Requires `CAP_SYS_NICE` or a suitable `RLIMIT_RTPRIO`; has no effect otherwise |
-| macOS | mach `thread_policy_set` with `THREAD_TIME_CONSTRAINT_POLICY` | None |
+| macOS, iOS | mach `thread_policy_set` with `THREAD_TIME_CONSTRAINT_POLICY` | None |
 | Windows | MMCSS, `Audio` task class | None |
-| Other | No-op | — |
+| Android | `setpriority` to nice -19 (urgent audio) | None |
+| Everything else | No-op | — |
 
 Three deviations from upstream are deliberate and documented on the type:
 upstream asks for `SCHED_FIFO` priority 35 rather than 10 (the crate's override
@@ -370,9 +371,13 @@ for this writes a process-global that is never restored, and disappears when its
 `AVRT_PRIORITY_HIGH` boost. None is network-visible — this is host-side
 scheduling only.
 
-Upstream invokes `ThreadPriority` only from its `linkaudiohut` example, never
-from the library itself; `examples/link_audio.rs` does the same here, raising the
-priority of the audio playback thread.
+Upstream invokes `ThreadPriority` only from its `linkaudiohut` example, through
+`link.callOnLinkThread` — never from the library. This port has no
+`callOnLinkThread` equivalent: Link work runs as tasks on a shared Tokio
+runtime, and raising the priority of a shared worker would boost unrelated
+tasks. `ThreadPriority` is therefore public API for callers who drive
+time-critical Link work on a thread they own, in the same way `ThreadFactory`
+is exported without internal call sites.
 
 Failures are not reported: as upstream, both methods are best-effort and never
 panic or return an error. They are logged at `debug` level.

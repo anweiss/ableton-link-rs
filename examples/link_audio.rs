@@ -138,17 +138,7 @@ fn start_playback(
 
         let sink = Sink::connect_new(stream.mixer());
         sink.append(LivePlayback::new(queue, channels, sample_rate));
-
-        // Mirrors upstream's `linkaudiohut`, which is the only place upstream
-        // invokes `platform::ThreadPriority` — on the thread doing
-        // time-critical audio work, not inside the library itself
-        // (examples/linkaudiohut/main.cpp).
-        let mut priority = ableton_link_rs::platform::ThreadPriority::new();
-        priority.set_high();
-
         sink.sleep_until_end();
-
-        priority.reset();
     });
 }
 

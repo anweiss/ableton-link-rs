@@ -47,9 +47,10 @@ impl ThreadFactory {
 /// | Platform | Mechanism | Upstream |
 /// |----------|-----------|----------|
 /// | Linux | `pthread_setschedparam` with `SCHED_FIFO` | same |
-/// | macOS | mach `thread_policy_set`, `THREAD_TIME_CONSTRAINT_POLICY` | same |
+/// | macOS, iOS | mach `thread_policy_set`, `THREAD_TIME_CONSTRAINT_POLICY` | same on macOS; upstream has no iOS path |
 /// | Windows | MMCSS (`AvSetMmThreadCharacteristicsW`) | same |
-/// | Other | no-op reporting success | same |
+/// | Android | `setpriority` to nice -19 (urgent audio) | upstream has no Android path |
+/// | Everything else | no-op reporting success | same |
 ///
 /// Three deviations from upstream are deliberate. The crate owns these
 /// numbers, none of them is network-visible (this is host-side scheduling
