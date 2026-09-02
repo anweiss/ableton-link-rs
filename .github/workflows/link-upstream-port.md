@@ -514,8 +514,10 @@ port genuinely needs no documentation change — an internal refactor, a bug fix
 API surface — say so in the pull request body and add the line `<!-- docs-not-needed -->`
 to it, which is the supported way past that check. You cannot set the `docs-not-needed`
 label yourself, because `safe-outputs` pins your label list to `upstream-sync` and
-`automation`; the body marker is the escape hatch you can actually reach. Do not leave
-it to review to notice.
+`automation`; the body marker is the escape hatch you can actually reach, and it works
+precisely *because* your pull requests carry `automation` — the check ignores that
+marker on any pull request that does not, since a body marker can otherwise be
+self-applied by anyone. Do not leave it to review to notice.
 
 So if your port needs a new dependency or a CI change, do not try to sneak it in and do
 not work around the restriction. Open an issue instead: describe the upstream change,

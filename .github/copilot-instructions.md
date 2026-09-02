@@ -16,8 +16,10 @@ This is enforced by CI, not left to review. The **README maintenance** check fai
 any pull request that changes `src/**` without changing `README.md`. When a change
 genuinely carries no documentation obligation — an internal refactor, or a bug fix
 with no API surface — say so in the pull request body and either apply the
-`docs-not-needed` label or add `<!-- docs-not-needed -->` to the body. Agent-authored
-pull requests must use the marker, since `safe-outputs` pins their labels.
+`docs-not-needed` label or add `<!-- docs-not-needed -->` to the body. The marker is
+honoured only on `automation`-labelled pull requests, because a body marker can be
+self-applied; agent-authored pull requests rely on it, since `safe-outputs` pins their
+labels and they carry `automation` already.
 
 When updating the README:
 

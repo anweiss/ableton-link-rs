@@ -29,10 +29,11 @@ jobs:
     name: README maintenance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v8
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const ESCAPE_LABEL = 'docs-not-needed';
+            const TRUSTED_LABEL = 'automation';
             const ESCAPE_MARKER = /<!--\s*docs-not-needed\s*-->/;
 
             const pr = context.payload.pull_request;
@@ -66,20 +67,34 @@ jobs:
               return;
             }
 
-            // The label is for humans. The marker exists because the port workflow
-            // cannot set arbitrary labels - `safe-outputs.create-pull-request`
-            // pins its label list to [upstream-sync, automation] - but it does
-            // write its own body, so the marker is the escape hatch it can
-            // actually reach. Without it an agent-authored refactor would be
-            // permanently stuck behind a check it has no way to satisfy.
+            // The label is for humans, and it is the real trust boundary: applying
+            // a label needs write access, so an outside contributor cannot reach
+            // it. The marker exists only because the port workflow cannot set
+            // arbitrary labels - `safe-outputs.create-pull-request` pins its list
+            // to [upstream-sync, automation] - but it does write its own body.
+            //
+            // That makes the marker weaker than the label, because anyone who can
+            // edit a pull request body can write it, including on a fork. So the
+            // marker is honoured ONLY on a pull request that already carries
+            // `automation`, which is itself label-gated and therefore trusted.
+            // Otherwise a drive-by contributor could waive the check on themselves.
             const labels = (pr.labels || []).map(l => l.name);
             if (labels.includes(ESCAPE_LABEL)) {
               core.notice(`Waived by the \`${ESCAPE_LABEL}\` label.`);
               return;
             }
             if (ESCAPE_MARKER.test(pr.body || '')) {
-              core.notice(`Waived by the \`${ESCAPE_LABEL}\` marker in the body.`);
-              return;
+              if (labels.includes(TRUSTED_LABEL)) {
+                core.notice(
+                  `Waived by the \`${ESCAPE_LABEL}\` marker on a \`${TRUSTED_LABEL}\` pull request.`
+                );
+                return;
+              }
+              core.warning(
+                `Ignoring the \`${ESCAPE_LABEL}\` marker: it is only honoured on a ` +
+                `\`${TRUSTED_LABEL}\`-labelled pull request, because a body marker ` +
+                `can be self-applied. Use the \`${ESCAPE_LABEL}\` label instead.`
+              );
             }
 
             const shown = src.slice(0, 10).map(p => `  - ${p}`).join('\n');
@@ -92,6 +107,6 @@ jobs:
               `alters the public API, or changes build requirements or MSRV.\n\n` +
               `If this change genuinely needs no documentation - an internal refactor, ` +
               `or a bug fix with no API surface - say so in the body and either apply ` +
-              `the \`${ESCAPE_LABEL}\` label or add \`<!-- ${ESCAPE_LABEL} -->\` to the ` +
-              `pull request body.`
+              `the \`${ESCAPE_LABEL}\` label, or - on an \`${TRUSTED_LABEL}\`-labelled ` +
+              `pull request - add \`<!-- ${ESCAPE_LABEL} -->\` to the body.`
             );
