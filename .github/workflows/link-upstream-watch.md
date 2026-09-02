@@ -161,7 +161,21 @@ status = "outstanding" | "retired"
 retired_at_pin = ""                    # the pin that retired it, or "" if outstanding
 why = "one line on the observable effect"
 note = "optional"                      # free text; nothing parses it
+blocked_on = "optional"                # SEE BELOW - preserve, never write
 ```
+
+**`blocked_on` is not yours to set, and not yours to drop.** It is free text naming a
+design decision a maintainer owes before an item can be ported at all, and the port
+workflow skips an item that has it so one undecidable item cannot head-of-line block
+everything behind it. Two rules:
+
+- **Never add one.** An agent that can mark its own work blocked can mark anything
+  blocked. Marking an item blocked is a maintainer's judgement, made in a reviewed
+  pull request.
+- **Never remove or reword one.** You rewrite this file wholesale, and the field is
+  optional, so dropping it passes the validator silently and quietly re-arms the port
+  workflow against an item that is still undecided. If you rewrite an item that has
+  `blocked_on`, carry the string across verbatim.
 
 Plus `[[undecided]]` and `[[not_applicable]]` tables, which exist so every SHA has a
 home. They are **not** the same shape as `[[port]]` — they carry no `id`, `status`,

@@ -146,6 +146,11 @@ for n, item in enumerate(port):
     # It is deliberately free text rather than a flag. The whole point is to
     # state the decision a human owes, and a bare `blocked = true` records that
     # someone gave up without recording what they gave up on.
+    #
+    # The field is optional, so its absence is valid and dropping one is silent
+    # here. `link-upstream-watch.md` rewrites this file wholesale, and is
+    # therefore told in its schema block to carry `blocked_on` across verbatim
+    # and never to write one - that instruction is what this check cannot do.
     if "blocked_on" in item:
         if item["status"] != "outstanding":
             err(f"{where}: blocked_on is set but status is {item['status']!r} — "
