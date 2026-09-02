@@ -125,7 +125,13 @@ safe-outputs:
     deduplicate-by-title: true
   add-comment:
     target: "*"
-    max: 1
+    # One comment per item skipped this run, plus one for the terminal stop.
+    # At `max: 1` a single skip comment consumed the whole allowance and the
+    # terminal `noop` could then not announce itself - reintroducing exactly
+    # the unannounced stop that "Every early stop must be announced" exists to
+    # prevent. Ten is well clear of the five items currently outstanding and is
+    # bounded anyway by the do-not-repeat rule in that section.
+    max: 10
   missing-tool:
 
 imports:
@@ -301,8 +307,10 @@ caused it.
 **`noop` alone is not an announcement.** It writes to a run artifact that nobody opens.
 A `noop`-only run is a green check with no notification, which is precisely the
 "unannounced stop" this section exists to prevent — run 33665748688 stopped on a
-design-blocked item, said so at length, and reached nobody. So whenever you `noop`,
-also do exactly one of these, in this order of preference:
+design-blocked item, said so at length, and reached nobody.
+
+So whenever you `noop` **because something is blocking progress**, also do exactly one
+of these, in this order of preference:
 
 1. If the blocker belongs to a backlog item, `add-comment` on that item's tracking
    issue (step 7 tells you how to find it), naming the run URL and what has to happen
@@ -310,6 +318,12 @@ also do exactly one of these, in this order of preference:
 2. If it belongs to an existing PR or issue, comment there instead.
 3. Only if there is no such issue or PR, `create-issue` — it is configured with the
    `needs-decision` label for this.
+
+**A run with nothing to do is not blocked.** If `summary.md` says the port is level
+with upstream, or the backlog is entirely retired, `noop` alone is the whole correct
+answer: there is no decision owed and no failure to report, and opening a
+`needs-decision` issue for it would be noise. The rule above is for a run that wanted
+to make progress and could not.
 
 Say nothing twice: if the last comment on that issue already reports this same blocker
 at this same watermark, `noop` alone is right and a second identical comment is noise.
