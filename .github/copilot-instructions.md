@@ -63,13 +63,44 @@ This library supports `no_std` environments via the `std` feature flag (enabled 
    - `cargo check --all-targets` (default features — `audio` off)
    - `cargo clippy --all-targets --all-features -- -D warnings` (std + audio)
 
+## Safe Rust by Default
+
+`src/lib.rs` carries `#![deny(unsafe_code)]`, so this rule is enforced by the
+compiler on every CI target, not by review.
+
+This is a port of a C++ library, which means the tempting shape for every
+platform-facing item is a hand-written FFI shim. That is almost never the right
+answer here. **Before writing any `unsafe`, look for a crate that already wraps
+the OS mechanism**, and prefer it even when it is not a byte-for-byte match —
+a vetted crate is tested on every platform this crate ships to, which a
+hand-rolled shim written against documentation is not.
+
+Worked example: `platform::ThreadPriority` (`src/platform/thread.rs`) drives
+`SCHED_FIFO` on Linux, the mach time-constraint policy on macOS and MMCSS on
+Windows — upstream's three mechanisms — entirely through the
+`audio_thread_priority` crate, with no `unsafe`. Where the crate's parameters
+differ from upstream's, the deviations are documented on the type rather than
+worked around with FFI.
+
+If nothing safe will do:
+
+1. Add `#[allow(unsafe_code)]` at the **narrowest** scope that works — a module
+   or an item, never the crate root.
+2. Put a comment next to it saying which crates you evaluated and why each was
+   rejected.
+3. Say the same thing in the pull request body. An `#[allow(unsafe_code)]` with
+   no stated alternative is a review blocker.
+
+`src/platform/clock.rs` is the one place this applies today: ESP-IDF's
+`esp_timer_get_time` has no safe wrapper in this crate's dependency set.
+
 ## LinkAudio (`audio` feature)
 
 The optional, **off-by-default** `audio` feature (`audio = ["std"]`) enables `src/link_audio/`, a Rust port of upstream's LinkAudio audio-streaming subsystem. It is a separate UDP protocol layered beside Link Classic, not a change to it.
 
 When modifying this module:
 
-1. **No `unsafe`.** `src/link_audio/mod.rs` carries `#![forbid(unsafe_code)]`. Upstream's raw-pointer ring buffer is replaced by a channel-based buffer pool (`queue.rs`) and RAII buffer handles lending `&mut [i16]` (`sink.rs`). Never remove the attribute to make a change fit.
+1. **No `unsafe`.** On top of the crate-wide `deny` above, `src/link_audio/mod.rs` carries `#![forbid(unsafe_code)]`, which cannot be opted out of with `#[allow]`. Upstream's raw-pointer ring buffer is replaced by a channel-based buffer pool (`queue.rs`) and RAII buffer handles lending `&mut [i16]` (`sink.rs`). Never remove the attribute to make a change fit.
 2. **Test with `--all-features`.** A bare `cargo test --all` compiles none of `src/link_audio/` and passes without running a single audio test.
 3. **Keep the default build working.** Verify with `cargo check --all-targets` that an audio-only change has not broken the audio-less configuration most users get.
 4. **Wire format.** `src/link_audio/{messages,payload,encoding,codec}.rs` put bytes on the network. LinkAudio length-prefixes strings and vectors with a **u32**, unlike Link Classic. The `aep4` peer-state entry (`src/link/audio_endpoint.rs`) is Link Classic wire format and is how audio peers discover each other.
