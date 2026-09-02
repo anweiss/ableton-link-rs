@@ -214,10 +214,10 @@ title = "Fix rare crash during initialization (CallbackDispatcher ordering, rema
 upstream = ["57b77a8040d3", "44d78f2cf3a4"]
 rust = ["src/link/controller.rs"]
 risk = "behavior"
-status = "outstanding"
-retired_at_pin = ""
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "The `RtClientStateSetter`/`CallbackDispatcher` UB fix landed; the follow-up commits add an explicit `start()`/`stop()` pair (`RtClientStateDispatcher`) to make shutdown deterministic and still need porting"
-note = "`5bf14d95471d` retired (ported, see issue #71); `57b77a8040d3`/`44d78f2cf3a4` still outstanding"
+note = "`5bf14d95471d` retired (ported, see issue #71); `57b77a8040d3`/`44d78f2cf3a4` ported: Controller now stores `JoinHandle`s for the join-session and peer-state-change dispatch loops and aborts them at the top of `disable()`, mirroring upstream's `mRtClientStateSetter.stop()` ordering. `retired_at_pin` is left at the unchanged pin because `increase-thread-priority-on-link-io-thread` (blocked_on) is still outstanding and precedes this item in ancestry, so the submodule pin itself was not advanced."
 
 [[port]]
 id = "sessioncontroller-shutdown-ordering-improvements"

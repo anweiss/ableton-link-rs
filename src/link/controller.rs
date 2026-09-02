@@ -67,6 +67,15 @@ pub struct Controller {
     clock: Clock,
     rx_event: Option<Receiver<OnEvent>>,
     notifier: Arc<Notify>,
+    /// Handles for the background dispatch loops (join-session and
+    /// peer-state-change) spawned in [`Controller::new`]. Rust analogue of
+    /// upstream's `RtClientStateSetter::stop()`
+    /// (`ableton::link::Controller::CallbackDispatcher`, see upstream commit
+    /// `44d78f2cf3a4`): aborted from [`Controller::disable`] so that no
+    /// dispatch work can run after shutdown has begun, rather than merely
+    /// relying on the loops to observe `enabled == false`.
+    join_session_task: Option<tokio::task::JoinHandle<()>>,
+    peer_state_change_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Controller {
@@ -175,7 +184,7 @@ impl Controller {
         let ps_loop = peer_state.clone();
         let tempo_cb_loop = tempo_callback.clone();
 
-        tokio::spawn(async move {
+        let join_session_task = tokio::spawn(async move {
             loop {
                 if let Some(session) = rx_join_session.recv().await {
                     join_session(
@@ -218,7 +227,7 @@ impl Controller {
         // it. A newer edge supersedes an older held one; latest wins.
         let mut deferred_audio_endpoint: Option<(NodeId, Option<SocketAddrV4>)> = None;
 
-        tokio::spawn(async move {
+        let peer_state_change_task = tokio::spawn(async move {
             loop {
                 if let Some(peer_state_changes) = rx_peer_state_change.recv().await {
                     debug!("controller received peer state changes");
@@ -486,6 +495,8 @@ impl Controller {
             clock,
             rx_event: Some(rx_event),
             notifier,
+            join_session_task: Some(join_session_task),
+            peer_state_change_task: Some(peer_state_change_task),
         })
     }
 
@@ -518,6 +529,20 @@ impl Controller {
     }
 
     pub async fn disable(&mut self) {
+        // Stop the background dispatch loops before anything else, mirroring
+        // upstream's `mRtClientStateSetter.stop()` at the top of the async
+        // shutdown handler (see `44d78f2cf3a4`, "Stop the
+        // RtClientStateDispatcher on shutdown"). Aborting here guarantees no
+        // further join-session or peer-state-change processing can run once
+        // shutdown has begun, rather than relying solely on the loops to
+        // observe `enabled == false` on their next iteration.
+        if let Some(handle) = self.join_session_task.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.peer_state_change_task.take() {
+            handle.abort();
+        }
+
         // Send bye bye message before disabling to properly notify other peers
         use crate::discovery::messenger::send_byebye;
         let node_id = if let Ok(peer_state) = self.peer_state.try_lock() {
@@ -554,10 +579,12 @@ impl Controller {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         info!("Completed Link disable process");
 
-        // NOTE: Spawned tokio tasks (discovery listener, measurement tasks) will observe
-        // enabled=false and stop processing new messages. The notifier signal causes
-        // the broadcast loop to exit. Full task cancellation (e.g., via JoinHandle::abort)
-        // would require storing task handles, which is left for a future refactor.
+        // NOTE: The join-session and peer-state-change dispatch loops are
+        // aborted above, before the bye-bye message is sent, matching
+        // upstream's shutdown ordering. Other spawned tasks (discovery
+        // listener, measurement tasks) still observe `enabled=false` and the
+        // notifier signal to wind down on their own, since they have no
+        // equivalent race window during startup.
     }
 
     pub async fn set_state(&self, mut new_client_state: IncomingClientState) {
