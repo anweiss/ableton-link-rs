@@ -157,7 +157,13 @@ impl PingResponder {
             debug!("pong_payload {:?}", pong_payload);
         }
 
-        let pong_message = encode_message(PONG, &pong_payload).unwrap();
+        let pong_message = match encode_message(PONG, &pong_payload) {
+            Ok(message) => message,
+            Err(e) => {
+                debug!("failed to encode pong message for {}: {}", src, e);
+                return;
+            }
+        };
         if let Err(e) = unicast_socket.send_to(&pong_message, src).await {
             debug!("failed to send pong message to {}: {}", src, e);
             return;
@@ -180,7 +186,17 @@ pub fn encode_message(message_type: MessageType, payload: &Payload) -> Result<Ve
     let message_size = PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE + payload.size() as usize;
 
     if message_size > MAX_MESSAGE_SIZE {
-        panic!("exceeded maximum message size");
+        // The ping and pong payloads this crate builds are bounded by
+        // construction, so this is unreachable internally. `encode_message` is
+        // public, though, and mirrors `discovery::messages::encode_message`: an
+        // over-limit message is a recoverable error the caller logs and drops,
+        // not a process abort.
+        return Err(crate::link::error::Error::Encoding(
+            encoding::EncodeError::MessageTooLarge {
+                size: message_size,
+                max: MAX_MESSAGE_SIZE,
+            },
+        ));
     }
 
     let mut encoded = encoding::encode_to_vec(&PROTOCOL_HEADER)?;
@@ -209,7 +225,10 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use crate::link::payload::HostTime;
+    use crate::link::{
+        encoding::PAYLOAD_ENTRY_HEADER_SIZE,
+        payload::{HostTime, HOST_TIME_SIZE},
+    };
 
     use super::*;
 
@@ -230,5 +249,34 @@ mod tests {
 
         let header = parse_message_header(&message).unwrap();
         info!("header: {:?}", header);
+    }
+
+    #[test]
+    fn encode_message_rejects_oversized_payload() {
+        // The ping/pong payloads this crate builds are bounded by
+        // construction, but `encode_message` is public: an over-limit message
+        // is reported the way `discovery::messages::encode_message` reports it,
+        // as a recoverable error rather than a panic.
+        let entry_size = PAYLOAD_ENTRY_HEADER_SIZE + HOST_TIME_SIZE as usize;
+        let mut payload = Payload::default();
+        for _ in 0..(MAX_MESSAGE_SIZE / entry_size + 1) {
+            payload
+                .entries
+                .push(PayloadEntry::HostTime(HostTime::default()));
+        }
+
+        let result = encode_message(PING, &payload);
+        // Match only on the error; never debug-print the `Ok` arm, which
+        // would write the encoded wire payload into the test log.
+        match result {
+            Err(crate::link::error::Error::Encoding(
+                crate::encoding::EncodeError::MessageTooLarge { size, max },
+            )) => {
+                assert_eq!(max, MAX_MESSAGE_SIZE);
+                assert!(size > MAX_MESSAGE_SIZE);
+            }
+            Err(other) => panic!("expected MessageTooLarge, got error {}", other),
+            Ok(_) => panic!("expected MessageTooLarge, got a successfully encoded message"),
+        }
     }
 }

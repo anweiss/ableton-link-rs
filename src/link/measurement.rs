@@ -502,7 +502,7 @@ impl Measurement {
 
         info!("sending initial host time ping {:?}", ht);
 
-        let init_bytes_sent = send_ping(
+        let init_bytes_sent = match send_ping(
             unicast_socket.clone(),
             *state.measurement_endpoint.as_ref().unwrap(),
             &Payload {
@@ -510,7 +510,17 @@ impl Measurement {
             },
         )
         .await
-        .unwrap();
+        {
+            Ok(bytes_sent) => bytes_sent,
+            Err(e) => {
+                debug!(
+                    "failed to send initial ping to {}: {}",
+                    state.measurement_endpoint.as_ref().unwrap(),
+                    e
+                );
+                0
+            }
+        };
 
         measurement.init_bytes_sent = init_bytes_sent;
 
@@ -588,7 +598,9 @@ impl Measurement {
                             ],
                         };
 
-                        let _ = send_ping(socket.clone(), endpoint, &payload).await.unwrap();
+                        if let Err(e) = send_ping(socket.clone(), endpoint, &payload).await {
+                            debug!("failed to send ping to {}: {}", endpoint, e);
+                        }
 
                         if ghost_time != Duration::microseconds(0)
                             && prev_host_time != Duration::microseconds(0)
@@ -695,7 +707,14 @@ pub async fn send_ping(
     measurement_endpoint: SocketAddrV4,
     payload: &Payload,
 ) -> io::Result<usize> {
-    let message = encode_message(PING, payload).unwrap();
+    let message = match encode_message(PING, payload) {
+        Ok(message) => message,
+        Err(e) => {
+            // Surface the encode failure through the existing `io::Result` so
+            // the send paths log and drop it rather than aborting.
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, e.to_string()));
+        }
+    };
     debug!(
         "sending ping message to measurement endpoint {}",
         measurement_endpoint
@@ -861,5 +880,68 @@ mod tests {
 
         // Clean up
         drop(measurement);
+    }
+
+    // Covers the send path itself, not just `encode_message`. An oversized
+    // payload must surface through the existing `io::Result` so the callers
+    // log and drop it. If this branch ever regresses to `unwrap()`, the
+    // oversized case below panics and this test fails.
+    #[tokio::test]
+    async fn send_ping_reports_an_oversized_payload_instead_of_panicking() {
+        use crate::link::encoding::PAYLOAD_ENTRY_HEADER_SIZE;
+        use crate::link::payload::HOST_TIME_SIZE;
+
+        let socket =
+            Arc::new(new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap());
+        // A real receiver, so the "well-formed payload still sends" half of
+        // this test cannot be satisfied by an unconditional early return.
+        let receiver = new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let to = match receiver.local_addr().unwrap() {
+            SocketAddr::V4(addr) => addr,
+            other => panic!("expected an IPv4 receiver address, got {}", other),
+        };
+
+        let entry_size = PAYLOAD_ENTRY_HEADER_SIZE + HOST_TIME_SIZE as usize;
+        let mut oversized = Payload::default();
+        for _ in 0..(MAX_MESSAGE_SIZE / entry_size + 1) {
+            oversized
+                .entries
+                .push(PayloadEntry::HostTime(HostTime::default()));
+        }
+
+        let err = send_ping(socket.clone(), to, &oversized)
+            .await
+            .expect_err("an oversized payload must be reported, not sent");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Guard against the inverse regression: an unconditional early error
+        // would also satisfy the assertion above, so prove a well-formed
+        // payload actually reaches the wire.
+        let small = Payload {
+            entries: vec![PayloadEntry::HostTime(HostTime::default())],
+        };
+        let sent = send_ping(socket, to, &small).await.unwrap();
+        assert!(sent > 0);
+
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("a well-formed ping should have been sent")
+        .expect("receiving the well-formed ping should succeed")
+        .0;
+        assert_eq!(received, sent);
+        // Exactly one datagram: the oversized message must not have been sent.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                receiver.recv_from(&mut buf),
+            )
+            .await
+            .is_err(),
+            "the oversized message must not be transmitted"
+        );
     }
 }

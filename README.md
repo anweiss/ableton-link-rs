@@ -297,15 +297,17 @@ when a string is longer than its `u32` length prefix can describe, so a truncate
 desynchronize the rest of the stream.
 
 `EncodeError` also carries `MessageTooLarge { size, max }`, which the encoding layer itself never
-raises; it is produced by the discovery message encoder. With the `std` feature,
-`discovery::messages::encode_message` returns
+raises; it is produced by the message encoders that sit above it. With the `std` feature,
+`discovery::messages::encode_message` and `link::pingresponder::encode_message` return
 `Err(Error::Encoding(EncodeError::MessageTooLarge { size, max }))` when a message's total encoded
-size — protocol header plus message header plus payload — would exceed
-`discovery::messages::MAX_MESSAGE_SIZE`; the discovery send path logs and drops such a message
-rather than failing the caller. Note the wrapper: `encode_message` yields `link::Result`, so
-callers match on `Error::Encoding(..)` and destructure the `EncodeError` inside it. This is
-specific to that encoder — the other `encode_message` functions in the crate enforce their own
-limits and signal oversized messages differently.
+size — protocol header plus message header plus payload — would exceed that module's
+`MAX_MESSAGE_SIZE`; the discovery and ping/pong send paths log and drop such a message
+rather than failing the caller. Note the wrapper: both yield `link::Result`, so
+callers match on `Error::Encoding(..)` and destructure the `EncodeError` inside it. The ping and
+pong payloads this crate builds are bounded by construction, so the ping/pong encoder only reports
+this for payloads supplied by a caller. With the `audio` feature,
+`link_audio::messages::encode_message` enforces its own limit and reports it as
+`AudioError::MessageTooLarge`.
 
 > **Breaking change in 0.3.0:** `Encode::encode_to` previously returned `()`. It now returns
 > `Result<(), EncodeError>`, and `EncodeError` — previously an uninhabited enum — has its first
