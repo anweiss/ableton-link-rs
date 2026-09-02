@@ -14,12 +14,20 @@ name: Copilot review loop for port PRs
 #
 # The ordering problem this solves
 # ================================
-# Copilot "always leaves a 'Comment' review, not an 'Approve' review or a
-# 'Request changes' review", and those reviews "will not block merging changes".
-# `main` also requires zero approving reviews. So nothing in branch protection
-# makes a port PR wait for review: auto-merge would fire the moment the 15
-# checks went green, typically before Copilot had finished looking at it, and
-# the review would land on an already-merged PR.
+# Copilot code review auto-approval is enabled on this repository, so the
+# reviewer CAN now submit an `APPROVED` or a `CHANGES_REQUESTED` review rather
+# than returning every verdict as a non-blocking `COMMENTED` one. That still
+# does not make branch protection wait: `main` requires zero approving reviews,
+# so auto-merge would fire the moment the 15 checks went green, typically
+# before Copilot had finished looking at the PR, and the review would land on
+# an already-merged pull request.
+#
+# Sign-off is also deliberately NOT delegated to the approval. Copilot can
+# approve while leaving non-blocking suggestions, and the rule here is that
+# every review finding is resolved before merge - so the gate stays "zero
+# outstanding comments at the current head", and an approval is recorded in the
+# status comment rather than obeyed. `CHANGES_REQUESTED` is honoured in the
+# other direction: it withholds sign-off even when it left no inline comments.
 #
 # The gate is therefore explicit and lives outside branch protection: this
 # workflow applies the `copilot-reviewed` label when the loop has finished, and
@@ -607,13 +615,30 @@ jobs:
               const reviews = await github.paginate(github.rest.pulls.listReviews, {
                 owner, repo, pull_number: number, per_page: 100,
               });
+              // `DISMISSED` reviews stay in the `listReviews` response, and a
+              // dismissed review is precisely the case the fallback re-request
+              // further down exists to recover from - counting one would leave
+              // `reviews.length > 0` and make that path unreachable. `PENDING`
+              // is a review that was started and never submitted: no verdict,
+              // and no comments anyone else can see.
               return reviews.filter(
-                r => r.user && r.user.login === REVIEWER && r.commit_id === headSha,
+                r => r.user && r.user.login === REVIEWER &&
+                     r.commit_id === headSha &&
+                     r.state !== 'DISMISSED' && r.state !== 'PENDING',
               );
             }
 
             // Requesting Copilot needs BOTH the right API and the right token,
             // and each was a separate silent no-op.
+            //
+            // This is now a *fallback*. The repository ruleset's
+            // `copilot_code_review` rule carries `review_on_push: true`, so
+            // Copilot re-reviews on its own every time the fix agent pushes,
+            // and this path only runs when that did not produce a review for
+            // the current head - a draft edge case, a rule change, or a review
+            // that was dismissed. It is kept because it is the only recovery
+            // available when the ruleset does not fire, and because both of
+            // the failures below are invisible in a response.
             //
             // 1. REST. `POST .../requested_reviewers` with
             //    `reviewers: ["Copilot"]` returns **201 Created** and adds
@@ -1055,6 +1080,78 @@ jobs:
 
               const outstanding = await commentsForReviews(number, reviews.map(r => r.id));
 
+              // Review *state* only started carrying information once
+              // auto-approval was enabled (repo Settings > Copilot > Code
+              // review). Before that every Copilot review arrived as
+              // `COMMENTED` regardless of verdict, so the only usable signal
+              // was "did it leave inline comments". Now it can also submit
+              // `APPROVED` or `CHANGES_REQUESTED`, and both need handling.
+              // Only the latest DECISIVE review carries the current verdict.
+              //
+              // Two separate traps here. First, asking `some` over every review
+              // at this head lets a superseded state dominate: an early
+              // `CHANGES_REQUESTED` would hold the pull request on `human-hold`
+              // forever after a later approval of the same SHA. Second - and
+              // this is the one that reopens the hole this whole block exists
+              // to close - `COMMENTED` is NEUTRAL. It does not supersede
+              // anything. Taking the latest review of any state would let a
+              // later comment-only review mask an active body-only
+              // `CHANGES_REQUESTED` and fall straight through to sign-off. So
+              // only `APPROVED` and `CHANGES_REQUESTED` are allowed to decide,
+              // which is also how GitHub itself resolves review state.
+              //
+              // Comment tracking above deliberately still spans *every* review
+              // at this head - a finding is not resolved just because a newer
+              // review exists - so only the verdict is narrowed here.
+              const decisive = reviews
+                .filter(r => r.submitted_at &&
+                             (r.state === 'APPROVED' || r.state === 'CHANGES_REQUESTED'))
+                .sort((a, b) => new Date(a.submitted_at) - new Date(b.submitted_at))
+                .pop();
+              const verdict = decisive ? decisive.state : null;
+              const approved = verdict === 'APPROVED';
+              const changesRequested = verdict === 'CHANGES_REQUESTED';
+
+              // The hole this closes: a `CHANGES_REQUESTED` carrying no inline
+              // comments used to read as "nothing outstanding" and sign off on
+              // a review that had explicitly withheld approval. It cannot be
+              // dispatched either - the fix agent is handed comment URLs, and
+              // there would be none - so park it for a human instead.
+              //
+              // Scoped to the DECISIVE review's own comments, not to
+              // `outstanding` as a whole. An older review at this same head may
+              // well have left an inline comment; testing `outstanding.length`
+              // would then skip this branch and dispatch that older URL alone,
+              // silently dropping the body-only change request that is the
+              // entire reason this branch exists.
+              const decisiveComments = decisive
+                ? outstanding.filter(c => c.pull_request_review_id === decisive.id)
+                : [];
+
+              if (changesRequested && decisiveComments.length === 0) {
+                await revoke(pr);
+                await writeState(number, handle, {
+                  phase: 'human-hold',
+                  reviewedSha: null,
+                  note: `Copilot requested changes on \`${short}\` in the review body ` +
+                        'without leaving any inline comments on that review, so there ' +
+                        'is nothing to hand the fix agent' +
+                        (outstanding.length
+                          ? `. ${outstanding.length} inline comment(s) from earlier ` +
+                            'review(s) of this same commit are also waiting'
+                          : '') +
+                        '. Read the review body and push a fix. `copilot-reviewed` is ' +
+                        'withheld and auto-merge stays disengaged.',
+                });
+                core.warning(`PR #${number}: changes requested with no inline comments.`);
+                return;
+              }
+
+              // Deliberately still gated on `outstanding.length === 0` rather
+              // than on `approved`. Copilot can approve while leaving
+              // non-blocking suggestions, and this repository's standing rule
+              // is that every review finding is resolved before merge. An
+              // approval is therefore recorded, not obeyed.
               if (outstanding.length === 0) {
                 // One read governs this entire decision. `pr` was fetched at
                 // the top of `reconcile`, several API calls ago - reviews, then
@@ -1106,7 +1203,8 @@ jobs:
                 await writeState(number, handle, {
                   phase: 'done',
                   reviewedSha: head,
-                  note: `Copilot reviewed \`${short}\` with nothing outstanding. ` +
+                  note: `Copilot reviewed \`${short}\` with nothing outstanding` +
+                        (approved ? ' and submitted an approving review' : '') + '. ' +
                         'Auto-merge may now queue this pull request; it still merges ' +
                         'only after every required check passes.',
                 });
