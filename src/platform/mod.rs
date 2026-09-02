@@ -22,5 +22,8 @@ pub use clock::EspClock;
 // Thread factory
 pub use thread::ThreadFactory;
 
+// Thread scheduling priority control
+pub use thread::ThreadPriority;
+
 // Network interface scanner
 pub use network::scan_network_interfaces;

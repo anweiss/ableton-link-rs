@@ -26,6 +26,252 @@ impl ThreadFactory {
     }
 }
 
+/// Raises (and can later restore) the scheduling priority of the calling
+/// thread. Rust analogue of upstream's `platform::ThreadPriority`
+/// (`include/ableton/platforms/{linux,darwin,windows}/ThreadFactory.hpp`),
+/// intended to be called from the Link IO thread to improve clock-sync
+/// quality under system load.
+///
+/// `set_high` captures the thread's current scheduling parameters the first
+/// call and is a no-op on subsequent calls until `reset` is called; `reset`
+/// restores the captured parameters and is a no-op if nothing was captured.
+#[derive(Debug, Default)]
+pub struct ThreadPriority {
+    #[cfg(target_os = "linux")]
+    original: Option<(libc::c_int, libc::sched_param)>,
+    #[cfg(target_os = "macos")]
+    original: Option<mach2::thread_policy::thread_time_constraint_policy_data_t>,
+    #[cfg(target_os = "windows")]
+    original: Option<winapi::shared::ntdef::HANDLE>,
+}
+
+// SAFETY: `HANDLE` is a raw pointer, but the value ThreadPriority stores is an
+// opaque MMCSS task handle owned solely by this struct; it is never
+// dereferenced, only passed back to AvRevertMmThreadCharacteristics.
+#[cfg(target_os = "windows")]
+unsafe impl Send for ThreadPriority {}
+
+impl ThreadPriority {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Raises the calling thread's scheduling priority. Captures the
+    /// current priority so it can be restored by `reset`. Noop if a
+    /// priority has already been captured and not yet reset.
+    #[cfg(target_os = "linux")]
+    pub fn set_high(&mut self) {
+        if self.original.is_none() {
+            self.capture_linux();
+        }
+
+        // SAFETY: `high` is a valid, fully-initialized `sched_param`, and
+        // `pthread_self()` always returns a valid handle for the calling
+        // thread.
+        unsafe {
+            let mut high: libc::sched_param = std::mem::zeroed();
+            high.sched_priority = 35;
+            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &high);
+        }
+    }
+
+    /// Resets the calling thread's scheduling priority to what it was
+    /// before `set_high` was called. Noop if no priority was captured.
+    #[cfg(target_os = "linux")]
+    pub fn reset(&mut self) {
+        if let Some((policy, params)) = self.original.take() {
+            // SAFETY: `params` was previously captured from a successful
+            // `pthread_getschedparam` call and is a valid `sched_param`.
+            unsafe {
+                libc::pthread_setschedparam(libc::pthread_self(), policy, &params);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_linux(&mut self) {
+        // SAFETY: `policy` and `params` are valid out-parameters for
+        // `pthread_getschedparam`, and `pthread_self()` always returns a
+        // valid handle for the calling thread.
+        unsafe {
+            let mut policy: libc::c_int = 0;
+            let mut params: libc::sched_param = std::mem::zeroed();
+            let result =
+                libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut params);
+            if result == 0 {
+                self.original = Some((policy, params));
+            }
+        }
+    }
+
+    /// Raises the calling thread's scheduling priority. Captures the
+    /// current priority so it can be restored by `reset`. Noop if a
+    /// priority has already been captured and not yet reset.
+    #[cfg(target_os = "macos")]
+    pub fn set_high(&mut self) {
+        use mach2::thread_policy::{
+            thread_policy_set, thread_time_constraint_policy_data_t, THREAD_TIME_CONSTRAINT_POLICY,
+            THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+        };
+        use mach2::traps::mach_task_self;
+
+        if self.original.is_none() {
+            self.capture_macos();
+        }
+
+        // SAFETY: `mach_thread_self` is not exposed by mach2, so we use
+        // `pthread_self`/`mach_task_self` in combination is not applicable
+        // here; instead we operate on the calling thread via
+        // `mach2::mach_init::mach_thread_self`.
+        let this_thread = unsafe { mach2::mach_init::mach_thread_self() };
+
+        let mut info = std::mem::MaybeUninit::<libc::mach_timebase_info>::uninit();
+        // SAFETY: `info` is a valid out-parameter for `mach_timebase_info`.
+        unsafe {
+            libc::mach_timebase_info(info.as_mut_ptr());
+        }
+        let info = unsafe { info.assume_init() };
+        let mach_ratio = info.denom as f64 / info.numer as f64;
+        let millisecond = mach_ratio * 1_000_000.0;
+
+        let mut policy = thread_time_constraint_policy_data_t {
+            // The nominal time interval between the beginnings of two
+            // consecutive duty cycles; how often the thread expects to run.
+            period: (millisecond * 1.0) as u32,
+            // The amount of CPU time the thread needs during each period.
+            computation: (millisecond * 0.2) as u32,
+            // The maximum real time that may elapse from the start of a
+            // period to the end of computation.
+            constraint: (millisecond * 1.0) as u32,
+            // The thread's computation can be preempted by other threads.
+            preemptible: 1,
+        };
+
+        // SAFETY: `policy` is a valid, fully-initialized
+        // `thread_time_constraint_policy_data_t` matching
+        // `THREAD_TIME_CONSTRAINT_POLICY_COUNT`, and `this_thread` was just
+        // obtained from `mach_thread_self`.
+        unsafe {
+            thread_policy_set(
+                this_thread,
+                THREAD_TIME_CONSTRAINT_POLICY,
+                &mut policy as *mut _ as mach2::thread_policy::thread_policy_t,
+                THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+            );
+        }
+    }
+
+    /// Resets the calling thread's scheduling priority to what it was
+    /// before `set_high` was called. Noop if no priority was captured.
+    #[cfg(target_os = "macos")]
+    pub fn reset(&mut self) {
+        use mach2::thread_policy::{
+            thread_policy_set, THREAD_TIME_CONSTRAINT_POLICY, THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+        };
+
+        if let Some(mut policy) = self.original.take() {
+            let this_thread = unsafe { mach2::mach_init::mach_thread_self() };
+            // SAFETY: `policy` was previously captured from a successful
+            // `thread_policy_get` call and is a valid
+            // `thread_time_constraint_policy_data_t`.
+            unsafe {
+                thread_policy_set(
+                    this_thread,
+                    THREAD_TIME_CONSTRAINT_POLICY,
+                    &mut policy as *mut _ as mach2::thread_policy::thread_policy_t,
+                    THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_macos(&mut self) {
+        use mach2::thread_policy::{
+            thread_policy_get, thread_time_constraint_policy_data_t, THREAD_TIME_CONSTRAINT_POLICY,
+            THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+        };
+
+        let this_thread = unsafe { mach2::mach_init::mach_thread_self() };
+        let mut policy = thread_time_constraint_policy_data_t {
+            period: 0,
+            computation: 0,
+            constraint: 0,
+            preemptible: 0,
+        };
+        let mut count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+        let mut get_default = 0;
+        // SAFETY: `policy`, `count` and `get_default` are valid
+        // out-parameters for `thread_policy_get`, and `this_thread` was
+        // just obtained from `mach_thread_self`.
+        let result = unsafe {
+            thread_policy_get(
+                this_thread,
+                THREAD_TIME_CONSTRAINT_POLICY,
+                &mut policy as *mut _ as mach2::thread_policy::thread_policy_t,
+                &mut count,
+                &mut get_default,
+            )
+        };
+        if result == mach2::kern_return::KERN_SUCCESS {
+            self.original = Some(policy);
+        }
+    }
+
+    /// Raises the calling thread's scheduling priority using the Windows
+    /// Multimedia Class Scheduler Service (MMCSS). Noop if a priority has
+    /// already been raised and not yet reset.
+    #[cfg(target_os = "windows")]
+    pub fn set_high(&mut self) {
+        use winapi::um::avrt::AVRT_PRIORITY_HIGH;
+        use winapi::um::avrt::{AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority};
+
+        if self.original.is_some() {
+            return;
+        }
+
+        let name: Vec<u16> = "Distribution\0".encode_utf16().collect();
+        let mut task_index: u32 = 0;
+        // SAFETY: `name` is a valid null-terminated wide string and
+        // `task_index` is a valid out-parameter.
+        let handle = unsafe { AvSetMmThreadCharacteristicsW(name.as_ptr(), &mut task_index) };
+        if !handle.is_null() {
+            // SAFETY: `handle` was just returned by a successful call to
+            // `AvSetMmThreadCharacteristicsW`.
+            unsafe {
+                AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH);
+            }
+            self.original = Some(handle);
+        }
+    }
+
+    /// Reverts the thread's MMCSS characteristics set by `set_high`. Noop
+    /// if `set_high` did not successfully raise the priority.
+    #[cfg(target_os = "windows")]
+    pub fn reset(&mut self) {
+        use winapi::um::avrt::AvRevertMmThreadCharacteristics;
+
+        if let Some(handle) = self.original.take() {
+            // SAFETY: `handle` was previously returned by a successful call
+            // to `AvSetMmThreadCharacteristicsW` and has not yet been
+            // reverted.
+            unsafe {
+                AvRevertMmThreadCharacteristics(handle);
+            }
+        }
+    }
+
+    /// Raises the calling thread's scheduling priority. Noop on platforms
+    /// without a specific implementation.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    pub fn set_high(&mut self) {}
+
+    /// Resets the calling thread's scheduling priority. Noop on platforms
+    /// without a specific implementation.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    pub fn reset(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +393,24 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_thread_priority_set_high_and_reset_are_noop_safe() {
+        // `set_high`/`reset` must not panic regardless of platform support,
+        // and calling `reset` without a prior `set_high` must be a noop.
+        let mut priority = ThreadPriority::new();
+        priority.reset();
+        priority.set_high();
+        priority.set_high(); // repeated call must be a noop, not an error
+        priority.reset();
+        priority.reset(); // repeated reset must also be a noop
+    }
+
+    #[test]
+    fn test_thread_priority_default() {
+        let priority = ThreadPriority::default();
+        // Should construct without a captured priority.
+        let _ = format!("{priority:?}");
     }
 }

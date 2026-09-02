@@ -36,9 +36,9 @@ schema_version = 1
 # Watermark this triage was computed against. Advisory: the real watermark is
 # the submodule pin, and the validator fails if this drifts from it.
 [watermark]
-pinned = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
+pinned = "7418012c2b2adaa563f5ed41cbff72cd97f1a66a"
 upstream = "902aef95bf94af49746fdda5369b42cdcfa1e6d2"
-commits_behind = 113
+commits_behind = 112
 
 # ---------------------------------------------------------------------------
 # Port items, in upstream ancestry order (oldest first). The port workflow
@@ -191,9 +191,10 @@ title = "Increase thread priority on Link IO thread (Linux, macOS, Windows)"
 upstream = ["7418012c2b2a", "eefe514d1846"]
 rust = ["src/platform/thread.rs"]
 risk = "behavior"
-status = "outstanding"
-retired_at_pin = ""
+status = "retired"
+retired_at_pin = "7418012c2b2a"
 why = "The IO thread now requests `SCHED_FIFO`/high-priority scheduling; improves clock-sync quality under load"
+note = "retired at pin `7418012c2b2a`; ported as `platform::ThreadPriority` (`set_high`/`reset`), mirroring upstream's final capture/restore shape from `eefe514d1846` rather than the stateless functor from `7418012c2b2a`. The pin itself only advances to `7418012c2b2a` because `90d6b7c2d3e3` (a separate, still-outstanding item) sits between the two commits in ancestry order."
 
 [[port]]
 id = "add-operator-for-sessionstate"
