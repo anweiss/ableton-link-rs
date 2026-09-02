@@ -1112,19 +1112,35 @@ jobs:
               const approved = verdict === 'APPROVED';
               const changesRequested = verdict === 'CHANGES_REQUESTED';
 
-              // The hole this closes: `CHANGES_REQUESTED` carrying no inline
+              // The hole this closes: a `CHANGES_REQUESTED` carrying no inline
               // comments used to read as "nothing outstanding" and sign off on
               // a review that had explicitly withheld approval. It cannot be
               // dispatched either - the fix agent is handed comment URLs, and
-              // there are none - so park it for a human instead.
-              if (changesRequested && outstanding.length === 0) {
+              // there would be none - so park it for a human instead.
+              //
+              // Scoped to the DECISIVE review's own comments, not to
+              // `outstanding` as a whole. An older review at this same head may
+              // well have left an inline comment; testing `outstanding.length`
+              // would then skip this branch and dispatch that older URL alone,
+              // silently dropping the body-only change request that is the
+              // entire reason this branch exists.
+              const decisiveComments = decisive
+                ? outstanding.filter(c => c.pull_request_review_id === decisive.id)
+                : [];
+
+              if (changesRequested && decisiveComments.length === 0) {
                 await revoke(pr);
                 await writeState(number, handle, {
                   phase: 'human-hold',
                   reviewedSha: null,
-                  note: `Copilot requested changes on \`${short}\` without leaving any ` +
-                        'inline comments, so there is nothing to hand the fix agent. ' +
-                        'Read the review body and push a fix. `copilot-reviewed` is ' +
+                  note: `Copilot requested changes on \`${short}\` in the review body ` +
+                        'without leaving any inline comments on that review, so there ' +
+                        'is nothing to hand the fix agent' +
+                        (outstanding.length
+                          ? `. ${outstanding.length} inline comment(s) from earlier ` +
+                            'review(s) of this same commit are also waiting'
+                          : '') +
+                        '. Read the review body and push a fix. `copilot-reviewed` is ' +
                         'withheld and auto-merge stays disengaged.',
                 });
                 core.warning(`PR #${number}: changes requested with no inline comments.`);
