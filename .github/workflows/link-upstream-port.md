@@ -129,8 +129,13 @@ safe-outputs:
     # At `max: 1` a single skip comment consumed the whole allowance and the
     # terminal `noop` could then not announce itself - reintroducing exactly
     # the unannounced stop that "Every early stop must be announced" exists to
-    # prevent. Ten is well clear of the five items currently outstanding and is
-    # bounded anyway by the do-not-repeat rule in that section.
+    # prevent. Ten is well clear of the five items currently outstanding.
+    #
+    # The quota is a hard ceiling, so the prompt reserves the tenth slot: at
+    # most nine per-item skip comments per run, with anything beyond that
+    # rolled into the terminal announcement. Without that reservation a run
+    # that skipped ten items would spend the whole allowance on skips and lose
+    # the terminal report - the same unannounced stop, one level up.
     max: 10
   missing-tool:
 
@@ -339,6 +344,16 @@ this same blocker at this same watermark, say nothing and let `noop` (or the pul
 request you are opening) stand. This applies to **every** run, not only ones that end
 in `noop`: a weekly run that skips a blocked item and then successfully opens a port PR
 would otherwise repost the identical blocker comment every week forever.
+
+**Reserve the last comment for the terminal report.** `add-comment` is capped at ten
+per run and the cap is enforced by the tooling, not by you — the eleventh call is
+dropped, not queued. The do-not-repeat rule bounds comments *across* runs but not
+*within* one, so a run that newly skips ten items would spend the entire allowance on
+skip notices and have nothing left to announce how it ended. So: **post at most nine
+per-item skip comments in a single run.** If a tenth item needs one, stop posting them
+individually and name the remaining skipped items in the terminal announcement instead
+— one comment listing them all, on the last of them if the run ends in `noop`, or in
+the pull request body if the run went on to port something.
 
 The run exits `success` either way, so an unannounced stop is indistinguishable from a
 healthy week. Five consecutive green runs hid the #71 deadlock precisely because a
