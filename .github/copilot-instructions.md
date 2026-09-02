@@ -94,9 +94,16 @@ If nothing safe will do:
 3. Say the same thing in the pull request body. An `#[allow(unsafe_code)]` with
    no stated alternative is a review blocker.
 
-Two places do this today: `src/platform/clock.rs` (ESP-IDF's
-`esp_timer_get_time`) and `examples/rusthut.rs` (Windows console mode). Each
+One place does this today: `examples/rusthut.rs` (Windows console mode), which
 names the crates it evaluated and why they were rejected.
+
+Note what is *not* on that list. `src/platform/clock.rs` reads ESP-IDF's
+`esp_timer_get_time` through `esp_idf_svc::timer::EspTaskTimerService::now()`,
+a safe wrapper over the identical call. A target-gated dependency
+(`[target.'cfg(target_os = "espidf")'.dependencies]`) does not reach hosted
+targets, so "that crate drags in a build script" is not on its own a reason to
+hand-roll FFI — verify the claim with
+`cargo metadata --filter-platform <host-triple>` before relying on it.
 
 ## LinkAudio (`audio` feature)
 
@@ -142,7 +149,13 @@ The `examples/esp32/` directory is a standalone Cargo project (not a workspace m
 `xtensa-esp32-espidf` with its own toolchain and dependencies.
 
 When modifying ESP32-related code:
-1. The main library should NOT depend on `esp-idf-svc` or `esp-idf-hal` — those are example-only deps
+1. The library takes `esp-idf-svc` only as a `cfg(target_os = "espidf")` target
+   dependency, for the safe `EspTaskTimerService::now()` clock read. Keep it
+   target-gated — it must never enter the host dependency graph. Verify with
+   `cargo metadata --filter-platform $(rustc -vV | grep host | cut -d' ' -f2)`.
+   `esp-idf-hal` and `esp-idf-sys` remain example-only.
 2. ESP32 platform code uses `#[cfg(target_os = "espidf")]` gates
-3. The ESP32 example cannot be cross-compiled in CI — only structure checks are run
+3. The ESP32 example cannot be cross-compiled in CI — only structure checks are
+   run, so `cfg(target_os = "espidf")` code is **never compiled by CI**. Changes
+   to it carry no automated proof; review them by hand against the upstream API.
 4. Test ESP32 clock changes by verifying the `ClockTrait` contract on native targets
