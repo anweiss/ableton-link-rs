@@ -200,11 +200,12 @@ note = "Partially ported; deliberately left outstanding. Done: `platform::Thread
 id = "add-operator-for-sessionstate"
 title = "Add `==` operator for SessionState"
 upstream = ["90d6b7c2d3e3"]
-rust = ["src/link/state.rs"]
+rust = ["src/link/mod.rs"]
 risk = "internal"
-status = "outstanding"
-retired_at_pin = ""
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "`SessionState` lacked equality; added for use in Link session state comparison logic"
+note = "Already ported in PR #89 (`feat: add PartialEq for SessionState and ApiState`), which derived `PartialEq` on `link::mod::ApiState`/`SessionState` and added a regression test (`test_session_state_equality`). The backlog entry was never flipped to `retired`; this commit is bookkeeping only, no Rust change. Pin not advanced further: earlier ancestry positions (e.g. `7418012c2b2a`/`eefe514d1846`, the thread-priority item) remain outstanding."
 
 [[port]]
 id = "fix-rare-crash-during-initialization-callbackdispatcher-ordering"
