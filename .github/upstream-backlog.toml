@@ -193,7 +193,7 @@ rust = ["src/platform/thread.rs"]
 risk = "behavior"
 status = "retired"
 retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
-why = "The IO thread now requests `SCHED_FIFO`/high-priority scheduling; improves clock-sync quality under load"
+why = "Adds `platform::ThreadPriority` so a thread driving time-critical Link work can request `SCHED_FIFO`/high-priority scheduling; improves clock-sync quality under load. Upstream calls it only from its `linkaudiohut` example via `callOnLinkThread`, never from the library."
 note = "Retired non-contiguously: the pin stays at `334972b404d7` because `90d6b7c2d3e3` and 19 other still-undecided commits sit between the pin and `7418012c2b2a` in ancestry order, so advancing the watermark would have silently skipped them. Ported as `platform::ThreadPriority` (`set_high`/`reset`), mirroring upstream's final capture/restore shape from `eefe514d1846` rather than the stateless functor from `7418012c2b2a`. Implemented over the `audio_thread_priority` crate rather than hand-rolled FFI, so the port carries no `unsafe`; see `src/platform/thread.rs` for the three documented deviations from upstream's raw parameters."
 
 [[port]]

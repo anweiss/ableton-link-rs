@@ -51,18 +51,26 @@ impl ThreadFactory {
 /// | Windows | MMCSS (`AvSetMmThreadCharacteristicsW`) | same |
 /// | Other | no-op reporting success | same |
 ///
-/// Three parameter-level deviations from upstream are deliberate, because the
-/// crate owns these numbers and they are not worth forking it over. None is
-/// network-visible; this is host-side scheduling only.
+/// Three deviations from upstream are deliberate. The crate owns these
+/// numbers, none of them is network-visible (this is host-side scheduling
+/// only), and none is worth forking it or hand-writing FFI over.
 ///
-/// 1. **macOS duty cycle.** Upstream asks for `computation = 0.2 * period`;
+/// 1. **Linux realtime priority.** Upstream asks for `SCHED_FIFO` priority 35;
+///    the crate asks for 10. The crate does expose a `set_rt_priority`
+///    override, but it writes a *process-global* atomic that is never
+///    restored, so calling it from a library would silently re-point every
+///    other user of the crate in the same process. It is also absent whenever
+///    the crate's `dbus` feature is enabled, and Cargo features are additive:
+///    a downstream crate turning `dbus` on would stop this crate compiling.
+///    Both are unacceptable for a library, so the default stands.
+/// 2. **macOS duty cycle.** Upstream asks for `computation = 0.2 * period`;
 ///    the crate asks for `period / 2`, tracking macOS 12's own behaviour. Both
 ///    request the same time-constraint policy.
-/// 2. **Windows MMCSS task.** Upstream registers as `"Distribution"`; the
-///    crate registers as `"Pro Audio"`. Both are MMCSS classes, and `Pro
-///    Audio` is the stricter one for time-critical audio work.
-/// 3. **Linux realtime priority.** The crate defaults to 10; upstream uses 35,
-///    so `set_high` requests 35 explicitly to match.
+/// 3. **Windows MMCSS task.** Upstream registers the `Distribution` task and
+///    then calls `AvSetMmThreadPriority(.., AVRT_PRIORITY_HIGH)`; the crate
+///    registers the `Audio` task and does not raise within it. Both obtain
+///    MMCSS scheduling; this port does not reach upstream's boosted tier.
+///
 pub struct ThreadPriority {
     handle: Option<audio_thread_priority::RtPriorityHandle>,
 }
@@ -96,18 +104,6 @@ impl ThreadPriority {
             return;
         }
 
-        // Upstream's Linux path asks for `SCHED_FIFO` priority 35; the crate
-        // would otherwise use 10. This is only exported on Linux when the
-        // crate's `dbus` feature is off, which is how this crate depends on it
-        // (`default-features = false`). If `dbus` is ever unified on by another
-        // dependency this stops compiling, which is the outcome we want: the
-        // scheduling mechanism would have silently changed to rtkit.
-        #[cfg(target_os = "linux")]
-        audio_thread_priority::set_rt_priority(Some(35));
-
-        // A 48-frame buffer at 48 kHz is a 1 ms period, matching upstream's
-        // macOS time-constraint period (`link_audio::MainController`'s timer
-        // period). Ignored on the platforms that do not derive a duty cycle.
         match audio_thread_priority::promote_current_thread_to_real_time(48, 48_000) {
             Ok(handle) => self.handle = Some(handle),
             Err(e) => {
