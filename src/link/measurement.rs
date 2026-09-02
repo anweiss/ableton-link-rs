@@ -502,7 +502,7 @@ impl Measurement {
 
         info!("sending initial host time ping {:?}", ht);
 
-        let init_bytes_sent = send_ping(
+        let init_bytes_sent = match send_ping(
             unicast_socket.clone(),
             *state.measurement_endpoint.as_ref().unwrap(),
             &Payload {
@@ -510,7 +510,17 @@ impl Measurement {
             },
         )
         .await
-        .unwrap();
+        {
+            Ok(bytes_sent) => bytes_sent,
+            Err(e) => {
+                debug!(
+                    "failed to send initial ping to {}: {}",
+                    state.measurement_endpoint.as_ref().unwrap(),
+                    e
+                );
+                0
+            }
+        };
 
         measurement.init_bytes_sent = init_bytes_sent;
 
@@ -588,7 +598,9 @@ impl Measurement {
                             ],
                         };
 
-                        let _ = send_ping(socket.clone(), endpoint, &payload).await.unwrap();
+                        if let Err(e) = send_ping(socket.clone(), endpoint, &payload).await {
+                            debug!("failed to send ping to {}: {}", endpoint, e);
+                        }
 
                         if ghost_time != Duration::microseconds(0)
                             && prev_host_time != Duration::microseconds(0)
@@ -695,7 +707,14 @@ pub async fn send_ping(
     measurement_endpoint: SocketAddrV4,
     payload: &Payload,
 ) -> io::Result<usize> {
-    let message = encode_message(PING, payload).unwrap();
+    let message = match encode_message(PING, payload) {
+        Ok(message) => message,
+        Err(e) => {
+            // Surface the encode failure through the existing `io::Result` so
+            // the send paths log and drop it rather than aborting.
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, e.to_string()));
+        }
+    };
     debug!(
         "sending ping message to measurement endpoint {}",
         measurement_endpoint
