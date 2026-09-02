@@ -35,6 +35,12 @@ impl ThreadFactory {
 /// `set_high` captures the thread's current scheduling parameters the first
 /// call and is a no-op on subsequent calls until `reset` is called; `reset`
 /// restores the captured parameters and is a no-op if nothing was captured.
+///
+/// The captured state is thread-affine — the parameters belong to whichever
+/// thread called `set_high`, and on Windows `AvRevertMmThreadCharacteristics`
+/// must run on the thread that created the handle. The type is therefore
+/// deliberately `!Send`: it must be constructed, used and dropped on a single
+/// thread.
 #[derive(Debug, Default)]
 pub struct ThreadPriority {
     #[cfg(target_os = "linux")]
@@ -43,13 +49,30 @@ pub struct ThreadPriority {
     original: Option<mach2::thread_policy::thread_time_constraint_policy_data_t>,
     #[cfg(target_os = "windows")]
     original: Option<winapi::shared::ntdef::HANDLE>,
+    /// Pins the captured, thread-affine state to its originating thread by
+    /// making the type neither `Send` nor `Sync`.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
-// SAFETY: `HANDLE` is a raw pointer, but the value ThreadPriority stores is an
-// opaque MMCSS task handle owned solely by this struct; it is never
-// dereferenced, only passed back to AvRevertMmThreadCharacteristics.
+/// Minimal MMCSS (`avrt.dll`) bindings.
+///
+/// Declared locally rather than imported from `winapi::um::avrt` because that
+/// module is gated behind winapi's `avrt` feature, and this workflow may not
+/// modify `Cargo.toml`. The signatures match `avrt.h` exactly.
 #[cfg(target_os = "windows")]
-unsafe impl Send for ThreadPriority {}
+mod avrt {
+    use winapi::shared::minwindef::{BOOL, DWORD, LPDWORD};
+    use winapi::shared::ntdef::{HANDLE, LPCWSTR};
+
+    pub const AVRT_PRIORITY_HIGH: DWORD = 1;
+
+    #[link(name = "avrt")]
+    extern "system" {
+        pub fn AvSetMmThreadCharacteristicsW(TaskName: LPCWSTR, TaskIndex: LPDWORD) -> HANDLE;
+        pub fn AvSetMmThreadPriority(AvrtHandle: HANDLE, Priority: DWORD) -> BOOL;
+        pub fn AvRevertMmThreadCharacteristics(avrt_handle: HANDLE) -> BOOL;
+    }
+}
 
 impl ThreadPriority {
     pub fn new() -> Self {
@@ -113,23 +136,19 @@ impl ThreadPriority {
             thread_policy_set, thread_time_constraint_policy_data_t, THREAD_TIME_CONSTRAINT_POLICY,
             THREAD_TIME_CONSTRAINT_POLICY_COUNT,
         };
-        use mach2::traps::mach_task_self;
 
         if self.original.is_none() {
             self.capture_macos();
         }
 
-        // SAFETY: `mach_thread_self` is not exposed by mach2, so we use
-        // `pthread_self`/`mach_task_self` in combination is not applicable
-        // here; instead we operate on the calling thread via
-        // `mach2::mach_init::mach_thread_self`.
-        let this_thread = unsafe { mach2::mach_init::mach_thread_self() };
-
-        let mut info = std::mem::MaybeUninit::<libc::mach_timebase_info>::uninit();
+        let mut info = std::mem::MaybeUninit::<mach2::mach_time::mach_timebase_info>::uninit();
         // SAFETY: `info` is a valid out-parameter for `mach_timebase_info`.
-        unsafe {
-            libc::mach_timebase_info(info.as_mut_ptr());
+        let info_result = unsafe { mach2::mach_time::mach_timebase_info(info.as_mut_ptr()) };
+        if info_result != mach2::kern_return::KERN_SUCCESS {
+            return;
         }
+        // SAFETY: `mach_timebase_info` returned KERN_SUCCESS, so `info` is
+        // initialized.
         let info = unsafe { info.assume_init() };
         let mach_ratio = info.denom as f64 / info.numer as f64;
         let millisecond = mach_ratio * 1_000_000.0;
@@ -147,17 +166,20 @@ impl ThreadPriority {
             preemptible: 1,
         };
 
-        // SAFETY: `policy` is a valid, fully-initialized
+        // SAFETY: `mach_thread_self` returns an owned send right to the
+        // calling thread's port, `policy` is a valid, fully-initialized
         // `thread_time_constraint_policy_data_t` matching
-        // `THREAD_TIME_CONSTRAINT_POLICY_COUNT`, and `this_thread` was just
-        // obtained from `mach_thread_self`.
+        // `THREAD_TIME_CONSTRAINT_POLICY_COUNT`, and the send right is
+        // released again with `mach_port_deallocate` before returning.
         unsafe {
+            let this_thread = mach2::mach_init::mach_thread_self();
             thread_policy_set(
                 this_thread,
                 THREAD_TIME_CONSTRAINT_POLICY,
                 &mut policy as *mut _ as mach2::thread_policy::thread_policy_t,
                 THREAD_TIME_CONSTRAINT_POLICY_COUNT,
             );
+            mach2::mach_port::mach_port_deallocate(mach2::traps::mach_task_self(), this_thread);
         }
     }
 
@@ -170,17 +192,19 @@ impl ThreadPriority {
         };
 
         if let Some(mut policy) = self.original.take() {
-            let this_thread = unsafe { mach2::mach_init::mach_thread_self() };
-            // SAFETY: `policy` was previously captured from a successful
-            // `thread_policy_get` call and is a valid
-            // `thread_time_constraint_policy_data_t`.
+            // SAFETY: `mach_thread_self` returns an owned send right to the
+            // calling thread's port, `policy` was previously captured from a
+            // successful `thread_policy_get` call, and the send right is
+            // released again with `mach_port_deallocate` before returning.
             unsafe {
+                let this_thread = mach2::mach_init::mach_thread_self();
                 thread_policy_set(
                     this_thread,
                     THREAD_TIME_CONSTRAINT_POLICY,
                     &mut policy as *mut _ as mach2::thread_policy::thread_policy_t,
                     THREAD_TIME_CONSTRAINT_POLICY_COUNT,
                 );
+                mach2::mach_port::mach_port_deallocate(mach2::traps::mach_task_self(), this_thread);
             }
         }
     }
@@ -192,7 +216,6 @@ impl ThreadPriority {
             THREAD_TIME_CONSTRAINT_POLICY_COUNT,
         };
 
-        let this_thread = unsafe { mach2::mach_init::mach_thread_self() };
         let mut policy = thread_time_constraint_policy_data_t {
             period: 0,
             computation: 0,
@@ -201,17 +224,21 @@ impl ThreadPriority {
         };
         let mut count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
         let mut get_default = 0;
-        // SAFETY: `policy`, `count` and `get_default` are valid
-        // out-parameters for `thread_policy_get`, and `this_thread` was
-        // just obtained from `mach_thread_self`.
+        // SAFETY: `mach_thread_self` returns an owned send right to the
+        // calling thread's port; `policy`, `count` and `get_default` are
+        // valid out-parameters for `thread_policy_get`; and the send right is
+        // released again with `mach_port_deallocate` before returning.
         let result = unsafe {
-            thread_policy_get(
+            let this_thread = mach2::mach_init::mach_thread_self();
+            let result = thread_policy_get(
                 this_thread,
                 THREAD_TIME_CONSTRAINT_POLICY,
                 &mut policy as *mut _ as mach2::thread_policy::thread_policy_t,
                 &mut count,
                 &mut get_default,
-            )
+            );
+            mach2::mach_port::mach_port_deallocate(mach2::traps::mach_task_self(), this_thread);
+            result
         };
         if result == mach2::kern_return::KERN_SUCCESS {
             self.original = Some(policy);
@@ -223,8 +250,9 @@ impl ThreadPriority {
     /// already been raised and not yet reset.
     #[cfg(target_os = "windows")]
     pub fn set_high(&mut self) {
-        use winapi::um::avrt::AVRT_PRIORITY_HIGH;
-        use winapi::um::avrt::{AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority};
+        use crate::platform::thread::avrt::{
+            AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, AVRT_PRIORITY_HIGH,
+        };
 
         if self.original.is_some() {
             return;
@@ -249,7 +277,7 @@ impl ThreadPriority {
     /// if `set_high` did not successfully raise the priority.
     #[cfg(target_os = "windows")]
     pub fn reset(&mut self) {
-        use winapi::um::avrt::AvRevertMmThreadCharacteristics;
+        use crate::platform::thread::avrt::AvRevertMmThreadCharacteristics;
 
         if let Some(handle) = self.original.take() {
             // SAFETY: `handle` was previously returned by a successful call

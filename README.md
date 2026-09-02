@@ -330,6 +330,36 @@ let current_time = clock.micros(); // chrono::Duration
 | Other | `std::time::Instant` fallback |
 | ESP32 (ESP-IDF) | `esp_timer_get_time()` |
 
+## Thread Priority
+
+`platform::ThreadPriority` raises (and can later restore) the scheduling priority
+of the *calling* thread. It is intended to be called from a thread that drives
+time-critical Link work, mirroring upstream's `platform::ThreadPriority`:
+
+```rust
+use ableton_link::platform::ThreadPriority;
+
+let mut priority = ThreadPriority::new();
+priority.set_high(); // capture current params, then raise
+// ... time-critical work on this thread ...
+priority.reset();    // restore the captured params
+```
+
+`set_high` captures the thread's current scheduling parameters on the first call
+and is a no-op until `reset` is called; `reset` restores them and is a no-op if
+nothing was captured. The type is `!Send`: the captured state is thread-affine
+and must be used and dropped on the thread that called `set_high`.
+
+| Platform | Mechanism | Privileges |
+|----------|-----------|------------|
+| Linux | `pthread_setschedparam` with `SCHED_FIFO`, priority 35 | Requires `CAP_SYS_NICE` or a suitable `RLIMIT_RTPRIO`; silently has no effect otherwise |
+| macOS | mach `thread_policy_set` with `THREAD_TIME_CONSTRAINT_POLICY` | None |
+| Windows | MMCSS `AvSetMmThreadCharacteristicsW("Distribution")` + `AVRT_PRIORITY_HIGH` | None |
+| Other | No-op | — |
+
+Failures are not reported: as upstream, both methods are best-effort and never
+panic or return an error.
+
 ## Architecture
 
 ```
