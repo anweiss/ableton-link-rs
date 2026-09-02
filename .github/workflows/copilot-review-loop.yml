@@ -1147,12 +1147,83 @@ jobs:
                 return;
               }
 
+              // Sign-off used to be inferred: zero outstanding inline comments
+              // meant clean. Auto-approval broke that inference. A verdict of
+              // `🔵 Needs a closer look` submits as `COMMENTED` with NO inline
+              // comments at all and hides its findings in the review body under
+              // a `Suppressed comments` section - so it reads as clean, earns
+              // `copilot-reviewed`, and arms auto-merge on a review that
+              // explicitly declined to approve. Observed on #145 at `1b3f926`'s
+              // predecessor, where the suppressed finding was a real defect.
+              //
+              // So require POSITIVE evidence instead. Every Copilot overview
+              // review carries `<!-- ccr-overview-v2 -->` and a verdict heading;
+              // only the green one means clean.
+              const OVERVIEW_MARKER = '<!-- ccr-overview-v2 -->';
+              const overview = reviews
+                .filter(r => r.submitted_at && (r.body || '').includes(OVERVIEW_MARKER))
+                .sort((a, b) => new Date(a.submitted_at) - new Date(b.submitted_at))
+                .pop();
+              const overviewVerdict = overview
+                ? ((overview.body.match(/^###[ \t]+(.+?)[ \t]*$/m) || [])[1] || null)
+                : null;
+              // Tri-state on purpose, and it fails CLOSED. `null` means no
+              // overview review exists at this head at all - an older format,
+              // or a review that predates auto-approval - and there the old
+              // inference is still the best available signal, so it falls
+              // through. But a heading that is present and simply not green
+              // parks, whatever it says: an unrecognised verdict is far more
+              // likely to be a new non-approving one than a renamed approval,
+              // and the cost of guessing wrong is a merged defect versus a
+              // pull request that waits for me.
+              const overviewClean = overviewVerdict
+                ? overviewVerdict.includes('🟢')
+                : null;
+              const suppressed = overview
+                ? /Suppressed comments \(\d+\)/.test(overview.body)
+                : false;
+
+              // Body-only findings: nothing to hand the fix agent, same as a
+              // body-only `CHANGES_REQUESTED` above, so park it for a human.
+              if (outstanding.length === 0 && overviewClean === false) {
+                await revoke(pr);
+                await writeState(number, handle, {
+                  phase: 'human-hold',
+                  reviewedSha: null,
+                  note: `Copilot returned \`${overviewVerdict}\` on \`${short}\` and left ` +
+                        'no inline comments' +
+                        (suppressed
+                          ? ', with its findings in the review body under ' +
+                            '**Suppressed comments**'
+                          : '') +
+                        '. There is nothing to hand the fix agent, and this is not an ' +
+                        'approval. Read the review body and push a fix. ' +
+                        '`copilot-reviewed` is withheld and auto-merge stays disengaged.',
+                });
+                core.warning(
+                  `PR #${number}: '${overviewVerdict}' with no inline comments.`,
+                );
+                return;
+              }
+
               // Deliberately still gated on `outstanding.length === 0` rather
               // than on `approved`. Copilot can approve while leaving
               // non-blocking suggestions, and this repository's standing rule
               // is that every review finding is resolved before merge. An
               // approval is therefore recorded, not obeyed.
               if (outstanding.length === 0) {
+                // An approving review can still carry suppressed comments -
+                // #142's `APPROVED` did. Those are Copilot's own low-severity
+                // holdbacks rather than a withheld verdict, so they do not
+                // block sign-off, but they are the one class of finding that
+                // never appears as a thread, so say so rather than let them
+                // merge unread.
+                if (suppressed) {
+                  core.warning(
+                    `PR #${number}: approving review carries suppressed comments; ` +
+                    'read the review body before merging.',
+                  );
+                }
                 // One read governs this entire decision. `pr` was fetched at
                 // the top of `reconcile`, several API calls ago - reviews, then
                 // their comments - so it is too stale to sign off from. Every
