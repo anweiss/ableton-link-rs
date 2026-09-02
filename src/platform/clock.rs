@@ -94,8 +94,8 @@ mod espidf_clock {
             // `EspTimerService::<Task>::new()` is `Ok(Self(Task))` upstream: it
             // holds no state and performs no hardware initialisation, so building
             // one per read is free and cannot fail in practice.
-            let timer = EspTaskTimerService::new()
-                .expect("EspTimerService::<Task>::new() is infallible");
+            let timer =
+                EspTaskTimerService::new().expect("EspTimerService::<Task>::new() is infallible");
             Duration::microseconds(timer.now().as_micros() as i64)
         }
     }
