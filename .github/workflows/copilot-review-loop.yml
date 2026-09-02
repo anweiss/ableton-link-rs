@@ -1086,21 +1086,29 @@ jobs:
               // `COMMENTED` regardless of verdict, so the only usable signal
               // was "did it leave inline comments". Now it can also submit
               // `APPROVED` or `CHANGES_REQUESTED`, and both need handling.
-              // Only the LATEST review carries the current verdict. Asking
-              // `some` over every review at this head lets a superseded state
-              // dominate: an early `CHANGES_REQUESTED` would hold the pull
-              // request on `human-hold` forever after a later approval of the
-              // same SHA, and an early approval would let the sign-off note
-              // claim an approval that has since been retracted.
+              // Only the latest DECISIVE review carries the current verdict.
+              //
+              // Two separate traps here. First, asking `some` over every review
+              // at this head lets a superseded state dominate: an early
+              // `CHANGES_REQUESTED` would hold the pull request on `human-hold`
+              // forever after a later approval of the same SHA. Second - and
+              // this is the one that reopens the hole this whole block exists
+              // to close - `COMMENTED` is NEUTRAL. It does not supersede
+              // anything. Taking the latest review of any state would let a
+              // later comment-only review mask an active body-only
+              // `CHANGES_REQUESTED` and fall straight through to sign-off. So
+              // only `APPROVED` and `CHANGES_REQUESTED` are allowed to decide,
+              // which is also how GitHub itself resolves review state.
               //
               // Comment tracking above deliberately still spans *every* review
               // at this head - a finding is not resolved just because a newer
               // review exists - so only the verdict is narrowed here.
-              const latest = reviews
-                .filter(r => r.submitted_at)
+              const decisive = reviews
+                .filter(r => r.submitted_at &&
+                             (r.state === 'APPROVED' || r.state === 'CHANGES_REQUESTED'))
                 .sort((a, b) => new Date(a.submitted_at) - new Date(b.submitted_at))
                 .pop();
-              const verdict = latest ? latest.state : null;
+              const verdict = decisive ? decisive.state : null;
               const approved = verdict === 'APPROVED';
               const changesRequested = verdict === 'CHANGES_REQUESTED';
 
