@@ -11,3 +11,5 @@ pub mod link;
 pub mod link_audio;
 #[cfg(feature = "std")]
 pub mod platform;
+
+// post-merge negative control for the README maintenance check.
