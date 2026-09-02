@@ -362,14 +362,19 @@ mechanisms upstream uses:
 | Android | `setpriority` to nice -19 (urgent audio) | None |
 | Everything else | No-op | — |
 
-Three deviations from upstream are deliberate and documented on the type:
-upstream asks for `SCHED_FIFO` priority 35 rather than 10 (the crate's override
-for this writes a process-global that is never restored, and disappears when its
-`dbus` feature is enabled, so a library must not call it); macOS asks for
-`computation = period / 2` rather than `0.2 * period`; and Windows registers the
-`Audio` MMCSS task rather than `Distribution` with an additional
-`AVRT_PRIORITY_HIGH` boost. None is network-visible — this is host-side
-scheduling only.
+Three deviations from upstream are deliberate and documented on the type. In each
+case the crate's behaviour is given first, then upstream's:
+
+- **Linux priority** — the crate uses `SCHED_FIFO` priority 10; upstream uses 35.
+  The crate's override for this writes a process-global that is never restored,
+  and is absent when its `dbus` feature is enabled, so a library must not call it.
+- **macOS time constraint** — the crate asks for `computation = period / 2`;
+  upstream asks for `0.2 * period`.
+- **Windows task class** — the crate registers the `Audio` MMCSS task and never
+  calls `AvSetMmThreadPriority`; upstream registers `Distribution` and
+  additionally boosts to `AVRT_PRIORITY_HIGH`.
+
+None is network-visible — this is host-side scheduling only.
 
 Upstream invokes `ThreadPriority` only from its `linkaudiohut` example, through
 `link.callOnLinkThread` — never from the library. This port has no
