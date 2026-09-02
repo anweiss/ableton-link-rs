@@ -66,13 +66,21 @@ impl ClockTrait for SafeClock {
 
 // ESP-IDF clock implementation using esp_timer_get_time() for microsecond precision.
 // This mirrors the C++ Ableton Link reference implementation's ESP32 platform code.
+//
+// Read through `esp_idf_svc::timer::EspTaskTimerService`, whose `now()` is a safe
+// wrapper over this very same `esp_timer_get_time()` call (esp-idf-svc v0.51.0,
+// `src/timer.rs:202`). The module therefore needs no `unsafe`, and the
+// package-wide `unsafe_code = "deny"` applies to it unmodified. The dependency is
+// gated to `cfg(target_os = "espidf")`, so ESP-IDF's build script never runs for
+// the hosted targets that do not compile this module.
+//
+// `esp_idf_svc::systime::EspSystemTime` is *not* an alternative: its `now()` reads
+// `gettimeofday`, a settable wall clock, whereas Link requires a monotonic
+// since-boot source.
 #[cfg(target_os = "espidf")]
 mod espidf_clock {
     use chrono::Duration;
-
-    unsafe extern "C" {
-        fn esp_timer_get_time() -> i64;
-    }
+    use esp_idf_svc::timer::EspTaskTimerService;
 
     #[derive(Clone, Copy, Debug)]
     pub struct EspClock;
@@ -83,7 +91,12 @@ mod espidf_clock {
         }
 
         pub fn micros(&self) -> Duration {
-            Duration::microseconds(unsafe { esp_timer_get_time() })
+            // `EspTimerService::<Task>::new()` is `Ok(Self(Task))` upstream: it
+            // holds no state and performs no hardware initialisation, so building
+            // one per read is free and cannot fail in practice.
+            let timer =
+                EspTaskTimerService::new().expect("EspTimerService::<Task>::new() is infallible");
+            Duration::microseconds(timer.now().as_micros() as i64)
         }
     }
 

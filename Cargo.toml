@@ -2,6 +2,18 @@
 name = "ableton-link-rs"
 version = "0.3.0"
 edition = "2021"
+# Enforced, not just advertised. Four floors were checked and this is the
+# highest that binds library consumers:
+#   - `[lints.rust]` below needs the `lints` table, stabilized in Cargo 1.74.
+#   - `esp-idf-svc` requires 1.77.
+#   - The normal+build dependency graph requires 1.85 (`rand`, `getrandom`).
+#   - This crate's own code calls `u*::is_multiple_of`, stable since 1.87
+#     (`src/link/median.rs`, `src/link/measurement.rs`). Declaring rust-version
+#     is what surfaced this: clippy's `incompatible_msrv` now enforces it.
+# Building the test suite additionally pulls dev-dependencies that require 1.88
+# (`tonic`, `hdrhistogram` via `console-subscriber`); that binds contributors,
+# not consumers, so it is documented in the README rather than set here.
+rust-version = "1.87"
 description = "Native Rust implementation of the Ableton Link protocol"
 license = "GPL-3.0"
 repository = "https://github.com/anweiss/ableton-link-rs"
@@ -90,6 +102,20 @@ winapi = { version = "0.3", features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"
 
+# Supplies the safe `EspTaskTimerService::now()` wrapper that `platform::clock`
+# uses instead of declaring `esp_timer_get_time` as a raw C symbol. Gated to the
+# ESP-IDF target so its build script never runs for hosted targets. Version
+# tracks the one `examples/esp32/Cargo.toml` already pins.
+#
+# `default-features = false` drops esp-idf-svc's default `std` and `binstart`:
+# `std` would cross this crate's own `std` feature boundary, and `binstart`
+# imposes a binary entry point, which a library must not do. `alloc` is not
+# optional — esp-idf-svc gates `pub mod timer` behind
+# `cfg(all(feature = "alloc", esp_idf_comp_esp_timer_enabled))`, so dropping it
+# removes the very module this dependency is here for.
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-svc = { version = "0.51", default-features = false, features = ["alloc"] }
+
 [dev-dependencies]
 console-subscriber = "0.5.0"
 
@@ -105,3 +131,15 @@ path = "examples/platform_demo.rs"
 name = "link_audio"
 path = "examples/link_audio.rs"
 required-features = ["audio"]
+
+# Enforced package-wide rather than as an inner attribute in `src/lib.rs`,
+# because `--all-targets` builds examples and integration tests as their own
+# crates, which a `#![deny]` in the library root does not reach.
+#
+# This is a port of a C++ library, so the tempting shape for every
+# platform-facing item is a hand-written FFI shim. Prefer a crate that already
+# wraps the OS mechanism. Opting out is deliberate and reviewable: add
+# `#[allow(unsafe_code)]` at the narrowest possible scope, with a comment naming
+# the crates evaluated and why each was rejected.
+[lints.rust]
+unsafe_code = "deny"

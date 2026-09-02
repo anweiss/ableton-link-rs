@@ -344,9 +344,20 @@ success without having run a single audio test. The final `cargo check --all-tar
 covers the opposite risk: that a change compiles only *with* `audio` enabled and
 breaks the default build everyone else gets.
 
-If your change touches `src/link_audio/`, also confirm the module still has no
-`unsafe` — it is `#![forbid(unsafe_code)]`, so a violation shows up as a compile
-error under `--all-features` rather than as a lint.
+**Do not write `unsafe`.** `Cargo.toml` sets `unsafe_code = "deny"` under
+`[lints.rust]`, covering examples and tests as well as the library, so
+hand-rolled FFI fails the build on every target rather than merely reading badly.
+Upstream is C++ and many of its platform items look like they need an FFI shim;
+they usually do not. Search crates.io for a crate that already wraps the OS
+mechanism and use it, even when its parameters are not a byte-for-byte match with
+upstream's — document the deviations on the Rust type instead. A vetted crate is
+tested on Linux, macOS and Windows; a shim you wrote against documentation and
+compiled on one of them is not.
+
+If you genuinely cannot find one, add `#[allow(unsafe_code)]` at the narrowest
+scope that works, comment it with the crates you evaluated and why each was
+rejected, and repeat that in the pull request body. `src/link_audio/` is stricter
+still — `#![forbid(unsafe_code)]` there cannot be opted out of at all.
 
 If you cannot get them green, **do not open a pull request**. Open an issue instead
 describing the upstream change, what you tried, and the exact failure. A red PR costs
