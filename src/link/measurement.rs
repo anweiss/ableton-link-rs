@@ -881,4 +881,45 @@ mod tests {
         // Clean up
         drop(measurement);
     }
+
+    // Covers the send path itself, not just `encode_message`. An oversized
+    // payload must surface through the existing `io::Result` so the callers
+    // log and drop it. If this branch ever regresses to `unwrap()`, the
+    // oversized case below panics and this test fails.
+    #[tokio::test]
+    async fn send_ping_reports_an_oversized_payload_instead_of_panicking() {
+        use crate::link::encoding::PAYLOAD_ENTRY_HEADER_SIZE;
+        use crate::link::payload::HOST_TIME_SIZE;
+
+        let socket =
+            Arc::new(new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap());
+        // A real receiver, so the "well-formed payload still sends" half of
+        // this test cannot be satisfied by an unconditional early return.
+        let receiver = new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let to = match receiver.local_addr().unwrap() {
+            SocketAddr::V4(addr) => addr,
+            other => panic!("expected an IPv4 receiver address, got {}", other),
+        };
+
+        let entry_size = PAYLOAD_ENTRY_HEADER_SIZE + HOST_TIME_SIZE as usize;
+        let mut oversized = Payload::default();
+        for _ in 0..(MAX_MESSAGE_SIZE / entry_size + 1) {
+            oversized
+                .entries
+                .push(PayloadEntry::HostTime(HostTime::default()));
+        }
+
+        let err = send_ping(socket.clone(), to, &oversized)
+            .await
+            .expect_err("an oversized payload must be reported, not sent");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Guard against the inverse regression: an unconditional early error
+        // would also satisfy the assertion above, so prove a well-formed
+        // payload actually reaches the wire.
+        let small = Payload {
+            entries: vec![PayloadEntry::HostTime(HostTime::default())],
+        };
+        assert!(send_ping(socket, to, &small).await.unwrap() > 0);
+    }
 }
