@@ -26,6 +26,104 @@ impl ThreadFactory {
     }
 }
 
+/// Raises (and can later restore) the scheduling priority of the calling
+/// thread. Rust analogue of upstream's `platform::ThreadPriority`
+/// (`include/ableton/platforms/{linux,darwin,windows}/ThreadFactory.hpp`),
+/// intended to be called from the Link IO thread to improve clock-sync
+/// quality under system load.
+///
+/// `set_high` captures the thread's current scheduling parameters on the first
+/// call and is a no-op on subsequent calls until `reset` is called; `reset`
+/// restores the captured parameters and is a no-op if nothing was captured.
+/// Both are best-effort: as upstream, a failure to change scheduling is
+/// ignored rather than reported.
+///
+/// # Implementation
+///
+/// This is built on the `audio_thread_priority` crate rather than on
+/// hand-written FFI, so the port carries no `unsafe`. That crate drives the
+/// same three OS mechanisms upstream uses:
+///
+/// | Platform | Mechanism | Upstream |
+/// |----------|-----------|----------|
+/// | Linux | `pthread_setschedparam` with `SCHED_FIFO` | same |
+/// | macOS, iOS | mach `thread_policy_set`, `THREAD_TIME_CONSTRAINT_POLICY` | same on macOS; upstream has no iOS path |
+/// | Windows | MMCSS (`AvSetMmThreadCharacteristicsW`) | same |
+/// | Android | `setpriority` to nice -19 (urgent audio) | upstream has no Android path |
+/// | Everything else | no-op reporting success | same |
+///
+/// Three deviations from upstream are deliberate. The crate owns these
+/// numbers, none of them is network-visible (this is host-side scheduling
+/// only), and none is worth forking it or hand-writing FFI over.
+///
+/// 1. **Linux realtime priority.** Upstream asks for `SCHED_FIFO` priority 35;
+///    the crate asks for 10. The crate does expose a `set_rt_priority`
+///    override, but it writes a *process-global* atomic that is never
+///    restored, so calling it from a library would silently re-point every
+///    other user of the crate in the same process. It is also absent whenever
+///    the crate's `dbus` feature is enabled, and Cargo features are additive:
+///    a downstream crate turning `dbus` on would stop this crate compiling.
+///    Both are unacceptable for a library, so the default stands.
+/// 2. **macOS duty cycle.** Upstream asks for `computation = 0.2 * period`;
+///    the crate asks for `period / 2`, tracking macOS 12's own behaviour. Both
+///    request the same time-constraint policy.
+/// 3. **Windows MMCSS task.** Upstream registers the `Distribution` task and
+///    then calls `AvSetMmThreadPriority(.., AVRT_PRIORITY_HIGH)`; the crate
+///    registers the `Audio` task and does not raise within it. Both obtain
+///    MMCSS scheduling; this port does not reach upstream's boosted tier.
+///
+pub struct ThreadPriority {
+    handle: Option<audio_thread_priority::RtPriorityHandle>,
+}
+
+impl core::fmt::Debug for ThreadPriority {
+    // `RtPriorityHandle` is opaque and not `Debug`, so report only whether a
+    // priority is currently captured.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ThreadPriority")
+            .field("raised", &self.handle.is_some())
+            .finish()
+    }
+}
+
+impl Default for ThreadPriority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ThreadPriority {
+    pub fn new() -> Self {
+        Self { handle: None }
+    }
+
+    /// Raises the calling thread's scheduling priority, capturing the current
+    /// parameters so `reset` can restore them. No-op if a priority has already
+    /// been captured and not yet reset.
+    pub fn set_high(&mut self) {
+        if self.handle.is_some() {
+            return;
+        }
+
+        match audio_thread_priority::promote_current_thread_to_real_time(48, 48_000) {
+            Ok(handle) => self.handle = Some(handle),
+            Err(e) => {
+                tracing::debug!("could not raise Link thread priority: {e}");
+            }
+        }
+    }
+
+    /// Restores the scheduling priority captured by `set_high`. No-op if
+    /// nothing was captured.
+    pub fn reset(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            if let Err(e) = audio_thread_priority::demote_current_thread_from_real_time(handle) {
+                tracing::debug!("could not restore Link thread priority: {e}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +245,40 @@ mod tests {
                 name
             );
         }
+    }
+
+    // Scheduling changes need privileges this test runner may not have, so
+    // these assert the state machine, not that the OS honoured the request.
+
+    #[test]
+    fn starts_unraised() {
+        let p = ThreadPriority::new();
+        assert!(p.handle.is_none());
+        assert_eq!(format!("{p:?}"), "ThreadPriority { raised: false }");
+    }
+
+    #[test]
+    fn reset_without_set_high_is_a_noop() {
+        let mut p = ThreadPriority::default();
+        p.reset();
+        assert!(p.handle.is_none());
+    }
+
+    #[test]
+    fn set_high_is_idempotent_and_reset_clears() {
+        let mut p = ThreadPriority::new();
+        p.set_high();
+        let raised = p.handle.is_some();
+
+        // A second call must not capture a second handle over the first.
+        p.set_high();
+        assert_eq!(p.handle.is_some(), raised);
+
+        p.reset();
+        assert!(p.handle.is_none());
+
+        // And reset must stay a noop once already reset.
+        p.reset();
+        assert!(p.handle.is_none());
     }
 }

@@ -330,6 +330,65 @@ let current_time = clock.micros(); // chrono::Duration
 | Other | `std::time::Instant` fallback |
 | ESP32 (ESP-IDF) | `esp_timer_get_time()` (via `esp-idf-svc`) |
 
+## Thread Priority
+
+`platform::ThreadPriority` raises (and can later restore) the scheduling priority
+of the *calling* thread. It is intended to be called from a thread that drives
+time-critical Link work, mirroring upstream's `platform::ThreadPriority`:
+
+```rust
+use ableton_link_rs::platform::ThreadPriority;
+
+let mut priority = ThreadPriority::new();
+priority.set_high(); // capture current params, then raise
+// ... time-critical work on this thread ...
+priority.reset();    // restore the captured params
+```
+
+`set_high` captures the thread's current scheduling parameters on the first call
+and is a no-op until `reset` is called; `reset` restores them and is a no-op if
+nothing was captured. The captured state is thread-affine: `set_high` and the
+matching `reset` must run on the same thread.
+
+This is implemented over the [`audio_thread_priority`][atp] crate rather than
+hand-written FFI, so it contains no `unsafe`. The crate drives the same three OS
+mechanisms upstream uses:
+
+| Platform | Mechanism | Privileges |
+|----------|-----------|------------|
+| Linux | `pthread_setschedparam` with `SCHED_FIFO`, priority 10 | Requires `CAP_SYS_NICE` or a suitable `RLIMIT_RTPRIO`; has no effect otherwise |
+| macOS, iOS | mach `thread_policy_set` with `THREAD_TIME_CONSTRAINT_POLICY` | None |
+| Windows | MMCSS, `Audio` task class | None |
+| Android | `setpriority` to nice -19 (urgent audio) | None |
+| Everything else | No-op | — |
+
+Three deviations from upstream are deliberate and documented on the type. In each
+case the crate's behaviour is given first, then upstream's:
+
+- **Linux priority** — the crate uses `SCHED_FIFO` priority 10; upstream uses 35.
+  The crate's override for this writes a process-global that is never restored,
+  and is absent when its `dbus` feature is enabled, so a library must not call it.
+- **macOS time constraint** — the crate asks for `computation = period / 2`;
+  upstream asks for `0.2 * period`.
+- **Windows task class** — the crate registers the `Audio` MMCSS task and never
+  calls `AvSetMmThreadPriority`; upstream registers `Distribution` and
+  additionally boosts to `AVRT_PRIORITY_HIGH`.
+
+None is network-visible — this is host-side scheduling only.
+
+Upstream invokes `ThreadPriority` only from its `linkaudiohut` example, through
+`link.callOnLinkThread` — never from the library. This port has no
+`callOnLinkThread` equivalent: Link work runs as tasks on a shared Tokio
+runtime, and raising the priority of a shared worker would boost unrelated
+tasks. `ThreadPriority` is therefore public API for callers who drive
+time-critical Link work on a thread they own, in the same way `ThreadFactory`
+is exported without internal call sites.
+
+Failures are not reported: as upstream, both methods are best-effort and never
+panic or return an error. They are logged at `debug` level.
+
+[atp]: https://crates.io/crates/audio_thread_priority
+
 ## Architecture
 
 ```
