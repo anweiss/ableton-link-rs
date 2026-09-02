@@ -13,7 +13,7 @@ A native Rust implementation of [Ableton Link](https://ableton.github.io/link), 
 * **Platform-Specific Timing**: High-resolution clocks using `mach_absolute_time` (macOS), `clock_gettime` (Linux), and `QueryPerformanceCounter` (Windows)
 * **Session Management**: Automatic peer discovery, session state synchronization, and callbacks for tempo and peer audio-endpoint changes
 * **Start/Stop Sync**: Synchronization of play/stop states across devices
-* **Memory Safe**: Leverages Rust's ownership system for safe concurrent networking. The package sets `unsafe_code = "deny"` in `[lints.rust]`, covering examples and tests as well as the library, so platform integration goes through vetted wrapper crates rather than hand-written FFI. The two exceptions — the ESP-IDF clock binding and Windows console-mode handling in `examples/rusthut.rs` — are narrowly scoped and each documents the crates evaluated in its place
+* **Memory Safe**: Leverages Rust's ownership system for safe concurrent networking. The package sets `unsafe_code = "deny"` in `[lints.rust]`, covering examples and tests as well as the library, so platform integration goes through vetted wrapper crates rather than hand-written FFI. `src/` contains no `unsafe` at all; the single exception is Windows console-mode handling in `examples/rusthut.rs`, narrowly scoped and documenting the crates evaluated in its place
 * **LinkAudio (optional)**: Stream PCM audio between Link peers, aligned to the shared beat grid, behind the optional `audio` feature — a fully safe-Rust port of the upstream LinkAudio subsystem
 
 ## License
@@ -328,7 +328,7 @@ let current_time = clock.micros(); // chrono::Duration
 | Linux | `clock_gettime(CLOCK_MONOTONIC_RAW)` |
 | Windows | `QueryPerformanceCounter()` |
 | Other | `std::time::Instant` fallback |
-| ESP32 (ESP-IDF) | `esp_timer_get_time()` |
+| ESP32 (ESP-IDF) | `esp_timer_get_time()` (via `esp-idf-svc`) |
 
 ## Architecture
 
