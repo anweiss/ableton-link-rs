@@ -920,6 +920,28 @@ mod tests {
         let small = Payload {
             entries: vec![PayloadEntry::HostTime(HostTime::default())],
         };
-        assert!(send_ping(socket, to, &small).await.unwrap() > 0);
+        let sent = send_ping(socket, to, &small).await.unwrap();
+        assert!(sent > 0);
+
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("a well-formed ping should have been sent")
+        .expect("receiving the well-formed ping should succeed")
+        .0;
+        assert_eq!(received, sent);
+        // Exactly one datagram: the oversized message must not have been sent.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                receiver.recv_from(&mut buf),
+            )
+            .await
+            .is_err(),
+            "the oversized message must not be transmitted"
+        );
     }
 }
