@@ -34,6 +34,14 @@ jobs:
           script: |
             const ESCAPE_LABEL = 'docs-not-needed';
             const TRUSTED_LABEL = 'automation';
+            // Machine-generated metadata churn. Both are label-gated, so an outside
+            // contributor cannot reach either. release-please bumps the version in
+            // `Cargo.toml` on every release and Dependabot bumps dependency
+            // requirements; neither carries a documentation obligation, and gating
+            // them would wedge the release train behind a docs check. The residual
+            // risk is a Dependabot bump that raises the MSRV, which review still
+            // has to catch.
+            const EXEMPT_LABELS = ['autorelease: pending', 'dependencies'];
             const ESCAPE_MARKER = /<!--\s*docs-not-needed\s*-->/;
 
             const pr = context.payload.pull_request;
@@ -53,17 +61,28 @@ jobs:
               ...new Set(files.flatMap(f => [f.filename, f.previous_filename].filter(Boolean))),
             ];
 
-            // Only `src/**` is gated. Test-only, example-only and CI-only changes
-            // do not carry a documentation obligation, and gating them would make
-            // the check something people learn to route around.
-            const src = paths.filter(p => p.startsWith('src/'));
-            if (src.length === 0) {
-              core.notice('No `src/**` changes; README not required.');
+            // `src/**` plus `Cargo.toml`. The manifest is where feature flags,
+            // dependencies and the MSRV live, and the README policy names all
+            // three - gating only `src/**` would let the check claim coverage it
+            // did not have. Test-only, example-only and CI-only changes carry no
+            // documentation obligation, and gating those would make this something
+            // people learn to route around.
+            const guarded = paths.filter(p => p.startsWith('src/') || p === 'Cargo.toml');
+            if (guarded.length === 0) {
+              core.notice('No `src/**` or `Cargo.toml` changes; README not required.');
+              return;
+            }
+
+            const labels = (pr.labels || []).map(l => l.name);
+
+            const exempt = EXEMPT_LABELS.filter(l => labels.includes(l));
+            if (exempt.length > 0) {
+              core.notice(`Exempt: \`${exempt.join('`, `')}\`.`);
               return;
             }
 
             if (paths.includes('README.md')) {
-              core.notice(`README.md updated alongside ${src.length} file(s) under src/.`);
+              core.notice(`README.md updated alongside ${guarded.length} guarded file(s).`);
               return;
             }
 
@@ -78,7 +97,6 @@ jobs:
             // marker is honoured ONLY on a pull request that already carries
             // `automation`, which is itself label-gated and therefore trusted.
             // Otherwise a drive-by contributor could waive the check on themselves.
-            const labels = (pr.labels || []).map(l => l.name);
             if (labels.includes(ESCAPE_LABEL)) {
               core.notice(`Waived by the \`${ESCAPE_LABEL}\` label.`);
               return;
@@ -97,10 +115,10 @@ jobs:
               );
             }
 
-            const shown = src.slice(0, 10).map(p => `  - ${p}`).join('\n');
-            const more = src.length > 10 ? `\n  …and ${src.length - 10} more` : '';
+            const shown = guarded.slice(0, 10).map(p => `  - ${p}`).join('\n');
+            const more = guarded.length > 10 ? `\n  …and ${guarded.length - 10} more` : '';
             core.setFailed(
-              `This pull request changes ${src.length} file(s) under \`src/\` ` +
+              `This pull request changes ${guarded.length} guarded file(s) ` +
               `without touching \`README.md\`.\n\n${shown}${more}\n\n` +
               `\`.github/copilot-instructions.md\` requires the README to be updated ` +
               `in the same pull request when a change adds a feature or feature flag, ` +

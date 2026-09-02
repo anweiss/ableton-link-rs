@@ -13,7 +13,11 @@ Any time changes to the library warrant a documentation update, the `README.md` 
 - Changes to the project status or maturity
 
 This is enforced by CI, not left to review. The **README maintenance** check fails
-any pull request that changes `src/**` without changing `README.md`. When a change
+any pull request that changes `src/**` or `Cargo.toml` without changing `README.md`.
+`Cargo.toml` is guarded because feature flags, dependencies and the MSRV live there.
+Pull requests labelled `autorelease: pending` or `dependencies` are exempt — version
+bumps and dependency bumps are machine-generated and carry no documentation
+obligation. When a change
 genuinely carries no documentation obligation — an internal refactor, or a bug fix
 with no API surface — say so in the pull request body and either apply the
 `docs-not-needed` label or add `<!-- docs-not-needed -->` to the body. The marker is
