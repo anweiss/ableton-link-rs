@@ -13,7 +13,7 @@ A native Rust implementation of [Ableton Link](https://ableton.github.io/link), 
 * **Platform-Specific Timing**: High-resolution clocks using `mach_absolute_time` (macOS), `clock_gettime` (Linux), and `QueryPerformanceCounter` (Windows)
 * **Session Management**: Automatic peer discovery, session state synchronization, and callbacks for tempo and peer audio-endpoint changes
 * **Start/Stop Sync**: Synchronization of play/stop states across devices
-* **Memory Safe**: Leverages Rust's ownership system for safe concurrent networking. The crate carries `#![deny(unsafe_code)]`, so platform integration goes through vetted wrapper crates rather than hand-written FFI; the sole exception is the ESP-IDF clock binding, which is narrowly scoped and documented
+* **Memory Safe**: Leverages Rust's ownership system for safe concurrent networking. The package sets `unsafe_code = "deny"` in `[lints.rust]`, covering examples and tests as well as the library, so platform integration goes through vetted wrapper crates rather than hand-written FFI. The two exceptions — the ESP-IDF clock binding and Windows console-mode handling in `examples/rusthut.rs` — are narrowly scoped and each documents the crates evaluated in its place
 * **LinkAudio (optional)**: Stream PCM audio between Link peers, aligned to the shared beat grid, behind the optional `audio` feature — a fully safe-Rust port of the upstream LinkAudio subsystem
 
 ## License

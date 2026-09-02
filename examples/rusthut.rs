@@ -374,6 +374,12 @@ fn disable_buffered_input() {
         use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
         use winapi::um::wincon::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT};
 
+        // Windows console mode has no safe wrapper in this example's dependency
+        // set. Evaluated and rejected: `crossterm` and `console`, both of which
+        // do this safely but would pull a full terminal-UI stack into an example
+        // whose only need is two `SetConsoleMode` calls; the Unix side here uses
+        // `termios` directly for the same reason.
+        #[allow(unsafe_code)]
         unsafe {
             let handle = io::stdin().as_raw_handle();
             let mut mode: u32 = 0;
@@ -406,6 +412,12 @@ fn enable_buffered_input() {
         use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
         use winapi::um::wincon::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT};
 
+        // Windows console mode has no safe wrapper in this example's dependency
+        // set. Evaluated and rejected: `crossterm` and `console`, both of which
+        // do this safely but would pull a full terminal-UI stack into an example
+        // whose only need is two `SetConsoleMode` calls; the Unix side here uses
+        // `termios` directly for the same reason.
+        #[allow(unsafe_code)]
         unsafe {
             let handle = io::stdin().as_raw_handle();
             let mut mode: u32 = 0;

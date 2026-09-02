@@ -65,8 +65,11 @@ This library supports `no_std` environments via the `std` feature flag (enabled 
 
 ## Safe Rust by Default
 
-`src/lib.rs` carries `#![deny(unsafe_code)]`, so this rule is enforced by the
-compiler on every CI target, not by review.
+`Cargo.toml` sets `unsafe_code = "deny"` under `[lints.rust]`, so this rule is
+enforced by the compiler on every CI target, not by review. It is set there
+rather than as `#![deny(...)]` in `src/lib.rs` deliberately: `--all-targets`
+builds `examples/` and `tests/` as separate crates, which a library inner
+attribute does not reach.
 
 This is a port of a C++ library, which means the tempting shape for every
 platform-facing item is a hand-written FFI shim. That is almost never the right
@@ -91,8 +94,9 @@ If nothing safe will do:
 3. Say the same thing in the pull request body. An `#[allow(unsafe_code)]` with
    no stated alternative is a review blocker.
 
-`src/platform/clock.rs` is the one place this applies today: ESP-IDF's
-`esp_timer_get_time` has no safe wrapper in this crate's dependency set.
+Two places do this today: `src/platform/clock.rs` (ESP-IDF's
+`esp_timer_get_time`) and `examples/rusthut.rs` (Windows console mode). Each
+names the crates it evaluated and why they were rejected.
 
 ## LinkAudio (`audio` feature)
 

@@ -67,10 +67,15 @@ impl ClockTrait for SafeClock {
 // ESP-IDF clock implementation using esp_timer_get_time() for microsecond precision.
 // This mirrors the C++ Ableton Link reference implementation's ESP32 platform code.
 #[cfg(target_os = "espidf")]
-// ESP-IDF exposes `esp_timer_get_time` only as a C symbol; there is no safe
-// Rust wrapper for it in this crate's dependency set, so the declaration and
-// the call have to be `unsafe`. Scoped to this module so the crate-wide
-// `deny(unsafe_code)` in `lib.rs` still covers everything else.
+// ESP-IDF exposes `esp_timer_get_time` only as a C symbol, so the declaration
+// and the call have to be `unsafe`. Evaluated and rejected: `esp-idf-sys`,
+// which does bind this function safely, and `esp-idf-hal`/`esp-idf-svc`, which
+// re-export it — all three run the ESP-IDF build system from a build script and
+// require the Espressif toolchain to be installed to build *at all*. Taking any
+// of them would make a one-line clock read dictate the build requirements of
+// the whole crate, including on the hosted targets that never use this module.
+// Scoped to this module so the package-wide `unsafe_code = "deny"` still covers
+// everything else.
 #[allow(unsafe_code)]
 mod espidf_clock {
     use chrono::Duration;

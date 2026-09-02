@@ -344,7 +344,8 @@ success without having run a single audio test. The final `cargo check --all-tar
 covers the opposite risk: that a change compiles only *with* `audio` enabled and
 breaks the default build everyone else gets.
 
-**Do not write `unsafe`.** `src/lib.rs` carries `#![deny(unsafe_code)]`, so
+**Do not write `unsafe`.** `Cargo.toml` sets `unsafe_code = "deny"` under
+`[lints.rust]`, covering examples and tests as well as the library, so
 hand-rolled FFI fails the build on every target rather than merely reading badly.
 Upstream is C++ and many of its platform items look like they need an FFI shim;
 they usually do not. Search crates.io for a crate that already wraps the OS
