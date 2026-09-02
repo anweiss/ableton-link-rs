@@ -49,18 +49,32 @@ pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 /// A permit is held across the consumer's `recv()`, not taken after it: a
 /// permit acquired after `start()` can only carry work observed in the current
 /// lifecycle, so no generation stamp on the work itself is needed.
+///
+/// The gate starts *closed*, matching `Controller`'s `enabled == false` at
+/// construction: dispatch only ever runs between an [`Controller::enable`] and
+/// the [`Controller::disable`] that follows it.
 #[derive(Debug)]
 pub(crate) struct DispatchGate {
     active: tokio::sync::watch::Sender<bool>,
     in_flight: tokio::sync::RwLock<()>,
+    /// Bumped by every [`DispatchGate::start`]. Consumers that carry state
+    /// across loop iterations - state the gate's own drain cannot reach,
+    /// because it does not live in a channel - compare this against the epoch
+    /// the state was recorded in and discard it when they differ.
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 impl DispatchGate {
     fn new() -> Self {
         DispatchGate {
-            active: tokio::sync::watch::Sender::new(true),
+            active: tokio::sync::watch::Sender::new(false),
             in_flight: tokio::sync::RwLock::new(()),
+            epoch: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// A view of the open/closed state for a dispatch loop to park on. `watch`
@@ -83,6 +97,8 @@ impl DispatchGate {
     }
 
     fn start(&self) {
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.active.send_if_modified(|open| {
             let changed = !*open;
             *open = true;
@@ -115,11 +131,16 @@ impl DispatchGate {
 /// and can never be admitted after a later [`DispatchGate::start`].
 ///
 /// Returns `None` only when the producers are gone for good.
+///
+/// The gate epoch the work was admitted under is returned alongside it, so a
+/// consumer holding state across loop iterations - state no channel drain can
+/// reach - can tell that the batch belongs to a later lifecycle and drop that
+/// state instead of releasing it into it.
 async fn gated_recv<'a, T>(
     gate: &'a DispatchGate,
     open: &mut tokio::sync::watch::Receiver<bool>,
     rx: &mut tokio::sync::mpsc::Receiver<T>,
-) -> Option<(tokio::sync::RwLockReadGuard<'a, ()>, T)> {
+) -> Option<(tokio::sync::RwLockReadGuard<'a, ()>, u64, T)> {
     loop {
         // Park without a permit while the gate is closed, so a disabled
         // controller's consumers never hold `stop()` up. Anything produced
@@ -137,6 +158,10 @@ async fn gated_recv<'a, T>(
             drop(permit);
             continue;
         }
+        // Read under the permit: the gate cannot close (and so cannot be
+        // restarted) while it is held, so this epoch stays valid for as long
+        // as the returned work is being dispatched.
+        let epoch = gate.epoch();
 
         tokio::select! {
             biased;
@@ -147,7 +172,7 @@ async fn gated_recv<'a, T>(
                     return None;
                 }
             }
-            work = rx.recv() => return work.map(|work| (permit, work)),
+            work = rx.recv() => return work.map(|work| (permit, epoch, work)),
         }
     }
 }
@@ -202,7 +227,9 @@ pub struct Controller {
     /// `44d78f2cf3a4`): closed and drained from [`Controller::disable`] so that
     /// no dispatch work can run after shutdown has begun, rather than merely
     /// relying on the loops to observe `enabled == false`. Reopened by
-    /// [`Controller::enable`], so disable/re-enable cycles keep working.
+    /// [`Controller::enable`], so disable/re-enable cycles keep working. Starts
+    /// closed, matching `enabled == false` at construction, so no dispatch work
+    /// runs before the first `enable()`.
     dispatch_gate: Arc<DispatchGate>,
 }
 
@@ -317,7 +344,7 @@ impl Controller {
 
         tokio::spawn(async move {
             let mut gate_open = gate_loop.subscribe();
-            while let Some((_permit, session)) =
+            while let Some((_permit, _epoch, session)) =
                 gated_recv(&gate_loop, &mut gate_open, &mut rx_join_session).await
             {
                 join_session(
@@ -357,15 +384,32 @@ impl Controller {
         // It is re-emitted the next time membership is applied successfully,
         // which is also what keeps it behind membership rather than ahead of
         // it. A newer edge supersedes an older held one; latest wins.
-        let mut deferred_audio_endpoint: Option<(NodeId, Option<SocketAddrV4>)> = None;
+        //
+        // Stamped with the gate epoch it was deferred in: this state outlives
+        // the loop iteration and so is not reached by the channel drain a gate
+        // close performs, and an endpoint held from a previous lifecycle must
+        // not be released into the next one.
+        let mut deferred_audio_endpoint: Option<(u64, NodeId, Option<SocketAddrV4>)> = None;
 
         let gate_loop = dispatch_gate.clone();
 
         tokio::spawn(async move {
             let mut gate_open = gate_loop.subscribe();
-            while let Some((_permit, peer_state_changes)) =
+            while let Some((_permit, epoch, peer_state_changes)) =
                 gated_recv(&gate_loop, &mut gate_open, &mut rx_peer_state_change).await
             {
+                // Anything held from a lifecycle that has since been torn down
+                // and restarted is dropped rather than dispatched.
+                if let Some((deferred_epoch, peer_id, _)) = deferred_audio_endpoint {
+                    if deferred_epoch != epoch {
+                        debug!(
+                            "Discarding AudioEndpoint change for peer {} deferred in a \
+                                 previous Link lifecycle",
+                            peer_id
+                        );
+                        deferred_audio_endpoint = None;
+                    }
+                }
                 debug!("controller received peer state changes");
                 // Set when a `SessionMembership` change in this batch was
                 // abandoned. Any audio-endpoint change queued behind it is
@@ -434,7 +478,7 @@ impl Controller {
                             // edge held back by an earlier abandoned
                             // membership change can be delivered - still
                             // after membership, which is the point.
-                            if let Some((peer_id, endpoint)) = deferred_audio_endpoint.take() {
+                            if let Some((_, peer_id, endpoint)) = deferred_audio_endpoint.take() {
                                 debug!(
                                     "Controller releasing deferred AudioEndpoint change \
                                          for peer {}",
@@ -596,7 +640,7 @@ impl Controller {
                                          membership change it follows was not applied",
                                     peer_id
                                 );
-                                deferred_audio_endpoint = Some((*peer_id, *endpoint));
+                                deferred_audio_endpoint = Some((epoch, *peer_id, *endpoint));
                                 continue;
                             }
                             dispatch_audio_endpoint_change(
