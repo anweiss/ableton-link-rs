@@ -43,7 +43,14 @@ jobs:
               pull_number: pr.number,
               per_page: 100,
             });
-            const paths = files.map(f => f.filename);
+            // A rename reports its destination in `filename` and its source in
+            // `previous_filename`. Reading only `filename` would let
+            // `src/foo.rs` -> `tests/foo.rs` take the "no src/** changes" path
+            // while the library quietly loses a module - which is precisely the
+            // "module structure changed" case the README policy names.
+            const paths = [
+              ...new Set(files.flatMap(f => [f.filename, f.previous_filename].filter(Boolean))),
+            ];
 
             // Only `src/**` is gated. Test-only, example-only and CI-only changes
             // do not carry a documentation obligation, and gating them would make
