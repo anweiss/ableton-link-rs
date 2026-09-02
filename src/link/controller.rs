@@ -31,6 +31,56 @@ use super::{
 
 pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 
+/// Start/stop gate for the background dispatch loops (join-session and
+/// peer-state-change) spawned in [`Controller::new`]. Rust analogue of
+/// upstream's `RtClientStateSetter::start()`/`stop()` (see upstream commits
+/// `57b77a8040d3` and `44d78f2cf3a4`): the loops are constructed once and
+/// gated, rather than torn down, so that a [`Controller::disable`] followed by
+/// a [`Controller::enable`] resumes dispatching instead of leaving the
+/// receivers permanently closed.
+///
+/// [`DispatchGate::stop`] is *acknowledged*: it both closes the gate against
+/// new work and waits for any batch already in flight to finish, so once it
+/// returns no dispatch work can be running against a `Controller` that has
+/// begun tearing down.
+#[derive(Debug, Default)]
+pub(crate) struct DispatchGate {
+    active: std::sync::atomic::AtomicBool,
+    in_flight: tokio::sync::RwLock<()>,
+}
+
+impl DispatchGate {
+    fn new() -> Self {
+        DispatchGate {
+            active: std::sync::atomic::AtomicBool::new(true),
+            in_flight: tokio::sync::RwLock::new(()),
+        }
+    }
+
+    /// Acquires the right to run one batch of dispatch work. Returns `None`
+    /// when the gate is closed, in which case the caller must skip the batch.
+    async fn enter(&self) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let guard = self.in_flight.read().await;
+        if self.active.load(std::sync::atomic::Ordering::Acquire) {
+            Some(guard)
+        } else {
+            None
+        }
+    }
+
+    fn start(&self) {
+        self.active
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    async fn stop(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        // Waiting for exclusive access drains any batch already in flight.
+        let _ = self.in_flight.write().await;
+    }
+}
+
 /// Invokes the registered audio-endpoint callback, if any. The registered
 /// callback is cloned out from under the outer guard so it is never dropped
 /// just because registration is momentarily in flight.
@@ -67,15 +117,15 @@ pub struct Controller {
     clock: Clock,
     rx_event: Option<Receiver<OnEvent>>,
     notifier: Arc<Notify>,
-    /// Handles for the background dispatch loops (join-session and
+    /// Gate for the background dispatch loops (join-session and
     /// peer-state-change) spawned in [`Controller::new`]. Rust analogue of
     /// upstream's `RtClientStateSetter::stop()`
     /// (`ableton::link::Controller::CallbackDispatcher`, see upstream commit
-    /// `44d78f2cf3a4`): aborted from [`Controller::disable`] so that no
-    /// dispatch work can run after shutdown has begun, rather than merely
-    /// relying on the loops to observe `enabled == false`.
-    join_session_task: Option<tokio::task::JoinHandle<()>>,
-    peer_state_change_task: Option<tokio::task::JoinHandle<()>>,
+    /// `44d78f2cf3a4`): closed and drained from [`Controller::disable`] so that
+    /// no dispatch work can run after shutdown has begun, rather than merely
+    /// relying on the loops to observe `enabled == false`. Reopened by
+    /// [`Controller::enable`], so disable/re-enable cycles keep working.
+    dispatch_gate: Arc<DispatchGate>,
 }
 
 impl Controller {
@@ -184,9 +234,15 @@ impl Controller {
         let ps_loop = peer_state.clone();
         let tempo_cb_loop = tempo_callback.clone();
 
-        let join_session_task = tokio::spawn(async move {
+        let dispatch_gate = Arc::new(DispatchGate::new());
+        let gate_loop = dispatch_gate.clone();
+
+        tokio::spawn(async move {
             loop {
                 if let Some(session) = rx_join_session.recv().await {
+                    let Some(_permit) = gate_loop.enter().await else {
+                        continue;
+                    };
                     join_session(
                         session,
                         ps_loop.clone(),
@@ -227,9 +283,14 @@ impl Controller {
         // it. A newer edge supersedes an older held one; latest wins.
         let mut deferred_audio_endpoint: Option<(NodeId, Option<SocketAddrV4>)> = None;
 
-        let peer_state_change_task = tokio::spawn(async move {
+        let gate_loop = dispatch_gate.clone();
+
+        tokio::spawn(async move {
             loop {
                 if let Some(peer_state_changes) = rx_peer_state_change.recv().await {
+                    let Some(_permit) = gate_loop.enter().await else {
+                        continue;
+                    };
                     debug!("controller received peer state changes");
                     // Set when a `SessionMembership` change in this batch was
                     // abandoned. Any audio-endpoint change queued behind it is
@@ -495,12 +556,17 @@ impl Controller {
             clock,
             rx_event: Some(rx_event),
             notifier,
-            join_session_task: Some(join_session_task),
-            peer_state_change_task: Some(peer_state_change_task),
+            dispatch_gate,
         })
     }
 
     pub async fn enable(&mut self) {
+        // Reopen the dispatch gate closed by a previous `disable()`, mirroring
+        // upstream's `RtClientStateSetter::start()` being paired with its
+        // `stop()`. Without this, a disable/re-enable cycle would leave the
+        // join-session and peer-state-change loops permanently gated off.
+        self.dispatch_gate.start();
+
         if let Ok(mut enabled) = self.enabled.try_lock() {
             *enabled = true;
         }
@@ -532,16 +598,13 @@ impl Controller {
         // Stop the background dispatch loops before anything else, mirroring
         // upstream's `mRtClientStateSetter.stop()` at the top of the async
         // shutdown handler (see `44d78f2cf3a4`, "Stop the
-        // RtClientStateDispatcher on shutdown"). Aborting here guarantees no
-        // further join-session or peer-state-change processing can run once
-        // shutdown has begun, rather than relying solely on the loops to
-        // observe `enabled == false` on their next iteration.
-        if let Some(handle) = self.join_session_task.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.peer_state_change_task.take() {
-            handle.abort();
-        }
+        // RtClientStateDispatcher on shutdown"). This closes the gate and
+        // drains any batch already in flight, so once it returns no further
+        // join-session or peer-state-change processing can run, rather than
+        // relying solely on the loops to observe `enabled == false` on their
+        // next iteration. The loops themselves stay alive so that a later
+        // `enable()` can resume dispatching.
+        self.dispatch_gate.stop().await;
 
         // Send bye bye message before disabling to properly notify other peers
         use crate::discovery::messenger::send_byebye;
@@ -580,11 +643,11 @@ impl Controller {
         info!("Completed Link disable process");
 
         // NOTE: The join-session and peer-state-change dispatch loops are
-        // aborted above, before the bye-bye message is sent, matching
-        // upstream's shutdown ordering. Other spawned tasks (discovery
-        // listener, measurement tasks) still observe `enabled=false` and the
-        // notifier signal to wind down on their own, since they have no
-        // equivalent race window during startup.
+        // gated off and drained above, before the bye-bye message is sent,
+        // matching upstream's shutdown ordering. Other spawned tasks
+        // (discovery listener, measurement tasks) still observe
+        // `enabled=false` and the notifier signal to wind down on their own,
+        // since they have no equivalent race window during startup.
     }
 
     pub async fn set_state(&self, mut new_client_state: IncomingClientState) {
