@@ -125,7 +125,18 @@ safe-outputs:
     deduplicate-by-title: true
   add-comment:
     target: "*"
-    max: 1
+    # One comment per item skipped this run, plus one for the terminal stop.
+    # At `max: 1` a single skip comment consumed the whole allowance and the
+    # terminal `noop` could then not announce itself - reintroducing exactly
+    # the unannounced stop that "Every early stop must be announced" exists to
+    # prevent. Ten is well clear of the five items currently outstanding.
+    #
+    # The quota is a hard ceiling, so the prompt reserves the tenth slot: at
+    # most nine per-item skip comments per run, with anything beyond that
+    # rolled into the terminal announcement. Without that reservation a run
+    # that skipped ten items would spend the whole allowance on skips and lose
+    # the terminal report - the same unannounced stop, one level up.
+    max: 10
   missing-tool:
 
 imports:
@@ -166,7 +177,13 @@ Otherwise, take the next item off the backlog:
    stop.
 2. **Check for an open port PR first.** Run
    `gh pr list --state open --label upstream-sync --json number,labels`. If any pull
-   request comes back, **stop** and do nothing else.
+   request comes back, **stop**: do not port anything, do not touch the backlog, and do
+   not open a second pull request.
+
+   "Stop" here means stop *porting*, not stop *reporting*. This is an early stop like
+   any other, so it is still governed by *Every early stop must be announced* below —
+   `noop` with the blocking PR number, and comment on that PR unless its last comment
+   already reports this same blocker at this same watermark.
 
    Match on `upstream-sync` and nothing else. The watch workflow's backlog pull
    requests carry `upstream-triage` instead, precisely so that a triage PR sitting
@@ -233,15 +250,28 @@ Otherwise, take the next item off the backlog:
    derived from the actual commit graph and the file is not. Concretely: for every
    outstanding item, find the lowest line number any of its SHAs has in
    `commits.txt`, and take the item with the lowest such number.
-5. Skip an item, and move to the next one, if either holds:
+5. Skip an item, and move to the next one, if any of these hold:
    - It is `risk: api-break`. Those need a maintainer to decide. Comment on that
      item's tracking issue (see step 7) rather than porting it.
    - It is `risk: wire-format` **and** upstream shipped no test for it that you can
      port as concrete byte-level expectations. See the wire-format rule below.
+   - It has a non-empty **`blocked_on`** field. That field means the item needs a
+     design decision before any of it can be written, and it names the decision.
+     Comment on its tracking issue as above — subject to the do-not-repeat rule in
+     "Every early stop must be announced", which applies to these skip comments even
+     when the run goes on to open a pull request — then **carry on to the next item**;
+     do not stop the run. One undecidable item must never head-of-line block every
+     item behind it; that is exactly how a crash fix ends up parked behind an
+     architecture question for weeks.
+
+     Do not add `blocked_on` to an item yourself. It is a maintainer's judgement,
+     it is reviewed in a pull request like any other change to this file, and an
+     agent that can mark its own work blocked can mark anything blocked.
 
    Skipping an item does **not** let you advance the watermark past it. See
    "Advance the watermark" — a skipped item is an unported commit, so the pin stops
-   before it.
+   before it. Porting a later item while an earlier one is skipped is fine and
+   expected: flip that later item to `retired` and leave the pin where it was.
 6. If `.github/upstream-backlog.toml` does not exist, or every item in it is
    retired, do not invent a backlog. Read `commits.txt` yourself, take the
    **oldest** commit that touches a mapped path, and port that.
@@ -286,6 +316,44 @@ Whenever you stop without opening a pull request — an open port PR, a genuine 
 port, nothing portable, a blocked wire-format item, a failing build — record the reason
 with the `noop` tool, naming the specific blocker and the issue or PR number that
 caused it.
+
+**`noop` alone is not an announcement.** It writes to a run artifact that nobody opens.
+A `noop`-only run is a green check with no notification, which is precisely the
+"unannounced stop" this section exists to prevent — run 33665748688 stopped on a
+design-blocked item, said so at length, and reached nobody.
+
+So whenever you `noop` **because something is blocking progress**, also do exactly one
+of these, in this order of preference:
+
+1. If the blocker belongs to a backlog item, `add-comment` on that item's tracking
+   issue (step 7 tells you how to find it), naming the run URL and what has to happen
+   before the next run can get further.
+2. If it belongs to an existing PR or issue, comment there instead.
+3. Only if there is no such issue or PR, `create-issue` — it is configured with the
+   `needs-decision` label for this.
+
+**A run with nothing to do is not blocked.** If `summary.md` says the port is level
+with upstream, or the backlog is entirely retired, `noop` alone is the whole correct
+answer: there is no decision owed and no failure to report, and opening a
+`needs-decision` issue for it would be noise. The rule above is for a run that wanted
+to make progress and could not.
+
+Say nothing twice: before commenting anywhere — whether for a skipped item in step 5 or
+for a terminal stop here — check the last comment on that issue. If it already reports
+this same blocker at this same watermark, say nothing and let `noop` (or the pull
+request you are opening) stand. This applies to **every** run, not only ones that end
+in `noop`: a weekly run that skips a blocked item and then successfully opens a port PR
+would otherwise repost the identical blocker comment every week forever.
+
+**Reserve the last comment for the terminal report.** `add-comment` is capped at ten
+per run and the cap is enforced by the tooling, not by you — the eleventh call is
+dropped, not queued. The do-not-repeat rule bounds comments *across* runs but not
+*within* one, so a run that newly skips ten items would spend the entire allowance on
+skip notices and have nothing left to announce how it ended. So: **post at most nine
+per-item skip comments in a single run.** If a tenth item needs one, stop posting them
+individually and name the remaining skipped items in the terminal announcement instead
+— one comment listing them all, on the last of them if the run ends in `noop`, or in
+the pull request body if the run went on to port something.
 
 The run exits `success` either way, so an unannounced stop is indistinguishable from a
 healthy week. Five consecutive green runs hid the #71 deadlock precisely because a
@@ -365,9 +433,23 @@ the maintainer more than no PR.
 
 ## Advance the watermark
 
-The submodule pin at `vendor/ableton-link` records how far upstream this port has been
-reconciled. In the same commit as your change, advance it to the upstream commit you
-just ported:
+**Unless an earlier item is skipped.** If you ported a later item because something
+before it is `blocked_on` a decision, or is a skipped `api-break` or `wire-format`
+item, then **do not touch the pin at all** — leave `vendor/ableton-link` exactly where
+it was and skip the rest of this section. The pin asserts that everything behind it is
+dealt with, and the skipped item is by definition not dealt with, so advancing it even
+to the SHA you just ported would claim work nobody has done and fail the validator.
+
+In that case set the retired item's `retired_at_pin` to the **current, unchanged** pin
+— the same 40-char SHA already in `[watermark].pinned` — not to the upstream commit you
+ported. The validator will emit `retired but <sha> is still ahead of the pin`; that
+warning is expected here and is exactly what a non-contiguous retirement looks like.
+Say in the PR body which item blocked the advance, and that the pin was deliberately
+left alone.
+
+Otherwise: the submodule pin at `vendor/ableton-link` records how far upstream this
+port has been reconciled. In the same commit as your change, advance it to the upstream
+commit you just ported:
 
 ```bash
 git -C vendor/ableton-link checkout <sha>
