@@ -505,7 +505,7 @@ that list is the highest-value part of reviewing one of these PRs.
 | Workflow | Cadence | What it does |
 | --- | --- | --- |
 | `link-upstream-watch.md` | Weekly, Monday | Triages upstream commits landed since the pin and proposes a pull request against [`.github/upstream-backlog.toml`](.github/upstream-backlog.toml) |
-| `link-upstream-port.md` | Weekly, Thursday | Takes the earliest outstanding backlog item that is not `blocked_on` a design decision, ports it, runs the full CI suite, and opens a draft PR |
+| `link-upstream-port.md` | Weekly, Thursday | Takes the earliest outstanding backlog item it can actually port — skipping ones that are `blocked_on` a design decision, `api-break`, or wire-format without a portable byte-level test — ports it, runs the full CI suite, and opens a draft PR |
 | `upstream-backlog-issues.yml` | On pushes touching the backlog file, plus daily | Reconciles one tracking issue per outstanding backlog item from the file. Deterministic `github-script`, not an agent |
 | `auto-merge-upstream-port.yml` | On every port PR event | Marks a qualifying port PR ready for review and enables auto-merge, so it lands once branch protection is satisfied |
 | `copilot-review-loop.yml` | On port PR events, plus a periodic sweep | Approves held CI runs, requests Copilot code review, batches its comments to `Copilot Review Fix`, and marks the PR `copilot-reviewed` when the loop finishes |

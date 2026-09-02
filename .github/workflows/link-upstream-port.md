@@ -172,7 +172,13 @@ Otherwise, take the next item off the backlog:
    stop.
 2. **Check for an open port PR first.** Run
    `gh pr list --state open --label upstream-sync --json number,labels`. If any pull
-   request comes back, **stop** and do nothing else.
+   request comes back, **stop**: do not port anything, do not touch the backlog, and do
+   not open a second pull request.
+
+   "Stop" here means stop *porting*, not stop *reporting*. This is an early stop like
+   any other, so it is still governed by *Every early stop must be announced* below —
+   `noop` with the blocking PR number, and comment on that PR unless its last comment
+   already reports this same blocker at this same watermark.
 
    Match on `upstream-sync` and nothing else. The watch workflow's backlog pull
    requests carry `upstream-triage` instead, precisely so that a triage PR sitting
