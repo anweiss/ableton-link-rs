@@ -24,7 +24,8 @@ import sys
 import tomllib
 from pathlib import Path
 
-BACKLOG = Path(sys.argv[1] if len(sys.argv) > 1 else ".github/upstream-backlog.toml")
+_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+BACKLOG = Path(_args[0] if _args else ".github/upstream-backlog.toml")
 SUBMODULE = Path("vendor/ableton-link")
 ROOT = Path(".")
 
@@ -35,6 +36,131 @@ RISKS = {"behavior", "wire-format", "api-break", "internal"}
 STATUSES = {"outstanding", "retired"}
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+# `title` and `impact` are the two fields a person reads before deciding whether
+# an item is worth their attention: they become the tracking issue's title and
+# its opening paragraph. Both were being written as C++ symbol soup — an item
+# called "Rename stopIoService to shutdown / LockFreeCallbackDispatcher::stop"
+# tells a reader who does not already have the upstream header open precisely
+# nothing about what breaks or for whom.
+#
+# The mechanical rule below is what makes "write plain language" enforceable
+# rather than aspirational. It is deliberately narrow: it rejects the tokens
+# that only ever appear when prose has been replaced by an identifier, and says
+# nothing about style, length or tone.
+#
+# The technical detail is not lost, it moves: `why` and `note` are agent-facing
+# and are exempt, so an item still carries everything a port run needs.
+JARGON = [
+    ("`", "backtick-quoted code"),
+    ("::", "a C++/Rust path separator"),
+    ("()", "a function-call suffix"),
+    ("->", "an arrow operator"),
+]
+# A path (`src/link/peers.rs`) or a source file name, as opposed to the "/" in
+# "and/or" — require a dot-suffix or a known source directory to avoid that.
+# Both halves must stay broad: the first miss found in review was that `tests/`,
+# `examples/`, `.github/` and `.yaml` all slipped through a narrower version.
+PATH_RE = re.compile(
+    r"\b(?:src|include|vendor|test|tests|examples|benches|scripts|docs|target)/"
+    r"|\.github/"
+    r"|\b[\w-]+\.(?:rs|cpp|hpp|cc|cxx|h|ipp|toml|py|yml|yaml|json|md|sh|lock)\b")
+# Identifiers, in the four shapes that actually show up in this backlog:
+# camelCase, multi-hump PascalCase, acronym-prefixed PascalCase (`UDPMessage`),
+# and snake_case or SCREAMING_SNAKE_CASE (`IP_MULTICAST_ALL`, `set_high`).
+# Single-hump words ("Link", "Linux", "Tokio") are ordinary English and stay
+# legal, which is the whole reason this is four narrow patterns and not one
+# broad one.
+SYMBOL_RE = re.compile(
+    r"\b(?:[a-z]+[A-Z]\w*"
+    r"|[A-Z][a-z]+[A-Z]\w*"
+    r"|[A-Z]{2,}[a-z]\w*"
+    r"|[A-Za-z]\w*_\w+)\b")
+# Words that look like identifiers to the regex but are ordinary English in this
+# problem domain. Keep this short; it is an escape hatch, not a second schema.
+SYMBOL_OK = {"GitHub", "IPv4", "IPv6", "macOS", "iOS", "JavaScript", "TypeScript"}
+
+
+def prose_problems(text):
+    """Return the reasons `text` reads as code rather than as English."""
+    found = []
+    for token, desc in JARGON:
+        if token in text:
+            found.append(f"contains {token!r} ({desc})")
+    if PATH_RE.search(text):
+        found.append("names a source path or file")
+    symbols = [s for s in SYMBOL_RE.findall(text) if s not in SYMBOL_OK]
+    if symbols:
+        uniq = sorted(set(symbols))[:4]
+        found.append("uses code identifiers: " + ", ".join(uniq))
+    return found
+
+
+# The prose rule is only worth anything if it cannot be walked around, and the
+# first draft of it could be: `tests/`, `.github/`, `.yaml`, SCREAMING_SNAKE_CASE
+# and acronym-prefixed PascalCase all passed. Those gaps are cheap to reopen by
+# "simplifying" a regex later, so they are pinned here rather than left in a
+# review thread. `--self-test` runs on every pull request alongside the real
+# check.
+#
+# Each rejection case names the one reason it must be caught for, and the test
+# asserts that reason was the *only* one. A fixture that trips three detectors
+# at once still passes when two of them regress, which would leave the table
+# looking like coverage while pinning nothing.
+#
+# The accept list matters as much as the reject list: a rule that fires on
+# ordinary English would push authors straight back to pasting identifiers,
+# because the field would become impossible to write.
+SELF_TEST_REJECT = [
+    ("wrap it in `x` please", "contains '`'"),
+    ("the separator is a::b", "contains '::'"),
+    ("it takes no arguments ()", "contains '()'"),
+    ("the callback returns a -> b", "contains '->'"),
+    ("the fixture lives under tests/ in the tree", "names a source path"),
+    ("this is configured under .github/ today", "names a source path"),
+    ("edit workflow.yaml before merging", "names a source path"),
+    ("the helper is audio-fixture.ipp", "names a source path"),
+    ("call sendPeerState again", "uses code identifiers"),
+    ("the PeerState value is stale", "uses code identifiers"),
+    ("the UDPMessage value is stale", "uses code identifiers"),
+    ("IP_MULTICAST_ALL is set on the socket", "uses code identifiers"),
+    ("set_high on the audio thread", "uses code identifiers"),
+]
+SELF_TEST_ACCEPT = [
+    "Ableton Link on Linux and macOS with Tokio",
+    "IPv4 and IPv6 addresses, reported through GitHub",
+    "a peer and/or an application, e.g. a sequencer",
+    "Keep running when sending a discovery packet fails",
+    "Clock synchronisation degrades on a busy machine and listeners hear drift",
+]
+
+
+def self_test():
+    failures = []
+    for text, reason in SELF_TEST_REJECT:
+        problems = prose_problems(text)
+        if not any(reason in p for p in problems):
+            failures.append(f"{text!r} was not caught for {reason!r}: {problems}")
+        elif len(problems) != 1:
+            failures.append(f"{text!r} is not an isolated fixture — it trips "
+                            f"{len(problems)} detectors ({problems}), so this case "
+                            "would keep passing if one of them regressed")
+    for text in SELF_TEST_ACCEPT:
+        problems = prose_problems(text)
+        if problems:
+            failures.append(f"ordinary English was rejected: {text!r} — {problems}")
+    for line in failures:
+        print(f"error: {line}")
+    n = len(SELF_TEST_REJECT) + len(SELF_TEST_ACCEPT)
+    if failures:
+        print(f"FAILED {len(failures)} of {n} prose cases")
+        return 1
+    print(f"prose rule self-test: {n} cases OK")
+    return 0
+
+
+if "--self-test" in sys.argv:
+    sys.exit(self_test())
 
 errors, warnings = [], []
 
@@ -74,7 +200,7 @@ if not port:
 
 # --- structure --------------------------------------------------------------
 REQUIRED = ["id", "title", "upstream", "rust", "risk", "status",
-            "retired_at_pin", "why"]
+            "retired_at_pin", "why", "impact"]
 
 seen_ids, sha_owner = {}, {}
 
@@ -97,6 +223,23 @@ for n, item in enumerate(port):
         err(f"{where}: title is empty")
     if not item["why"].strip():
         err(f"{where}: why is empty — every item has to say why it matters")
+
+    # `impact` is the one field written for a reader rather than for the port
+    # agent: it opens the tracking issue and has to stand on its own for someone
+    # who has never opened the upstream header. `why` stays as deep and as
+    # symbol-dense as it needs to be, and carries the detail the agent works
+    # from, so nothing is lost by keeping identifiers out of `impact`.
+    if not item["impact"].strip():
+        err(f"{where}: impact is empty — say in plain language what someone "
+            "using this library would notice, and leave the mechanics to `why`")
+    for field in ("title", "impact"):
+        for problem in prose_problems(item[field]):
+            err(f"{where}: {field} {problem}. It is read by people deciding "
+                "whether this matters to them; describe the effect, and keep "
+                "the identifiers in `why` and `note`.")
+    if len(item["impact"].split()) > 90:
+        err(f"{where}: impact is {len(item['impact'].split())} words — it is a "
+            "short orienting paragraph, not the full story. Move detail to `why`.")
 
     if item["risk"] not in RISKS:
         err(f"{where}: risk must be one of {sorted(RISKS)}, got {item['risk']!r}")

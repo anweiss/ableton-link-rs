@@ -236,7 +236,15 @@ Otherwise, take the next item off the backlog:
    longer holds one.
 
    Each item is a `[[port]]` table with `id`, `title`, `upstream` (the list of
-   upstream SHAs it covers), `rust`, `risk`, `status`, `retired_at_pin` and `why`.
+   upstream SHAs it covers), `rust`, `risk`, `status`, `retired_at_pin`, `impact` and
+   `why`.
+
+   **`title` and `impact` are the plain-language pair; `why` and `note` are yours.**
+   `title` and `impact` become the tracking issue a person reads, and the validator
+   rejects backticks, `::`, `()`, `->`, source paths, and identifiers in any of
+   camelCase, PascalCase, acronym-prefixed PascalCase, snake_case or
+   SCREAMING_SNAKE_CASE. `why` and `note` are exempt and are where the mechanics
+   belong — that is the pair you read from, and the pair you write to.
 4. Consider only items with `status = "outstanding"`. Of those, take the **first item
    any of whose `upstream` SHAs still appears in
    `/tmp/gh-aw/agent/upstream/commits.txt`**. An item whose SHAs are all gone from
@@ -495,7 +503,13 @@ retired_at_pin = "<the new 40-character pin>"
 ```
 
 and update `[watermark]` — `pinned` to the new pin, `upstream` to the current
-upstream head, `commits_behind` to what is left. Then run:
+upstream head, `commits_behind` to what is left.
+
+If what you actually did differs from what the item said you would do, correct `why`
+and `note` too — they are the record, and a stale one sends the next run at work that
+is already done. Leave `title` and `impact` alone unless the *effect* changed; if it
+did, rewrite them in plain language, because the validator will reject any identifier
+you put there. Then run:
 
 ```bash
 python3 .github/scripts/validate-upstream-backlog.py
@@ -553,6 +567,18 @@ pasting the upstream subject, since upstream subjects are often C++-specific (e.
 Body:
 
 ```markdown
+<Two to four sentences of plain language: what was wrong or missing before this pull
+request, what is true after it, and who notices — an application using this crate, a
+listener hearing drift, a peer running another implementation. No backticks, no
+function names, no file paths; those go in the detail section below. If the change is
+genuinely invisible from outside, say that outright and say why it was still worth
+doing.>
+
+Closes #<issue>
+
+<details>
+<summary><b>Porting detail</b></summary>
+
 Ports [`<short-sha>`](https://github.com/Ableton/link/commit/<sha>) — <upstream subject>.
 
 **Upstream change.** <what upstream did and why, from reading the diff>
@@ -563,6 +589,8 @@ C++ structure and why>
 **Wire format.** <"unchanged", or exactly which bytes moved and which upstream encoder
 you matched>
 
+</details>
+
 **Watermark.** `vendor/ableton-link` advanced <old-sha> -> <new-sha>.
 <if you skipped commits in that range, list them and why>
 
@@ -572,9 +600,27 @@ you matched>
 change — an internal refactor, or a bug fix with no API surface — say so in one
 sentence and then include this line verbatim, on its own line:>
 <!-- docs-not-needed -->
-
-Closes #<issue>
 ```
+
+**Lead with the effect, not the mechanics.** The opening paragraph is what a
+maintainer scanning the pull-request list reads, what lands in the merge notification,
+and what someone hitting this bug in six months finds. A body that opens with
+`shutdown()` renamed from `stopIoService()` moved into `~SessionController()` tells
+that reader nothing about whether it affects them. Everything technical is still
+required — it just lives under `Porting detail`, which is markup a reviewer clicks and
+a later agent reads straight through. Do not thin the detail out to compensate: the
+split is by audience, not a budget.
+
+**The upstream subject goes inside the disclosure, not above it.** Upstream subjects
+are written for a C++ codebase and are frequently a bare function name, so hoisting
+one to the top of the body reintroduces exactly the problem the opening paragraph
+exists to solve. The `Ports <sha>` line is provenance for a reviewer who has already
+decided to look, and grep finds a SHA inside a `<details>` block perfectly well.
+
+**The watermark, verification and marker stay outside the disclosure triangle.** They
+are review gates rather than background, and a reviewer must not have to expand
+anything to check that the pin moved where the body claims it did. `Closes` stays
+outside too, so the linkage to the tracking issue is visible at a glance.
 
 **That marker is part of the template, not an afterthought.** The `README maintenance`
 check fails any pull request touching `src/**` or `examples/**` that does not also

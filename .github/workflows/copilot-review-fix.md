@@ -209,11 +209,17 @@ that describes an implementation that no longer exists is worse than no record.
 So whenever your change makes any of these untrue, fix them in the same pass:
 
 - **The backlog `note` and `why`** in `.github/upstream-backlog.toml` — edit them
-  directly; they ride along in your push.
+  directly; they ride along in your push. Leave `title` and `impact` alone unless the
+  observable *effect* changed, and if it did, write them as plain sentences: the
+  validator is a required check and it rejects backticks, `::`, `()`, `->`, source
+  paths, and identifiers in any of camelCase, PascalCase, acronym-prefixed
+  PascalCase, snake_case or SCREAMING_SNAKE_CASE.
 - **The pull request title and body** — use `update-pull-request`. Rewrite only what
   became inaccurate; keep the structure, the `Closes` line, the `Upstream` SHAs, and
-  the `<!-- docs-not-needed -->` marker if one is present. Do not restate your review
-  fixes there; that is what your summary comment is for.
+  the `<!-- docs-not-needed -->` marker if one is present. The body's opening
+  paragraph is deliberately plain language written for a person, and the mechanics sit
+  under `Porting detail`; keep that split when you edit either. Do not restate your
+  review fixes there; that is what your summary comment is for.
 
 Judge this against what the code does *after* your push, not against what the comments
 asked for. On #147 both the title ("abort Controller dispatch loops on disable") and

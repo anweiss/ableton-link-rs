@@ -129,6 +129,8 @@ jobs:
           fetch-depth: 0
       - name: Fetch upstream master for the drift range
         run: git -C vendor/ableton-link fetch --unshallow origin master || git -C vendor/ableton-link fetch origin master
+      - name: Check the plain-language rule cannot be walked around
+        run: python3 .github/scripts/validate-upstream-backlog.py --self-test
       - name: Validate .github/upstream-backlog.toml
         run: python3 .github/scripts/validate-upstream-backlog.py
 

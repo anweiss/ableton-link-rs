@@ -540,6 +540,18 @@ Every upstream commit that has been triaged gets a bucket:
 | `[[undecided]]` | The right Rust answer is not obvious yet. The pin may **not** advance past these |
 | `[[not_applicable]]` | Confined to deliberately unported paths (ASIO, Catch2, CMake, C++ examples), with a required `reason` |
 
+A `[[port]]` item describes itself twice, for two different readers. `title` and
+`impact` are plain language for a person — what goes wrong today, what gets better,
+and who notices — and the validator rejects backticks, `::`, `()`, `->`, source paths
+and
+identifiers in any of camelCase, PascalCase, acronym-prefixed PascalCase, snake_case
+or SCREAMING_SNAKE_CASE in them, because those two fields become the tracking issue's
+title and opening paragraph. `why` and `note` are the opposite: they
+are what a port agent works from, are exempt from that rule, and should be as dense
+and symbol-heavy as the work requires. The generated issue leads with `impact` and
+puts `why` and `note` under a `Porting detail` disclosure triangle; the split is by
+audience, not a limit on detail.
+
 Two caveats on "gets a bucket". Commits that landed upstream *after*
 `[watermark].upstream` — the point triage last reached — are expected to be
 unclassified until the next watch run, and only warn; erroring on them would turn every
