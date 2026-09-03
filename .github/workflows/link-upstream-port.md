@@ -573,11 +573,12 @@ function names, no file paths; those go in the detail section below. If the chan
 genuinely invisible from outside, say that outright and say why it was still worth
 doing.>
 
-Ports [`<short-sha>`](https://github.com/Ableton/link/commit/<sha>) — <upstream subject>.
 Closes #<issue>
 
 <details>
 <summary><b>Porting detail</b></summary>
+
+Ports [`<short-sha>`](https://github.com/Ableton/link/commit/<sha>) — <upstream subject>.
 
 **Upstream change.** <what upstream did and why, from reading the diff>
 
@@ -609,9 +610,16 @@ required — it just lives under `Porting detail`, which is markup a reviewer cl
 a later agent reads straight through. Do not thin the detail out to compensate: the
 split is by audience, not a budget.
 
+**The upstream subject goes inside the disclosure, not above it.** Upstream subjects
+are written for a C++ codebase and are frequently a bare function name, so hoisting
+one to the top of the body reintroduces exactly the problem the opening paragraph
+exists to solve. The `Ports <sha>` line is provenance for a reviewer who has already
+decided to look, and grep finds a SHA inside a `<details>` block perfectly well.
+
 **The watermark, verification and marker stay outside the disclosure triangle.** They
 are review gates rather than background, and a reviewer must not have to expand
-anything to check that the pin moved where the body claims it did.
+anything to check that the pin moved where the body claims it did. `Closes` stays
+outside too, so the linkage to the tracking issue is visible at a glance.
 
 **That marker is part of the template, not an afterthought.** The `README maintenance`
 check fails any pull request touching `src/**` or `examples/**` that does not also

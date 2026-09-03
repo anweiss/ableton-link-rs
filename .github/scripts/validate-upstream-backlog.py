@@ -24,7 +24,8 @@ import sys
 import tomllib
 from pathlib import Path
 
-BACKLOG = Path(sys.argv[1] if len(sys.argv) > 1 else ".github/upstream-backlog.toml")
+_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+BACKLOG = Path(_args[0] if _args else ".github/upstream-backlog.toml")
 SUBMODULE = Path("vendor/ableton-link")
 ROOT = Path(".")
 
@@ -58,10 +59,23 @@ JARGON = [
 ]
 # A path (`src/link/peers.rs`) or a source file name, as opposed to the "/" in
 # "and/or" — require a dot-suffix or a known source directory to avoid that.
-PATH_RE = re.compile(r"\b(?:src|include|vendor|test)/|\b\w+\.(?:rs|cpp|hpp|h|toml|py|yml)\b")
-# camelCase and multi-hump PascalCase are identifiers, not English. Single-hump
-# words ("Link", "Linux", "Tokio") are fine and must stay legal.
-SYMBOL_RE = re.compile(r"\b(?:[a-z]+[A-Z]\w*|[A-Z][a-z]+[A-Z]\w*)\b")
+# Both halves must stay broad: the first miss found in review was that `tests/`,
+# `examples/`, `.github/` and `.yaml` all slipped through a narrower version.
+PATH_RE = re.compile(
+    r"\b(?:src|include|vendor|test|tests|examples|benches|scripts|docs|target)/"
+    r"|\.github/"
+    r"|\b[\w-]+\.(?:rs|cpp|hpp|cc|cxx|h|ipp|toml|py|yml|yaml|json|md|sh|lock)\b")
+# Identifiers, in the four shapes that actually show up in this backlog:
+# camelCase, multi-hump PascalCase, acronym-prefixed PascalCase (`UDPMessage`),
+# and snake_case or SCREAMING_SNAKE_CASE (`IP_MULTICAST_ALL`, `set_high`).
+# Single-hump words ("Link", "Linux", "Tokio") are ordinary English and stay
+# legal, which is the whole reason this is four narrow patterns and not one
+# broad one.
+SYMBOL_RE = re.compile(
+    r"\b(?:[a-z]+[A-Z]\w*"
+    r"|[A-Z][a-z]+[A-Z]\w*"
+    r"|[A-Z]{2,}[a-z]\w*"
+    r"|[A-Za-z]\w*_\w+)\b")
 # Words that look like identifiers to the regex but are ordinary English in this
 # problem domain. Keep this short; it is an escape hatch, not a second schema.
 SYMBOL_OK = {"GitHub", "IPv4", "IPv6", "macOS", "iOS", "JavaScript", "TypeScript"}
@@ -80,6 +94,62 @@ def prose_problems(text):
         uniq = sorted(set(symbols))[:4]
         found.append("uses code identifiers: " + ", ".join(uniq))
     return found
+
+
+# The prose rule is only worth anything if it cannot be walked around, and the
+# first draft of it could be: `tests/`, `.github/`, `.yaml`, SCREAMING_SNAKE_CASE
+# and acronym-prefixed PascalCase all passed. Those gaps are cheap to reopen by
+# "simplifying" a regex later, so they are pinned here rather than left in a
+# review thread. `--self-test` runs on every pull request alongside the real
+# check.
+#
+# The accept list matters as much as the reject list: a rule that fires on
+# ordinary English would push authors straight back to pasting identifiers,
+# because the field would become impossible to write.
+SELF_TEST_REJECT = [
+    "IP_MULTICAST_ALL is set on the socket",
+    "UDPMessage parsing changed",
+    "a regression test lives in tests/discovery.rs",
+    "see examples/hut for usage",
+    "configured under .github/workflows",
+    "the fixture is audio_fixture.ipp",
+    "edit workflow.yaml",
+    "call sendPeerState again",
+    "PeerState::endpoint() was renamed",
+    "set_high on the audio thread",
+    "wrap it in `code`",
+    "the callback returns a -> b",
+]
+SELF_TEST_ACCEPT = [
+    "Ableton Link on Linux and macOS with Tokio",
+    "IPv4 and IPv6 addresses, reported through GitHub",
+    "a peer and/or an application, e.g. a sequencer",
+    "Keep running when sending a discovery packet fails",
+    "Clock synchronisation degrades on a busy machine and listeners hear drift",
+]
+
+
+def self_test():
+    failures = []
+    for text in SELF_TEST_REJECT:
+        if not prose_problems(text):
+            failures.append(f"should have been rejected but passed: {text!r}")
+    for text in SELF_TEST_ACCEPT:
+        problems = prose_problems(text)
+        if problems:
+            failures.append(f"ordinary English was rejected: {text!r} — {problems}")
+    for line in failures:
+        print(f"error: {line}")
+    n = len(SELF_TEST_REJECT) + len(SELF_TEST_ACCEPT)
+    if failures:
+        print(f"FAILED {len(failures)} of {n} prose cases")
+        return 1
+    print(f"prose rule self-test: {n} cases OK")
+    return 0
+
+
+if "--self-test" in sys.argv:
+    sys.exit(self_test())
 
 errors, warnings = [], []
 
