@@ -31,6 +31,159 @@ use super::{
 
 pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 
+/// Start/stop gate for the background dispatch loops (join-session and
+/// peer-state-change) spawned in [`Controller::new`]. Rust analogue of
+/// upstream's `RtClientStateSetter::start()`/`stop()` (see upstream commits
+/// `57b77a8040d3` and `44d78f2cf3a4`): the loops are constructed once and
+/// gated, rather than torn down, so that a [`Controller::disable`] followed by
+/// a [`Controller::enable`] resumes dispatching instead of leaving the
+/// receivers permanently closed.
+///
+/// [`DispatchGate::stop`] is *acknowledged*: it closes the gate against new
+/// work and then waits for every consumer to release its permit, which a
+/// consumer does only after discarding whatever its queue still held. So once
+/// `stop()` returns, no dispatch work is running against a `Controller` that
+/// has begun tearing down, and nothing produced before the shutdown is left
+/// sitting in a channel waiting to be dispatched into the next lifecycle.
+///
+/// A permit is held across the consumer's `recv()`, not taken after it: a
+/// permit acquired after `start()` can only carry work observed in the current
+/// lifecycle, so no generation stamp on the work itself is needed.
+///
+/// The gate starts *closed*, matching `Controller`'s `enabled == false` at
+/// construction: dispatch only ever runs between an [`Controller::enable`] and
+/// the [`Controller::disable`] that follows it.
+#[derive(Debug)]
+pub(crate) struct DispatchGate {
+    active: tokio::sync::watch::Sender<bool>,
+    in_flight: tokio::sync::RwLock<()>,
+    /// Bumped by every [`DispatchGate::start`]. Consumers that carry state
+    /// across loop iterations - state the gate's own drain cannot reach,
+    /// because it does not live in a channel - compare this against the epoch
+    /// the state was recorded in and discard it when they differ.
+    epoch: std::sync::atomic::AtomicU64,
+}
+
+impl DispatchGate {
+    fn new() -> Self {
+        DispatchGate {
+            active: tokio::sync::watch::Sender::new(false),
+            in_flight: tokio::sync::RwLock::new(()),
+            epoch: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A view of the open/closed state for a dispatch loop to park on. `watch`
+    /// is lossless with respect to transitions the receiver has not yet seen,
+    /// so a close that lands between a consumer's open check and its wait
+    /// cannot be missed.
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.active.subscribe()
+    }
+
+    /// Acquires the right to receive and run dispatch work. The permit is held
+    /// across the consumer's `recv()`, so [`DispatchGate::stop`] cannot return
+    /// while a consumer still holds queued work it has not discarded.
+    async fn permit(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.in_flight.read().await
+    }
+
+    fn is_open(&self) -> bool {
+        *self.active.borrow()
+    }
+
+    fn start(&self) {
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.active.send_if_modified(|open| {
+            let changed = !*open;
+            *open = true;
+            changed
+        });
+    }
+
+    async fn stop(&self) {
+        self.active.send_if_modified(|open| {
+            let changed = *open;
+            *open = false;
+            changed
+        });
+        // Waiting for exclusive access waits out any batch already in flight,
+        // and - because a consumer drains its queue before releasing its permit
+        // - also for the pre-stop queue contents to have been discarded.
+        let _ = self.in_flight.write().await;
+    }
+}
+
+/// Waits for the next batch of dispatch work that may legitimately run in the
+/// current lifecycle, returning it together with the gate permit that must be
+/// held while it is dispatched.
+///
+/// The permit is taken *before* the `recv()`, not after: a batch is therefore
+/// only ever returned while a permit covering the lifecycle it was received in
+/// is held, which is what [`DispatchGate::stop`] waits on. When the gate closes
+/// while this is parked, everything the channel still holds was produced by the
+/// lifecycle being torn down, so it is discarded before the permit is released
+/// and can never be admitted after a later [`DispatchGate::start`].
+///
+/// Returns `None` only when the producers are gone for good.
+///
+/// The gate epoch the work was admitted under is returned alongside it, so a
+/// consumer holding state across loop iterations - state no channel drain can
+/// reach - can tell that the batch belongs to a later lifecycle and drop that
+/// state instead of releasing it into it.
+async fn gated_recv<'a, T>(
+    gate: &'a DispatchGate,
+    open: &mut tokio::sync::watch::Receiver<bool>,
+    rx: &mut tokio::sync::mpsc::Receiver<T>,
+) -> Option<(tokio::sync::RwLockReadGuard<'a, ()>, u64, T)> {
+    loop {
+        // Park without a permit while the gate is closed, so a disabled
+        // controller's consumers never hold `stop()` up. Anything produced
+        // while it was closed is discarded on the way back in, alongside
+        // whatever was already queued when it closed.
+        if !*open.borrow_and_update() {
+            if open.wait_for(|open| *open).await.is_err() {
+                return None;
+            }
+            drain_pending(rx);
+        }
+
+        let permit = gate.permit().await;
+        if !gate.is_open() {
+            drop(permit);
+            continue;
+        }
+        // Read under the permit: the gate cannot close (and so cannot be
+        // restarted) while it is held, so this epoch stays valid for as long
+        // as the returned work is being dispatched.
+        let epoch = gate.epoch();
+
+        tokio::select! {
+            biased;
+            closed = open.wait_for(|open| !*open) => {
+                drain_pending(rx);
+                drop(permit);
+                if closed.is_err() {
+                    return None;
+                }
+            }
+            work = rx.recv() => return work.map(|work| (permit, epoch, work)),
+        }
+    }
+}
+
+/// Discards everything currently queued on `rx` without dispatching it. Used by
+/// the dispatch loops when the gate closes, so work produced in the lifecycle
+/// being torn down cannot be delivered into the next one.
+fn drain_pending<T>(rx: &mut tokio::sync::mpsc::Receiver<T>) {
+    while rx.try_recv().is_ok() {}
+}
+
 /// Invokes the registered audio-endpoint callback, if any. The registered
 /// callback is cloned out from under the outer guard so it is never dropped
 /// just because registration is momentarily in flight.
@@ -67,6 +220,17 @@ pub struct Controller {
     clock: Clock,
     rx_event: Option<Receiver<OnEvent>>,
     notifier: Arc<Notify>,
+    /// Gate for the background dispatch loops (join-session and
+    /// peer-state-change) spawned in [`Controller::new`]. Rust analogue of
+    /// upstream's `RtClientStateSetter::stop()`
+    /// (`ableton::link::Controller::CallbackDispatcher`, see upstream commit
+    /// `44d78f2cf3a4`): closed and drained from [`Controller::disable`] so that
+    /// no dispatch work can run after shutdown has begun, rather than merely
+    /// relying on the loops to observe `enabled == false`. Reopened by
+    /// [`Controller::enable`], so disable/re-enable cycles keep working. Starts
+    /// closed, matching `enabled == false` at construction, so no dispatch work
+    /// runs before the first `enable()`.
+    dispatch_gate: Arc<DispatchGate>,
 }
 
 impl Controller {
@@ -175,24 +339,28 @@ impl Controller {
         let ps_loop = peer_state.clone();
         let tempo_cb_loop = tempo_callback.clone();
 
+        let dispatch_gate = Arc::new(DispatchGate::new());
+        let gate_loop = dispatch_gate.clone();
+
         tokio::spawn(async move {
-            loop {
-                if let Some(session) = rx_join_session.recv().await {
-                    join_session(
-                        session,
-                        ps_loop.clone(),
-                        s_state_loop.clone(),
-                        c_state_loop.clone(),
-                        clock,
-                        s_stop_sync_enabled_loop.clone(),
-                        discovery_loop.clone(),
-                        peers_loop.clone(),
-                        s_peer_counter_loop.clone(),
-                        s_loop.clone(),
-                        tempo_cb_loop.clone(),
-                    )
-                    .await;
-                }
+            let mut gate_open = gate_loop.subscribe();
+            while let Some((_permit, _epoch, session)) =
+                gated_recv(&gate_loop, &mut gate_open, &mut rx_join_session).await
+            {
+                join_session(
+                    session,
+                    ps_loop.clone(),
+                    s_state_loop.clone(),
+                    c_state_loop.clone(),
+                    clock,
+                    s_stop_sync_enabled_loop.clone(),
+                    discovery_loop.clone(),
+                    peers_loop.clone(),
+                    s_peer_counter_loop.clone(),
+                    s_loop.clone(),
+                    tempo_cb_loop.clone(),
+                )
+                .await;
             }
         });
 
@@ -216,138 +384,156 @@ impl Controller {
         // It is re-emitted the next time membership is applied successfully,
         // which is also what keeps it behind membership rather than ahead of
         // it. A newer edge supersedes an older held one; latest wins.
-        let mut deferred_audio_endpoint: Option<(NodeId, Option<SocketAddrV4>)> = None;
+        //
+        // Stamped with the gate epoch it was deferred in: this state outlives
+        // the loop iteration and so is not reached by the channel drain a gate
+        // close performs, and an endpoint held from a previous lifecycle must
+        // not be released into the next one.
+        let mut deferred_audio_endpoint: Option<(u64, NodeId, Option<SocketAddrV4>)> = None;
+
+        let gate_loop = dispatch_gate.clone();
 
         tokio::spawn(async move {
-            loop {
-                if let Some(peer_state_changes) = rx_peer_state_change.recv().await {
-                    debug!("controller received peer state changes");
-                    // Set when a `SessionMembership` change in this batch was
-                    // abandoned. Any audio-endpoint change queued behind it is
-                    // then held back rather than delivered against state the
-                    // abandoned change was supposed to update.
-                    let mut membership_abandoned = false;
-                    for peer_state_change in peer_state_changes.iter() {
-                        match peer_state_change {
-                            PeerStateChange::SessionMembership => {
-                                debug!("Controller received SessionMembership change");
-                                // Both reads come from one guard: taken
-                                // separately they are two chances to bail, and
-                                // two different snapshots of the same state.
-                                let ids = peer_state_loop
-                                    .try_lock()
-                                    .map(|ps| (ps.session_id(), ps.ident()))
-                                    .ok();
-                                let (session_id, self_node_id) = match ids {
-                                    Some(ids) => ids,
-                                    None => {
-                                        membership_abandoned = true;
-                                        continue;
-                                    }
-                                };
-
-                                let count = unique_session_peer_count(
-                                    session_id,
-                                    p_loop.clone(),
-                                    self_node_id,
-                                );
-                                let old_count = if let Ok(spc) = s_peer_counter_loop.try_lock() {
-                                    spc.session_peer_count
-                                } else {
+            let mut gate_open = gate_loop.subscribe();
+            while let Some((_permit, epoch, peer_state_changes)) =
+                gated_recv(&gate_loop, &mut gate_open, &mut rx_peer_state_change).await
+            {
+                // Anything held from a lifecycle that has since been torn down
+                // and restarted is dropped rather than dispatched.
+                if let Some((deferred_epoch, peer_id, _)) = deferred_audio_endpoint {
+                    if deferred_epoch != epoch {
+                        debug!(
+                            "Discarding AudioEndpoint change for peer {} deferred in a \
+                                 previous Link lifecycle",
+                            peer_id
+                        );
+                        deferred_audio_endpoint = None;
+                    }
+                }
+                debug!("controller received peer state changes");
+                // Set when a `SessionMembership` change in this batch was
+                // abandoned. Any audio-endpoint change queued behind it is
+                // then held back rather than delivered against state the
+                // abandoned change was supposed to update.
+                let mut membership_abandoned = false;
+                for peer_state_change in peer_state_changes.iter() {
+                    match peer_state_change {
+                        PeerStateChange::SessionMembership => {
+                            debug!("Controller received SessionMembership change");
+                            // Both reads come from one guard: taken
+                            // separately they are two chances to bail, and
+                            // two different snapshots of the same state.
+                            let ids = peer_state_loop
+                                .try_lock()
+                                .map(|ps| (ps.session_id(), ps.ident()))
+                                .ok();
+                            let (session_id, self_node_id) = match ids {
+                                Some(ids) => ids,
+                                None => {
                                     membership_abandoned = true;
                                     continue;
-                                };
+                                }
+                            };
 
+                            let count =
+                                unique_session_peer_count(session_id, p_loop.clone(), self_node_id);
+                            let old_count = if let Ok(spc) = s_peer_counter_loop.try_lock() {
+                                spc.session_peer_count
+                            } else {
+                                membership_abandoned = true;
+                                continue;
+                            };
+
+                            debug!(
+                                "SessionMembership: old_count={}, new_count={}",
+                                old_count, count
+                            );
+
+                            // Only update the session peer count if it has actually changed
+                            if old_count != count {
+                                if let Ok(mut spc) = s_peer_counter_loop.try_lock() {
+                                    spc.session_peer_count = count;
+                                }
                                 debug!(
-                                    "SessionMembership: old_count={}, new_count={}",
+                                    "Updated session peer count from {} to {}",
                                     old_count, count
                                 );
-
-                                // Only update the session peer count if it has actually changed
-                                if old_count != count {
-                                    if let Ok(mut spc) = s_peer_counter_loop.try_lock() {
-                                        spc.session_peer_count = count;
-                                    }
-                                    debug!(
-                                        "Updated session peer count from {} to {}",
-                                        old_count, count
-                                    );
-                                }
-
-                                if old_count != count && count == 0 {
-                                    reset_state(
-                                        peer_state_loop.clone(),
-                                        s_state_loop.clone(),
-                                        c_state_loop.clone(),
-                                        discovery_loop.clone(),
-                                        sessions_loop.clone(),
-                                        clock,
-                                        s_stop_sync_enabled_loop.clone(),
-                                        tempo_cb_loop.clone(),
-                                    )
-                                    .await
-                                }
-
-                                // Membership is now applied, so an endpoint
-                                // edge held back by an earlier abandoned
-                                // membership change can be delivered - still
-                                // after membership, which is the point.
-                                if let Some((peer_id, endpoint)) = deferred_audio_endpoint.take() {
-                                    debug!(
-                                        "Controller releasing deferred AudioEndpoint change \
-                                         for peer {}",
-                                        peer_id
-                                    );
-                                    dispatch_audio_endpoint_change(
-                                        &audio_endpoint_cb_loop,
-                                        peer_id,
-                                        endpoint,
-                                    );
-                                }
                             }
-                            PeerStateChange::SessionTimeline(peer_session, timeline) => {
-                                // handle_timeline_from_session
 
-                                debug!(
-                                    "controller received timeline with tempo: {} for session: {}",
-                                    timeline.tempo, peer_session
-                                );
-
-                                let new_timeline = sessions_loop
-                                    .saw_session_timeline(*peer_session, *timeline)
-                                    .await;
-
-                                let ghost_x_form = if let Ok(state) = s_state_loop.try_lock() {
-                                    state.ghost_x_form
-                                } else {
-                                    continue;
-                                };
-
-                                update_session_timing(
+                            if old_count != count && count == 0 {
+                                reset_state(
+                                    peer_state_loop.clone(),
                                     s_state_loop.clone(),
                                     c_state_loop.clone(),
-                                    new_timeline,
-                                    ghost_x_form,
+                                    discovery_loop.clone(),
+                                    sessions_loop.clone(),
                                     clock,
                                     s_stop_sync_enabled_loop.clone(),
                                     tempo_cb_loop.clone(),
-                                    *peer_session,
-                                );
-
-                                update_discovery(
-                                    s_state_loop.clone(),
-                                    peer_state_loop.clone(),
-                                    discovery_loop.clone(),
                                 )
-                                .await;
+                                .await
                             }
-                            PeerStateChange::SessionStartStopState(
-                                peer_session,
-                                peer_start_stop_state,
-                            ) => {
-                                // handle_start_stop_state_from_session
 
-                                info!(
+                            // Membership is now applied, so an endpoint
+                            // edge held back by an earlier abandoned
+                            // membership change can be delivered - still
+                            // after membership, which is the point.
+                            if let Some((_, peer_id, endpoint)) = deferred_audio_endpoint.take() {
+                                debug!(
+                                    "Controller releasing deferred AudioEndpoint change \
+                                         for peer {}",
+                                    peer_id
+                                );
+                                dispatch_audio_endpoint_change(
+                                    &audio_endpoint_cb_loop,
+                                    peer_id,
+                                    endpoint,
+                                );
+                            }
+                        }
+                        PeerStateChange::SessionTimeline(peer_session, timeline) => {
+                            // handle_timeline_from_session
+
+                            debug!(
+                                "controller received timeline with tempo: {} for session: {}",
+                                timeline.tempo, peer_session
+                            );
+
+                            let new_timeline = sessions_loop
+                                .saw_session_timeline(*peer_session, *timeline)
+                                .await;
+
+                            let ghost_x_form = if let Ok(state) = s_state_loop.try_lock() {
+                                state.ghost_x_form
+                            } else {
+                                continue;
+                            };
+
+                            update_session_timing(
+                                s_state_loop.clone(),
+                                c_state_loop.clone(),
+                                new_timeline,
+                                ghost_x_form,
+                                clock,
+                                s_stop_sync_enabled_loop.clone(),
+                                tempo_cb_loop.clone(),
+                                *peer_session,
+                            );
+
+                            update_discovery(
+                                s_state_loop.clone(),
+                                peer_state_loop.clone(),
+                                discovery_loop.clone(),
+                            )
+                            .await;
+                        }
+                        PeerStateChange::SessionStartStopState(
+                            peer_session,
+                            peer_start_stop_state,
+                        ) => {
+                            // handle_start_stop_state_from_session
+
+                            info!(
                                     "controller received start stop state. isPlaying: {}, beats: {}, time: {} for session: {}",
                                     peer_start_stop_state.is_playing,
                                     peer_start_stop_state.beats.floating(),
@@ -355,116 +541,113 @@ impl Controller {
                                     peer_session,
                                 );
 
-                                let peer_session_id = if let Ok(ps) = peer_state_loop.try_lock() {
-                                    ps.session_id()
+                            let peer_session_id = if let Ok(ps) = peer_state_loop.try_lock() {
+                                ps.session_id()
+                            } else {
+                                continue;
+                            };
+
+                            let current_timestamp = if let Ok(s_state) = s_state_loop.try_lock() {
+                                s_state.start_stop_state.timestamp
+                            } else {
+                                continue;
+                            };
+
+                            if *peer_session == peer_session_id
+                                && peer_start_stop_state.timestamp > current_timestamp
+                            {
+                                if let Ok(mut s_state) = s_state_loop.try_lock() {
+                                    s_state.start_stop_state = *peer_start_stop_state;
                                 } else {
                                     continue;
-                                };
+                                }
 
-                                let current_timestamp = if let Ok(s_state) = s_state_loop.try_lock()
-                                {
-                                    s_state.start_stop_state.timestamp
-                                } else {
-                                    continue;
-                                };
+                                update_discovery(
+                                    s_state_loop.clone(),
+                                    peer_state_loop.clone(),
+                                    discovery_loop.clone(),
+                                )
+                                .await;
 
-                                if *peer_session == peer_session_id
-                                    && peer_start_stop_state.timestamp > current_timestamp
-                                {
-                                    if let Ok(mut s_state) = s_state_loop.try_lock() {
-                                        s_state.start_stop_state = *peer_start_stop_state;
+                                let sync_enabled =
+                                    if let Ok(enabled) = s_stop_sync_enabled_loop.try_lock() {
+                                        *enabled
                                     } else {
                                         continue;
-                                    }
+                                    };
 
-                                    update_discovery(
-                                        s_state_loop.clone(),
-                                        peer_state_loop.clone(),
-                                        discovery_loop.clone(),
-                                    )
-                                    .await;
-
-                                    let sync_enabled =
-                                        if let Ok(enabled) = s_stop_sync_enabled_loop.try_lock() {
-                                            *enabled
+                                if sync_enabled {
+                                    let (timeline, ghost_x_form) =
+                                        if let Ok(s_state) = s_state_loop.try_lock() {
+                                            (s_state.timeline, s_state.ghost_x_form)
                                         } else {
                                             continue;
                                         };
 
-                                    if sync_enabled {
-                                        let (timeline, ghost_x_form) =
-                                            if let Ok(s_state) = s_state_loop.try_lock() {
-                                                (s_state.timeline, s_state.ghost_x_form)
-                                            } else {
-                                                continue;
-                                            };
-
-                                        if let Ok(mut c_state) = c_state_loop.try_lock() {
-                                            c_state.start_stop_state =
-                                                map_start_stop_state_from_session_to_client(
-                                                    *peer_start_stop_state,
-                                                    timeline,
-                                                    ghost_x_form,
-                                                );
-                                        }
+                                    if let Ok(mut c_state) = c_state_loop.try_lock() {
+                                        c_state.start_stop_state =
+                                            map_start_stop_state_from_session_to_client(
+                                                *peer_start_stop_state,
+                                                timeline,
+                                                ghost_x_form,
+                                            );
                                     }
                                 }
                             }
-                            PeerStateChange::PeerLeft => {
-                                let s_id = if let Ok(ps) = peer_state_loop.try_lock() {
-                                    ps.session_id()
-                                } else {
-                                    continue;
-                                };
-                                let peer_ident = if let Ok(ps) = peer_state_loop.try_lock() {
-                                    ps.ident()
-                                } else {
-                                    continue;
-                                };
-                                let count =
-                                    unique_session_peer_count(s_id, p_loop.clone(), peer_ident);
-                                let old_count = if let Ok(spc) = s_peer_counter_loop.try_lock() {
-                                    spc.session_peer_count
-                                } else {
-                                    continue;
-                                };
-                                if let Ok(mut spc) = s_peer_counter_loop.try_lock() {
-                                    spc.session_peer_count = count;
-                                }
-                                if old_count != count && count == 0 {
-                                    reset_state(
-                                        peer_state_loop.clone(),
-                                        s_state_loop.clone(),
-                                        c_state_loop.clone(),
-                                        discovery_loop.clone(),
-                                        sessions_loop.clone(),
-                                        clock,
-                                        s_stop_sync_enabled_loop.clone(),
-                                        tempo_cb_loop.clone(),
-                                    )
-                                    .await;
-                                }
+                        }
+                        PeerStateChange::PeerLeft => {
+                            let s_id = if let Ok(ps) = peer_state_loop.try_lock() {
+                                ps.session_id()
+                            } else {
+                                continue;
+                            };
+                            let peer_ident = if let Ok(ps) = peer_state_loop.try_lock() {
+                                ps.ident()
+                            } else {
+                                continue;
+                            };
+                            let count = unique_session_peer_count(s_id, p_loop.clone(), peer_ident);
+                            let old_count = if let Ok(spc) = s_peer_counter_loop.try_lock() {
+                                spc.session_peer_count
+                            } else {
+                                continue;
+                            };
+                            if let Ok(mut spc) = s_peer_counter_loop.try_lock() {
+                                spc.session_peer_count = count;
                             }
-                            PeerStateChange::AudioEndpoint(peer_id, endpoint) => {
+                            if old_count != count && count == 0 {
+                                reset_state(
+                                    peer_state_loop.clone(),
+                                    s_state_loop.clone(),
+                                    c_state_loop.clone(),
+                                    discovery_loop.clone(),
+                                    sessions_loop.clone(),
+                                    clock,
+                                    s_stop_sync_enabled_loop.clone(),
+                                    tempo_cb_loop.clone(),
+                                )
+                                .await;
+                            }
+                        }
+                        PeerStateChange::AudioEndpoint(peer_id, endpoint) => {
+                            debug!(
+                                "Controller received AudioEndpoint change for peer {}",
+                                peer_id
+                            );
+                            if membership_abandoned {
                                 debug!(
-                                    "Controller received AudioEndpoint change for peer {}",
+                                    "Deferring AudioEndpoint change for peer {}: the \
+                                         membership change it follows was not applied",
                                     peer_id
                                 );
-                                if membership_abandoned {
-                                    debug!(
-                                        "Deferring AudioEndpoint change for peer {}: the \
-                                         membership change it follows was not applied",
-                                        peer_id
-                                    );
-                                    deferred_audio_endpoint = Some((*peer_id, *endpoint));
-                                    continue;
-                                }
-                                dispatch_audio_endpoint_change(
-                                    &audio_endpoint_cb_loop,
-                                    *peer_id,
-                                    *endpoint,
-                                );
+                                deferred_audio_endpoint = Some((epoch, *peer_id, *endpoint));
+                                continue;
                             }
+                            dispatch_audio_endpoint_change(
+                                &audio_endpoint_cb_loop,
+                                *peer_id,
+                                *endpoint,
+                            );
                         }
                     }
                 }
@@ -486,13 +669,28 @@ impl Controller {
             clock,
             rx_event: Some(rx_event),
             notifier,
+            dispatch_gate,
         })
     }
 
     pub async fn enable(&mut self) {
-        if let Ok(mut enabled) = self.enabled.try_lock() {
-            *enabled = true;
-        }
+        // Flip the enabled flag *before* reopening the gate, and do it with a
+        // blocking lock rather than a `try_lock`, so the two lifecycle controls
+        // cannot diverge: a failed `try_lock` here used to leave dispatch active
+        // while `is_enabled()` still reported false. Every holder of this lock
+        // takes it for a single bool read or write and never across an await,
+        // so this cannot deadlock; a poisoned lock is recovered from rather
+        // than skipped, since the value it guards is a plain bool.
+        *self
+            .enabled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        // Reopen the dispatch gate closed by a previous `disable()`, mirroring
+        // upstream's `RtClientStateSetter::start()` being paired with its
+        // `stop()`. Without this, a disable/re-enable cycle would leave the
+        // join-session and peer-state-change loops permanently gated off.
+        self.dispatch_gate.start();
 
         reset_state(
             self.peer_state.clone(),
@@ -518,21 +716,42 @@ impl Controller {
     }
 
     pub async fn disable(&mut self) {
-        // Send bye bye message before disabling to properly notify other peers
-        use crate::discovery::messenger::send_byebye;
-        let node_id = if let Ok(peer_state) = self.peer_state.try_lock() {
-            peer_state.node_state.node_id
-        } else {
-            return; // If we can't get the node_id, we can't send bye message
-        };
-        info!(
-            "Disabling Link instance, sending bye-bye message for node {}",
-            node_id
-        );
-        send_byebye(node_id);
+        // Stop the background dispatch loops before anything else, mirroring
+        // upstream's `mRtClientStateSetter.stop()` at the top of the async
+        // shutdown handler (see `44d78f2cf3a4`, "Stop the
+        // RtClientStateDispatcher on shutdown"). This closes the gate and
+        // drains any batch already in flight, so once it returns no further
+        // join-session or peer-state-change processing can run, rather than
+        // relying solely on the loops to observe `enabled == false` on their
+        // next iteration. The loops themselves stay alive so that a later
+        // `enable()` can resume dispatching.
+        self.dispatch_gate.stop().await;
 
-        if let Ok(mut enabled) = self.enabled.try_lock() {
-            *enabled = false;
+        // Send bye bye message before disabling to properly notify other peers.
+        // On lock contention the bye-bye is skipped - it is best-effort - but
+        // the rest of the teardown must still run, otherwise `enabled` would be
+        // left true while the dispatch gate is already closed.
+        use crate::discovery::messenger::send_byebye;
+        if let Ok(peer_state) = self.peer_state.try_lock() {
+            let node_id = peer_state.node_state.node_id;
+            drop(peer_state);
+            info!(
+                "Disabling Link instance, sending bye-bye message for node {}",
+                node_id
+            );
+            send_byebye(node_id);
+        } else {
+            info!("Could not read node id, skipping bye-bye message");
+        }
+
+        // Symmetrically with `enable()`, take the lock properly rather than
+        // best-effort: a skipped `try_lock` here would leave `enabled` true
+        // behind an already-closed gate.
+        {
+            *self
+                .enabled
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
             info!("Set Link enabled state to false");
         }
 
@@ -554,10 +773,12 @@ impl Controller {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         info!("Completed Link disable process");
 
-        // NOTE: Spawned tokio tasks (discovery listener, measurement tasks) will observe
-        // enabled=false and stop processing new messages. The notifier signal causes
-        // the broadcast loop to exit. Full task cancellation (e.g., via JoinHandle::abort)
-        // would require storing task handles, which is left for a future refactor.
+        // NOTE: The join-session and peer-state-change dispatch loops are
+        // gated off and drained above, before the bye-bye message is sent,
+        // matching upstream's shutdown ordering. Other spawned tasks
+        // (discovery listener, measurement tasks) still observe
+        // `enabled=false` and the notifier signal to wind down on their own,
+        // since they have no equivalent race window during startup.
     }
 
     pub async fn set_state(&self, mut new_client_state: IncomingClientState) {
