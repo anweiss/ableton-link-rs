@@ -178,17 +178,20 @@ Otherwise, take the next item off the backlog:
 2. **Check for an open port PR first.** Run
 
    ```bash
-   gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
+   gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
      --jq '.[] | select([.labels[].name] | index("upstream-sync")) | .number'
    ```
 
    If any pull request comes back, **stop**: do not port anything, do not touch the
    backlog, and do not open a second pull request.
 
-   **Use `gh api`, not `gh pr list`.** `gh pr list` fails in this sandbox with
-   `malformed version`; run 33717533039 spent four tool calls discovering that before
-   falling back to `gh api`. The same bug hits `gh issue list`, so the stranded-port
-   check below uses `gh api` too.
+   **Use `gh api --paginate`, not `gh pr list`.** `gh pr list` fails in this sandbox
+   with `malformed version`; run 33717533039 spent four tool calls discovering that
+   before falling back to `gh api`. The same bug hits `gh issue list`, so the
+   stranded-port check below uses `gh api` too. `--paginate` is not optional: a single
+   page caps at 100, so an older `upstream-sync` pull request beyond it would exit
+   successfully with no match and read as clear — a silent false negative on the one
+   check that must not have one.
 
    **This check fails closed.** If the command errors, returns something you cannot
    parse, or you are otherwise unsure whether a port PR is open, treat that as
@@ -219,7 +222,7 @@ Otherwise, take the next item off the backlog:
    **Then check for a stranded port.** Run
 
    ```bash
-   gh api "repos/$GITHUB_REPOSITORY/issues?state=open&labels=upstream-sync&per_page=100" \
+   gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&labels=upstream-sync&per_page=100" \
      --jq '.[] | select(.pull_request == null) | .number'
    ```
 
@@ -312,7 +315,7 @@ Otherwise, take the next item off the backlog:
 7. Find the item's tracking issue so the pull request can close it:
 
    ```bash
-   gh api "repos/$GITHUB_REPOSITORY/issues?state=open&labels=upstream-item&per_page=100" \
+   gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&labels=upstream-item&per_page=100" \
      --jq '.[] | select(.pull_request == null)
               | select(.body | contains("<!-- upstream-backlog-id: THE_ID -->")) | .number'
    ```
@@ -380,13 +383,19 @@ comment you write with a marker on its own line, built from the blocker and the
 watermark you are stopping at:
 
 ```
-<!-- link-upstream-port:blocked id=<blocking PR/issue number or backlog id> pin=<short pin> -->
+<!-- link-upstream-port:blocked id=<blocking PR/issue number or backlog id> pin=<full 40-char pin> -->
 ```
 
 Then the rule is a search, not a judgement call: list that issue or pull request's
 comments and look for **that exact marker**. If it is there, say nothing and let `noop`
 (or the pull request you are opening) stand. If it is not, comment — no matter what
 else has been said there.
+
+**`pin` is the full 40-character watermark, never an abbreviation.** Exact matching
+needs one canonical spelling, and "short pin" does not fix a length: one run emitting
+seven characters and the next emitting twelve for the same watermark would miss each
+other's marker and repost the comment this is meant to suppress. `summary.md` already
+carries the full SHA — use it verbatim.
 
 **Do not substitute your own reading of the latest comment for that search.** Run
 33717533039 halted on open PR #147, read its most recent comment — a maintainer's
