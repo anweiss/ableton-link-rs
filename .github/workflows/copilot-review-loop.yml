@@ -532,7 +532,15 @@ jobs:
                 // noise; a missing one is the unannounced stop this exists to end.
                 core.warning(`PR #${number}: could not list comments: ${err.message}`);
               }
-              if (comments.some(c => (c.body || '').includes(marker))) return;
+              // Author check, not just marker check, for the same reason the state
+              // lookup has one: the marker shape is public and the head is public,
+              // so anyone with comment access could otherwise pre-seed it and
+              // suppress the handoff notification.
+              const already = comments.some(
+                c => (c.body || '').includes(marker) &&
+                     c.user && c.user.login === 'github-actions[bot]',
+              );
+              if (already) return;
               await github.rest.issues.createComment({
                 owner, repo, issue_number: number,
                 body: [
