@@ -51,18 +51,26 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     #[cfg(unix)]
     udp_sock.set_reuse_port(true)?;
 
-    // On Linux, a socket bound to the multicast port receives datagrams for any
-    // group joined by *any* socket in the system, even groups this socket never
-    // joined itself. On a multi-homed host that hands discovery traffic to
-    // sockets that have no business seeing it - in particular the per-interface
-    // ephemeral sockets below, which join no group at all and only exist to send
-    // and to collect the unicast responses they trigger.
+    // On Linux, a socket bound to a port receives datagrams for *any* multicast
+    // group joined by any socket on the host, including groups this socket never
+    // joined itself. The socket this matters for is the discovery listener, which
+    // binds the Link port wildcard and with `SO_REUSEADDR`/`SO_REUSEPORT` shares it
+    // with whatever else is there - other Link instances in this process, and any
+    // other program that binds the same port for a group of its own. All of their
+    // traffic lands in this port's receive path to be parsed and discarded.
+    //
+    // It is deliberately *not* about the per-interface sockets created below: those
+    // bind an ephemeral port, so port demultiplexing already keeps discovery
+    // multicast away from them regardless of this option.
     //
     // `IP_MULTICAST_ALL=0` (upstream `c5574eee4d03`) narrows delivery to this
-    // socket's own memberships. It is a per-socket filter, not per-interface
-    // metadata: it does not report which interface a datagram arrived on, so the
-    // listener's choice of response socket in `socket_for_target` remains a
-    // longest-prefix match on the source address, exactly as upstream's does.
+    // socket's own memberships. That is a filter on *group*, not on interface: the
+    // listener joins the discovery group on every interface, so Link traffic
+    // arriving on any of them still matches, and the option reports nothing about
+    // which interface a datagram came in on. Response-socket selection in
+    // `socket_for_target` therefore remains a longest-prefix match on the source
+    // address. Closing that gap needs per-interface listeners or arrival metadata
+    // and is tracked in #154.
     //
     // The option is IPv4-only, so it is applied only to IPv4 sockets.
     #[cfg(target_os = "linux")]
