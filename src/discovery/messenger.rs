@@ -55,9 +55,13 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     // group joined by any socket on the host, including groups this socket never
     // joined itself. The socket this matters for is the discovery listener, which
     // binds the Link port wildcard and with `SO_REUSEADDR`/`SO_REUSEPORT` shares it
-    // with whatever else is there - other Link instances in this process, and any
-    // other program that binds the same port for a group of its own. All of their
-    // traffic lands in this port's receive path to be parsed and discarded.
+    // with anything else on that port - including a program that binds it and joins
+    // a multicast group of its own. That program's traffic lands in this port's
+    // receive path to be parsed and discarded.
+    //
+    // Other Link instances are not that case: they join the same discovery group,
+    // so their packets are addressed to a membership this listener holds and remain
+    // deliverable. Only traffic for groups this socket never joined is excluded.
     //
     // It is deliberately *not* about the per-interface sockets created below: those
     // bind an ephemeral port, so port demultiplexing already keeps discovery
