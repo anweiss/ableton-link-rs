@@ -51,6 +51,16 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     #[cfg(unix)]
     udp_sock.set_reuse_port(true)?;
 
+    // On Linux, the kernel by default delivers a multicast datagram to every
+    // socket in the process that has joined the group, regardless of which
+    // interface it arrived on. On a multi-homed host that makes a peer appear
+    // reachable through interfaces it never actually sent on. Restricting
+    // delivery to the interface the group was joined on (mirrors upstream's
+    // `IP_MULTICAST_ALL=0`, see `c5574eee4d03`) fixes that at the socket
+    // instead of approximating it with a subnet filter after the fact.
+    #[cfg(target_os = "linux")]
+    udp_sock.set_multicast_all_v4(false)?;
+
     // When binding to a concrete interface address, make sure outgoing multicast
     // traffic leaves through that very interface.
     if let SocketAddr::V4(addr) = addr {
