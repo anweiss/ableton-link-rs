@@ -260,15 +260,14 @@ note = "Merged with \"Fix ESP-IDF 6.0 PeerState init + Peers use-after-move (cor
 
 [[port]]
 id = "set-ip-multicast-all-0-on-linux"
-title = "Stop seeing discovery traffic arrive on the wrong network interface on Linux"
+title = "Stop handing discovery sockets multicast traffic for groups they never joined on Linux"
 upstream = ["c5574eee4d03", "d466f42a7b36"]
 rust = ["src/discovery/messenger.rs"]
 risk = "behavior"
-status = "retired"
-retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
-why = "`IP_MULTICAST_ALL=0` restricts multicast reception to the joined interface on Linux; the subnet filter in `UdpMessenger` that worked around the old behaviour is then removed; together these fix spurious cross-interface packet reception on multi-homed Linux hosts"
-note = "Ported `IP_MULTICAST_ALL=0` as `Socket::set_multicast_all_v4(false)` in `new_udp_reuseport` (`src/discovery/messenger.rs`), via socket2 (already a dependency with the `all` feature enabled), gated `#[cfg(target_os = \"linux\")]` to match upstream's `#if defined(__linux__)`. This is a per-socket membership filter, not per-interface arrival metadata: it does not tell the listener which interface a datagram came in on, so `socket_for_target` still picks the response socket by longest common prefix with the source address, exactly as upstream does after the same commit. Selecting the response socket from `IP_PKTINFO` would go beyond upstream and is not attempted here. This port never had upstream's subnet-filter workaround in `UdpMessenger` (no equivalent code exists in `src/discovery/messenger.rs`), so there was nothing to remove for the second half of upstream's change. `retired_at_pin` is left at the unchanged pin because earlier ancestry items (`increase-thread-priority-on-link-io-thread`, `sessioncontroller-shutdown-ordering-improvements`, `fix-use-after-move-in-peers-sawpeerongateway`) remain outstanding/blocked and precede this item, so the submodule pin itself was not advanced."
-impact = "By default Linux hands a socket bound to the discovery port every multicast datagram for any group joined anywhere on the system, including groups that socket never joined. Asking the operating system to deliver only this socket's own memberships stops discovery traffic reaching sockets that have no business seeing it."
+status = "outstanding"
+retired_at_pin = ""
+why = "`IP_MULTICAST_ALL=0` narrows delivery to the groups a socket joined itself on Linux, instead of every group joined anywhere on the system; the subnet filter in `UdpMessenger` that approximated this at the application layer is then removed. It is a per-socket membership filter, not per-interface arrival metadata: it does not report which interface a datagram came in on, so response-socket selection stays a longest-prefix match on the source address, as upstream's does. This port never had the subnet-filter workaround, so only the additive half applies."
+impact = "By default Linux hands a socket bound to the discovery port every multicast datagram for any group joined anywhere on the machine, including groups that socket never joined. Sockets that exist only to send and to collect the replies they trigger therefore see traffic that is none of their business. Asking the operating system to deliver only each socket's own memberships stops that."
 
 [[port]]
 id = "catch-message-encode-exceptions-in-sendudpmessage"

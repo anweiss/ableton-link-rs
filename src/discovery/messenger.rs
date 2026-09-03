@@ -63,9 +63,12 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     // metadata: it does not report which interface a datagram arrived on, so the
     // listener's choice of response socket in `socket_for_target` remains a
     // longest-prefix match on the source address, exactly as upstream's does.
+    //
+    // The option is IPv4-only, so it is applied only to IPv4 sockets.
     #[cfg(target_os = "linux")]
-    #[cfg(target_os = "linux")]
-    udp_sock.set_multicast_all_v4(false)?;
+    if addr.is_ipv4() {
+        udp_sock.set_multicast_all_v4(false)?;
+    }
 
     // When binding to a concrete interface address, make sure outgoing multicast
     // traffic leaves through that very interface.
