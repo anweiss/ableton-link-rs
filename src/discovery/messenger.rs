@@ -51,13 +51,19 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     #[cfg(unix)]
     udp_sock.set_reuse_port(true)?;
 
-    // On Linux, the kernel by default delivers a multicast datagram to every
-    // socket in the process that has joined the group, regardless of which
-    // interface it arrived on. On a multi-homed host that makes a peer appear
-    // reachable through interfaces it never actually sent on. Restricting
-    // delivery to the interface the group was joined on (mirrors upstream's
-    // `IP_MULTICAST_ALL=0`, see `c5574eee4d03`) fixes that at the socket
-    // instead of approximating it with a subnet filter after the fact.
+    // On Linux, a socket bound to the multicast port receives datagrams for any
+    // group joined by *any* socket in the system, even groups this socket never
+    // joined itself. On a multi-homed host that hands discovery traffic to
+    // sockets that have no business seeing it - in particular the per-interface
+    // ephemeral sockets below, which join no group at all and only exist to send
+    // and to collect the unicast responses they trigger.
+    //
+    // `IP_MULTICAST_ALL=0` (upstream `c5574eee4d03`) narrows delivery to this
+    // socket's own memberships. It is a per-socket filter, not per-interface
+    // metadata: it does not report which interface a datagram arrived on, so the
+    // listener's choice of response socket in `socket_for_target` remains a
+    // longest-prefix match on the source address, exactly as upstream's does.
+    #[cfg(target_os = "linux")]
     #[cfg(target_os = "linux")]
     udp_sock.set_multicast_all_v4(false)?;
 
