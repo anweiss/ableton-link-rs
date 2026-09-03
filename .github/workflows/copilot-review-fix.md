@@ -211,8 +211,9 @@ So whenever your change makes any of these untrue, fix them in the same pass:
 - **The backlog `note` and `why`** in `.github/upstream-backlog.toml` — edit them
   directly; they ride along in your push. Leave `title` and `impact` alone unless the
   observable *effect* changed, and if it did, write them as plain sentences: the
-  validator is a required check and it rejects backticks, `::`, `()`, source paths and
-  camelCase or PascalCase identifiers in those two fields.
+  validator is a required check and it rejects backticks, `::`, `()`, `->`, source
+  paths, and identifiers in any of camelCase, PascalCase, acronym-prefixed
+  PascalCase, snake_case or SCREAMING_SNAKE_CASE.
 - **The pull request title and body** — use `update-pull-request`. Rewrite only what
   became inaccurate; keep the structure, the `Closes` line, the `Upstream` SHAs, and
   the `<!-- docs-not-needed -->` marker if one is present. The body's opening

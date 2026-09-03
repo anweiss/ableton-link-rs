@@ -177,9 +177,10 @@ maintainer triaging the backlog, a user wondering whether a bug affects them.
   is an upstream cleanup with no analogue here, say exactly that; "no user-visible
   effect, recorded so the commit is accounted for" is a perfectly good `impact`.
 - **Neither may contain code.** The validator rejects backticks, `::`, `()`, `->`,
-  source paths, file names, and camelCase or PascalCase identifiers in these two
-  fields, and names the offending tokens. This is mechanical and it will fail the
-  build, so write the sentence rather than pasting the symbol.
+  source paths, file names, and identifiers in any of camelCase, PascalCase,
+  acronym-prefixed PascalCase, snake_case or SCREAMING_SNAKE_CASE — and it names the
+  offending tokens. This is mechanical and it will fail the build, so write the
+  sentence rather than pasting the symbol.
 - **Nothing is lost by that.** `why` and `note` are exempt and unlimited, and they are
   where the port agent reads from, so keep them as dense and as symbol-heavy as the
   work requires. Name the exact upstream functions, the exact Rust modules, the exact

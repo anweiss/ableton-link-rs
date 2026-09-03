@@ -241,8 +241,9 @@ Otherwise, take the next item off the backlog:
 
    **`title` and `impact` are the plain-language pair; `why` and `note` are yours.**
    `title` and `impact` become the tracking issue a person reads, and the validator
-   rejects backticks, `::`, `()`, source paths and camelCase or PascalCase
-   identifiers in them. `why` and `note` are exempt and are where the mechanics
+   rejects backticks, `::`, `()`, `->`, source paths, and identifiers in any of
+   camelCase, PascalCase, acronym-prefixed PascalCase, snake_case or
+   SCREAMING_SNAKE_CASE. `why` and `note` are exempt and are where the mechanics
    belong — that is the pair you read from, and the pair you write to.
 4. Consider only items with `status = "outstanding"`. Of those, take the **first item
    any of whose `upstream` SHAs still appears in

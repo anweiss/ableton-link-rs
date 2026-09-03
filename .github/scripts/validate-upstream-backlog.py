@@ -103,22 +103,28 @@ def prose_problems(text):
 # review thread. `--self-test` runs on every pull request alongside the real
 # check.
 #
+# Each rejection case names the one reason it must be caught for, and the test
+# asserts that reason was the *only* one. A fixture that trips three detectors
+# at once still passes when two of them regress, which would leave the table
+# looking like coverage while pinning nothing.
+#
 # The accept list matters as much as the reject list: a rule that fires on
 # ordinary English would push authors straight back to pasting identifiers,
 # because the field would become impossible to write.
 SELF_TEST_REJECT = [
-    "IP_MULTICAST_ALL is set on the socket",
-    "UDPMessage parsing changed",
-    "a regression test lives in tests/discovery.rs",
-    "see examples/hut for usage",
-    "configured under .github/workflows",
-    "the fixture is audio_fixture.ipp",
-    "edit workflow.yaml",
-    "call sendPeerState again",
-    "PeerState::endpoint() was renamed",
-    "set_high on the audio thread",
-    "wrap it in `code`",
-    "the callback returns a -> b",
+    ("wrap it in `x` please", "contains '`'"),
+    ("the separator is a::b", "contains '::'"),
+    ("it takes no arguments ()", "contains '()'"),
+    ("the callback returns a -> b", "contains '->'"),
+    ("the fixture lives under tests/ in the tree", "names a source path"),
+    ("this is configured under .github/ today", "names a source path"),
+    ("edit workflow.yaml before merging", "names a source path"),
+    ("the helper is audio-fixture.ipp", "names a source path"),
+    ("call sendPeerState again", "uses code identifiers"),
+    ("the PeerState value is stale", "uses code identifiers"),
+    ("the UDPMessage value is stale", "uses code identifiers"),
+    ("IP_MULTICAST_ALL is set on the socket", "uses code identifiers"),
+    ("set_high on the audio thread", "uses code identifiers"),
 ]
 SELF_TEST_ACCEPT = [
     "Ableton Link on Linux and macOS with Tokio",
@@ -131,9 +137,14 @@ SELF_TEST_ACCEPT = [
 
 def self_test():
     failures = []
-    for text in SELF_TEST_REJECT:
-        if not prose_problems(text):
-            failures.append(f"should have been rejected but passed: {text!r}")
+    for text, reason in SELF_TEST_REJECT:
+        problems = prose_problems(text)
+        if not any(reason in p for p in problems):
+            failures.append(f"{text!r} was not caught for {reason!r}: {problems}")
+        elif len(problems) != 1:
+            failures.append(f"{text!r} is not an isolated fixture — it trips "
+                            f"{len(problems)} detectors ({problems}), so this case "
+                            "would keep passing if one of them regressed")
     for text in SELF_TEST_ACCEPT:
         problems = prose_problems(text)
         if problems:
