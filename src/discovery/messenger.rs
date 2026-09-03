@@ -829,6 +829,8 @@ pub fn send_byebye(node_state: NodeId) {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv6Addr;
+
     use super::*;
 
     fn interface_socket() -> InterfaceSocket {
@@ -838,6 +840,32 @@ mod tests {
             ),
             cancel: Cancel::default(),
         }
+    }
+
+    /// `IP_MULTICAST_ALL=0` is the whole behavioral change in this port, and it is a
+    /// socket option with no observable effect on a single-group test host, so nothing
+    /// else in the suite would notice it being removed or mis-gated. Read it back off a
+    /// socket the helper produced.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ipv4_sockets_are_not_given_groups_they_never_joined() {
+        let socket = new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+
+        assert!(
+            !socket2::SockRef::from(&socket).multicast_all_v4().unwrap(),
+            "new_udp_reuseport must clear IP_MULTICAST_ALL on IPv4 sockets, or the \
+             discovery listener keeps receiving multicast for groups it never joined"
+        );
+    }
+
+    /// `IP_MULTICAST_ALL` is an IPv4-only option, so setting it on an IPv6 socket fails
+    /// outright. This helper serves both families, and an earlier revision of this port
+    /// gated the call on Linux alone: every IPv6 caller then failed before bind. Keep a
+    /// test on the IPv6 path so that mis-gating cannot come back silently.
+    #[tokio::test]
+    async fn ipv6_sockets_are_still_constructible() {
+        new_udp_reuseport(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0))
+            .expect("new_udp_reuseport must support IPv6 callers");
     }
 
     #[test]

@@ -264,8 +264,8 @@ title = "Stop handing discovery sockets multicast traffic for groups they never 
 upstream = ["c5574eee4d03", "d466f42a7b36"]
 rust = ["src/discovery/messenger.rs"]
 risk = "behavior"
-status = "outstanding"
-retired_at_pin = ""
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "`IP_MULTICAST_ALL=0` narrows delivery to the groups a socket joined itself on Linux, instead of every group joined anywhere on the system; the subnet filter in `UdpMessenger` that approximated this at the application layer is then removed. It is a per-socket membership filter, not per-interface arrival metadata: it does not report which interface a datagram came in on, so response-socket selection stays a longest-prefix match on the source address, as upstream's does. This port never had the subnet-filter workaround, so only the additive half applies."
 impact = "By default Linux hands a socket bound to the discovery port every multicast datagram for any group joined anywhere on the machine, including groups that socket never joined. Sockets that exist only to send and to collect the replies they trigger therefore see traffic that is none of their business. Asking the operating system to deliver only each socket's own memberships stops that."
 
