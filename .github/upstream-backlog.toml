@@ -260,14 +260,14 @@ note = "Merged with \"Fix ESP-IDF 6.0 PeerState init + Peers use-after-move (cor
 
 [[port]]
 id = "set-ip-multicast-all-0-on-linux"
-title = "Stop seeing discovery traffic arrive on the wrong network interface on Linux"
+title = "Stop handing discovery sockets multicast traffic for groups they never joined on Linux"
 upstream = ["c5574eee4d03", "d466f42a7b36"]
 rust = ["src/discovery/messenger.rs"]
 risk = "behavior"
-status = "outstanding"
-retired_at_pin = ""
-why = "`IP_MULTICAST_ALL=0` restricts multicast reception to the joined interface on Linux; the subnet filter in `UdpMessenger` that worked around the old behaviour is then removed; together these fix spurious cross-interface packet reception on multi-homed Linux hosts"
-impact = "By default Linux hands multicast traffic to a socket no matter which interface it arrived on, so on a machine with several networks a peer appears to be reachable through interfaces it is not. This library works around that by filtering on address ranges, which is only approximate. Asking the operating system for the correct behaviour fixes it properly and lets the workaround be removed."
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
+why = "`IP_MULTICAST_ALL=0` narrows delivery to the groups a socket joined itself on Linux, instead of every group joined anywhere on the system; the subnet filter in `UdpMessenger` that approximated this at the application layer is then removed. It is a per-socket membership filter, not per-interface arrival metadata: it does not report which interface a datagram came in on, so response-socket selection stays a longest-prefix match on the source address, as upstream's does. This port never had the subnet-filter workaround, so only the additive half applies. Note also that this port's listener joins the group on every interface, so the option excludes other groups rather than other interfaces; the interface-identity gap that leaves is tracked in issue #154, not here."
+impact = "By default Linux hands a socket every multicast datagram for any group joined anywhere on the machine, including groups that socket never joined. Anything else that binds the discovery port and joins a group of its own therefore has its traffic parsed and thrown away by discovery. Asking the operating system for only this socket's own memberships stops that. Other Link instances join the same group, so their packets keep arriving as they should, and nothing changes about which interface a peer looks reachable through."
 
 [[port]]
 id = "catch-message-encode-exceptions-in-sendudpmessage"

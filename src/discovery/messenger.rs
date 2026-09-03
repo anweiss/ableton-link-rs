@@ -51,6 +51,37 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     #[cfg(unix)]
     udp_sock.set_reuse_port(true)?;
 
+    // On Linux, a socket bound to a port receives datagrams for *any* multicast
+    // group joined by any socket on the host, including groups this socket never
+    // joined itself. The socket this matters for is the discovery listener, which
+    // binds the Link port wildcard and with `SO_REUSEADDR`/`SO_REUSEPORT` shares it
+    // with anything else on that port - including a program that binds it and joins
+    // a multicast group of its own. That program's traffic lands in this port's
+    // receive path to be parsed and discarded.
+    //
+    // Other Link instances are not that case: they join the same discovery group,
+    // so their packets are addressed to a membership this listener holds and remain
+    // deliverable. Only traffic for groups this socket never joined is excluded.
+    //
+    // It is deliberately *not* about the per-interface sockets created below: those
+    // bind an ephemeral port, so port demultiplexing already keeps discovery
+    // multicast away from them regardless of this option.
+    //
+    // `IP_MULTICAST_ALL=0` (upstream `c5574eee4d03`) narrows delivery to this
+    // socket's own memberships. That is a filter on *group*, not on interface: the
+    // listener joins the discovery group on every interface, so Link traffic
+    // arriving on any of them still matches, and the option reports nothing about
+    // which interface a datagram came in on. Response-socket selection in
+    // `socket_for_target` therefore remains a longest-prefix match on the source
+    // address. Closing that gap needs per-interface listeners or arrival metadata
+    // and is tracked in #154.
+    //
+    // The option is IPv4-only, so it is applied only to IPv4 sockets.
+    #[cfg(target_os = "linux")]
+    if addr.is_ipv4() {
+        udp_sock.set_multicast_all_v4(false)?;
+    }
+
     // When binding to a concrete interface address, make sure outgoing multicast
     // traffic leaves through that very interface.
     if let SocketAddr::V4(addr) = addr {
@@ -810,6 +841,8 @@ pub fn send_byebye(node_state: NodeId) {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv6Addr;
+
     use super::*;
 
     fn interface_socket() -> InterfaceSocket {
@@ -819,6 +852,32 @@ mod tests {
             ),
             cancel: Cancel::default(),
         }
+    }
+
+    /// `IP_MULTICAST_ALL=0` is the whole behavioral change in this port, and it is a
+    /// socket option with no observable effect on a single-group test host, so nothing
+    /// else in the suite would notice it being removed or mis-gated. Read it back off a
+    /// socket the helper produced.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ipv4_sockets_are_not_given_groups_they_never_joined() {
+        let socket = new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+
+        assert!(
+            !socket2::SockRef::from(&socket).multicast_all_v4().unwrap(),
+            "new_udp_reuseport must clear IP_MULTICAST_ALL on IPv4 sockets, or the \
+             discovery listener keeps receiving multicast for groups it never joined"
+        );
+    }
+
+    /// `IP_MULTICAST_ALL` is an IPv4-only option, so setting it on an IPv6 socket fails
+    /// outright. This helper serves both families, and an earlier revision of this port
+    /// gated the call on Linux alone: every IPv6 caller then failed before bind. Keep a
+    /// test on the IPv6 path so that mis-gating cannot come back silently.
+    #[tokio::test]
+    async fn ipv6_sockets_are_still_constructible() {
+        new_udp_reuseport(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0))
+            .expect("new_udp_reuseport must support IPv6 callers");
     }
 
     #[test]
