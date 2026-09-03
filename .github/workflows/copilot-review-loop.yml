@@ -514,6 +514,49 @@ jobs:
               return next;
             }
 
+            // The state comment is edited in place, which is right for a running
+            // status and wrong for a handoff: editing a comment notifies nobody, so
+            // a loop that gives up does it behind a green check. PR #152 sat in
+            // `rounds-exhausted` and the only trace was a silently rewritten sticky
+            // comment. A terminal phase posts its own comment instead, once per
+            // phase and head, marked so a later sweep cannot repost it.
+            async function announceHandoff(number, phase, head, note) {
+              const marker = `<!-- copilot-review-loop:handoff phase=${phase} head=${head} -->`;
+              let comments = [];
+              try {
+                comments = await github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: number, per_page: 100,
+                });
+              } catch (err) {
+                // Fail closed towards announcing. A duplicate handoff comment is
+                // noise; a missing one is the unannounced stop this exists to end.
+                core.warning(`PR #${number}: could not list comments: ${err.message}`);
+              }
+              // Author check, not just marker check, for the same reason the state
+              // lookup has one: the marker shape is public and the head is public,
+              // so anyone with comment access could otherwise pre-seed it and
+              // suppress the handoff notification.
+              const already = comments.some(
+                c => (c.body || '').includes(marker) &&
+                     c.user && c.user.login === 'github-actions[bot]',
+              );
+              if (already) return;
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: number,
+                body: [
+                  '**Copilot review loop - handing off.**',
+                  '',
+                  note,
+                  '',
+                  'The loop keeps sweeping this pull request, but it will not ' +
+                  'dispatch the coding agent again on its own - it needs the ' +
+                  'situation to change. See the loop state comment for details.',
+                  '',
+                  marker,
+                ].join('\n'),
+              });
+            }
+
             function stalled(value) {
               if (!value.phaseSince) return false;
               const age = Date.now() - new Date(value.phaseSince).getTime();
@@ -1359,6 +1402,12 @@ jobs:
                         'or address the comments by hand - the loop re-reviews ' +
                         'whatever you push. `copilot-reviewed` is withheld.',
                   });
+                  await announceHandoff(
+                    number, 'agent-failed', head,
+                    `Copilot Review Fix ([run](${run.html_url})) ended ` +
+                    `\`${run.conclusion}\` without moving the head, so the ` +
+                    `${outstanding.length} outstanding comment(s) are unchanged. ` +
+                    'Nothing further is dispatched; `copilot-reviewed` is withheld.');
                   core.warning(
                     `PR #${number}: Copilot Review Fix run ${run.id} ended ` +
                     `'${run.conclusion}' without moving the head.`);
@@ -1388,6 +1437,12 @@ jobs:
                         'round again. This one needs a human; `copilot-reviewed` is ' +
                         'withheld and auto-merge stays disengaged.',
                 });
+                await announceHandoff(
+                  number, 'rounds-exhausted', head,
+                  `The coding agent has had ${handle.value.rounds} pass(es) here and ` +
+                  `Copilot still has ${outstanding.length} outstanding comment(s), so ` +
+                  'the loop has stopped rather than going round again. ' +
+                  '`copilot-reviewed` is withheld and auto-merge stays disengaged.');
                 core.warning(`PR #${number}: review rounds exhausted.`);
                 return;
               }
@@ -1404,6 +1459,12 @@ jobs:
                         'checks.\n\nAddress them by hand and push; the loop re-reviews ' +
                         'the new head on its own.',
                 });
+                await announceHandoff(
+                  number, 'needs-pat', head,
+                  `Copilot left ${outstanding.length} comment(s) on \`${short}\` that ` +
+                  'cannot be handed to Copilot Review Fix because the `PIPELINE_PAT` ' +
+                  'secret is not set. Address them by hand and push; the loop ' +
+                  're-reviews the new head on its own.');
                 core.warning(`PR #${number}: cannot dispatch agent without PIPELINE_PAT.`);
                 return;
               }
