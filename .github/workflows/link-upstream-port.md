@@ -176,14 +176,32 @@ Otherwise, take the next item off the backlog:
 1. Read `/tmp/gh-aw/agent/upstream/summary.md`. If the port is level with upstream,
    stop.
 2. **Check for an open port PR first.** Run
-   `gh pr list --state open --label upstream-sync --json number,labels`. If any pull
-   request comes back, **stop**: do not port anything, do not touch the backlog, and do
-   not open a second pull request.
+
+   ```bash
+   gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
+     --jq '.[] | select([.labels[].name] | index("upstream-sync")) | .number'
+   ```
+
+   If any pull request comes back, **stop**: do not port anything, do not touch the
+   backlog, and do not open a second pull request.
+
+   **Use `gh api`, not `gh pr list`.** `gh pr list` fails in this sandbox with
+   `malformed version`; run 33717533039 spent four tool calls discovering that before
+   falling back to `gh api`. The same bug hits `gh issue list`, so the stranded-port
+   check below uses `gh api` too.
+
+   **This check fails closed.** If the command errors, returns something you cannot
+   parse, or you are otherwise unsure whether a port PR is open, treat that as
+   **blocked** and stop — never as "nothing is open". A false "clear" is the one
+   outcome that actually loses work: two ports branch off the same watermark, both
+   advance the submodule pin from the same base, and the second silently drops the
+   first's changes from its own assumptions. Stopping a week early costs one cycle;
+   guessing wrong costs a port.
 
    "Stop" here means stop *porting*, not stop *reporting*. This is an early stop like
    any other, so it is still governed by *Every early stop must be announced* below —
-   `noop` with the blocking PR number, and comment on that PR unless its last comment
-   already reports this same blocker at this same watermark.
+   `noop` with the blocking PR number, and a comment on that PR unless it already
+   carries this run's blocker marker, exactly as defined there.
 
    Match on `upstream-sync` and nothing else. The watch workflow's backlog pull
    requests carry `upstream-triage` instead, precisely so that a triage PR sitting
@@ -199,7 +217,15 @@ Otherwise, take the next item off the backlog:
    open one to merge.
 
    **Then check for a stranded port.** Run
-   `gh issue list --state open --label upstream-sync`. A stranded port is a port whose
+
+   ```bash
+   gh api "repos/$GITHUB_REPOSITORY/issues?state=open&labels=upstream-sync&per_page=100" \
+     --jq '.[] | select(.pull_request == null) | .number'
+   ```
+
+   The `select(.pull_request == null)` is required: the issues endpoint returns pull
+   requests too, and without it every open port PR would also read as a stranded port.
+   A stranded port is a port whose
    push failed and got turned into an issue instead of a pull request, so it holds work
    that is not on `main` yet. Redoing it would just produce a second copy of the same
    change, so if one exists, **stop** and comment on it saying the port is still
@@ -286,12 +312,14 @@ Otherwise, take the next item off the backlog:
 7. Find the item's tracking issue so the pull request can close it:
 
    ```bash
-   gh issue list --state open --label upstream-item --limit 100 \
-     --json number,body \
-     --jq '.[] | select(.body | contains("<!-- upstream-backlog-id: THE_ID -->")) | .number'
+   gh api "repos/$GITHUB_REPOSITORY/issues?state=open&labels=upstream-item&per_page=100" \
+     --jq '.[] | select(.pull_request == null)
+              | select(.body | contains("<!-- upstream-backlog-id: THE_ID -->")) | .number'
    ```
 
-   Match on that marker, never on the title — titles get edited. If exactly one
+   `gh api` again rather than `gh issue list`, for the same sandbox reason as step 2.
+   Match on that marker, never on the title — titles get edited, and since these
+   titles are now plain-language prose they get edited more, not less. If exactly one
    number comes back, remember it as the item's issue number. If none comes back,
    carry on with the port and leave `Closes` out of the pull request body; the issue
    is opened by a separate reconcile workflow and may simply not exist yet. That is
@@ -346,12 +374,33 @@ answer: there is no decision owed and no failure to report, and opening a
 `needs-decision` issue for it would be noise. The rule above is for a run that wanted
 to make progress and could not.
 
-Say nothing twice: before commenting anywhere — whether for a skipped item in step 5 or
-for a terminal stop here — check the last comment on that issue. If it already reports
-this same blocker at this same watermark, say nothing and let `noop` (or the pull
-request you are opening) stand. This applies to **every** run, not only ones that end
+**Say nothing twice — and decide that mechanically.** Before commenting anywhere,
+whether for a skipped item in step 5 or for a terminal stop here, stamp every blocker
+comment you write with a marker on its own line, built from the blocker and the
+watermark you are stopping at:
+
+```
+<!-- link-upstream-port:blocked id=<blocking PR/issue number or backlog id> pin=<short pin> -->
+```
+
+Then the rule is a search, not a judgement call: list that issue or pull request's
+comments and look for **that exact marker**. If it is there, say nothing and let `noop`
+(or the pull request you are opening) stand. If it is not, comment — no matter what
+else has been said there.
+
+**Do not substitute your own reading of the latest comment for that search.** Run
+33717533039 halted on open PR #147, read its most recent comment — a maintainer's
+note about review scope, which said nothing about porting being blocked — and reasoned
+"this last comment already reports the current status at this watermark", so it stayed
+silent. The weekly cycle was lost with a green check and no notification: exactly the
+unannounced stop this section exists to prevent. A human status update is not this
+workflow's blocker announcement, and only the marker can tell the two apart.
+
+Search **all** comments, not only the last one. A later unrelated comment must not
+un-suppress an announcement you have already made, or a long-lived blocker reposts
+itself every week forever. This applies to **every** run, not only ones that end
 in `noop`: a weekly run that skips a blocked item and then successfully opens a port PR
-would otherwise repost the identical blocker comment every week forever.
+would otherwise repost the identical blocker comment every week.
 
 **Reserve the last comment for the terminal report.** `add-comment` is capped at ten
 per run and the cap is enforced by the tooling, not by you — the eleventh call is
