@@ -317,7 +317,7 @@ Otherwise, take the next item off the backlog:
    ```bash
    gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&labels=upstream-item&per_page=100" \
      --jq '.[] | select(.pull_request == null)
-              | select(.body | contains("<!-- upstream-backlog-id: THE_ID -->")) | .number'
+              | select((.body // "") | contains("<!-- upstream-backlog-id: THE_ID -->")) | .number'
    ```
 
    `gh api` again rather than `gh issue list`, for the same sandbox reason as step 2.
