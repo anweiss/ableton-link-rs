@@ -1465,15 +1465,12 @@ mod dispatch_gate_tests {
     /// admit work against a controller that no longer exists. This is the
     /// path `disable()`-based lifecycle tests cannot reach.
     #[tokio::test]
+    #[ignore] // `Controller::new` binds sockets and needs a non-loopback IPv4 interface — run locally with --include-ignored
     async fn drop_without_disable_closes_the_gate() {
         let clock = Clock::new();
-        let controller = match Controller::new(tempo::Tempo::new(120.0), clock).await {
-            Ok(controller) => controller,
-            // `Controller::new` binds sockets and needs a non-loopback IPv4
-            // interface; there is nothing to assert about the gate if the
-            // controller could not be constructed at all.
-            Err(_) => return,
-        };
+        let controller = Controller::new(tempo::Tempo::new(120.0), clock)
+            .await
+            .expect("Controller::new must succeed for this test to prove anything about drop");
         let gate = controller.dispatch_gate_handle();
 
         // Stand in for `enable()`, which additionally starts discovery: the
