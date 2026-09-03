@@ -107,15 +107,30 @@ impl DispatchGate {
     }
 
     async fn stop(&self) {
+        self.close();
+        // Waiting for exclusive access waits out any batch already in flight,
+        // and - because a consumer drains its queue before releasing its permit
+        // - also for the pre-stop queue contents to have been discarded.
+        let _ = self.in_flight.write().await;
+    }
+
+    /// Closes the gate against new dispatch work without waiting for any batch
+    /// already in flight to finish. Idempotent: closing an already-closed gate
+    /// is a no-op, mirroring upstream's `LockFreeCallbackDispatcher::stop()`
+    /// (`53f0627c9cf8`) being safe to call more than once.
+    ///
+    /// This is the synchronous half of [`DispatchGate::stop`], used from
+    /// [`Controller`]'s [`Drop`] impl where an `async` wait is not available -
+    /// Rust analogue of upstream moving `stopIoService()` (renamed
+    /// `shutdown()`) into `~SessionController()` in `cccaecc9e93b`, so
+    /// teardown is requested from the destructor rather than relying solely
+    /// on an explicit `disable()` having been called first.
+    fn close(&self) {
         self.active.send_if_modified(|open| {
             let changed = *open;
             *open = false;
             changed
         });
-        // Waiting for exclusive access waits out any batch already in flight,
-        // and - because a consumer drains its queue before releasing its permit
-        // - also for the pre-stop queue contents to have been discarded.
-        let _ = self.in_flight.write().await;
     }
 }
 
@@ -231,6 +246,21 @@ pub struct Controller {
     /// closed, matching `enabled == false` at construction, so no dispatch work
     /// runs before the first `enable()`.
     dispatch_gate: Arc<DispatchGate>,
+}
+
+impl Drop for Controller {
+    /// Closes the dispatch gate on drop, mirroring upstream moving
+    /// `stopIoService()` (renamed `shutdown()`) into `~SessionController()`
+    /// (`cccaecc9e93b`): a `Controller` dropped without a preceding
+    /// `disable()` still stops admitting new dispatch work rather than
+    /// leaving the gate open behind a destroyed controller. This only closes
+    /// the gate, since `Drop::drop` cannot be `async` and so cannot await
+    /// in-flight work the way `disable()`'s async `DispatchGate::stop` does.
+    /// Closing is idempotent (`53f0627c9cf8`), so calling it here as well as
+    /// from a prior `disable()` is harmless.
+    fn drop(&mut self) {
+        self.dispatch_gate.close();
+    }
 }
 
 impl Controller {
