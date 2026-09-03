@@ -107,15 +107,30 @@ impl DispatchGate {
     }
 
     async fn stop(&self) {
+        self.close();
+        // Waiting for exclusive access waits out any batch already in flight,
+        // and - because a consumer drains its queue before releasing its permit
+        // - also for the pre-stop queue contents to have been discarded.
+        let _ = self.in_flight.write().await;
+    }
+
+    /// Closes the gate against new dispatch work without waiting for any batch
+    /// already in flight to finish. Idempotent: closing an already-closed gate
+    /// is a no-op, mirroring upstream's `LockFreeCallbackDispatcher::stop()`
+    /// (`53f0627c9cf8`) being safe to call more than once.
+    ///
+    /// This is the synchronous half of [`DispatchGate::stop`], used from
+    /// [`Controller`]'s [`Drop`] impl where an `async` wait is not available -
+    /// Rust analogue of upstream moving `stopIoService()` (renamed
+    /// `shutdown()`) into `~SessionController()` in `cccaecc9e93b`, so
+    /// teardown is requested from the destructor rather than relying solely
+    /// on an explicit `disable()` having been called first.
+    fn close(&self) {
         self.active.send_if_modified(|open| {
             let changed = *open;
             *open = false;
             changed
         });
-        // Waiting for exclusive access waits out any batch already in flight,
-        // and - because a consumer drains its queue before releasing its permit
-        // - also for the pre-stop queue contents to have been discarded.
-        let _ = self.in_flight.write().await;
     }
 }
 
@@ -231,6 +246,21 @@ pub struct Controller {
     /// closed, matching `enabled == false` at construction, so no dispatch work
     /// runs before the first `enable()`.
     dispatch_gate: Arc<DispatchGate>,
+}
+
+impl Drop for Controller {
+    /// Closes the dispatch gate on drop, mirroring upstream moving
+    /// `stopIoService()` (renamed `shutdown()`) into `~SessionController()`
+    /// (`cccaecc9e93b`): a `Controller` dropped without a preceding
+    /// `disable()` still stops admitting new dispatch work rather than
+    /// leaving the gate open behind a destroyed controller. This only closes
+    /// the gate, since `Drop::drop` cannot be `async` and so cannot await
+    /// in-flight work the way `disable()`'s async `DispatchGate::stop` does.
+    /// Closing is idempotent (`53f0627c9cf8`), so calling it here as well as
+    /// from a prior `disable()` is harmless.
+    fn drop(&mut self) {
+        self.dispatch_gate.close();
+    }
 }
 
 impl Controller {
@@ -1343,4 +1373,129 @@ fn map_start_stop_state_from_client_to_session(
 pub struct SessionPeerCounter {
     // callback: Option<PeerCountCallback>,
     pub session_peer_count: usize,
+}
+
+#[cfg(test)]
+impl Controller {
+    /// Test-only handle on the dispatch gate, so a test can observe the gate
+    /// after the `Controller` owning it has been dropped.
+    fn dispatch_gate_handle(&self) -> Arc<DispatchGate> {
+        self.dispatch_gate.clone()
+    }
+}
+
+#[cfg(test)]
+mod dispatch_gate_tests {
+    use super::*;
+
+    /// A dispatch loop shaped like the ones spawned in [`Controller::new`]:
+    /// every batch is admitted through the gate, and every batch that is
+    /// admitted is recorded.
+    fn spawn_gated_loop(
+        gate: Arc<DispatchGate>,
+        mut rx: tokio::sync::mpsc::Receiver<u32>,
+        seen: Arc<Mutex<Vec<u32>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut gate_open = gate.subscribe();
+            while let Some((_permit, _epoch, work)) =
+                gated_recv(&gate, &mut gate_open, &mut rx).await
+            {
+                seen.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(work);
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn close_is_idempotent() {
+        let gate = DispatchGate::new();
+        gate.start();
+        assert!(gate.is_open());
+        gate.close();
+        assert!(!gate.is_open());
+        // Mirrors upstream's `LockFreeCallbackDispatcher::stop()`
+        // (`53f0627c9cf8`) being safe to call more than once - including from
+        // both an explicit `disable()` and the destructor afterwards.
+        gate.close();
+        assert!(!gate.is_open());
+        gate.stop().await;
+        assert!(!gate.is_open());
+    }
+
+    /// Work queued while the gate was open but not yet admitted must never be
+    /// dispatched once the gate has been closed synchronously, which is the
+    /// only thing a `Drop` impl can do.
+    #[tokio::test]
+    async fn close_stops_admitting_queued_work() {
+        let gate = Arc::new(DispatchGate::new());
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        gate.start();
+        let handle = spawn_gated_loop(gate.clone(), rx, seen.clone());
+
+        tx.send(1).await.unwrap();
+        // Let the open gate admit and dispatch it before closing, so the
+        // second half of the test is about the closed gate and not about the
+        // (separately covered) drain of work still queued at close time.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.stop().await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![1],
+            "work admitted while the gate was open should be dispatched"
+        );
+
+        // Gate closed: queue more, then give the loop every chance to run it.
+        tx.send(2).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![1],
+            "no work may be dispatched after the gate has been closed"
+        );
+
+        handle.abort();
+    }
+
+    /// Dropping an enabled `Controller` without a preceding `disable()` must
+    /// leave the dispatch gate closed, so a loop still parked on it cannot
+    /// admit work against a controller that no longer exists. This is the
+    /// path `disable()`-based lifecycle tests cannot reach.
+    #[tokio::test]
+    #[ignore] // `Controller::new` binds sockets and needs a non-loopback IPv4 interface — run locally with --include-ignored
+    async fn drop_without_disable_closes_the_gate() {
+        let clock = Clock::new();
+        let controller = Controller::new(tempo::Tempo::new(120.0), clock)
+            .await
+            .expect("Controller::new must succeed for this test to prove anything about drop");
+        let gate = controller.dispatch_gate_handle();
+
+        // Stand in for `enable()`, which additionally starts discovery: the
+        // gate state this test is about is exactly what `enable()` sets.
+        gate.start();
+        assert!(gate.is_open());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_gated_loop(gate.clone(), rx, seen.clone());
+
+        drop(controller);
+
+        assert!(
+            !gate.is_open(),
+            "dropping a Controller must close its dispatch gate"
+        );
+
+        tx.send(7).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no dispatch work may be admitted after the Controller was dropped"
+        );
+
+        handle.abort();
+    }
 }
