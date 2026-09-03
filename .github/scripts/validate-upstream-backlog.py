@@ -36,6 +36,51 @@ STATUSES = {"outstanding", "retired"}
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
+# `title` and `impact` are the two fields a person reads before deciding whether
+# an item is worth their attention: they become the tracking issue's title and
+# its opening paragraph. Both were being written as C++ symbol soup — an item
+# called "Rename stopIoService to shutdown / LockFreeCallbackDispatcher::stop"
+# tells a reader who does not already have the upstream header open precisely
+# nothing about what breaks or for whom.
+#
+# The mechanical rule below is what makes "write plain language" enforceable
+# rather than aspirational. It is deliberately narrow: it rejects the tokens
+# that only ever appear when prose has been replaced by an identifier, and says
+# nothing about style, length or tone.
+#
+# The technical detail is not lost, it moves: `why` and `note` are agent-facing
+# and are exempt, so an item still carries everything a port run needs.
+JARGON = [
+    ("`", "backtick-quoted code"),
+    ("::", "a C++/Rust path separator"),
+    ("()", "a function-call suffix"),
+    ("->", "an arrow operator"),
+]
+# A path (`src/link/peers.rs`) or a source file name, as opposed to the "/" in
+# "and/or" — require a dot-suffix or a known source directory to avoid that.
+PATH_RE = re.compile(r"\b(?:src|include|vendor|test)/|\b\w+\.(?:rs|cpp|hpp|h|toml|py|yml)\b")
+# camelCase and multi-hump PascalCase are identifiers, not English. Single-hump
+# words ("Link", "Linux", "Tokio") are fine and must stay legal.
+SYMBOL_RE = re.compile(r"\b(?:[a-z]+[A-Z]\w*|[A-Z][a-z]+[A-Z]\w*)\b")
+# Words that look like identifiers to the regex but are ordinary English in this
+# problem domain. Keep this short; it is an escape hatch, not a second schema.
+SYMBOL_OK = {"GitHub", "IPv4", "IPv6", "macOS", "iOS", "JavaScript", "TypeScript"}
+
+
+def prose_problems(text):
+    """Return the reasons `text` reads as code rather than as English."""
+    found = []
+    for token, desc in JARGON:
+        if token in text:
+            found.append(f"contains {token!r} ({desc})")
+    if PATH_RE.search(text):
+        found.append("names a source path or file")
+    symbols = [s for s in SYMBOL_RE.findall(text) if s not in SYMBOL_OK]
+    if symbols:
+        uniq = sorted(set(symbols))[:4]
+        found.append("uses code identifiers: " + ", ".join(uniq))
+    return found
+
 errors, warnings = [], []
 
 
@@ -74,7 +119,7 @@ if not port:
 
 # --- structure --------------------------------------------------------------
 REQUIRED = ["id", "title", "upstream", "rust", "risk", "status",
-            "retired_at_pin", "why"]
+            "retired_at_pin", "why", "impact"]
 
 seen_ids, sha_owner = {}, {}
 
@@ -97,6 +142,23 @@ for n, item in enumerate(port):
         err(f"{where}: title is empty")
     if not item["why"].strip():
         err(f"{where}: why is empty — every item has to say why it matters")
+
+    # `impact` is the one field written for a reader rather than for the port
+    # agent: it opens the tracking issue and has to stand on its own for someone
+    # who has never opened the upstream header. `why` stays as deep and as
+    # symbol-dense as it needs to be, and carries the detail the agent works
+    # from, so nothing is lost by keeping identifiers out of `impact`.
+    if not item["impact"].strip():
+        err(f"{where}: impact is empty — say in plain language what someone "
+            "using this library would notice, and leave the mechanics to `why`")
+    for field in ("title", "impact"):
+        for problem in prose_problems(item[field]):
+            err(f"{where}: {field} {problem}. It is read by people deciding "
+                "whether this matters to them; describe the effect, and keep "
+                "the identifiers in `why` and `note`.")
+    if len(item["impact"].split()) > 90:
+        err(f"{where}: impact is {len(item['impact'].split())} words — it is a "
+            "short orienting paragraph, not the full story. Move detail to `why`.")
 
     if item["risk"] not in RISKS:
         err(f"{where}: risk must be one of {sorted(RISKS)}, got {item['risk']!r}")

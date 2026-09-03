@@ -48,146 +48,159 @@ commits_behind = 113
 
 [[port]]
 id = "catch-exception-in-udpmessenger-send-path"
-title = "Catch exception in UdpMessenger send path"
+title = "Keep running when sending a discovery packet fails"
 upstream = ["4d10802c6c91"]
 rust = ["src/discovery/messenger.rs"]
 risk = "behavior"
 status = "retired"
 retired_at_pin = "e233c676"
 why = "`sendPeerState` was not catching `UdpSendException`; a failed send now logs and continues rather than propagating"
+impact = "If the network refused a discovery packet - a downed interface, an unreachable route - the failure escaped as an error instead of being absorbed, and a single bad send could stop this peer announcing itself for the rest of the session. Such a send is now logged and skipped, and the next announcement goes out normally."
 note = "retired at pin `e233c676`"
 
 [[port]]
 id = "fix-message-size-assertion-asio-socket"
-title = "Fix message size assertion (ASIO socket)"
+title = "Stop rejecting messages that sit exactly on the size limit"
 upstream = ["71cd8351dc70"]
 rust = ["src/discovery/messenger.rs"]
 risk = "behavior"
 status = "retired"
 retired_at_pin = "e233c676"
 why = "Assertion was off-by-one and could fire on valid maximum-size messages; Tokio path should be checked for equivalent over-size guard"
+impact = "An off-by-one in the size check treated a message occupying the full allowed payload as oversized and aborted the process in debug builds. Entirely valid traffic from a peer advertising a lot of state could therefore take down a listener."
 note = "retired at pin `e233c676`"
 
 [[port]]
 id = "measurement-with-one-socket-shared-unicast-socket"
-title = "Measurement with one socket (shared unicast socket)"
+title = "Share one socket per network interface instead of opening a second"
 upstream = ["e233c67621f3"]
 rust = ["src/link/measurement.rs", "src/link/pingresponder.rs"]
 risk = "behavior"
 status = "retired"
 retired_at_pin = "e233c676"
 why = "`Measurement` now receives a shared socket reference instead of opening its own, reducing fd usage and allowing `PingResponder` and `Measurement` to share one socket per gateway"
+impact = "Latency measurement opened its own socket alongside the one already listening for the replies it depends on. On a host with many interfaces, or an application already near its file-descriptor limit, that doubled the cost for no benefit. Both now share a single socket per interface."
 note = "retired at pin `e233c676`"
 
 [[port]]
 id = "make-endpoint-reusable-rename-measurementendpointv4-v6-endpointv4"
-title = "Make Endpoint reusable (rename MeasurementEndpointV4/V6 → EndpointV4/V6 with key template)"
+title = "Generalise the peer address type so more than one kind of address can be announced"
 upstream = ["36d75d4e4555"]
 rust = ["src/link/measurement.rs", "src/discovery/peers.rs"]
 risk = "wire-format"
 status = "retired"
 retired_at_pin = "5226d027"
 why = "`MeasurementEndpointV4/V6` renamed to generic `EndpointV4/V6<key>` parameterized by FourCC key; prepares for `audioEndpoint` with different keys"
+impact = "A peer could advertise exactly one address, hard-wired to latency measurement. Making the type generic over which kind of address it carries is what later allows a peer to advertise an audio address as well, without a second near-identical copy of the same code."
 note = "retired at pin `5226d027`"
 
 [[port]]
 id = "rename-peerstate-endpoint-to-measurementendpoint"
-title = "Rename PeerState::endpoint() to measurementEndpoint()"
+title = "Name the existing peer address for what it actually is"
 upstream = ["9f9669875587"]
 rust = ["src/discovery/peers.rs"]
 risk = "internal"
 status = "retired"
 retired_at_pin = "5226d027"
 why = "API rename to make room for `audioEndpoint`; no wire change"
+impact = "A rename only. The single address a peer advertises is specifically its measurement address, and saying so leaves room for the audio address added shortly afterwards. Nothing an application sends, receives or calls changes."
 note = "retired at pin `5226d027`"
 
 [[port]]
 id = "add-audioendpoint-to-peerstate-new-wire-payload"
-title = "Add audioEndpoint to PeerState (new wire payload fields `aep4`/`aep6`)"
+title = "Understand the audio address that newer peers now advertise"
 upstream = ["5226d027663e"]
 rust = ["src/discovery/peers.rs", "src/link/payload.rs", "src/encoding.rs"]
 risk = "wire-format"
 status = "retired"
 retired_at_pin = "5226d027"
 why = "PeerState now serializes optional IPv4/IPv6 audio endpoints with FourCC keys `0x61657034` (`aep4`) and `0x61657036` (`aep6`); peers that don't understand them silently skip — but this crate must at least parse them to stay forward-compatible with current Ableton Live/Bitwig"
+impact = "Current Ableton Live and Bitwig releases announce an optional audio address alongside the existing one. Peers are expected to skip fields they do not recognise, but this library has to read them correctly to stay compatible as the protocol grows, and to offer them to applications that want to use them."
 note = "retired at pin `5226d027`"
 
 [[port]]
 id = "replace-link-optional-with-std-optional"
-title = "Replace link::Optional with std::optional"
+title = "Upstream dropped its hand-written optional type in favour of the standard one"
 upstream = ["fc33dfd10874"]
 rust = ["src/link/state.rs"]
 risk = "internal"
 status = "retired"
 retired_at_pin = "5226d027"
 why = "Removes custom `Optional<T>` in favour of `std::optional`; Rust `Option` already matches; check `OptionalTimeline`, `OptionalStartStopState`, `OptionalClientStartStopState` usage in `state.rs`"
+impact = "An upstream cleanup with no direct equivalent here, because this language already provides the type upstream switched to. Recorded so the commit is accounted for, and so the places this library represents an absent value stay in step with it."
 note = "retired at pin `5226d027`"
 
 [[port]]
 id = "add-sessionid-to-clientstates"
-title = "Add SessionId to ClientStates"
+title = "Tell an application when it has joined a different session"
 upstream = ["57fcc6e2e1f6"]
 rust = ["src/link/state.rs", "src/link/controller.rs"]
 risk = "behavior"
 status = "retired"
 retired_at_pin = "fd6fdd4"
 why = "`ClientState`, `RtClientState`, and `ApiState` now carry a `timelineSessionId`; used to detect when the local peer has joined a new session so the callback fires correctly"
+impact = "The state handed to applications did not record which session it belonged to, so joining a new session could pass unnoticed and the change callback would not fire when it should have. Carrying the session identity through makes that transition observable."
 note = "retired at pin `fd6fdd4` (PR #83)"
 
 [[port]]
 id = "output-nodeid-bytes-as-hex-in-display"
-title = "Output NodeId bytes as hex in Display/Debug"
+title = "Print peer identifiers as readable hex rather than raw bytes"
 upstream = ["588fd85708d6"]
 rust = ["src/link/node.rs"]
 risk = "internal"
 status = "retired"
 retired_at_pin = "e233c676"
 why = "`NodeId`'s `operator<<` previously wrote raw bytes to the stream; fixed to hex; the Rust `Display`/`Debug` impl should be checked for the same issue"
+impact = "Logging a peer identifier wrote its raw bytes straight into the output, producing unreadable and occasionally terminal-corrupting text. It is now printed as hex, which is what anyone reading a log expects to see."
 note = "retired at pin `e233c676`"
 
 [[port]]
 id = "route-callbacks-through-sessioncontroller-shutdown-ordering-improvements"
-title = "Add link::SessionController / ApiConfig / route callbacks through it"
+title = "Shut the audio extension down before the core it depends on"
 upstream = ["165c764990b0", "cbc81f057633", "fd30b5048e20"]
 rust = ["src/link_audio/api.rs"]
 risk = "behavior"
 status = "retired"
 retired_at_pin = "fd30b5048e20136b71046f7dad8a2c29bcd46892"
 why = "Extracts a `SessionController` type that owns callback-routing so callbacks fired during/after partial destruction become safe no-ops, and an `ApiConfig` template split so a differently-shaped controller (channels/audio) can share `Controller`. Rust's ownership model has no raw-pointer-nulling equivalent, and `ApiConfig`'s template split has no analogue since Rust's `AudioEngine` is a separate type composed alongside `BasicLink` rather than a template parameter of `Controller`, so the only observable behavior change ported here is the shutdown-ordering guarantee: `LinkAudio`'s `Drop` impl now explicitly withdraws the audio endpoint, clears session peers, and aborts the peer-sync task *before* `BasicLink`/`Controller` is dropped, rather than relying on struct field drop order (which would have dropped `link` first, backwards from upstream's intent)."
+impact = "Teardown relied on the order fields happened to be declared in, which was the reverse of what upstream intends: the core could be dismantled while the audio extension was still announcing itself and still referring to it. Shutdown is now explicit and ordered, so a callback arriving mid-teardown can no longer reach a half-destroyed object."
 
 [[port]]
 id = "add-gatewayfactory-gatewayschanged-notification"
-title = "Add GatewayFactory::gatewaysChanged() notification"
+title = "Notify when a usable network interface appears or disappears"
 upstream = ["334972b404d7"]
 rust = ["src/discovery/gateway.rs", "src/discovery/messenger.rs"]
 risk = "behavior"
 status = "retired"
 retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "`PeerGateways` now calls `factory.gatewaysChanged()` when a gateway is added or removed so callers can react (e.g. update announced endpoints); the Rust `GatewayFactory` trait may need a `gateways_changed` method"
+impact = "Nothing was told when the set of usable network interfaces changed, so anything that has to re-announce an address when a network comes or goes had no signal to act on. The notification is what lets the addresses a peer advertises follow the network it is actually on."
 
 [[port]]
 id = "add-networkbytestreamserializable-for-string-and-int16-t"
-title = "Add NetworkByteStreamSerializable for string and int16_t"
+title = "Support text and small integers in the wire format"
 upstream = ["ef11fe77ad14", "519c7be073ec"]
 rust = ["src/encoding.rs"]
 risk = "wire-format"
 status = "retired"
 retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "Adds `std::string` and `int16_t` to the portable byte-stream serialization; needed by LinkAudio peer names on the wire; `int16_t` may be used by audio payload keys in future"
+impact = "The wire format could only carry a fixed set of value types. Peer names, which upstream's audio work puts on the wire, are text, so the encoder has to learn text and small integers before any of those payloads can be read or written at all."
 
 [[port]]
 id = "have-peers-notify-on-audioendpoint-changes"
-title = "Have Peers notify on audioEndpoint changes"
+title = "Tell an application when a peer changes its audio address"
 upstream = ["741390fd8930"]
 rust = ["src/discovery/peers.rs", "src/link/controller.rs", "src/link/mod.rs"]
 risk = "behavior"
 status = "retired"
 retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "`link::Peers` gained a callback to notify consumers when peer audio endpoints change; ported as `PeerStateChange::AudioEndpoint` fired from `saw_peer`, delivered through a new `Controller::audio_endpoint_callback` (mirroring `tempo_callback`) and exposed publicly as `BasicLink::set_audio_endpoint_callback`. Diverges from upstream by omitting the gateway address, since this port has no multi-gateway concept."
+impact = "A peer can start advertising an audio address, change it, or withdraw it at any point during a session. With no notification an application would keep using a stale address, or never discover one that appeared after the peer was first seen. Applications can now subscribe to that change."
 
 [[port]]
 id = "increase-thread-priority-on-link-io-thread"
-title = "Increase thread priority on Link IO thread (Linux, macOS, Windows)"
+title = "Run time-critical clock work at raised scheduler priority"
 upstream = ["7418012c2b2a", "eefe514d1846"]
 rust = ["src/platform/thread.rs"]
 risk = "behavior"
@@ -195,70 +208,77 @@ status = "outstanding"
 retired_at_pin = ""
 blocked_on = "Whether this crate should own its execution context. Upstream raises the priority of a thread it owns, reached through `callOnLinkThread`; this port has no owned thread at all — every Link task is a bare `tokio::spawn` onto the caller's ambient runtime, across 30+ sites in `src/discovery/` and `src/link/`. Boosting a shared Tokio worker would boost unrelated caller tasks, so there is nothing correct to raise. Closing this needs a decision on giving the crate its own runtime (e.g. built with `on_thread_start`), which is an architectural change across many files, not a transliteration. Until that is decided the port agent skips this item and works the ones behind it; the watermark still stops here."
 why = "Adds `platform::ThreadPriority` so a thread driving time-critical Link work can request `SCHED_FIFO`/high-priority scheduling; improves clock-sync quality under load. Upstream calls it only from its `linkaudiohut` example, via `callOnLinkThread`, never from the library itself."
+impact = "Clock synchronisation degrades when the work driving it competes with ordinary threads on a busy machine, which listeners hear as drift between peers. Upstream lets that work ask the operating system for real-time scheduling. The ability to make the request exists here, but nothing in this library yet owns a thread to apply it to, so the benefit is not yet realised."
 note = "Partially ported; deliberately left outstanding. Done: `platform::ThreadPriority` (`set_high`/`reset`) exists as public API, mirroring upstream's capture/restore shape from `eefe514d1846` rather than the stateless functor from `7418012c2b2a`, implemented over the `audio_thread_priority` crate rather than hand-rolled FFI so the port carries no `unsafe`; see `src/platform/thread.rs` for the three documented deviations from upstream's raw parameters. Not done, and the reason this stays outstanding: nothing raises the priority of this port's Link IO execution, which is what the title claims. Upstream reaches its IO thread through `callOnLinkThread`; this port has no equivalent, because every Link task is a bare `tokio::spawn` onto the caller's ambient runtime (30+ sites across `src/discovery/` and `src/link/`). There is therefore no thread this crate owns and may boost, and raising a shared Tokio worker would boost unrelated caller tasks. Retiring on the API alone would assert a behaviour change that does not happen. Closing this needs an execution hook — e.g. the crate owning a runtime built with `on_thread_start` — which is a design change rather than a transliteration and should be scoped as its own item. Note also that the watermark cannot advance past `7418012c2b2a` yet: `90d6b7c2d3e3` and 19 other still-undecided commits sit between it and the pin in ancestry order."
 
 [[port]]
 id = "add-operator-for-sessionstate"
-title = "Add `==` operator for SessionState"
+title = "Allow two session states to be compared directly"
 upstream = ["90d6b7c2d3e3"]
 rust = ["src/link/mod.rs"]
 risk = "internal"
 status = "retired"
 retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "`SessionState` lacked equality; added for use in Link session state comparison logic"
+impact = "Comparing two snapshots of session state had to be done a field at a time, which is easy to get wrong and silently incomplete as soon as a field is added. Direct comparison is now supported."
 note = "Already ported in PR #89 (`feat: add PartialEq for SessionState and ApiState`), which derived `PartialEq` on `link::mod::ApiState`/`SessionState` and added a regression test (`test_session_state_equality`). The backlog entry was never flipped to `retired`; this commit is bookkeeping only, no Rust change. Pin not advanced further: earlier ancestry positions (e.g. `7418012c2b2a`/`eefe514d1846`, the thread-priority item) remain outstanding."
 
 [[port]]
 id = "fix-rare-crash-during-initialization-callbackdispatcher-ordering"
-title = "Fix rare crash during initialization (CallbackDispatcher ordering, remaining shutdown-ordering follow-ups)"
+title = "Make shutdown deterministic so no callback fires once teardown has begun"
 upstream = ["57b77a8040d3", "44d78f2cf3a4"]
 rust = ["src/link/controller.rs"]
 risk = "behavior"
 status = "retired"
 retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "The `RtClientStateSetter`/`CallbackDispatcher` UB fix landed; the follow-up commits add an explicit `start()`/`stop()` pair (`RtClientStateDispatcher`) so shutdown is deterministic. Ported here as `DispatchGate`: `disable()` closes and drains it before any other teardown, so no dispatch work runs once `disable()` returns."
+impact = "Callbacks could still be delivered while the object owning them was being taken apart, which showed up as a rare crash around startup and shutdown. Disabling now closes and drains the path callbacks travel along before anything else is dismantled, and re-enabling reopens it cleanly, so work queued in one lifecycle cannot leak into the next."
 note = "`5bf14d95471d` retired (ported, see issue #71); `57b77a8040d3`/`44d78f2cf3a4` ported: `Controller` holds an `Arc<DispatchGate>` that the join-session and peer-state-change loops pass every batch through, and `disable()` closes and drains that gate before any other teardown, mirroring upstream's `mRtClientStateSetter.stop()` ordering. The loops themselves stay alive for the process lifetime so `enable()` can reopen the gate and resume dispatching; each loop holds its gate permit across its own `recv()` and discards whatever its channel still holds when the gate closes, so `stop()` returning means the pre-shutdown queue contents are gone and no work produced in one lifecycle can be dispatched into the next. The gate starts closed, matching `enabled == false` at construction, so no dispatch runs before the first `enable()`; and each `start()` bumps a gate epoch that per-loop state living outside the channels (the deferred audio-endpoint edge) is stamped with, so state held from a torn-down lifecycle is discarded rather than released into the next one. `enable()`/`disable()` set the `enabled` flag under a blocking lock before/after moving the gate, so the two lifecycle controls cannot diverge under contention. An earlier revision of this port aborted the loops' `JoinHandle`s instead, which broke disable/re-enable; review replaced it with the gate. `retired_at_pin` is left at the unchanged pin because `increase-thread-priority-on-link-io-thread` (blocked_on) is still outstanding and precedes this item in ancestry, so the submodule pin itself was not advanced."
 
 [[port]]
 id = "sessioncontroller-shutdown-ordering-improvements"
-title = "Rename stopIoService to shutdown / LockFreeCallbackDispatcher::stop / stop audio before Link shutdown / remove mpSessionController checks"
+title = "Finish the shutdown-ordering work on the core and its callback dispatcher"
 upstream = ["cccaecc9e93b", "53f0627c9cf8", "eb25bb250f2f", "7f222b559678"]
 rust = ["src/link/controller.rs", "src/link_audio/api.rs", "src/link_audio/engine.rs"]
 risk = "behavior"
 status = "outstanding"
 retired_at_pin = ""
 why = "Moves `shutdown()` (renamed from `stopIoService()`) into `~SessionController()` so it runs before base-class teardown; makes `LockFreeCallbackDispatcher::stop()` idempotent and re-checks `mRunning` after waking so no callback fires after stop is requested; has LinkAudio's own `~SessionController` call `stopAudio()` via the IO thread before `this->shutdown()`; and removes now-unnecessary `mpSessionController` null checks. The LinkAudio shutdown-ordering half of the behavior was already addressed in Rust by the sibling `route-callbacks-through-sessioncontroller-shutdown-ordering-improvements` item's `LinkAudio::Drop` change, but the `Controller`/dispatcher half (`shutdown()` rename/move, `LockFreeCallbackDispatcher::stop()` idempotency) still needs a Rust equivalent."
+impact = "Half of upstream's shutdown rework is already reflected here: the audio extension stops before the core it depends on. The remaining half is the core itself, where asking it to stop twice should be harmless and no callback should be delivered after a stop has been requested. Until that lands, tearing down under load can still deliver a callback that was already meant to be cancelled."
 
 [[port]]
 id = "fix-use-after-move-in-peers-sawpeerongateway"
-title = "Fix use-after-move in Peers (sawPeerOnGateway / peerLeftGateway)"
+title = "Audit peer bookkeeping for values read after ownership was given away"
 upstream = ["ef2d1fd99d70", "f5fabf4ac8be"]
 rust = ["src/discovery/peers.rs"]
 risk = "internal"
 status = "outstanding"
 retired_at_pin = ""
 why = "`std::move` on a value that was then read again; Rust's borrow checker would normally catch this at compile time, but the equivalent logic in `peers.rs` should be audited for correctness Also covers: `PeerState::fromPayload` initializer list was missing the third field after `audioEndpoint` was added; also fixes use-after-move in `Peers::GatewayObserver`"
+impact = "Upstream read two values after handing ownership of them elsewhere, and separately left a field unset when the audio address was introduced. This language rejects the first class of mistake at compile time, so the work here is an audit rather than a fix: confirm the equivalent peer bookkeeping is correct and that no field was missed."
 note = "Merged with \"Fix ESP-IDF 6.0 PeerState init + Peers use-after-move (core portions)\" on migration: both claimed f5fabf4ac8be."
 
 [[port]]
 id = "set-ip-multicast-all-0-on-linux"
-title = "Set IP_MULTICAST_ALL=0 on Linux sockets + remove UdpMessenger subnet filter"
+title = "Stop seeing discovery traffic arrive on the wrong network interface on Linux"
 upstream = ["c5574eee4d03", "d466f42a7b36"]
 rust = ["src/discovery/messenger.rs"]
 risk = "behavior"
 status = "outstanding"
 retired_at_pin = ""
 why = "`IP_MULTICAST_ALL=0` restricts multicast reception to the joined interface on Linux; the subnet filter in `UdpMessenger` that worked around the old behaviour is then removed; together these fix spurious cross-interface packet reception on multi-homed Linux hosts"
+impact = "By default Linux hands multicast traffic to a socket no matter which interface it arrived on, so on a machine with several networks a peer appears to be reachable through interfaces it is not. This library works around that by filtering on address ranges, which is only approximate. Asking the operating system for the correct behaviour fixes it properly and lets the workaround be removed."
 
 [[port]]
 id = "catch-message-encode-exceptions-in-sendudpmessage"
-title = "Catch message-encode exceptions in sendUdpMessage"
+title = "Handle a message too large to encode instead of failing hard"
 upstream = ["e9a2e414d63f"]
 rust = ["src/discovery/messenger.rs", "src/discovery/messages.rs", "src/encoding.rs"]
 risk = "behavior"
 status = "retired"
 retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "`encodeMessage` is now inside the `try` block so encoding errors (e.g. oversized payload) are caught and logged instead of propagating; previously only the `send()` call was guarded. Ported: `encode_message` now returns `EncodeError::MessageTooLarge` (an additive variant on the already-`non_exhaustive` `EncodeError`, so the public `Error` enum is unchanged) instead of panicking, and `send_message` logs and returns `Ok(())` on that error instead of unwrapping. The submodule pin was not advanced past this commit because several outstanding backlog items (e.g. `have-peers-notify-on-audioendpoint-changes`, `increase-thread-priority-on-link-io-thread`) sit earlier in upstream ancestry and remain unaudited."
+impact = "Only the send itself was protected against failure, not the step that builds the packet. A peer state too large to fit in one packet - many advertised addresses, a long name - would therefore abort the process rather than being logged and dropped."
 
 # ---------------------------------------------------------------------------
 # Commits seen and consciously parked. Kept so that coverage stays provable:

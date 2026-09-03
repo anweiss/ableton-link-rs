@@ -74,6 +74,7 @@ jobs:
               'risk': p['risk'],
               'status': p['status'],
               'why': p['why'],
+              'impact': p['impact'],
               'note': p.get('note', ''),
               'retired_at_pin': p['retired_at_pin'],
           } for p in d['port']]
@@ -143,13 +144,29 @@ jobs:
               if (prev.state !== 'open' && issue.state === 'open') byId.set(m[1], issue);
             }
 
+            // The body leads with plain language and buries the mechanics, on
+            // purpose. `impact` is prose written for someone who has never
+            // opened the upstream header and is deciding whether this issue is
+            // theirs; the validator keeps identifiers out of it. `why` and
+            // `note` are the opposite — dense, symbol-heavy, and what a port
+            // agent actually works from — so they stay in full, one disclosure
+            // triangle away. Collapsing costs an agent nothing: it reads the
+            // raw body, where `<details>` is just markup.
             const body = it => [
-              `**Upstream:** ${it.upstream.map(s => `\`${s}\``).join(', ')}`,
-              `**Rust:** ${it.rust.map(p => `\`${p}\``).join(', ') || '_unmapped_'}`,
-              `**Risk:** \`${it.risk}\``,
+              it.impact,
+              '',
+              `**Risk:** \`${it.risk}\` · ` +
+                `**Upstream:** ${it.upstream.map(s => `\`${s}\``).join(', ')} · ` +
+                `**Rust:** ${it.rust.map(p => `\`${p}\``).join(', ') || '_unmapped_'}`,
+              '',
+              '<details>',
+              '<summary><b>Porting detail</b> — what upstream changed, and what ' +
+                'has to change here</summary>',
               '',
               it.why,
               ...(it.note ? ['', `_${it.note}_`] : []),
+              '',
+              '</details>',
               '',
               '---',
               '',

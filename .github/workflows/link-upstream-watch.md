@@ -153,16 +153,45 @@ commits_behind = 117
 
 [[port]]
 id = "kebab-case-stable-slug"
-title = "what changed, in plain terms"
+title = "the effect, in plain language"   # SEE BELOW - no identifiers
 upstream = ["<40-char sha>", "..."]   # every SHA this one idea covers
 rust = ["src/..."]                     # from the module map
 risk = "wire-format" | "behavior" | "api-break" | "internal"
 status = "outstanding" | "retired"
 retired_at_pin = ""                    # the pin that retired it, or "" if outstanding
-why = "one line on the observable effect"
+why = "the mechanics: what upstream changed, and what has to change here"
+impact = "SEE BELOW - prose, for a person, no identifiers"
 note = "optional"                      # free text; nothing parses it
 blocked_on = "optional"                # SEE BELOW - preserve, never write
 ```
+
+**`title` and `impact` are written for a person; `why` and `note` are written for the
+port agent.** Every `[[port]]` item becomes a tracking issue: `title` is its title and
+`impact` is its opening paragraph, and that pair is all most readers will ever see.
+They have to make sense to someone who has never opened the upstream header — a
+maintainer triaging the backlog, a user wondering whether a bug affects them.
+
+- **`impact` is required.** Two to four sentences. Say what goes wrong today or what
+  gets better, and who notices — an application using this crate, a listener hearing
+  drift, a peer on another implementation. If nothing is observable because the change
+  is an upstream cleanup with no analogue here, say exactly that; "no user-visible
+  effect, recorded so the commit is accounted for" is a perfectly good `impact`.
+- **Neither may contain code.** The validator rejects backticks, `::`, `()`, `->`,
+  source paths, file names, and camelCase or PascalCase identifiers in these two
+  fields, and names the offending tokens. This is mechanical and it will fail the
+  build, so write the sentence rather than pasting the symbol.
+- **Nothing is lost by that.** `why` and `note` are exempt and unlimited, and they are
+  where the port agent reads from, so keep them as dense and as symbol-heavy as the
+  work requires. Name the exact upstream functions, the exact Rust modules, the exact
+  ordering constraint. The rule is a split of audience, not a ban on detail.
+
+Concretely — the same item, written both ways:
+
+| Field | Too specific to be useful | What to write |
+| --- | --- | --- |
+| `title` | Rename stopIoService to shutdown / LockFreeCallbackDispatcher::stop | Finish the shutdown-ordering work on the core and its callback dispatcher |
+| `impact` | Moves `shutdown()` into `~SessionController()` so it runs before base-class teardown | Tearing down under load can still deliver a callback that was already meant to be cancelled. Upstream made stopping idempotent and ordered; half of that is reflected here and half is not. |
+| `why` | — | keep the full mechanical description here, symbols and all |
 
 **`blocked_on` is not yours to set, and not yours to drop.** It is free text naming a
 design decision a maintainer owes before an item can be ported at all, and the port
