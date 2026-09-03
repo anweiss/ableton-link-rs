@@ -383,13 +383,33 @@ comment you write with a marker on its own line, built from the blocker and the
 watermark you are stopping at:
 
 ```
-<!-- link-upstream-port:blocked id=<blocking PR/issue number or backlog id> pin=<full 40-char pin> -->
+<!-- link-upstream-port:blocked id=<canonical blocker id> pin=<full 40-char pin> -->
 ```
 
+**`id` has exactly one canonical spelling per blocker.** If the blocker is a backlog
+item — the step 5 skip case — `id` is its **backlog `id`**, never the tracking issue
+number, even though you are commenting on that issue. A backlog blocker has both, and
+if one run stamps the backlog id while the next stamps the issue number, the two
+markers miss each other and the comment reposts. Use the issue or pull request number
+only for blockers that have no backlog item behind them, such as the open port PR in
+step 2 or a stranded port.
+
 Then the rule is a search, not a judgement call: list that issue or pull request's
-comments and look for **that exact marker**. If it is there, say nothing and let `noop`
-(or the pull request you are opening) stand. If it is not, comment — no matter what
-else has been said there.
+comments and look for **that exact marker**.
+
+```bash
+gh api --paginate "repos/$GITHUB_REPOSITORY/issues/THE_NUMBER/comments?per_page=100" \
+  --jq '.[] | (.body // "")' \
+  | grep -F '<!-- link-upstream-port:blocked id=THE_ID pin=THE_FULL_PIN -->'
+```
+
+That endpoint serves pull request conversation comments as well as issue comments, so
+it is the same command either way. `--paginate` is required here for the same reason it
+is on the blocker queries: a long-lived thread past 100 comments would drop an older
+marker off the first page and repost the blocker every week thereafter.
+
+If the marker is there, say nothing and let `noop` (or the pull request you are opening)
+stand. If it is not, comment — no matter what else has been said there.
 
 **`pin` is the full 40-character watermark, never an abbreviation.** Exact matching
 needs one canonical spelling, and "short pin" does not fix a length: one run emitting
