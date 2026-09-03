@@ -548,8 +548,9 @@ jobs:
                   '',
                   note,
                   '',
-                  'The loop will not act on this pull request again until it is ' +
-                  'pushed to. See the loop state comment for details.',
+                  'The loop keeps sweeping this pull request, but it will not ' +
+                  'dispatch the coding agent again on its own - it needs the ' +
+                  'situation to change. See the loop state comment for details.',
                   '',
                   marker,
                 ].join('\n'),
