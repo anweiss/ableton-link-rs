@@ -1374,3 +1374,131 @@ pub struct SessionPeerCounter {
     // callback: Option<PeerCountCallback>,
     pub session_peer_count: usize,
 }
+
+#[cfg(test)]
+impl Controller {
+    /// Test-only handle on the dispatch gate, so a test can observe the gate
+    /// after the `Controller` owning it has been dropped.
+    fn dispatch_gate_handle(&self) -> Arc<DispatchGate> {
+        self.dispatch_gate.clone()
+    }
+}
+
+#[cfg(test)]
+mod dispatch_gate_tests {
+    use super::*;
+
+    /// A dispatch loop shaped like the ones spawned in [`Controller::new`]:
+    /// every batch is admitted through the gate, and every batch that is
+    /// admitted is recorded.
+    fn spawn_gated_loop(
+        gate: Arc<DispatchGate>,
+        mut rx: tokio::sync::mpsc::Receiver<u32>,
+        seen: Arc<Mutex<Vec<u32>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut gate_open = gate.subscribe();
+            while let Some((_permit, _epoch, work)) =
+                gated_recv(&gate, &mut gate_open, &mut rx).await
+            {
+                seen.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(work);
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn close_is_idempotent() {
+        let gate = DispatchGate::new();
+        gate.start();
+        assert!(gate.is_open());
+        gate.close();
+        assert!(!gate.is_open());
+        // Mirrors upstream's `LockFreeCallbackDispatcher::stop()`
+        // (`53f0627c9cf8`) being safe to call more than once - including from
+        // both an explicit `disable()` and the destructor afterwards.
+        gate.close();
+        assert!(!gate.is_open());
+        gate.stop().await;
+        assert!(!gate.is_open());
+    }
+
+    /// Work queued while the gate was open but not yet admitted must never be
+    /// dispatched once the gate has been closed synchronously, which is the
+    /// only thing a `Drop` impl can do.
+    #[tokio::test]
+    async fn close_stops_admitting_queued_work() {
+        let gate = Arc::new(DispatchGate::new());
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        gate.start();
+        let handle = spawn_gated_loop(gate.clone(), rx, seen.clone());
+
+        tx.send(1).await.unwrap();
+        // Let the open gate admit and dispatch it before closing, so the
+        // second half of the test is about the closed gate and not about the
+        // (separately covered) drain of work still queued at close time.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.stop().await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![1],
+            "work admitted while the gate was open should be dispatched"
+        );
+
+        // Gate closed: queue more, then give the loop every chance to run it.
+        tx.send(2).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![1],
+            "no work may be dispatched after the gate has been closed"
+        );
+
+        handle.abort();
+    }
+
+    /// Dropping an enabled `Controller` without a preceding `disable()` must
+    /// leave the dispatch gate closed, so a loop still parked on it cannot
+    /// admit work against a controller that no longer exists. This is the
+    /// path `disable()`-based lifecycle tests cannot reach.
+    #[tokio::test]
+    async fn drop_without_disable_closes_the_gate() {
+        let clock = Clock::new();
+        let controller = match Controller::new(tempo::Tempo::new(120.0), clock).await {
+            Ok(controller) => controller,
+            // `Controller::new` binds sockets and needs a non-loopback IPv4
+            // interface; there is nothing to assert about the gate if the
+            // controller could not be constructed at all.
+            Err(_) => return,
+        };
+        let gate = controller.dispatch_gate_handle();
+
+        // Stand in for `enable()`, which additionally starts discovery: the
+        // gate state this test is about is exactly what `enable()` sets.
+        gate.start();
+        assert!(gate.is_open());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_gated_loop(gate.clone(), rx, seen.clone());
+
+        drop(controller);
+
+        assert!(
+            !gate.is_open(),
+            "dropping a Controller must close its dispatch gate"
+        );
+
+        tx.send(7).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no dispatch work may be admitted after the Controller was dropped"
+        );
+
+        handle.abort();
+    }
+}
