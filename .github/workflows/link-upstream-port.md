@@ -294,7 +294,9 @@ Otherwise, take the next item off the backlog:
      port as concrete byte-level expectations. See the wire-format rule below.
    - It has a non-empty **`blocked_on`** field. That field means the item needs a
      design decision before any of it can be written, and it names the decision.
-     Comment on its tracking issue as above — subject to the do-not-repeat rule in
+     Comment on its tracking issue as above — that comment **must end with the
+     `<!-- link-upstream-port:blocked id=<backlog id> pin=<full 40-char pin> -->`
+     marker line**, and is subject to the do-not-repeat rule in
      "Every early stop must be announced", which applies to these skip comments even
      when the run goes on to open a pull request — then **carry on to the next item**;
      do not stop the run. One undecidable item must never head-of-line block every
@@ -371,11 +373,28 @@ of these, in this order of preference:
 3. Only if there is no such issue or PR, `create-issue` — it is configured with the
    `needs-decision` label for this.
 
+Every one of those three bodies ends with the marker line described below.
+
 **A run with nothing to do is not blocked.** If `summary.md` says the port is level
 with upstream, or the backlog is entirely retired, `noop` alone is the whole correct
 answer: there is no decision owed and no failure to report, and opening a
 `needs-decision` issue for it would be noise. The rule above is for a run that wanted
 to make progress and could not.
+
+**Every blocker comment — and every blocker issue body — ends with the marker.** This
+is a template, not a suggestion — the marker line is part of the body, and a body
+without it is a defect:
+
+```markdown
+<one or two sentences: what this run wanted to do, what stopped it, and what has to
+happen before the next run can get further. Link the run URL.>
+
+<!-- link-upstream-port:blocked id=<canonical blocker id> pin=<full 40-char pin> -->
+```
+
+Run 33789092748 wrote a correct blocker comment on #106 and omitted the marker, which
+would have reposted the identical comment on every subsequent run. Compose the marker
+line as you compose the body, not as an afterthought.
 
 **Say nothing twice — and decide that mechanically.** Before commenting anywhere,
 whether for a skipped item in step 5 or for a terminal stop here, stamp every blocker
@@ -394,19 +413,33 @@ markers miss each other and the comment reposts. Use the issue or pull request n
 only for blockers that have no backlog item behind them, such as the open port PR in
 step 2 or a stranded port.
 
-Then the rule is a search, not a judgement call: list that issue or pull request's
-comments and look for **that exact marker**.
+Then the rule is a search, not a judgement call: look for **that exact marker** in the
+target's own body and in every one of its comments.
 
 ```bash
-gh api --paginate "repos/$GITHUB_REPOSITORY/issues/THE_NUMBER/comments?per_page=100" \
-  --jq '.[] | (.body // "")' \
-  | grep -F '<!-- link-upstream-port:blocked id=THE_ID pin=THE_FULL_PIN -->'
+{ gh api "repos/$GITHUB_REPOSITORY/issues/THE_NUMBER" --jq '(.body // "")'
+  gh api --paginate "repos/$GITHUB_REPOSITORY/issues/THE_NUMBER/comments?per_page=100" \
+    --jq '.[] | (.body // "")'
+} | grep -F '<!-- link-upstream-port:blocked id=THE_ID pin=THE_FULL_PIN -->'
 ```
 
-That endpoint serves pull request conversation comments as well as issue comments, so
-it is the same command either way. `--paginate` is required here for the same reason it
-is on the blocker queries: a long-lived thread past 100 comments would drop an older
-marker off the first page and repost the blocker every week thereafter.
+Those endpoints serve pull requests as well as issues, so it is the same command either
+way. **The body is searched, not only the comments**, because option 3 above puts the
+marker in a body: an issue this workflow created for a blocker with nowhere else to
+report it carries its marker in the issue body and has no comments at all, and a
+comments-only lookup would miss it and file a second issue for the same blocker at the
+same watermark. `--paginate` is required for the same reason it is on the blocker
+queries: a long-lived thread past 100 comments would drop an older marker off the first
+page and repost the blocker every week thereafter.
+
+For that option 3 case there is no `THE_NUMBER` yet on the run that finds it, so search
+this workflow's open `needs-decision` issues for the marker before creating another:
+
+```bash
+gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&labels=needs-decision&per_page=100" \
+  --jq '.[] | select(.pull_request == null) | (.body // "")' \
+  | grep -F '<!-- link-upstream-port:blocked id=THE_ID pin=THE_FULL_PIN -->'
+```
 
 If the marker is there, say nothing and let `noop` (or the pull request you are opening)
 stand. If it is not, comment — no matter what else has been said there.
