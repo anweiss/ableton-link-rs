@@ -294,7 +294,9 @@ Otherwise, take the next item off the backlog:
      port as concrete byte-level expectations. See the wire-format rule below.
    - It has a non-empty **`blocked_on`** field. That field means the item needs a
      design decision before any of it can be written, and it names the decision.
-     Comment on its tracking issue as above — subject to the do-not-repeat rule in
+     Comment on its tracking issue as above — that comment **must end with the
+     `<!-- link-upstream-port:blocked id=<backlog id> pin=<full 40-char pin> -->`
+     marker line**, and is subject to the do-not-repeat rule in
      "Every early stop must be announced", which applies to these skip comments even
      when the run goes on to open a pull request — then **carry on to the next item**;
      do not stop the run. One undecidable item must never head-of-line block every
@@ -371,11 +373,27 @@ of these, in this order of preference:
 3. Only if there is no such issue or PR, `create-issue` — it is configured with the
    `needs-decision` label for this.
 
+Every one of those three bodies ends with the marker line described below.
+
 **A run with nothing to do is not blocked.** If `summary.md` says the port is level
 with upstream, or the backlog is entirely retired, `noop` alone is the whole correct
 answer: there is no decision owed and no failure to report, and opening a
 `needs-decision` issue for it would be noise. The rule above is for a run that wanted
 to make progress and could not.
+
+**Every blocker comment ends with the marker.** This is a template, not a suggestion —
+the marker line is part of the comment body, and a comment without it is a defect:
+
+```markdown
+<one or two sentences: what this run wanted to do, what stopped it, and what has to
+happen before the next run can get further. Link the run URL.>
+
+<!-- link-upstream-port:blocked id=<canonical blocker id> pin=<full 40-char pin> -->
+```
+
+Run 33789092748 wrote a correct blocker comment on #106 and omitted the marker, which
+would have reposted the identical comment on every subsequent run. Compose the marker
+line as you compose the body, not as an afterthought.
 
 **Say nothing twice — and decide that mechanically.** Before commenting anywhere,
 whether for a skipped item in step 5 or for a terminal stop here, stamp every blocker
