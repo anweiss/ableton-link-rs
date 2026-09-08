@@ -107,15 +107,56 @@ impl DispatchGate {
     }
 
     async fn stop(&self) {
+        self.close();
+        // Waiting for exclusive access waits out any batch already in flight,
+        // and - because a consumer drains its queue before releasing its permit
+        // - also for the pre-stop queue contents to have been discarded.
+        let _ = self.in_flight.write().await;
+    }
+
+    /// Closes the gate against new dispatch work without waiting for any batch
+    /// already in flight to finish. Idempotent: closing an already-closed gate
+    /// is a no-op, mirroring upstream's `LockFreeCallbackDispatcher::stop()`
+    /// (`53f0627c9cf8`) being safe to call more than once.
+    ///
+    /// This is the synchronous half of [`DispatchGate::stop`], used from
+    /// [`DispatchTasks`]'s destructor where an `async` wait is not available -
+    /// Rust analogue of upstream moving `stopIoService()` (renamed
+    /// `shutdown()`) into `~SessionController()` in `cccaecc9e93b`, so
+    /// teardown is requested from the destructor rather than relying solely
+    /// on an explicit `disable()` having been called first.
+    fn close(&self) {
         self.active.send_if_modified(|open| {
             let changed = *open;
             *open = false;
             changed
         });
-        // Waiting for exclusive access waits out any batch already in flight,
-        // and - because a consumer drains its queue before releasing its permit
-        // - also for the pre-stop queue contents to have been discarded.
-        let _ = self.in_flight.write().await;
+    }
+}
+
+/// Owns the controller's two dispatch tasks independently of their shared gate.
+/// Drop requests cancellation; it does not join a task currently being polled
+/// on another runtime thread. Use `Controller::disable` to await dispatch.
+struct DispatchTasks {
+    gate: Arc<DispatchGate>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl DispatchTasks {
+    fn new() -> Self {
+        Self {
+            gate: Arc::new(DispatchGate::new()),
+            tasks: Vec::new(),
+        }
+    }
+}
+
+impl Drop for DispatchTasks {
+    fn drop(&mut self) {
+        self.gate.close();
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
@@ -158,9 +199,9 @@ async fn gated_recv<'a, T>(
             drop(permit);
             continue;
         }
-        // Read under the permit: the gate cannot close (and so cannot be
-        // restarted) while it is held, so this epoch stays valid for as long
-        // as the returned work is being dispatched.
+        // Read under the permit: stop() cannot finish (and enable() cannot
+        // restart the controller) while it is held. Drop can close the gate
+        // without waiting for the permit.
         let epoch = gate.epoch();
 
         tokio::select! {
@@ -201,6 +242,8 @@ pub(crate) fn dispatch_audio_endpoint_change(
 }
 
 pub struct Controller {
+    // Drop this owner before releasing the controller's other fields.
+    dispatch: DispatchTasks,
     pub tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
     /// Invoked whenever a peer's discovered audio endpoint changes. Rust
     /// analogue of upstream's `Controller::SawAudioEndpointCallback`. Set via
@@ -220,17 +263,6 @@ pub struct Controller {
     clock: Clock,
     rx_event: Option<Receiver<OnEvent>>,
     notifier: Arc<Notify>,
-    /// Gate for the background dispatch loops (join-session and
-    /// peer-state-change) spawned in [`Controller::new`]. Rust analogue of
-    /// upstream's `RtClientStateSetter::stop()`
-    /// (`ableton::link::Controller::CallbackDispatcher`, see upstream commit
-    /// `44d78f2cf3a4`): closed and drained from [`Controller::disable`] so that
-    /// no dispatch work can run after shutdown has begun, rather than merely
-    /// relying on the loops to observe `enabled == false`. Reopened by
-    /// [`Controller::enable`], so disable/re-enable cycles keep working. Starts
-    /// closed, matching `enabled == false` at construction, so no dispatch work
-    /// runs before the first `enable()`.
-    dispatch_gate: Arc<DispatchGate>,
 }
 
 impl Controller {
@@ -339,10 +371,10 @@ impl Controller {
         let ps_loop = peer_state.clone();
         let tempo_cb_loop = tempo_callback.clone();
 
-        let dispatch_gate = Arc::new(DispatchGate::new());
-        let gate_loop = dispatch_gate.clone();
+        let mut dispatch = DispatchTasks::new();
+        let gate_loop = dispatch.gate.clone();
 
-        tokio::spawn(async move {
+        dispatch.tasks.push(tokio::spawn(async move {
             let mut gate_open = gate_loop.subscribe();
             while let Some((_permit, _epoch, session)) =
                 gated_recv(&gate_loop, &mut gate_open, &mut rx_join_session).await
@@ -362,7 +394,7 @@ impl Controller {
                 )
                 .await;
             }
-        });
+        }));
 
         let discovery_loop = discovery.clone();
         let s_state_loop = session_state.clone();
@@ -391,9 +423,9 @@ impl Controller {
         // not be released into the next one.
         let mut deferred_audio_endpoint: Option<(u64, NodeId, Option<SocketAddrV4>)> = None;
 
-        let gate_loop = dispatch_gate.clone();
+        let gate_loop = dispatch.gate.clone();
 
-        tokio::spawn(async move {
+        dispatch.tasks.push(tokio::spawn(async move {
             let mut gate_open = gate_loop.subscribe();
             while let Some((_permit, epoch, peer_state_changes)) =
                 gated_recv(&gate_loop, &mut gate_open, &mut rx_peer_state_change).await
@@ -652,9 +684,10 @@ impl Controller {
                     }
                 }
             }
-        });
+        }));
 
         Ok(Self {
+            dispatch,
             tempo_callback,
             audio_endpoint_callback,
             peer_state,
@@ -669,7 +702,6 @@ impl Controller {
             clock,
             rx_event: Some(rx_event),
             notifier,
-            dispatch_gate,
         })
     }
 
@@ -690,7 +722,7 @@ impl Controller {
         // upstream's `RtClientStateSetter::start()` being paired with its
         // `stop()`. Without this, a disable/re-enable cycle would leave the
         // join-session and peer-state-change loops permanently gated off.
-        self.dispatch_gate.start();
+        self.dispatch.gate.start();
 
         reset_state(
             self.peer_state.clone(),
@@ -725,7 +757,7 @@ impl Controller {
         // relying solely on the loops to observe `enabled == false` on their
         // next iteration. The loops themselves stay alive so that a later
         // `enable()` can resume dispatching.
-        self.dispatch_gate.stop().await;
+        self.dispatch.gate.stop().await;
 
         // Send bye bye message before disabling to properly notify other peers.
         // On lock contention the bye-bye is skipped - it is best-effort - but
@@ -1343,4 +1375,178 @@ fn map_start_stop_state_from_client_to_session(
 pub struct SessionPeerCounter {
     // callback: Option<PeerCountCallback>,
     pub session_peer_count: usize,
+}
+
+#[cfg(test)]
+mod dispatch_gate_tests {
+    use super::*;
+    use std::{future::Future, task::Context, task::Waker, time::Duration};
+    use tokio::sync::oneshot;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn close_is_idempotent() {
+        let gate = DispatchGate::new();
+        gate.start();
+        assert!(gate.is_open());
+        gate.close();
+        assert!(!gate.is_open());
+        // Mirrors upstream's `LockFreeCallbackDispatcher::stop()`
+        // (`53f0627c9cf8`) being safe to call more than once - including from
+        // both an explicit `disable()` and the destructor afterwards.
+        gate.close();
+        assert!(!gate.is_open());
+        gate.stop().await;
+        assert!(!gate.is_open());
+    }
+
+    #[tokio::test]
+    async fn close_stops_admitting_queued_work() {
+        let gate = DispatchGate::new();
+        let mut open = gate.subscribe();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        gate.start();
+        tx.try_send(1).unwrap();
+        gate.close();
+
+        let mut recv = Box::pin(gated_recv(&gate, &mut open, &mut rx));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(recv.as_mut().poll(&mut context).is_pending());
+        tx.try_send(2).unwrap();
+        assert!(recv.as_mut().poll(&mut context).is_pending());
+
+        // Reopening drains both pre-close and disabled-lifecycle work.
+        gate.start();
+        assert!(recv.as_mut().poll(&mut context).is_pending());
+        tx.try_send(3).unwrap();
+        let (permit, epoch, work) = recv.await.unwrap();
+        assert_eq!(work, 3);
+        assert_eq!(epoch, gate.epoch());
+        drop(permit);
+        gate.stop().await;
+    }
+
+    #[tokio::test]
+    async fn drop_cancels_queued_work_before_first_poll() {
+        let mut dispatch = DispatchTasks::new();
+        let gate = dispatch.gate.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (callback_tx, mut callback_rx) = tokio::sync::mpsc::channel(4);
+        gate.start();
+        tx.try_send(7).unwrap();
+        let task_gate = gate.clone();
+        dispatch.tasks.push(tokio::spawn(async move {
+            let mut open = task_gate.subscribe();
+            while let Some((_permit, _, work)) = gated_recv(&task_gate, &mut open, &mut rx).await {
+                callback_tx.try_send(work).unwrap();
+            }
+        }));
+
+        // Current-thread runtime: the task cannot run before this drop.
+        drop(dispatch);
+        assert!(!gate.is_open());
+        tokio::time::timeout(TEST_TIMEOUT, tx.closed())
+            .await
+            .unwrap();
+        assert_eq!(callback_rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn drop_releases_parked_tasks_in_each_gate_state() {
+        for enabled in [false, true] {
+            let mut dispatch = DispatchTasks::new();
+            if enabled {
+                dispatch.gate.start();
+            }
+            let gate = dispatch.gate.clone();
+            let task_gate = gate.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(1);
+            let (started_tx, started_rx) = oneshot::channel();
+            dispatch.tasks.push(tokio::spawn(async move {
+                let mut open = task_gate.subscribe();
+                started_tx.send(()).unwrap();
+                assert!(gated_recv(&task_gate, &mut open, &mut rx).await.is_none());
+            }));
+            // The task runs until gated_recv yields before we can resume.
+            tokio::time::timeout(TEST_TIMEOUT, started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(dispatch);
+            assert!(!gate.is_open());
+            tokio::time::timeout(TEST_TIMEOUT, tx.closed())
+                .await
+                .unwrap();
+            assert_eq!(Arc::strong_count(&gate), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_cancels_admitted_work_suspended_before_callback() {
+        let mut dispatch = DispatchTasks::new();
+        let gate = dispatch.gate.clone();
+        gate.start();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (admitted_tx, admitted_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let (callback_tx, callback_rx) = oneshot::channel();
+        let task_gate = gate.clone();
+        dispatch.tasks.push(tokio::spawn(async move {
+            let mut open = task_gate.subscribe();
+            let (_permit, _, work) = gated_recv(&task_gate, &mut open, &mut rx).await.unwrap();
+            admitted_tx.send(()).unwrap();
+            resume_rx.await.unwrap();
+            callback_tx.send(work).unwrap();
+        }));
+        tx.try_send(7).unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, admitted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(gate.in_flight.try_write().is_err());
+        drop(dispatch);
+        assert!(!gate.is_open());
+        // Make the suspended future ready after cancellation was requested.
+        // The cancelled task must not resume to invoke its callback.
+        resume_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(TEST_TIMEOUT, callback_rx)
+            .await
+            .unwrap()
+            .is_err());
+        assert!(gate.in_flight.try_write().is_ok());
+        tokio::time::timeout(TEST_TIMEOUT, tx.closed())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_without_disable_closes_the_gate() {
+        let clock = Clock::new();
+        let controller = Controller::new(tempo::Tempo::new(120.0), clock)
+            .await
+            .expect("Controller::new must succeed for this test to prove anything about drop");
+        let gate = controller.dispatch.gate.clone();
+        let tasks: Vec<_> = controller
+            .dispatch
+            .tasks
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
+        assert_eq!(tasks.len(), 2);
+
+        // Stand in for `enable()`, which additionally starts discovery: the
+        // gate state this test is about is exactly what `enable()` sets.
+        gate.start();
+        assert!(gate.is_open());
+        drop(controller);
+        assert!(!gate.is_open());
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while tasks.iter().any(|task| !task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 }
