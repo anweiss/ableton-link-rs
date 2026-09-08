@@ -161,10 +161,9 @@ impl BasicLink {
     /// Stops dispatch and suppresses discovery without destroying the consumers
     /// needed by a later [`Self::enable`].
     pub async fn disable(&mut self) {
-        self.controller.disable().await;
-
-        // Update the atomic session state to reflect the new enable state
+        // Match Controller's transition before either future can be cancelled.
         self.atomic_session_state.set_enabled(false);
+        self.controller.disable().await;
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -547,6 +546,23 @@ mod tests {
     use tracing::info;
 
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_disable_keeps_atomic_and_controller_enabled_flags_consistent() {
+        use std::future::Future;
+        let mut link = BasicLink::new(120.0).await.unwrap();
+        link.enable().await;
+        let mut disable = Box::pin(link.disable());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(disable.as_mut().poll(&mut context).is_pending());
+        drop(disable);
+        assert!(!link.is_enabled());
+        assert!(!link.atomic_session_state.is_enabled());
+        link.enable().await;
+        assert!(link.is_enabled());
+        assert!(link.atomic_session_state.is_enabled());
+        link.disable().await;
+    }
 
     #[tokio::test]
     async fn test_basic_link() {

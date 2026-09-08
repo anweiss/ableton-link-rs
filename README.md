@@ -102,8 +102,9 @@ rather than accumulating detached schedulers. Transient UDP receive errors retry
 with a short backoff instead of permanently removing an interface receiver.
 Socket reads are cancelled and re-armed across the barrier so the first fresh
 packet is accepted, and BYEBYE forwarding remains inside that cancellation scope.
-An interrupted enable can be retried; enabled is published only after startup
-finishes.
+Interrupted enable/disable can be retried. Startup resets peer counts and
+publishes enabled after preparation but before admitting packets; disable clears
+both controller and real-time atomic enabled flags before awaiting shutdown.
 The standalone `Messenger::listen` and `PeerGateway::listen` APIs retain their
 notifier-based terminal cancellation; the controller uses separate owned paths.
 Repeated disable/enable cycles resume peer measurement and session

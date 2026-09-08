@@ -166,7 +166,12 @@ impl DispatchGate {
     }
 
     pub(crate) async fn start(&self) {
+        self.start_with(|| {}).await;
+    }
+
+    async fn start_with(&self, publish: impl FnOnce()) {
         if self.is_open() {
+            publish();
             return;
         }
         let epoch = self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
@@ -192,6 +197,10 @@ impl DispatchGate {
             }
             ready.await;
         }
+        // No await between publishing lifecycle state and opening admission.
+        // Receivers can only wake after all readiness acknowledgements and
+        // their enabled flag agree.
+        publish();
         self.active.send_replace(DispatchState::Open);
     }
 
@@ -837,6 +846,7 @@ impl Controller {
         self.discovery.measurement_service.stop().await;
         self.discovery.stop().await;
         self.dispatch.gate.stop().await;
+        self.session_peer_counter.lock().unwrap().session_peer_count = 0;
 
         // Reset while dispatch and discovery are still disabled. Opening first
         // lets a resumed result handler race this new lifecycle's state reset.
@@ -867,13 +877,15 @@ impl Controller {
                     .await;
             }));
         }
-        self.discovery.gate.start().await;
-        // Publish only after the final barrier: a cancelled enable remains
-        // retryable instead of reporting enabled with discovery still preparing.
-        *self
-            .enabled
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.discovery
+            .gate
+            .start_with(|| {
+                *self
+                    .enabled
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            })
+            .await;
     }
 
     pub async fn disable(&mut self) {
@@ -1717,6 +1729,55 @@ mod dispatch_gate_tests {
             .unwrap();
         assert!(controller.is_enabled());
         assert!(gate.is_open());
+        controller.disable().await;
+    }
+
+    #[tokio::test]
+    async fn enabled_publication_happens_after_preparation_but_before_admission() {
+        let gate = DispatchGate::new();
+        let mut open = gate.subscribe();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let published = std::sync::atomic::AtomicBool::new(false);
+        let mut start = Box::pin(gate.start_with(|| {
+            assert!(
+                !gate.is_open(),
+                "publication must precede receiver admission"
+            );
+            published.store(true, std::sync::atomic::Ordering::Release);
+        }));
+        let mut receive = Box::pin(gated_recv(&gate, &mut open, &mut rx));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(start.as_mut().poll(&mut context).is_pending());
+        assert!(!published.load(std::sync::atomic::Ordering::Acquire));
+        assert!(receive.as_mut().poll(&mut context).is_pending());
+        assert!(start.as_mut().poll(&mut context).is_ready());
+        tx.send(1).await.unwrap();
+        assert_eq!(receive.await.unwrap().2, 1);
+        assert!(published.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn retry_enable_clears_peer_count_after_cancelled_disable() {
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        controller.enable().await;
+        controller
+            .session_peer_counter
+            .lock()
+            .unwrap()
+            .session_peer_count = 3;
+        let gate = controller.discovery.gate.clone();
+        let permit = gate.permit().await;
+        let mut disable = Box::pin(controller.disable());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(disable.as_mut().poll(&mut context).is_pending());
+        drop(disable);
+        drop(permit);
+        assert_eq!(controller.num_peers(), 3);
+        controller.enable().await;
+        assert_eq!(controller.num_peers(), 0);
+        assert!(controller.peers.lock().unwrap().is_empty());
         controller.disable().await;
     }
 
