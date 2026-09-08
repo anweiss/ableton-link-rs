@@ -15,20 +15,13 @@ use tokio::{
 };
 use tracing::{debug, info};
 
-use crate::{
-    discovery::{
-        messages::{encode_message, BYEBYE},
-        LINK_PORT, MULTICAST_ADDR,
-    },
-    link::{
-        clock::Clock,
-        controller::SessionPeerCounter,
-        ghostxform::GhostXForm,
-        measurement::{MeasurePeerEvent, MeasurementService},
-        node::{NodeId, NodeState},
-        payload::Payload,
-        state::SessionState,
-    },
+use crate::link::{
+    clock::Clock,
+    controller::SessionPeerCounter,
+    ghostxform::GhostXForm,
+    measurement::{MeasurePeerEvent, MeasurementService},
+    node::{NodeId, NodeState},
+    state::SessionState,
 };
 
 use super::{
@@ -58,6 +51,18 @@ pub enum OnEvent {
 }
 
 impl PeerGateway {
+    #[cfg(test)]
+    pub(crate) fn socket_probes(&self) -> Vec<std::sync::Weak<UdpSocket>> {
+        let mut probes = self.messenger.socket_probes();
+        probes.push(Arc::downgrade(&self.measurement_service.shared_socket));
+        probes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn event_state_probe(&self) -> std::sync::Weak<Mutex<Vec<(Instant, NodeId)>>> {
+        Arc::downgrade(&self.peer_timeouts)
+    }
+
     pub async fn new(
         peer_state: Arc<Mutex<PeerState>>,
         session_state: Arc<Mutex<SessionState>>,
@@ -156,7 +161,6 @@ impl PeerGateway {
                 .unwrap()
         );
 
-        let ctrl_socket = self.messenger.interface.as_ref().unwrap().clone();
         let peer_state = self.peer_state.clone();
 
         // Get self node ID for filtering self-messages
@@ -171,47 +175,59 @@ impl PeerGateway {
 
         self.measurement_service.listen(notifier.clone()).await;
 
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.unwrap();
-            ctrl_socket.set_broadcast(true).unwrap();
-            ctrl_socket.set_multicast_ttl_v4(2).unwrap();
-
-            let peer_ident = peer_state
-                .try_lock()
-                .map(|state| state.ident())
-                .unwrap_or_default();
-
-            let message = encode_message(peer_ident, 0, BYEBYE, &Payload::default(), 0).unwrap();
-
-            ctrl_socket
-                .send_to(&message, (MULTICAST_ADDR, LINK_PORT))
-                .await
-                .unwrap();
-
-            notifier.notify_waiters();
-        });
-
+        let mut children = tokio::task::JoinSet::new();
         let measurement_notifier = Arc::new(Notify::new());
 
-        tokio::spawn(async move {
-            loop {
-                select! {
-                    Some(val) = rx_event.recv() => {
-                        match val {
-                            OnEvent::PeerState(msg) => {
-                                on_peer_state(msg, peer_timeouts.clone(), tx_peer_event.clone(), epoch, measurement_notifier.clone(), self_node_id)
-                                    .await
-                            }
-                            OnEvent::Byebye(node_id) => {
-                                on_byebye(node_id, peer_timeouts.clone(), tx_peer_event.clone(), measurement_notifier.clone()).await
-                            }
-                        }
+        children.spawn(async move {
+            while let Some(val) = rx_event.recv().await {
+                match val {
+                    OnEvent::PeerState(msg) => {
+                        on_peer_state(
+                            msg,
+                            peer_timeouts.clone(),
+                            tx_peer_event.clone(),
+                            epoch,
+                            measurement_notifier.clone(),
+                            self_node_id,
+                        )
+                        .await
+                    }
+                    OnEvent::Byebye(node_id) => {
+                        on_byebye(
+                            node_id,
+                            peer_timeouts.clone(),
+                            tx_peer_event.clone(),
+                            measurement_notifier.clone(),
+                        )
+                        .await
                     }
                 }
             }
         });
 
-        self.messenger.listen().await;
+        let messenger = self.messenger.listen();
+        tokio::pin!(messenger);
+        loop {
+            select! {
+                _ = &mut messenger => break,
+                signal = tokio::signal::ctrl_c() => {
+                    match signal {
+                        Ok(()) => {
+                            send_byebye(peer_state.lock().unwrap().ident());
+                            notifier.notify_waiters();
+                        }
+                        Err(error) => tracing::warn!("Ctrl-C listener failed: {}", error),
+                    }
+                    break;
+                }
+                result = children.join_next(), if !children.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        tracing::warn!("peer gateway worker failed: {}", error);
+                    }
+                }
+            }
+        }
+        children.shutdown().await;
     }
 }
 

@@ -1808,6 +1808,8 @@ mod dispatch_gate_tests {
                 .all(|task| !task.is_finished()));
         }
 
+        let sockets = controller.discovery.socket_probes();
+        let event_state = controller.discovery.event_state_probe();
         let tasks: Vec<_> = controller
             .dispatch
             .tasks
@@ -1816,7 +1818,10 @@ mod dispatch_gate_tests {
             .collect();
         drop(controller);
         tokio::time::timeout(TEST_TIMEOUT, async {
-            while tasks.iter().any(|task| !task.is_finished()) {
+            while tasks.iter().any(|task| !task.is_finished())
+                || sockets.iter().any(|socket| socket.strong_count() != 0)
+                || event_state.strong_count() != 0
+            {
                 tokio::task::yield_now().await;
             }
         })

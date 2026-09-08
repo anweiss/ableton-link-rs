@@ -99,7 +99,9 @@ Repeated disable/enable cycles resume peer measurement and session
 joining; enabling an already-enabled instance is a no-op.
 
 Dropping alone closes dispatch admission and requests cancellation of owned
-dispatch, discovery/broadcast, and measurement tasks;
+dispatch, discovery/broadcast (including socket receivers and interface scanning),
+and measurement tasks. Temporary-disable notifications cannot terminate the
+owned broadcaster, even when handled after re-enable;
 it does not synchronously join a callback already executing on another runtime
 thread.
 

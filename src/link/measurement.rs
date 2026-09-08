@@ -310,6 +310,7 @@ struct MeasurementRegistration {
     node_id: NodeId,
     endpoint: SocketAddr,
     sender: Sender<PongMessage>,
+    job: Arc<()>,
     measurements: Arc<Mutex<HashMap<NodeId, Measurement>>>,
     dispatch: PongDispatch,
 }
@@ -324,17 +325,19 @@ impl Drop for MeasurementRegistration {
             .dispatch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // An older cancelled job must not unregister its replacement.
+        // Map and route can be replaced independently (including by a different
+        // node reusing an endpoint). Only remove entries owned by this job.
+        if measurements
+            .get(&self.node_id)
+            .is_some_and(|measurement| Arc::ptr_eq(&measurement.job, &self.job))
+        {
+            measurements.remove(&self.node_id);
+        }
         if dispatch
             .get(&self.endpoint)
             .is_some_and(|sender| sender.same_channel(&self.sender))
         {
             dispatch.remove(&self.endpoint);
-            if measurements.get(&self.node_id).is_some_and(|measurement| {
-                measurement.measurement_endpoint.map(SocketAddr::V4) == Some(self.endpoint)
-            }) {
-                measurements.remove(&self.node_id);
-            }
         }
     }
 }
@@ -372,15 +375,17 @@ async fn measure_peer_in_epoch(
         node_id,
         endpoint,
         sender: tx_pong,
+        job: Arc::new(()),
         measurements: measurement_map.clone(),
         dispatch: pong_dispatch,
     };
 
-    let measurement =
+    let mut measurement =
         Measurement::with_socket(state, clock, tx_measurement, notifier, socket, rx_pong).await;
     if measurement.cancelled {
         return;
     }
+    measurement.job = registration.job.clone();
     measurement_map
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -546,6 +551,7 @@ pub struct Measurement {
     tx_timer: Sender<()>,
     tasks: MeasurementTasks,
     cancelled: bool,
+    job: Arc<()>,
 }
 
 impl Measurement {
@@ -606,6 +612,7 @@ impl Measurement {
             init_bytes_sent: 0,
             tasks: MeasurementTasks(Vec::new()),
             cancelled: false,
+            job: Arc::new(()),
         };
 
         let ht = HostTime::new(clock.micros());
@@ -766,7 +773,9 @@ impl Measurement {
                         }
 
                         if data.try_lock().unwrap().len() > NUMBER_DATA_POINTS {
-                            tx_timer.send(()).await.unwrap();
+                            if let Err(error) = tx_timer.send(()).await {
+                                debug!("measurement timer closed during cancellation: {}", error);
+                            }
                             break;
                         }
                     }
@@ -817,7 +826,9 @@ async fn reset_timer(
                     info!("measuring {} failed", measurement_endpoint);
 
                     let data = data.try_lock().unwrap().clone();
-                    tx_measurement.send(data).await.unwrap();
+                    if let Err(error) = tx_measurement.send(data).await {
+                        debug!("measurement result receiver closed during cancellation: {}", error);
+                    }
                     break;
                 }
             }
@@ -838,7 +849,12 @@ async fn finish(
     debug!("measuring {} done", measurement_endpoint);
 
     let d = data.try_lock().unwrap().clone();
-    tx_measurement.send(d).await.unwrap();
+    if let Err(error) = tx_measurement.send(d).await {
+        debug!(
+            "measurement result receiver closed during cancellation: {}",
+            error
+        );
+    }
     data.try_lock().unwrap().clear();
 }
 
@@ -895,6 +911,119 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    fn inert_measurement(job: Arc<()>, endpoint: SocketAddrV4) -> Measurement {
+        let (tx_timer, _rx_timer) = mpsc::channel(1);
+        Measurement {
+            unicast_socket: None,
+            session_id: SessionId::default(),
+            measurement_endpoint: Some(endpoint),
+            data: Arc::new(Mutex::new(Vec::new())),
+            clock: Clock::new(),
+            measurements_started: Arc::new(Mutex::new(0)),
+            success: Arc::new(Mutex::new(false)),
+            init_bytes_sent: 0,
+            tx_timer,
+            tasks: MeasurementTasks(Vec::new()),
+            cancelled: false,
+            job,
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_cleans_old_node_without_deleting_replacements() {
+        for replace_same_node in [false, true] {
+            let endpoint = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808);
+            let node = NodeId::from_array([1; 8]);
+            let replacement_node = if replace_same_node {
+                node
+            } else {
+                NodeId::from_array([2; 8])
+            };
+            let old_job = Arc::new(());
+            let replacement_job = Arc::new(());
+            let measurements = Arc::new(Mutex::new(HashMap::from([(
+                node,
+                inert_measurement(old_job.clone(), endpoint),
+            )])));
+            let (old_route, _rx_old) = mpsc::channel(1);
+            let (replacement_route, _rx_new) = mpsc::channel(1);
+            let dispatch = Arc::new(Mutex::new(HashMap::from([(
+                SocketAddr::V4(endpoint),
+                replacement_route.clone(),
+            )])));
+            let registration = MeasurementRegistration {
+                node_id: node,
+                endpoint: SocketAddr::V4(endpoint),
+                sender: old_route,
+                job: old_job,
+                measurements: measurements.clone(),
+                dispatch: dispatch.clone(),
+            };
+            measurements.lock().unwrap().insert(
+                replacement_node,
+                inert_measurement(replacement_job.clone(), endpoint),
+            );
+            drop(registration);
+            let entries = measurements.lock().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(Arc::ptr_eq(
+                &entries[&replacement_node].job,
+                &replacement_job
+            ));
+            assert!(dispatch.lock().unwrap()[&SocketAddr::V4(endpoint)]
+                .same_channel(&replacement_route));
+        }
+    }
+
+    #[tokio::test]
+    async fn workers_tolerate_closed_result_channels() {
+        let endpoint = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808);
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let data = Arc::new(Mutex::new(vec![(1.0, 2.0)]));
+        finish(
+            Arc::new(Mutex::new(false)),
+            endpoint,
+            data.clone(),
+            tx.clone(),
+        )
+        .await;
+        assert!(data.lock().unwrap().is_empty());
+        reset_timer(
+            Arc::new(Mutex::new(NUMBER_MEASUREMENTS)),
+            Clock::new(),
+            None,
+            endpoint,
+            data,
+            tx,
+            Arc::new(Notify::new()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pong_worker_tolerates_a_closed_timer_channel() {
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let SocketAddr::V4(endpoint) = socket.local_addr().unwrap() else {
+            panic!("expected IPv4");
+        };
+        let mut measurement = inert_measurement(Arc::new(()), endpoint);
+        measurement.unicast_socket = Some(socket);
+        *measurement.data.lock().unwrap() = vec![(1.0, 2.0); NUMBER_DATA_POINTS + 1];
+        let (tx_pong, rx_pong) = mpsc::channel(1);
+        measurement.listen(rx_pong).await;
+        let packet = encode_message(PONG, &Payload::default()).unwrap();
+        tx_pong
+            .send((packet, SocketAddr::V4(endpoint)))
+            .await
+            .unwrap();
+        let worker = measurement.tasks.0.pop().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .expect("closed timer must not panic the pong worker");
+    }
+
     #[tokio::test]
     async fn cancelled_registration_preserves_a_replacement_route() {
         let dispatch = Arc::new(Mutex::new(HashMap::new()));
@@ -907,6 +1036,7 @@ mod tests {
             node_id: NodeId::default(),
             endpoint,
             sender: first,
+            job: Arc::new(()),
             measurements,
             dispatch: dispatch.clone(),
         };
@@ -920,15 +1050,23 @@ mod tests {
         let dispatch = Arc::new(Mutex::new(HashMap::new()));
         let (sender, mut receiver) = mpsc::channel(1);
         let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 20808));
+        let job = Arc::new(());
+        let node = NodeId::default();
+        let measurements = Arc::new(Mutex::new(HashMap::from([(
+            node,
+            inert_measurement(job.clone(), SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808)),
+        )])));
         dispatch.lock().unwrap().insert(endpoint, sender.clone());
         drop(MeasurementRegistration {
-            node_id: NodeId::default(),
+            node_id: node,
             endpoint,
             sender,
-            measurements: Arc::new(Mutex::new(HashMap::new())),
+            job,
+            measurements: measurements.clone(),
             dispatch: dispatch.clone(),
         });
         assert!(dispatch.lock().unwrap().is_empty());
+        assert!(measurements.lock().unwrap().is_empty());
         assert!(receiver.recv().await.is_none());
     }
 
