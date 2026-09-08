@@ -88,10 +88,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Call `link.disable().await` before dropping a Link instance when shutdown must
-wait for its join-session and peer-state-change dispatch work to finish. Dropping
-alone closes dispatch admission and requests cancellation of those two tasks;
+wait for its admitted dispatch work to stop. Disable cancels active measurements
+and parks request intake before stopping the measurement-result,
+join-session, and peer-state-change consumers rather than destroying them, and
+suppresses discovery broadcasts. `link.enable().await` resets session state and
+waits for those consumers to discard disabled-lifecycle queues before admitting
+fresh work. Measurement results are also checked against their originating
+lifecycle so a late result cannot be forwarded after a restart.
+Repeated disable/enable cycles resume peer measurement and session
+joining; enabling an already-enabled instance is a no-op.
+
+Dropping alone closes dispatch admission and requests cancellation of owned
+dispatch, discovery/broadcast, and measurement tasks;
 it does not synchronously join a callback already executing on another runtime
-thread. Disable/re-enable keeps the dispatch tasks alive for reuse.
+thread.
 
 ## Building and Running Examples
 

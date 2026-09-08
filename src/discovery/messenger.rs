@@ -258,7 +258,7 @@ impl Messenger {
 
         spawn_interface_scan(multicast_socket, context);
 
-        broadcast_state(
+        broadcast_state_loop(
             self.ttl,
             self.ttl_ratio,
             self.last_broadcast_time.clone(),
@@ -268,6 +268,7 @@ impl Messenger {
             self.notifier.clone(),
             self.enabled.clone(),
             self.group_id,
+            false,
         )
         .await;
     }
@@ -588,6 +589,33 @@ pub async fn broadcast_state(
     enabled: Arc<Mutex<bool>>,
     group_id: SessionGroupId,
 ) {
+    broadcast_state_loop(
+        ttl,
+        ttl_ratio,
+        last_broadcast_time,
+        interface_sockets,
+        peer_state,
+        to,
+        n,
+        enabled,
+        group_id,
+        true,
+    )
+    .await;
+}
+
+async fn broadcast_state_loop(
+    ttl: u8,
+    ttl_ratio: u8,
+    last_broadcast_time: Arc<Mutex<Instant>>,
+    interface_sockets: InterfaceSockets,
+    peer_state: Arc<Mutex<PeerState>>,
+    to: SocketAddrV4,
+    n: Arc<Notify>,
+    enabled: Arc<Mutex<bool>>,
+    group_id: SessionGroupId,
+    stop_on_notify: bool,
+) {
     let lbt = last_broadcast_time.clone();
 
     let mut sleep_time = Duration::default();
@@ -648,7 +676,13 @@ pub async fn broadcast_state(
                 }
             }
             _ = n.notified() => {
-                break;
+                if stop_on_notify || *enabled.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+                    break;
+                }
+                // Disable is temporary: keep this listener's broadcast loop
+                // alive. A signal while enabled (Ctrl-C) remains terminal.
+                // Controller owns and aborts the listener on final drop.
+                sleep_time = Duration::ZERO;
             }
         }
     }
@@ -852,6 +886,105 @@ mod tests {
             ),
             cancel: Cancel::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn restart_broadcasts_after_disable_notifications() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let SocketAddr::V4(destination) = receiver.local_addr().unwrap() else {
+            panic!("expected IPv4");
+        };
+        let interfaces = Arc::new(Mutex::new(HashMap::from([(
+            Ipv4Addr::LOCALHOST,
+            interface_socket(),
+        )])));
+        let enabled = Arc::new(Mutex::new(true));
+        let notifier = Arc::new(Notify::new());
+        let mut broadcast = Box::pin(broadcast_state_loop(
+            1,
+            1,
+            Arc::new(Mutex::new(Instant::now() - Duration::from_secs(2))),
+            interfaces,
+            Arc::new(Mutex::new(PeerState {
+                measurement_endpoint: Some(destination),
+                ..PeerState::default()
+            })),
+            destination,
+            notifier.clone(),
+            enabled.clone(),
+            0,
+            false,
+        ));
+        let mut buf = [0; MAX_MESSAGE_SIZE];
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::select! {
+                    _ = &mut broadcast => panic!("disable must not terminate broadcasting"),
+                    packet = receiver.recv_from(&mut buf) => {
+                        let (size, _) = packet.unwrap();
+                        let (header, _) = parse_message_header(&buf[..size]).unwrap();
+                        assert_eq!(header.message_type, ALIVE);
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+            *enabled.lock().unwrap() = false;
+            notifier.notify_waiters();
+            // Poll the actual notification path while disabled, without relying
+            // on a sleep to guess when a separately spawned task has processed it.
+            use std::future::Future;
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(broadcast.as_mut().poll(&mut context).is_pending());
+            assert!(receiver.try_recv_from(&mut buf).is_err());
+            *enabled.lock().unwrap() = true;
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_broadcast_still_stops_on_notification() {
+        use std::future::Future;
+
+        let notifier = Arc::new(Notify::new());
+        let mut broadcast = Box::pin(broadcast_state(
+            1,
+            1,
+            Arc::new(Mutex::new(Instant::now())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(PeerState::default())),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1),
+            notifier.clone(),
+            Arc::new(Mutex::new(false)),
+            0,
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(broadcast.as_mut().poll(&mut context).is_pending());
+        notifier.notify_waiters();
+        assert!(broadcast.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[tokio::test]
+    async fn enabled_controller_broadcast_stops_on_terminal_notification() {
+        use std::future::Future;
+
+        let notifier = Arc::new(Notify::new());
+        let mut broadcast = Box::pin(broadcast_state_loop(
+            1,
+            1,
+            Arc::new(Mutex::new(Instant::now())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(PeerState::default())),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1),
+            notifier.clone(),
+            Arc::new(Mutex::new(true)),
+            0,
+            false,
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(broadcast.as_mut().poll(&mut context).is_pending());
+        notifier.notify_waiters();
+        assert!(broadcast.as_mut().poll(&mut context).is_ready());
     }
 
     /// `IP_MULTICAST_ALL=0` is the whole behavioral change in this port, and it is a

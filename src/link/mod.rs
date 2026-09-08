@@ -148,6 +148,9 @@ impl BasicLink {
 
 #[cfg(feature = "std")]
 impl BasicLink {
+    /// Enables discovery and dispatch, including after a previous [`Self::disable`].
+    /// Waits for consumers to prepare the new lifecycle before returning.
+    /// Calling this while already enabled leaves the current session unchanged.
     pub async fn enable(&mut self) {
         self.controller.enable().await;
 
@@ -155,6 +158,8 @@ impl BasicLink {
         self.atomic_session_state.set_enabled(true);
     }
 
+    /// Stops dispatch and suppresses discovery without destroying the consumers
+    /// needed by a later [`Self::enable`].
     pub async fn disable(&mut self) {
         self.controller.disable().await;
 

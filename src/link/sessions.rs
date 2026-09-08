@@ -14,8 +14,14 @@ use crate::{
 };
 
 use super::{
-    clock::Clock, encoding::PayloadEntryHeader, ghostxform::GhostXForm,
-    measurement::MeasurePeerEvent, node::NodeId, timeline::Timeline, Result,
+    clock::Clock,
+    controller::{gated_recv, DispatchGate},
+    encoding::PayloadEntryHeader,
+    ghostxform::GhostXForm,
+    measurement::MeasurePeerEvent,
+    node::NodeId,
+    timeline::Timeline,
+    Result,
 };
 
 pub const SESSION_MEMBERSHIP_HEADER_KEY: u32 = u32::from_be_bytes(*b"sess");
@@ -134,8 +140,34 @@ impl Sessions {
         clock: Clock,
         tx_join_session: tokio::sync::mpsc::Sender<Session>,
         notifier: Arc<Notify>,
-        mut rx_measure_peer_result: tokio::sync::mpsc::Receiver<MeasurePeerEvent>,
+        rx_measure_peer_result: tokio::sync::mpsc::Receiver<MeasurePeerEvent>,
     ) -> Self {
+        let gate = Arc::new(DispatchGate::new_open());
+        let (sessions, task) = Self::with_dispatch_gate(
+            init,
+            tx_measure_peer_state,
+            peers,
+            clock,
+            tx_join_session,
+            rx_measure_peer_result,
+            gate,
+        );
+        tokio::spawn(async move {
+            notifier.notified().await;
+            task.abort();
+        });
+        sessions
+    }
+
+    pub(crate) fn with_dispatch_gate(
+        init: Session,
+        tx_measure_peer_state: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+        peers: Arc<Mutex<Vec<ControllerPeer>>>,
+        clock: Clock,
+        tx_join_session: tokio::sync::mpsc::Sender<Session>,
+        mut rx_measure_peer_result: tokio::sync::mpsc::Receiver<MeasurePeerEvent>,
+        gate: Arc<DispatchGate>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let other_sessions = Arc::new(Mutex::new(vec![init.clone()]));
         let current = Arc::new(Mutex::new(init));
 
@@ -145,11 +177,17 @@ impl Sessions {
         let peers_loop = peers.clone();
         let tx_measure_peer_state_loop = tx_measure_peer_state.clone();
 
-        let jh = tokio::spawn(async move {
-            loop {
-                if let Some(MeasurePeerEvent::XForm(session_id, x_form)) =
-                    rx_measure_peer_result.recv().await
-                {
+        let mut open = gate.subscribe();
+        let task = tokio::spawn(async move {
+            while let Some((_permit, _, event)) =
+                gated_recv(&gate, &mut open, &mut rx_measure_peer_result).await
+            {
+                let MeasurePeerEvent::XForm(session_id, x_form) = event else {
+                    continue;
+                };
+                // A handler may be blocked sending to another gated consumer.
+                // Cancel that await on disable instead of holding stop() up.
+                let handle = async {
                     if x_form == GhostXForm::default() {
                         handle_failed_measurement(
                             session_id,
@@ -172,27 +210,28 @@ impl Sessions {
                         )
                         .await;
                     }
-                } else {
-                    info!("measure peer event channel closed");
+                };
+                tokio::select! {
+                    biased;
+                    _ = open.closed() => {}
+                    _ = handle => {}
                 }
             }
+            debug!("measure peer event channel closed");
         });
 
-        tokio::spawn(async move {
-            notifier.notified().await;
-
-            jh.abort();
-        });
-
-        Self {
-            other_sessions,
-            current,
-            tx_measure_peer_state,
-            peers,
-            clock,
-            is_founding: Arc::new(Mutex::new(false)),
-            has_joined: Arc::new(Mutex::new(false)),
-        }
+        (
+            Self {
+                other_sessions,
+                current,
+                tx_measure_peer_state,
+                peers,
+                clock,
+                is_founding: Arc::new(Mutex::new(false)),
+                has_joined: Arc::new(Mutex::new(false)),
+            },
+            task,
+        )
     }
 
     pub fn reset_session(&mut self, session: Session) {
