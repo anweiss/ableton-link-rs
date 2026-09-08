@@ -87,6 +87,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Call `link.disable().await` before dropping a Link instance when shutdown must
+wait for its join-session and peer-state-change dispatch work to finish. Dropping
+alone closes dispatch admission and requests cancellation of those two tasks;
+it does not synchronously join a callback already executing on another runtime
+thread. Disable/re-enable keeps the dispatch tasks alive for reuse.
+
 ## Building and Running Examples
 
 ```bash
