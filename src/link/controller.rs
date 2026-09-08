@@ -183,28 +183,27 @@ impl DispatchGate {
             let ready = self.ready.notified();
             tokio::pin!(ready);
             ready.as_mut().enable();
-            let all_ready = {
+            {
                 let mut subscribers = self
                     .subscribers
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 subscribers.retain(|subscriber| subscriber.strong_count() != 0);
-                subscribers.iter().all(|subscriber| {
+                let all_ready = subscribers.iter().all(|subscriber| {
                     subscriber.upgrade().is_none_or(|prepared| {
                         prepared.load(std::sync::atomic::Ordering::Acquire) >= epoch
                     })
-                })
-            };
-            if all_ready {
-                break;
+                });
+                if all_ready {
+                    // Serialize the final readiness check and opening with
+                    // subscribe(), including receivers created by interface scans.
+                    publish();
+                    self.active.send_replace(DispatchState::Open);
+                    return;
+                }
             }
             ready.await;
         }
-        // No await between publishing lifecycle state and opening admission.
-        // Receivers can only wake after all readiness acknowledgements and
-        // their enabled flag agree.
-        publish();
-        self.active.send_replace(DispatchState::Open);
     }
 
     pub(crate) async fn stop(&self) {
@@ -1742,6 +1741,10 @@ mod dispatch_gate_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let published = std::sync::atomic::AtomicBool::new(false);
         let mut start = Box::pin(gate.start_with(|| {
+            assert!(
+                gate.subscribers.try_lock().is_err(),
+                "registration must remain serialized through publication and opening"
+            );
             assert!(
                 !gate.is_open(),
                 "publication must precede receiver admission"
