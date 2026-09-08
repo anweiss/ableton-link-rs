@@ -253,11 +253,11 @@ title = "Audit peer bookkeeping for values read after ownership was given away"
 upstream = ["ef2d1fd99d70", "f5fabf4ac8be"]
 rust = ["src/discovery/peers.rs"]
 risk = "internal"
-status = "outstanding"
-retired_at_pin = ""
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "`std::move` on a value that was then read again; Rust's borrow checker would normally catch this at compile time, but the equivalent logic in `peers.rs` should be audited for correctness Also covers: `PeerState::fromPayload` initializer list was missing the third field after `audioEndpoint` was added; also fixes use-after-move in `Peers::GatewayObserver`"
 impact = "Upstream read two values after handing ownership of them elsewhere, and separately left a field unset when the audio address was introduced. This language rejects the first class of mistake at compile time, so the work here is an audit rather than a fix: confirm the equivalent peer bookkeeping is correct and that no field was missed."
-note = "Merged with \"Fix ESP-IDF 6.0 PeerState init + Peers use-after-move (core portions)\" on migration: both claimed f5fabf4ac8be."
+note = "Merged with \"Fix ESP-IDF 6.0 PeerState init + Peers use-after-move (core portions)\" on migration: both claimed f5fabf4ac8be. Audited `saw_peer`/`peer_left`/`GatewayObserver` in `src/discovery/peers.rs`: neither upstream mistake has a Rust equivalent. `ef2d1fd99d70`'s `make_pair(std::move(peerState), std::move(gatewayAddr))`-then-read bug has no analogue because `saw_peer` never moves `peer_seen_peer_state` before reading from it — it destructures into a fresh `PeerState` (`ps`) up front and reads only from `ps`/its derived locals afterward, and the peer list update clones (`peer.clone()`) rather than moving. `f5fabf4ac8be`'s two core-portion bugs are likewise absent: `PeerState` here has all three fields (`node_state`, `measurement_endpoint`, `audio_endpoint`) populated in every construction site, so the missing-third-field initializer bug is not representable, and `GatewayObserver`'s callback dispatch (`peer_event` match arms in `GatewayObserver::new`) reads `peer_state`/`node_id` by value from the channel and never touches them again afterward, so there is no post-move read to fix. The ESP-IDF-specific `esp_netif_next` → `esp_netif_next_unsafe`/`esp_netif_tcpip_exec` portion of `f5fabf4ac8be` has no analogue here. This port does scan interfaces for discovery — `src/platform/network.rs`, called from `src/discovery/messenger.rs` — but it does so through the cross-platform `network-interface` crate with an `if-addrs` fallback, and makes no direct `esp_netif` calls anywhere, so there is no ESP-IDF interface enumeration to make thread-safe. This entry is bookkeeping only; no Rust change was needed."
 
 [[port]]
 id = "set-ip-multicast-all-0-on-linux"
