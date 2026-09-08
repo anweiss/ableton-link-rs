@@ -143,10 +143,13 @@ impl DispatchGate {
     /// Registers a consumer for the startup barrier and subscribes to state.
     pub(crate) fn subscribe(&self) -> DispatchReceiver {
         let prepared_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        self.subscribers
+        let mut subscribers = self
+            .subscribers
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(Arc::downgrade(&prepared_epoch));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Interface receivers may churn without another start() to clean up.
+        subscribers.retain(|subscriber| subscriber.strong_count() != 0);
+        subscribers.push(Arc::downgrade(&prepared_epoch));
         DispatchReceiver {
             state: self.active.subscribe(),
             prepared_epoch,
@@ -1754,6 +1757,21 @@ mod dispatch_gate_tests {
         tx.send(1).await.unwrap();
         assert_eq!(receive.await.unwrap().2, 1);
         assert!(published.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn open_gate_prunes_departed_receiver_registrations_during_churn() {
+        let gate = DispatchGate::new_open();
+        let retained = gate.subscribe();
+        for _ in 0..1000 {
+            let receiver = gate.subscribe();
+            assert_eq!(gate.subscribers.lock().unwrap().len(), 2);
+            drop(receiver);
+        }
+        drop(retained);
+        let _receiver = gate.subscribe();
+        assert_eq!(gate.subscribers.lock().unwrap().len(), 1);
+        assert!(gate.is_open());
     }
 
     #[tokio::test]
