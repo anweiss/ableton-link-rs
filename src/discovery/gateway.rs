@@ -202,6 +202,9 @@ impl PeerGateway {
         let mut children = tokio::task::JoinSet::new();
         let measurement_notifier = Arc::new(Notify::new());
         let gate = self.gate.clone();
+        // Register socket receivers before the event consumer can acknowledge
+        // startup; otherwise the first barrier could miss its discovery children.
+        let messenger = self.messenger.listen_owned();
 
         children.spawn(async move {
             while let Some((_permit, generation, val)) =
@@ -240,7 +243,6 @@ impl PeerGateway {
             }
         });
 
-        let messenger = self.messenger.listen();
         tokio::pin!(messenger);
         loop {
             select! {

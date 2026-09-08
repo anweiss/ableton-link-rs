@@ -100,6 +100,10 @@ gate; prior-lifecycle packets, blocked sends, and pruning work cannot refill the
 reset peer list. Session remeasurement has one owned, epoch-scoped retry worker
 rather than accumulating detached schedulers. Transient UDP receive errors retry
 with a short backoff instead of permanently removing an interface receiver.
+Socket reads are cancelled and re-armed across the barrier so the first fresh
+packet is accepted, and BYEBYE forwarding remains inside that cancellation scope.
+An interrupted enable can be retried; enabled is published only after startup
+finishes.
 Repeated disable/enable cycles resume peer measurement and session
 joining; enabling an already-enabled instance is a no-op.
 

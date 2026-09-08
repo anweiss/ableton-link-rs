@@ -109,6 +109,15 @@ struct Cancel {
 }
 
 impl Cancel {
+    async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_cancelled() {
+            notified.await;
+        }
+    }
+
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
         self.notify.notify_waiters();
@@ -233,6 +242,10 @@ impl Messenger {
     }
 
     pub async fn listen(&self) {
+        self.listen_owned().await;
+    }
+
+    pub(crate) fn listen_owned(&self) -> impl std::future::Future<Output = ()> + '_ {
         let multicast_socket = self.interface.as_ref().unwrap().clone();
         let interface_sockets = self.interface_sockets.clone();
         let peer_state = self.peer_state.clone();
@@ -291,18 +304,20 @@ impl Messenger {
             self.group_id,
             false,
         );
-        tokio::pin!(broadcast);
-        loop {
-            select! {
-                _ = &mut broadcast => break,
-                result = children.join_next(), if !children.is_empty() => {
-                    if let Some(Err(error)) = result {
-                        warn!("discovery worker failed: {}", error);
+        async move {
+            tokio::pin!(broadcast);
+            loop {
+                select! {
+                    _ = &mut broadcast => break,
+                    result = children.join_next(), if !children.is_empty() => {
+                        if let Some(Err(error)) = result {
+                            warn!("discovery worker failed: {}", error);
+                        }
                     }
                 }
             }
+            children.shutdown().await;
         }
-        children.shutdown().await;
     }
 }
 
@@ -493,140 +508,172 @@ fn common_prefix_len(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
     (u32::from(a) ^ u32::from(b)).leading_zeros()
 }
 
-async fn receive_loop(
+fn receive_loop(
     receive_socket: Arc<UdpSocket>,
     cancel: Option<Cancel>,
     context: ReceiveContext,
-) {
-    loop {
-        let mut buf = [0; MAX_MESSAGE_SIZE];
-        let generation = context.gate.epoch();
-
-        let received = match &cancel {
-            Some(cancel) => {
-                if cancel.is_cancelled() {
-                    break;
+) -> impl std::future::Future<Output = ()> {
+    let mut open = context.gate.subscribe();
+    async move {
+        loop {
+            let mut buf = [0; MAX_MESSAGE_SIZE];
+            let cancelled = async {
+                match &cancel {
+                    Some(cancel) => cancel.cancelled().await,
+                    None => std::future::pending::<()>().await,
                 }
-
-                select! {
-                    received = receive_socket.recv_from(&mut buf) => received,
-                    _ = cancel.notify.notified() => break,
+            };
+            tokio::pin!(cancelled);
+            select! {
+            biased;
+            _ = &mut cancelled => break,
+            _ = open.wait_open(|| loop {
+                match receive_socket.try_recv_from(&mut buf) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        warn!("discovery socket drain failed: {}", error);
+                        break;
+                    }
                 }
+            }) => {}
             }
-            None => receive_socket.recv_from(&mut buf).await,
-        };
-        #[cfg(test)]
-        let received = if context.fail_receive_once.swap(false, Ordering::Relaxed) {
-            Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-        } else {
-            received
-        };
-
-        let (amt, src) = match received {
-            Ok(received) => received,
-            Err(e) => {
-                warn!("discovery socket receive failed: {}", e);
-                // UDP errors can be transient. Keep the registered interface's
-                // receiver alive, but back off to avoid spinning on a bad socket.
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            let _permit = context.gate.permit().await;
+            if !context.gate.is_open() {
                 continue;
             }
-        };
 
-        let (header, header_len) = match parse_message_header(&buf[..amt]) {
-            Ok(header) => header,
-            Err(e) => {
-                debug!("ignoring malformed message from {}: {}", src, e);
+            let received = select! {
+                biased;
+                _ = &mut cancelled => break,
+                _ = open.closed() => continue,
+                result = receive_socket.recv_from(&mut buf) => result,
+            };
+            #[cfg(test)]
+            let received = if context.fail_receive_once.swap(false, Ordering::Relaxed) {
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            } else {
+                received
+            };
+
+            let (amt, src) = match received {
+                Ok(received) => received,
+                Err(e) => {
+                    warn!("discovery socket receive failed: {}", e);
+                    // UDP errors can be transient. Keep the registered interface's
+                    // receiver alive, but back off to avoid spinning on a bad socket.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+
+            let (header, header_len) = match parse_message_header(&buf[..amt]) {
+                Ok(header) => header,
+                Err(e) => {
+                    debug!("ignoring malformed message from {}: {}", src, e);
+                    continue;
+                }
+            };
+
+            // TODO figure out how to encode group ID
+            let should_ignore = match context.peer_state.try_lock() {
+                Ok(guard) => header.ident == guard.ident() && header.group_id == context.group_id,
+                Err(_) => false, // If we can't get the lock, don't ignore
+            };
+
+            if should_ignore {
+                debug!("ignoring messages from self (peer {})", header.ident);
                 continue;
-            }
-        };
-
-        // TODO figure out how to encode group ID
-        let should_ignore = match context.peer_state.try_lock() {
-            Ok(guard) => header.ident == guard.ident() && header.group_id == context.group_id,
-            Err(_) => false, // If we can't get the lock, don't ignore
-        };
-
-        if should_ignore {
-            debug!("ignoring messages from self (peer {})", header.ident);
-            continue;
-        } else {
-            debug!(
-                "received message type {} from peer {} at {}",
-                MESSAGE_TYPES[header.message_type as usize], header.ident, src
-            );
-        }
-
-        // Check if Link is enabled before processing ALIVE and RESPONSE messages
-        // BYEBYE messages should still be processed even when disabled to properly clean up peers
-        let is_enabled = if let Ok(enabled_guard) = context.enabled.try_lock() {
-            *enabled_guard
-        } else {
-            false
-        };
-
-        let handle = async {
-            if let SocketAddr::V4(src) = src {
+            } else {
                 debug!(
-                    "Received message type {} from peer {}",
-                    header.message_type, header.ident
+                    "received message type {} from peer {} at {}",
+                    MESSAGE_TYPES[header.message_type as usize], header.ident, src
                 );
-                match header.message_type {
-                    ALIVE => {
-                        if !is_enabled {
-                            debug!(
-                                "ignoring ALIVE message from peer {} because Link is disabled",
-                                header.ident
-                            );
-                            return;
-                        }
+            }
 
-                        if let Some(socket) =
-                            socket_for_target(&context.interface_sockets, *src.ip())
-                        {
-                            send_response(
-                                socket,
-                                context.peer_state.clone(),
-                                context.ttl,
-                                src,
-                                context.last_broadcast_time.clone(),
-                                context.group_id,
+            // Check if Link is enabled before processing ALIVE and RESPONSE messages
+            // BYEBYE messages should still be processed even when disabled to properly clean up peers
+            let is_enabled = if let Ok(enabled_guard) = context.enabled.try_lock() {
+                *enabled_guard
+            } else {
+                false
+            };
+
+            let handle = async {
+                if let SocketAddr::V4(src) = src {
+                    debug!(
+                        "Received message type {} from peer {}",
+                        header.message_type, header.ident
+                    );
+                    match header.message_type {
+                        ALIVE => {
+                            if !is_enabled {
+                                debug!(
+                                    "ignoring ALIVE message from peer {} because Link is disabled",
+                                    header.ident
+                                );
+                                return;
+                            }
+
+                            if let Some(socket) =
+                                socket_for_target(&context.interface_sockets, *src.ip())
+                            {
+                                send_response(
+                                    socket,
+                                    context.peer_state.clone(),
+                                    context.ttl,
+                                    src,
+                                    context.last_broadcast_time.clone(),
+                                    context.group_id,
+                                )
+                                .await;
+                            } else {
+                                warn!("no interface socket available to respond to {}", src);
+                            }
+
+                            receive_peer_state(
+                                context.tx_event.clone(),
+                                header,
+                                &buf[header_len..amt],
                             )
                             .await;
-                        } else {
-                            warn!("no interface socket available to respond to {}", src);
                         }
-
-                        receive_peer_state(context.tx_event.clone(), header, &buf[header_len..amt])
-                            .await;
-                    }
-                    RESPONSE => {
-                        if !is_enabled {
-                            debug!(
+                        RESPONSE => {
+                            if !is_enabled {
+                                debug!(
                                 "ignoring RESPONSE message from peer {} because Link is disabled",
                                 header.ident
                             );
-                            return;
-                        }
+                                return;
+                            }
 
-                        receive_peer_state(context.tx_event.clone(), header, &buf[header_len..amt])
+                            receive_peer_state(
+                                context.tx_event.clone(),
+                                header,
+                                &buf[header_len..amt],
+                            )
                             .await;
-                    }
-                    BYEBYE => {
-                        info!("Received BYEBYE message from peer {}", header.ident);
-                        receive_bye_bye(context.tx_event.clone(), header.ident).await;
-                    }
-                    _ => {
-                        tracing::warn!(
-                            "unknown message type {} from peer {}",
-                            header.message_type,
-                            header.ident
-                        );
+                        }
+                        BYEBYE => {
+                            info!("Received BYEBYE message from peer {}", header.ident);
+                            receive_bye_bye(context.tx_event.clone(), header.ident).await;
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "unknown message type {} from peer {}",
+                                header.message_type,
+                                header.ident
+                            );
+                        }
                     }
                 }
+            };
+            select! {
+                biased;
+                _ = open.closed() => {}
+                _ = handle => {}
             }
-        };
-        context.gate.run_in_epoch(generation, handle).await;
+        }
     }
 }
 
@@ -887,13 +934,11 @@ pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf:
 
 pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
     info!("Received BYEBYE message from peer {}", node_id);
-    tokio::spawn(async move {
-        if let Err(e) = tx.send(OnEvent::Byebye(node_id)).await {
-            debug!("Failed to send BYEBYE event: {:?}", e);
-        } else {
-            info!("Successfully forwarded BYEBYE event for peer {}", node_id);
-        }
-    });
+    if let Err(e) = tx.send(OnEvent::Byebye(node_id)).await {
+        debug!("Failed to send BYEBYE event: {:?}", e);
+    } else {
+        info!("Successfully forwarded BYEBYE event for peer {}", node_id);
+    }
 }
 
 pub fn send_byebye(node_state: NodeId) {
@@ -930,13 +975,9 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn transient_receive_error_does_not_remove_the_worker() {
-        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
-        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(1);
-        let context = ReceiveContext {
-            fail_receive_once: Arc::new(AtomicBool::new(true)),
+    fn receive_context(tx_event: Sender<OnEvent>) -> ReceiveContext {
+        ReceiveContext {
+            fail_receive_once: Arc::new(AtomicBool::new(false)),
             gate: Arc::new(crate::link::controller::DispatchGate::new_open()),
             interface_sockets: Arc::new(Mutex::new(HashMap::new())),
             peer_state: Arc::new(Mutex::new(PeerState::default())),
@@ -946,7 +987,79 @@ mod tests {
             enabled: Arc::new(Mutex::new(true)),
             group_id: 0,
             gateways_changed: Arc::new(AtomicUsize::new(0)),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_rearms_and_accepts_the_first_fresh_packet_after_restart() {
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let context = receive_context(tx);
+        let gate = context.gate.clone();
+        let cancel = Cancel::default();
+        let worker = tokio::spawn(receive_loop(socket.clone(), Some(cancel.clone()), context));
+        for cycle in 0..3 {
+            let node = NodeId::from_array([42 + cycle; 8]);
+            let packet = encode_message(node, 0, BYEBYE, &Payload::default(), 0).unwrap();
+            sender
+                .send_to(&packet, socket.local_addr().unwrap())
+                .await
+                .unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap();
+            assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == node));
+            gate.stop().await;
+            sender
+                .send_to(&packet, socket.local_addr().unwrap())
+                .await
+                .unwrap();
+            // The stopped receiver is parked, so readiness proves a stale
+            // packet is queued before the next startup drain.
+            socket.readable().await.unwrap();
+            gate.start().await;
+            assert!(rx.try_recv().is_err());
+        }
+        gate.stop().await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_byebye_send_is_cancelled_inside_its_epoch() {
+        use std::future::Future;
+        let gate = crate::link::controller::DispatchGate::new_open();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let old = NodeId::from_array([1; 8]);
+        tx.send(OnEvent::Byebye(old)).await.unwrap();
+        let mut work = Box::pin(gate.run_in_epoch(
+            gate.epoch(),
+            receive_bye_bye(tx.clone(), NodeId::from_array([2; 8])),
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(work.as_mut().poll(&mut context).is_pending());
+        gate.close();
+        assert!(matches!(
+            work.as_mut().poll(&mut context),
+            std::task::Poll::Ready(None)
+        ));
+        drop(work);
+        assert!(matches!(rx.recv().await, Some(OnEvent::Byebye(id)) if id == old));
+        gate.start().await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn transient_receive_error_does_not_remove_the_worker() {
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(1);
+        let context = receive_context(tx_event);
+        context.fail_receive_once.store(true, Ordering::Relaxed);
         let node = NodeId::from_array([42; 8]);
         let packet = encode_message(node, 0, BYEBYE, &Payload::default(), 0).unwrap();
         let worker = tokio::spawn(receive_loop(socket.clone(), None, context));

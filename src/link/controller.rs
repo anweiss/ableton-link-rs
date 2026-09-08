@@ -83,6 +83,24 @@ pub(crate) struct DispatchReceiver {
 }
 
 impl DispatchReceiver {
+    pub(crate) async fn wait_open(&mut self, mut drain: impl FnMut()) {
+        loop {
+            let state = *self.state.borrow_and_update();
+            if state == DispatchState::Open {
+                return;
+            }
+            drain();
+            if let DispatchState::Preparing(epoch) = state {
+                self.prepared_epoch
+                    .store(epoch, std::sync::atomic::Ordering::Release);
+                self.ready.notify_one();
+            }
+            if self.state.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub(crate) async fn closed(&mut self) {
         let _ = self
             .state
@@ -139,11 +157,11 @@ impl DispatchGate {
     /// Acquires the right to receive and run dispatch work. The permit is held
     /// across the consumer's `recv()`, so [`DispatchGate::stop`] cannot return
     /// while a consumer still holds queued work it has not discarded.
-    async fn permit(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+    pub(crate) async fn permit(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
         self.in_flight.read().await
     }
 
-    fn is_open(&self) -> bool {
+    pub(crate) fn is_open(&self) -> bool {
         *self.active.borrow() == DispatchState::Open
     }
 
@@ -814,6 +832,12 @@ impl Controller {
             return;
         }
 
+        // A cancelled enable/disable may leave only some gates open. Quiesce
+        // them before retrying the reset instead of assuming an atomic startup.
+        self.discovery.measurement_service.stop().await;
+        self.discovery.stop().await;
+        self.dispatch.gate.stop().await;
+
         // Reset while dispatch and discovery are still disabled. Opening first
         // lets a resumed result handler race this new lifecycle's state reset.
         reset_state(
@@ -831,14 +855,6 @@ impl Controller {
         self.discovery.measurement_service.start().await;
         self.dispatch.gate.start().await;
 
-        // Start advertising only once every consumer has drained its old queue.
-        // This bool is never held across an await; recover poison rather than
-        // silently leaving the gate and enabled state inconsistent.
-        *self
-            .enabled
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-
         // Only start the discovery listener if it hasn't been started already
         if let Some(rx_event) = self.rx_event.take() {
             let discovery = self.discovery.clone();
@@ -852,9 +868,21 @@ impl Controller {
             }));
         }
         self.discovery.gate.start().await;
+        // Publish only after the final barrier: a cancelled enable remains
+        // retryable instead of reporting enabled with discovery still preparing.
+        *self
+            .enabled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
     }
 
     pub async fn disable(&mut self) {
+        // Publish the transition before awaiting, so cancellation cannot leave
+        // is_enabled true with only part of the pipeline running.
+        *self
+            .enabled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         // Stop request intake and cancel active measurements first. Its closed
         // consumer keeps draining sends from dispatch while those loops wind down.
         self.discovery.measurement_service.stop().await;
@@ -885,17 +913,6 @@ impl Controller {
             send_byebye(node_id);
         } else {
             info!("Could not read node id, skipping bye-bye message");
-        }
-
-        // Symmetrically with `enable()`, take the lock properly rather than
-        // best-effort: a skipped `try_lock` here would leave `enabled` true
-        // behind an already-closed gate.
-        {
-            *self
-                .enabled
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
-            info!("Set Link enabled state to false");
         }
 
         // Cancel this lifecycle's measurements and wake the enabled-gated
@@ -1671,6 +1688,36 @@ mod dispatch_gate_tests {
     #[tokio::test]
     async fn restart_measures_and_joins_a_peer_after_each_enable() {
         measures_and_joins_after_each_enable().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_enable_does_not_publish_success_and_can_be_retried() {
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let gate = controller.discovery.gate.clone();
+        let enabled = controller.enabled.clone();
+        let blocker = gate.subscribe();
+        let mut enable = Box::pin(controller.enable());
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::select! {
+                _ = &mut enable => panic!("unacknowledged discovery consumer must block enable"),
+                _ = async {
+                    while gate.epoch() == 0 { tokio::task::yield_now().await; }
+                } => {}
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!*enabled.lock().unwrap());
+        drop(enable);
+        drop(blocker);
+        tokio::time::timeout(TEST_TIMEOUT, controller.enable())
+            .await
+            .unwrap();
+        assert!(controller.is_enabled());
+        assert!(gate.is_open());
+        controller.disable().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
