@@ -158,8 +158,11 @@ impl PeerGateway {
     }
 
     pub async fn listen(&self, rx_event: Receiver<OnEvent>, notifier: Arc<Notify>) {
-        self.listen_with_dispatch(rx_event, notifier, self.gate.subscribe())
-            .await;
+        select! {
+            biased;
+            _ = notifier.notified() => {}
+            _ = self.listen_with_dispatch(rx_event, notifier.clone(), self.gate.subscribe()) => {}
+        }
     }
 
     pub(crate) async fn listen_with_dispatch(

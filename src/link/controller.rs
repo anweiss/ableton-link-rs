@@ -1720,6 +1720,23 @@ mod dispatch_gate_tests {
         controller.disable().await;
     }
 
+    #[tokio::test]
+    async fn public_gateway_listen_preserves_notifier_cancellation() {
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let notifier = controller.notifier.clone();
+        let mut listen = Box::pin(
+            controller
+                .discovery
+                .listen(controller.rx_event.take().unwrap(), notifier.clone()),
+        );
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(listen.as_mut().poll(&mut context).is_pending());
+        notifier.notify_waiters();
+        assert!(listen.as_mut().poll(&mut context).is_ready());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restart_measures_and_joins_on_a_multi_thread_runtime() {
         measures_and_joins_after_each_enable().await;

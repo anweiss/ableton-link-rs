@@ -104,6 +104,8 @@ Socket reads are cancelled and re-armed across the barrier so the first fresh
 packet is accepted, and BYEBYE forwarding remains inside that cancellation scope.
 An interrupted enable can be retried; enabled is published only after startup
 finishes.
+The standalone `Messenger::listen` and `PeerGateway::listen` APIs retain their
+notifier-based terminal cancellation; the controller uses separate owned paths.
 Repeated disable/enable cycles resume peer measurement and session
 joining; enabling an already-enabled instance is a no-op.
 

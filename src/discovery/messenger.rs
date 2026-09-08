@@ -242,7 +242,11 @@ impl Messenger {
     }
 
     pub async fn listen(&self) {
-        self.listen_owned().await;
+        select! {
+            biased;
+            _ = self.notifier.notified() => {}
+            _ = self.listen_owned() => {}
+        }
     }
 
     pub(crate) fn listen_owned(&self) -> impl std::future::Future<Output = ()> + '_ {
@@ -974,6 +978,26 @@ mod tests {
     use std::net::Ipv6Addr;
 
     use super::*;
+
+    #[tokio::test]
+    async fn public_messenger_listen_preserves_notifier_cancellation() {
+        use std::future::Future;
+        let notifier = Arc::new(Notify::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let messenger = Messenger::new(
+            Arc::new(Mutex::new(PeerState::default())),
+            tx,
+            Instant::now(),
+            notifier.clone(),
+            Arc::new(Mutex::new(false)),
+        )
+        .unwrap();
+        let mut listen = Box::pin(messenger.listen());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(listen.as_mut().poll(&mut context).is_pending());
+        notifier.notify_waiters();
+        assert!(listen.as_mut().poll(&mut context).is_ready());
+    }
 
     fn receive_context(tx_event: Sender<OnEvent>) -> ReceiveContext {
         ReceiveContext {
