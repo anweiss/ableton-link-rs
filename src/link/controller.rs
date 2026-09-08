@@ -1819,6 +1819,30 @@ mod dispatch_gate_tests {
         assert!(listen.as_mut().poll(&mut context).is_ready());
     }
 
+    #[tokio::test]
+    async fn signal_setup_error_does_not_terminate_the_discovery_listener() {
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let gate = controller.discovery.gate.clone();
+        let mut listen = Box::pin(controller.discovery.listen_with_signal(
+            controller.rx_event.take().unwrap(),
+            controller.notifier.clone(),
+            gate.subscribe(),
+            std::future::ready(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        // Ready errors must neither exit the listener nor be polled repeatedly.
+        assert!(listen.as_mut().poll(&mut context).is_pending());
+        assert!(listen.as_mut().poll(&mut context).is_pending());
+        tokio::time::timeout(TEST_TIMEOUT, gate.start())
+            .await
+            .unwrap();
+        assert!(listen.as_mut().poll(&mut context).is_pending());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restart_measures_and_joins_on_a_multi_thread_runtime() {
         measures_and_joins_after_each_enable().await;

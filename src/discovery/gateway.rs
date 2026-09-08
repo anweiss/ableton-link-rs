@@ -167,9 +167,20 @@ impl PeerGateway {
 
     pub(crate) async fn listen_with_dispatch(
         &self,
+        rx_event: Receiver<OnEvent>,
+        notifier: Arc<Notify>,
+        open: DispatchReceiver,
+    ) {
+        self.listen_with_signal(rx_event, notifier, open, tokio::signal::ctrl_c())
+            .await;
+    }
+
+    pub(crate) async fn listen_with_signal(
+        &self,
         mut rx_event: Receiver<OnEvent>,
         notifier: Arc<Notify>,
         mut open: DispatchReceiver,
+        signal: impl std::future::Future<Output = std::io::Result<()>>,
     ) {
         let node_id = self
             .peer_state
@@ -247,18 +258,23 @@ impl PeerGateway {
         });
 
         tokio::pin!(messenger);
+        tokio::pin!(signal);
+        let mut signal_available = true;
         loop {
             select! {
                 _ = &mut messenger => break,
-                signal = tokio::signal::ctrl_c() => {
-                    match signal {
+                result = &mut signal, if signal_available => {
+                    match result {
                         Ok(()) => {
                             send_byebye(peer_state.lock().unwrap().ident());
                             notifier.notify_waiters();
+                            break;
                         }
-                        Err(error) => tracing::warn!("Ctrl-C listener failed: {}", error),
+                        Err(error) => {
+                            tracing::warn!("Ctrl-C listener failed; discovery continues: {}", error);
+                            signal_available = false;
+                        }
                     }
-                    break;
                 }
                 result = children.join_next(), if !children.is_empty() => {
                     if let Some(Err(error)) = result {
