@@ -102,6 +102,8 @@ rather than accumulating detached schedulers. Transient UDP receive errors retry
 with a short backoff instead of permanently removing an interface receiver.
 Socket reads are cancelled and re-armed across the barrier so the first fresh
 packet is accepted, and BYEBYE forwarding remains inside that cancellation scope.
+Receivers continue discarding during preparation; the final admission transition
+performs another queued-datagram drain before publishing enabled.
 Interrupted enable/disable can be retried. Startup resets peer counts and
 publishes enabled after preparation but before admitting packets; disable clears
 both controller and real-time atomic enabled flags before awaiting shutdown.

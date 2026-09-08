@@ -164,6 +164,15 @@ pub struct Messenger {
 }
 
 impl Messenger {
+    pub(crate) fn discard_queued_datagrams(&self) {
+        if let Some(socket) = &self.interface {
+            drain_socket(socket);
+        }
+        for entry in interface_socket_entries(&self.interface_sockets) {
+            drain_socket(&entry.socket);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn socket_probes(&self) -> Vec<std::sync::Weak<UdpSocket>> {
         let mut sockets = vec![Arc::downgrade(self.interface.as_ref().unwrap())];
@@ -273,6 +282,8 @@ impl Messenger {
             gate: self.gate.clone(),
             #[cfg(test)]
             fail_receive_once: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            drain_count: Arc::new(AtomicUsize::new(0)),
         };
 
         // The shared multicast socket receives the multicast traffic of every
@@ -327,6 +338,8 @@ impl Messenger {
 
 #[derive(Clone)]
 struct ReceiveContext {
+    #[cfg(test)]
+    drain_count: Arc<AtomicUsize>,
     #[cfg(test)]
     fail_receive_once: Arc<AtomicBool>,
     gate: Arc<crate::link::controller::DispatchGate>,
@@ -512,6 +525,20 @@ fn common_prefix_len(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
     (u32::from(a) ^ u32::from(b)).leading_zeros()
 }
 
+fn drain_socket(socket: &UdpSocket) {
+    let mut buf = [0; MAX_MESSAGE_SIZE];
+    loop {
+        match socket.try_recv_from(&mut buf) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => {
+                warn!("discovery socket drain failed: {}", error);
+                break;
+            }
+        }
+    }
+}
+
 fn receive_loop(
     receive_socket: Arc<UdpSocket>,
     cancel: Option<Cancel>,
@@ -531,16 +558,11 @@ fn receive_loop(
             select! {
             biased;
             _ = &mut cancelled => break,
-            _ = open.wait_open(|| loop {
-                match receive_socket.try_recv_from(&mut buf) {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        warn!("discovery socket drain failed: {}", error);
-                        break;
-                    }
-                }
-            }) => {}
+            _ = open.wait_open(&context.gate, || {
+                drain_socket(&receive_socket);
+                #[cfg(test)]
+                context.drain_count.fetch_add(1, Ordering::SeqCst);
+            }, || receive_socket.readable()) => {}
             }
             let _permit = context.gate.permit().await;
             if !context.gate.is_open() {
@@ -1001,6 +1023,7 @@ mod tests {
 
     fn receive_context(tx_event: Sender<OnEvent>) -> ReceiveContext {
         ReceiveContext {
+            drain_count: Arc::new(AtomicUsize::new(0)),
             fail_receive_once: Arc::new(AtomicBool::new(false)),
             gate: Arc::new(crate::link::controller::DispatchGate::new_open()),
             interface_sockets: Arc::new(Mutex::new(HashMap::new())),
@@ -1021,6 +1044,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let context = receive_context(tx);
         let gate = context.gate.clone();
+        let drain_count = context.drain_count.clone();
         let cancel = Cancel::default();
         let worker = tokio::spawn(receive_loop(socket.clone(), Some(cancel.clone()), context));
         for cycle in 0..3 {
@@ -1035,13 +1059,18 @@ mod tests {
                 .unwrap();
             assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == node));
             gate.stop().await;
+            let drained = drain_count.load(Ordering::SeqCst);
             sender
                 .send_to(&packet, socket.local_addr().unwrap())
                 .await
                 .unwrap();
-            // The stopped receiver is parked, so readiness proves a stale
-            // packet is queued before the next startup drain.
-            socket.readable().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while drain_count.load(Ordering::SeqCst) == drained {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
             gate.start().await;
             assert!(rx.try_recv().is_err());
         }
@@ -1051,6 +1080,58 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn receiver_keeps_discarding_after_acknowledging_preparation() {
+        use std::future::Future;
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let context = receive_context(tx);
+        let gate = context.gate.clone();
+        gate.close();
+        let drain_count = context.drain_count.clone();
+        let worker = tokio::spawn(receive_loop(socket.clone(), None, context));
+        let blocker = gate.subscribe();
+        let mut start = Box::pin(gate.start());
+        let mut poll_context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(start.as_mut().poll(&mut poll_context).is_pending());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while drain_count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let acknowledged = drain_count.load(Ordering::SeqCst);
+        let old = NodeId::from_array([41; 8]);
+        let packet = encode_message(old, 0, BYEBYE, &Payload::default(), 0).unwrap();
+        sender
+            .send_to(&packet, socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while drain_count.load(Ordering::SeqCst) == acknowledged {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("receiver must drain arrivals while another subscriber delays opening");
+        drop(blocker);
+        start.await;
+        let fresh = NodeId::from_array([42; 8]);
+        let packet = encode_message(fresh, 0, BYEBYE, &Payload::default(), 0).unwrap();
+        sender
+            .send_to(&packet, socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap();
+        assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == fresh));
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

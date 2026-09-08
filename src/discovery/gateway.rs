@@ -52,6 +52,10 @@ pub enum OnEvent {
 }
 
 impl PeerGateway {
+    pub(crate) fn discard_queued_datagrams(&self) {
+        self.messenger.discard_queued_datagrams();
+    }
+
     pub(crate) async fn stop(&self) {
         self.gate.stop().await;
         self.peer_timeouts.lock().unwrap().clear();

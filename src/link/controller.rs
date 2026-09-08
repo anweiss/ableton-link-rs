@@ -83,20 +83,45 @@ pub(crate) struct DispatchReceiver {
 }
 
 impl DispatchReceiver {
-    pub(crate) async fn wait_open(&mut self, mut drain: impl FnMut()) {
+    pub(crate) async fn wait_open<F, Fut>(
+        &mut self,
+        gate: &DispatchGate,
+        mut drain: impl FnMut(),
+        mut readable: F,
+    ) where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<()>>,
+    {
         loop {
-            let state = *self.state.borrow_and_update();
-            if state == DispatchState::Open {
-                return;
+            {
+                // A preparation drain must not continue past the final opening
+                // transition and consume the first newly admitted packet.
+                let _registration = gate
+                    .subscribers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let state = *self.state.borrow_and_update();
+                if state == DispatchState::Open {
+                    return;
+                }
+                drain();
+                if let DispatchState::Preparing(epoch) = state {
+                    self.prepared_epoch
+                        .store(epoch, std::sync::atomic::Ordering::Release);
+                    self.ready.notify_one();
+                }
             }
-            drain();
-            if let DispatchState::Preparing(epoch) = state {
-                self.prepared_epoch
-                    .store(epoch, std::sync::atomic::Ordering::Release);
-                self.ready.notify_one();
-            }
-            if self.state.changed().await.is_err() {
-                return;
+            tokio::select! {
+                biased;
+                changed = self.state.changed() => {
+                    if changed.is_err() { return; }
+                }
+                result = readable() => {
+                    if let Err(error) = result {
+                        tracing::warn!("disabled ingress readiness failed: {}", error);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
             }
         }
     }
@@ -882,6 +907,7 @@ impl Controller {
         self.discovery
             .gate
             .start_with(|| {
+                self.discovery.discard_queued_datagrams();
                 *self
                     .enabled
                     .lock()
