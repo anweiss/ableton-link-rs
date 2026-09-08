@@ -11,7 +11,7 @@ use tokio::sync::{
 use tracing::{debug, info};
 
 use crate::link::{
-    controller::SessionPeerCounter,
+    controller::{gated_recv, DispatchGate, SessionPeerCounter},
     node::{NodeId, NodeState},
     sessions::SessionId,
     state::StartStopState,
@@ -45,35 +45,64 @@ impl Drop for GatewayObserver {
 
 impl GatewayObserver {
     pub async fn new(
-        mut on_peer_event: Receiver<PeerEvent>,
+        on_peer_event: Receiver<PeerEvent>,
         peer_state: Arc<Mutex<PeerState>>,
         session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
         tx_peer_state_change: Sender<Vec<PeerStateChange>>,
         peers: Arc<Mutex<Vec<ControllerPeer>>>,
         _notifier: Arc<Notify>,
     ) -> Self {
+        Self::with_dispatch_gate(
+            on_peer_event,
+            peer_state,
+            session_peer_counter,
+            tx_peer_state_change,
+            peers,
+            Arc::new(DispatchGate::new_open()),
+        )
+        .await
+    }
+
+    pub(crate) async fn with_dispatch_gate(
+        mut on_peer_event: Receiver<PeerEvent>,
+        peer_state: Arc<Mutex<PeerState>>,
+        session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
+        tx_peer_state_change: Sender<Vec<PeerStateChange>>,
+        peers: Arc<Mutex<Vec<ControllerPeer>>>,
+        gate: Arc<DispatchGate>,
+    ) -> Self {
         let observer_peers = peers.clone();
         let peer_state_loop = peer_state.clone();
 
+        let mut open = gate.subscribe();
         let task = tokio::spawn(async move {
-            while let Some(peer_event) = on_peer_event.recv().await {
-                match peer_event {
-                    PeerEvent::SawPeer(peer_state) => {
-                        saw_peer(
-                            peer_state,
-                            peers.clone(),
-                            peer_state_loop.clone(),
-                            session_peer_counter.clone(),
-                            tx_peer_state_change.clone(),
-                        )
-                        .await
+            while let Some((_permit, _, peer_event)) =
+                gated_recv(&gate, &mut open, &mut on_peer_event).await
+            {
+                let handle = async {
+                    match peer_event {
+                        PeerEvent::SawPeer(peer_state) => {
+                            saw_peer(
+                                peer_state,
+                                peers.clone(),
+                                peer_state_loop.clone(),
+                                session_peer_counter.clone(),
+                                tx_peer_state_change.clone(),
+                            )
+                            .await
+                        }
+                        PeerEvent::PeerLeft(node_id) => {
+                            peer_left(node_id, peers.clone(), tx_peer_state_change.clone()).await
+                        }
+                        PeerEvent::PeerTimedOut(node_id) => {
+                            peer_left(node_id, peers.clone(), tx_peer_state_change.clone()).await
+                        }
                     }
-                    PeerEvent::PeerLeft(node_id) => {
-                        peer_left(node_id, peers.clone(), tx_peer_state_change.clone()).await
-                    }
-                    PeerEvent::PeerTimedOut(node_id) => {
-                        peer_left(node_id, peers.clone(), tx_peer_state_change.clone()).await
-                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = open.closed() => {}
+                    _ = handle => {}
                 }
             }
         });
@@ -445,6 +474,44 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn observer_drains_disabled_events_before_admitting_fresh_peers() {
+        let gate = Arc::new(DispatchGate::new());
+        let (tx_event, rx_event) = mpsc::channel(2);
+        let (tx_changes, mut rx_changes) = mpsc::channel(2);
+        let peers = Arc::new(Mutex::new(vec![]));
+        let observer = GatewayObserver::with_dispatch_gate(
+            rx_event,
+            Arc::new(Mutex::new(PeerState::default())),
+            Arc::new(Mutex::new(SessionPeerCounter::default())),
+            tx_changes,
+            peers.clone(),
+            gate.clone(),
+        )
+        .await;
+        let (stale, fresh, _) = init_peers();
+        for _ in 0..3 {
+            tx_event
+                .send(PeerEvent::SawPeer(stale.clone()))
+                .await
+                .unwrap();
+            gate.start().await;
+            assert!(peers.lock().unwrap().is_empty());
+            assert!(rx_changes.try_recv().is_err());
+            tx_event
+                .send(PeerEvent::SawPeer(fresh.clone()))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx_changes.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(peers.lock().unwrap()[0].peer_state.ident(), fresh.ident());
+            gate.stop().await;
+            observer.reset_peers();
+        }
+    }
 
     #[tokio::test]
     async fn observer_exits_when_event_channel_closes() {

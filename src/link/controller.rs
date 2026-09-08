@@ -118,7 +118,7 @@ impl DispatchGate {
         gate
     }
 
-    fn epoch(&self) -> u64 {
+    pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(std::sync::atomic::Ordering::Acquire)
     }
 
@@ -437,6 +437,7 @@ impl Controller {
             .await?,
         );
         discovery.measurement_service.stop().await;
+        discovery.stop().await;
 
         let mut dispatch = DispatchTasks::new();
         let (sessions, session_task) = Sessions::with_dispatch_gate(
@@ -842,17 +843,22 @@ impl Controller {
         if let Some(rx_event) = self.rx_event.take() {
             let discovery = self.discovery.clone();
             let notifier = self.notifier.clone();
+            let events = discovery.gate.subscribe();
 
             self.dispatch.tasks.push(tokio::spawn(async move {
-                discovery.listen(rx_event, notifier).await;
+                discovery
+                    .listen_with_dispatch(rx_event, notifier, events)
+                    .await;
             }));
         }
+        self.discovery.gate.start().await;
     }
 
     pub async fn disable(&mut self) {
         // Stop request intake and cancel active measurements first. Its closed
         // consumer keeps draining sends from dispatch while those loops wind down.
         self.discovery.measurement_service.stop().await;
+        self.discovery.stop().await;
         // Stop the background dispatch loops before anything else, mirroring
         // upstream's `mRtClientStateSetter.stop()` at the top of the async
         // shutdown handler (see `44d78f2cf3a4`, "Stop the
@@ -1751,7 +1757,29 @@ mod dispatch_gate_tests {
         responding.store(true, Ordering::Relaxed);
 
         for cycle in 0..3 {
+            controller
+                .discovery
+                .event_sender()
+                .send(OnEvent::PeerState(
+                    crate::discovery::peers::PeerStateMessageType {
+                        node_state: NodeState {
+                            node_id: NodeId::from_array([99; 8]),
+                            session_id: SessionId(NodeId::from_array([99; 8])),
+                            timeline: Timeline::default(),
+                            start_stop_state: StartStopState::default(),
+                        },
+                        ttl: 3,
+                        measurement_endpoint: Some(endpoint),
+                        audio_endpoint: None,
+                    },
+                ))
+                .await
+                .unwrap();
             controller.enable().await;
+            assert!(
+                controller.peers.lock().unwrap().is_empty(),
+                "disabled discovery events must not repopulate reset peers"
+            );
             assert_eq!(controller.session_id(), SessionId(node_id));
             let previous_pings = pings.load(Ordering::Relaxed);
             let timeline = Timeline {
@@ -1812,6 +1840,7 @@ mod dispatch_gate_tests {
         let event_state = controller.discovery.event_state_probe();
         let peer_state = Arc::downgrade(&controller.discovery.peer_state);
         let peer_counter = Arc::downgrade(&controller.discovery.session_peer_counter);
+        let peers = Arc::downgrade(&controller.peers);
         let tasks: Vec<_> = controller
             .dispatch
             .tasks
@@ -1825,6 +1854,7 @@ mod dispatch_gate_tests {
                 || event_state.strong_count() != 0
                 || peer_state.strong_count() != 0
                 || peer_counter.strong_count() != 0
+                || peers.strong_count() != 0
             {
                 tokio::task::yield_now().await;
             }

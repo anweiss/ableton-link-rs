@@ -130,6 +130,7 @@ pub struct InterfaceSocket {
 pub type InterfaceSockets = Arc<Mutex<HashMap<Ipv4Addr, InterfaceSocket>>>;
 
 pub struct Messenger {
+    pub(crate) gate: Arc<crate::link::controller::DispatchGate>,
     pub interface: Option<Arc<UdpSocket>>,
     /// One ephemeral socket per usable interface, used to send discovery messages
     /// and to listen for the unicast responses they trigger.
@@ -227,6 +228,7 @@ impl Messenger {
             enabled,
             group_id: 0,
             gateways_changed,
+            gate: Arc::new(crate::link::controller::DispatchGate::new_open()),
         })
     }
 
@@ -251,6 +253,9 @@ impl Messenger {
             enabled: enabled.clone(),
             group_id,
             gateways_changed: self.gateways_changed.clone(),
+            gate: self.gate.clone(),
+            #[cfg(test)]
+            fail_receive_once: Arc::new(AtomicBool::new(false)),
         };
 
         // The shared multicast socket receives the multicast traffic of every
@@ -303,6 +308,9 @@ impl Messenger {
 
 #[derive(Clone)]
 struct ReceiveContext {
+    #[cfg(test)]
+    fail_receive_once: Arc<AtomicBool>,
+    gate: Arc<crate::link::controller::DispatchGate>,
     interface_sockets: InterfaceSockets,
     peer_state: Arc<Mutex<PeerState>>,
     ttl: u8,
@@ -492,6 +500,7 @@ async fn receive_loop(
 ) {
     loop {
         let mut buf = [0; MAX_MESSAGE_SIZE];
+        let generation = context.gate.epoch();
 
         let received = match &cancel {
             Some(cancel) => {
@@ -506,12 +515,21 @@ async fn receive_loop(
             }
             None => receive_socket.recv_from(&mut buf).await,
         };
+        #[cfg(test)]
+        let received = if context.fail_receive_once.swap(false, Ordering::Relaxed) {
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+        } else {
+            received
+        };
 
         let (amt, src) = match received {
             Ok(received) => received,
             Err(e) => {
                 warn!("discovery socket receive failed: {}", e);
-                break;
+                // UDP errors can be transient. Keep the registered interface's
+                // receiver alive, but back off to avoid spinning on a bad socket.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
             }
         };
 
@@ -547,64 +565,68 @@ async fn receive_loop(
             false
         };
 
-        if let SocketAddr::V4(src) = src {
-            debug!(
-                "Received message type {} from peer {}",
-                header.message_type, header.ident
-            );
-            match header.message_type {
-                ALIVE => {
-                    if !is_enabled {
-                        debug!(
-                            "ignoring ALIVE message from peer {} because Link is disabled",
+        let handle = async {
+            if let SocketAddr::V4(src) = src {
+                debug!(
+                    "Received message type {} from peer {}",
+                    header.message_type, header.ident
+                );
+                match header.message_type {
+                    ALIVE => {
+                        if !is_enabled {
+                            debug!(
+                                "ignoring ALIVE message from peer {} because Link is disabled",
+                                header.ident
+                            );
+                            return;
+                        }
+
+                        if let Some(socket) =
+                            socket_for_target(&context.interface_sockets, *src.ip())
+                        {
+                            send_response(
+                                socket,
+                                context.peer_state.clone(),
+                                context.ttl,
+                                src,
+                                context.last_broadcast_time.clone(),
+                                context.group_id,
+                            )
+                            .await;
+                        } else {
+                            warn!("no interface socket available to respond to {}", src);
+                        }
+
+                        receive_peer_state(context.tx_event.clone(), header, &buf[header_len..amt])
+                            .await;
+                    }
+                    RESPONSE => {
+                        if !is_enabled {
+                            debug!(
+                                "ignoring RESPONSE message from peer {} because Link is disabled",
+                                header.ident
+                            );
+                            return;
+                        }
+
+                        receive_peer_state(context.tx_event.clone(), header, &buf[header_len..amt])
+                            .await;
+                    }
+                    BYEBYE => {
+                        info!("Received BYEBYE message from peer {}", header.ident);
+                        receive_bye_bye(context.tx_event.clone(), header.ident).await;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "unknown message type {} from peer {}",
+                            header.message_type,
                             header.ident
                         );
-                        continue;
                     }
-
-                    if let Some(socket) = socket_for_target(&context.interface_sockets, *src.ip()) {
-                        send_response(
-                            socket,
-                            context.peer_state.clone(),
-                            context.ttl,
-                            src,
-                            context.last_broadcast_time.clone(),
-                            context.group_id,
-                        )
-                        .await;
-                    } else {
-                        warn!("no interface socket available to respond to {}", src);
-                    }
-
-                    receive_peer_state(context.tx_event.clone(), header, &buf[header_len..amt])
-                        .await;
-                }
-                RESPONSE => {
-                    if !is_enabled {
-                        debug!(
-                            "ignoring RESPONSE message from peer {} because Link is disabled",
-                            header.ident
-                        );
-                        continue;
-                    }
-
-                    receive_peer_state(context.tx_event.clone(), header, &buf[header_len..amt])
-                        .await;
-                }
-                BYEBYE => {
-                    info!("Received BYEBYE message from peer {}", header.ident);
-                    receive_bye_bye(context.tx_event.clone(), header.ident).await;
-                }
-                _ => {
-                    tracing::warn!(
-                        "unknown message type {} from peer {}",
-                        header.message_type,
-                        header.ident
-                    );
-                    continue;
                 }
             }
-        }
+        };
+        context.gate.run_in_epoch(generation, handle).await;
     }
 }
 
@@ -907,6 +929,40 @@ mod tests {
     use std::net::Ipv6Addr;
 
     use super::*;
+
+    #[tokio::test]
+    async fn transient_receive_error_does_not_remove_the_worker() {
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(1);
+        let context = ReceiveContext {
+            fail_receive_once: Arc::new(AtomicBool::new(true)),
+            gate: Arc::new(crate::link::controller::DispatchGate::new_open()),
+            interface_sockets: Arc::new(Mutex::new(HashMap::new())),
+            peer_state: Arc::new(Mutex::new(PeerState::default())),
+            ttl: 1,
+            tx_event,
+            last_broadcast_time: Arc::new(Mutex::new(Instant::now())),
+            enabled: Arc::new(Mutex::new(true)),
+            group_id: 0,
+            gateways_changed: Arc::new(AtomicUsize::new(0)),
+        };
+        let node = NodeId::from_array([42; 8]);
+        let packet = encode_message(node, 0, BYEBYE, &Payload::default(), 0).unwrap();
+        let worker = tokio::spawn(receive_loop(socket.clone(), None, context));
+        for _ in 0..2 {
+            sender
+                .send_to(&packet, socket.local_addr().unwrap())
+                .await
+                .unwrap();
+        }
+        let event = tokio::time::timeout(Duration::from_secs(5), rx_event.recv())
+            .await
+            .unwrap();
+        assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == node));
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
 
     fn interface_socket() -> InterfaceSocket {
         InterfaceSocket {

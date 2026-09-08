@@ -95,6 +95,11 @@ suppresses discovery broadcasts. `link.enable().await` resets session state and
 waits for those consumers to discard disabled-lifecycle queues before admitting
 fresh work. Measurement results are also checked against their originating
 lifecycle so a late result cannot be forwarded after a restart.
+The discovery event and observer queues participate in their own acknowledged
+gate; prior-lifecycle packets, blocked sends, and pruning work cannot refill the
+reset peer list. Session remeasurement has one owned, epoch-scoped retry worker
+rather than accumulating detached schedulers. Transient UDP receive errors retry
+with a short backoff instead of permanently removing an interface receiver.
 Repeated disable/enable cycles resume peer measurement and session
 joining; enabling an already-enabled instance is a no-op.
 
