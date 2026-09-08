@@ -100,7 +100,9 @@ joining; enabling an already-enabled instance is a no-op.
 
 Dropping alone closes dispatch admission and requests cancellation of owned
 dispatch, discovery/broadcast (including socket receivers and interface scanning),
-and measurement tasks. Temporary-disable notifications cannot terminate the
+gateway-observer, and measurement tasks. The observer also exits when its input
+channel closes and can be cancelled while its downstream queue is full.
+Temporary-disable notifications cannot terminate the
 owned broadcaster, even when handled after re-enable;
 it does not synchronously join a callback already executing on another runtime
 thread.

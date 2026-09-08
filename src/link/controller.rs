@@ -1810,6 +1810,8 @@ mod dispatch_gate_tests {
 
         let sockets = controller.discovery.socket_probes();
         let event_state = controller.discovery.event_state_probe();
+        let peer_state = Arc::downgrade(&controller.discovery.peer_state);
+        let peer_counter = Arc::downgrade(&controller.discovery.session_peer_counter);
         let tasks: Vec<_> = controller
             .dispatch
             .tasks
@@ -1821,6 +1823,8 @@ mod dispatch_gate_tests {
             while tasks.iter().any(|task| !task.is_finished())
                 || sockets.iter().any(|socket| socket.strong_count() != 0)
                 || event_state.strong_count() != 0
+                || peer_state.strong_count() != 0
+                || peer_counter.strong_count() != 0
             {
                 tokio::task::yield_now().await;
             }
