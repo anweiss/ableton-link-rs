@@ -1674,17 +1674,23 @@ mod dispatch_gate_tests {
 
     async fn measures_and_joins_after_each_enable() {
         use crate::link::pingresponder::{PingResponder, MAX_MESSAGE_SIZE};
-        use std::net::Ipv4Addr;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let clock = Clock::new();
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), clock)
+            .await
+            .unwrap();
+        let local_ip = controller
+            .discovery
+            .measurement_service
+            .shared_socket
+            .local_addr()
+            .unwrap()
+            .ip();
         let peer_id = NodeId::from_array([1; 8]);
         let peer_session = SessionId(peer_id);
-        let socket = Arc::new(
-            tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap(),
-        );
+        // Keep source and destination on the same local interface on every platform.
+        let socket = Arc::new(tokio::net::UdpSocket::bind((local_ip, 0)).await.unwrap());
         let std::net::SocketAddr::V4(endpoint) = socket.local_addr().unwrap() else {
             panic!("expected an IPv4 measurement endpoint");
         };
@@ -1712,9 +1718,6 @@ mod dispatch_gate_tests {
             }
         });
 
-        let mut controller = Controller::new(tempo::Tempo::new(120.0), clock)
-            .await
-            .unwrap();
         let node_id = controller.peer_state.lock().unwrap().ident();
         // Even disable-before-first-enable must not kill the only result consumer.
         controller.disable().await;
