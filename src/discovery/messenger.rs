@@ -2251,6 +2251,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires disposable CI adapters configured by the platform fixture"]
     async fn multihomed_adapter_ingress_and_churn() {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init()
+            .unwrap();
         assert_eq!(
             std::env::var("LINK_154_ADAPTER_FIXTURE").as_deref(),
             Ok("1")
@@ -2279,6 +2284,16 @@ mod tests {
             &context,
             &mut children,
             &[host_a.clone(), host_b.clone()],
+        );
+        assert_eq!(
+            interface_socket_entries(&context.interface_sockets).len(),
+            2
+        );
+        eprintln!(
+            "fixture adapters: {:?}, {:?}; generation {}",
+            host_a,
+            host_b,
+            topology.check().unwrap()
         );
         children.spawn(receive_loop(listener.clone(), None, context.clone()));
         for _ in 0..3 {
@@ -2363,6 +2378,7 @@ mod tests {
 
     #[cfg(any(target_os = "macos", windows))]
     async fn adapter_peer(local: Ipv4Addr, host: &Ipv4Interface) {
+        eprintln!("peer {} expects response from {:?}", local, host);
         let socket = PacketSocket::new(SocketAddrV4::new(local, 0), Some(host.index)).unwrap();
         let packet = encode_message(
             NodeId::from_array([42; 8]),

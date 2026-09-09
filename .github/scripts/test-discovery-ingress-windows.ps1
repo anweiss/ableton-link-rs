@@ -1,11 +1,43 @@
 param([string]$TestBinary, [switch]$Churn)
 $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true') { throw 'Requires a disposable GitHub Actions runner' }
+# New-NetIPAddress disables DHCP. Use the address-only IP Helper operation so
+# the runner's existing DHCP address/default route remain untouched.
+Add-Type @'
+using System;
+using System.Net;
+using System.Runtime.InteropServices;
+public static class FixtureAddress {
+    [StructLayout(LayoutKind.Explicit, Size = 80)]
+    public struct Row {
+        [FieldOffset(0)] public ushort Family;
+        [FieldOffset(4)] public uint Address;
+        [FieldOffset(32)] public ulong Luid;
+        [FieldOffset(40)] public uint Index;
+        [FieldOffset(60)] public byte Prefix;
+        [FieldOffset(61)] public byte SkipAsSource;
+    }
+    [DllImport("iphlpapi.dll")] static extern void InitializeUnicastIpAddressEntry(out Row row);
+    [DllImport("iphlpapi.dll")] static extern uint CreateUnicastIpAddressEntry(ref Row row);
+    [DllImport("iphlpapi.dll")] static extern uint DeleteUnicastIpAddressEntry(ref Row row);
+    public static void Set(uint index, string address, bool add) {
+        Row row;
+        InitializeUnicastIpAddressEntry(out row);
+        row.Family = 2;
+        row.Address = BitConverter.ToUInt32(IPAddress.Parse(address).GetAddressBytes(), 0);
+        row.Index = index;
+        row.Prefix = 24;
+        row.SkipAsSource = 1;
+        uint error = add ? CreateUnicastIpAddressEntry(ref row) : DeleteUnicastIpAddressEntry(ref row);
+        if (error != 0) throw new System.ComponentModel.Win32Exception((int)error);
+    }
+}
+'@
 if ($Churn) {
     if ($env:LINK_154_ADAPTER_FIXTURE -ne '1') { throw 'Fixture not active' }
     $index = [int]$env:LINK_154_ADAPTER_A
-    Remove-NetIPAddress -InterfaceIndex $index -IPAddress 10.42.0.1 -Confirm:$false
-    New-NetIPAddress -InterfaceIndex $index -IPAddress 10.42.0.1 -PrefixLength 24 -SkipAsSource $true | Out-Null
+    [FixtureAddress]::Set($index, '10.42.0.1', $false)
+    [FixtureAddress]::Set($index, '10.42.0.1', $true)
     Start-Sleep -Seconds 3
     exit
 }
@@ -26,7 +58,7 @@ $rule = 'ableton-link-154-fixture'
 try {
     New-NetFirewallRule -Name $rule -DisplayName $rule -Direction Inbound -Action Allow -Protocol UDP -Program $TestBinary | Out-Null
     foreach ($entry in $assignments) {
-        New-NetIPAddress -InterfaceIndex $entry[0] -IPAddress $entry[1] -PrefixLength 24 -SkipAsSource $true | Out-Null
+        [FixtureAddress]::Set($entry[0], $entry[1], $true)
         $created += ,$entry
     }
     Start-Sleep -Seconds 3
@@ -36,7 +68,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Multihomed fixture failed: $LASTEXITCODE" }
 } finally {
     foreach ($entry in $created) {
-        Remove-NetIPAddress -InterfaceIndex $entry[0] -IPAddress $entry[1] -Confirm:$false
+        [FixtureAddress]::Set($entry[0], $entry[1], $false)
     }
     Remove-NetFirewallRule -Name $rule
 }
