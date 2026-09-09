@@ -38,7 +38,7 @@ impl PacketSocket {
         options.set_broadcast(true)?;
         if let Some(index) = index {
             pin_egress(&std_socket, index)?;
-            options.set_multicast_if_v4(addr.ip())?;
+            Self::pin_multicast(&std_socket, index)?;
         }
         Ok(Self {
             socket: Arc::new(UdpSocket::from_std(std_socket)?),
@@ -46,9 +46,110 @@ impl PacketSocket {
         })
     }
 
+    // socket2/nix expose address-only outgoing IPv4 multicast options. Their safe
+    // indexed membership methods do not select the outgoing multicast interface.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(unsafe_code)]
+    fn pin_multicast(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let value = libc::ip_mreqn {
+            imr_multiaddr: libc::in_addr { s_addr: 0 },
+            imr_address: libc::in_addr { s_addr: 0 },
+            imr_ifindex: index.try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "interface index out of range")
+            })?,
+        };
+        // SAFETY: IP_MULTICAST_IF accepts a fully initialized ip_mreqn on both
+        // platforms. The live socket and option remain borrowed for the syscall.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MULTICAST_IF,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(windows)]
+    fn pin_multicast(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
+        if index == 0 || index > 0x00ff_ffff {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multicast interface index out of range",
+            ));
+        }
+        // Winsock interprets 0.x.x.x as a network-byte-order interface index.
+        socket2::SockRef::from(socket).set_multicast_if_v4(&std::net::Ipv4Addr::from(index))
+    }
+
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<(usize, PktInfo)> {
         self.socket
             .try_io(Interest::READABLE, || self.info.recv(buf))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn set_membership(socket: &UdpSocket, index: u32, join: bool) -> io::Result<()> {
+    let socket = socket2::SockRef::from(socket);
+    let interface = socket2::InterfaceIndexOrAddress::Index(index);
+    if join {
+        socket.join_multicast_v4_n(&super::MULTICAST_ADDR, &interface)
+    } else {
+        socket.leave_multicast_v4_n(&super::MULTICAST_ADDR, &interface)
+    }
+}
+
+// Darwin IP_ADD_MEMBERSHIP reads only ip_mreq, silently ignoring the extra
+// ip_mreqn index passed by socket2's _v4_n API. nix has no group_req wrapper.
+// RFC 3678 MCAST_JOIN/LEAVE_GROUP is required for indexed memberships here.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub(super) fn set_membership(socket: &UdpSocket, index: u32, join: bool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // Darwin SDK netinet/in.h defines these under #pragma pack(4).
+    // libc does not currently publish the Darwin group_req or constants.
+    #[repr(C, packed(4))]
+    struct GroupRequest {
+        interface: u32,
+        group: libc::sockaddr_storage,
+    }
+    const MCAST_JOIN_GROUP: libc::c_int = 80;
+    const MCAST_LEAVE_GROUP: libc::c_int = 81;
+    let mut address =
+        socket2::SockAddr::from(SocketAddrV4::new(super::MULTICAST_ADDR, 0)).as_storage();
+    // SAFETY: SockAddr constructed the fully initialized native sockaddr storage;
+    // view_as uses that same native type, not a reinterpretation of another ABI.
+    let request = GroupRequest {
+        interface: index,
+        group: unsafe { *address.view_as::<libc::sockaddr_storage>() },
+    };
+    let option = if join {
+        MCAST_JOIN_GROUP
+    } else {
+        MCAST_LEAVE_GROUP
+    };
+    // SAFETY: synchronous option call borrows a live socket and initialized
+    // group_req of the platform's own layout. No pointer escapes.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            option,
+            std::ptr::from_ref(&request).cast(),
+            std::mem::size_of_val(&request) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 

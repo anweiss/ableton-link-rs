@@ -32,20 +32,6 @@ pub(crate) fn scan_discovery_interfaces() -> std::io::Result<Vec<Ipv4Interface>>
     }
     result.sort_by_key(|interface| (interface.addr, interface.index));
     result.dedup();
-    // The public InterfaceSockets map is keyed by local address. Do not choose
-    // an arbitrary adapter when that address belongs to multiple adapters.
-    let ambiguous: Vec<_> = result
-        .windows(2)
-        .filter(|pair| pair[0].addr == pair[1].addr)
-        .map(|pair| pair[0].addr)
-        .collect();
-    for addr in &ambiguous {
-        error!(
-            "discovery cannot register duplicate local IPv4 address {}",
-            addr
-        );
-    }
-    result.retain(|interface| !ambiguous.contains(&interface.addr));
     Ok(result)
 }
 

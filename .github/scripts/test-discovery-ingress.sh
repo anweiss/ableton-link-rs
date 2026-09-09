@@ -6,7 +6,7 @@ set -euo pipefail
 [[ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]]
 
 create_a() {
-  ip link add veth-a type veth peer name peer-a
+  ip link add veth-a ${LINK_154_INDEX:+index "$LINK_154_INDEX"} type veth peer name peer-a
   ip link set peer-a netns link154-a
   ip addr add 10.42.0.1/24 dev veth-a
   ip link set veth-a up
@@ -15,8 +15,11 @@ create_a() {
   ip netns exec link154-a ip route add 224.0.0.0/4 dev peer-a
 }
 
-if [[ "${1:-}" == "--replace-a" ]]; then
+if [[ "${1:-}" == "--replace-a" || "${1:-}" == "--reuse-a" ]]; then
   [[ "${LINK_154_NETNS:-}" == "1" ]]
+  if [[ "$1" == "--reuse-a" ]]; then
+    ip link del veth-a
+  fi
   create_a
   exit
 fi

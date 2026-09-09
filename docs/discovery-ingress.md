@@ -45,6 +45,18 @@ The Windows setter uses target-gated `windows-sys` 0.61.2 bindings (already
 transitive through socket-pktinfo); the older winapi bindings do not expose
 `IP_UNICAST_IF`. This dependency is optional under `std` as well.
 
+Linux/Windows memberships use socket2's safe indexed membership methods.
+Darwin requires `MCAST_JOIN_GROUP` / `MCAST_LEAVE_GROUP` with `group_req`:
+its `IP_ADD_MEMBERSHIP` consumes only `ip_mreq`, ignoring the index appended by
+socket2's `join_multicast_v4_n`. The real two-adapter fixture exposed this as an
+incorrect first membership and `EADDRINUSE` on the second. Neither socket2 nor
+nix provides the needed RFC 3678 wrapper, so it is a narrow local exception.
+Memberships are joined once per adapter even with multiple local aliases.
+Outgoing multicast uses `IP_MULTICAST_IF` with `ip_mreqn` on Linux/macOS and
+Winsock's indexed `0.x.x.x` form on Windows. The Unix setter is another narrow
+unsafe exception: socket2 and nix expose address-only outgoing multicast
+setters, which are ambiguous when two adapters share an address.
+
 ## Registration, queues and lifecycle
 
 Each registration retains index, name, local address and its own socket/Cancel
@@ -54,6 +66,31 @@ across await points. Immediately before the nonblocking send, the map lock
 protects the generation check and syscall together. Removal cancels parked
 receivers and pending response/event forwarding; no lookup substitutes another
 registration when the original has disappeared.
+
+Before initial enumeration, discovery subscribes to raw topology notifications:
+Linux route-netlink link/IPv4-address groups, macOS routing-socket interface and
+address messages, and Windows IP Helper interface/address callbacks. Unix uses
+safe nix sockets and Tokio `AsyncFd`; only the Windows callback ownership needs
+local unsafe code. `netwatcher` was evaluated but rejected: its drain followed by
+snapshot-diff delivery collapses remove/add events whose final snapshot is
+identical. This monitor conservatively advances a global generation for relevant
+raw events, without comparing snapshots. Unrelated interface changes therefore
+also rebuild discovery registrations.
+
+Receive/send boundaries check the event stream and lease generation. The
+scanner wakes on events; its five-second tick remains a retry mechanism, not the
+only source of lifetime changes. Enumeration is bracketed by generation checks,
+and registration refuses a stale snapshot. Stream errors invalidate leases and
+are logged, rather than allowing stale sends. Windows callback cancellation
+waits for callbacks before freeing their context; a failed native cancellation
+is logged and retains that context instead of risking use-after-free.
+
+The public `InterfaceSockets` alias remains address-keyed. Each value privately
+groups the distinct adapters sharing that address; all managed receive, send,
+broadcast and reconciliation paths visit the complete group. Captured leases
+omit sibling entries, so removing one adapter does not retain another adapter's
+receiver through unrelated pending work. The map's length is an address count,
+not an adapter count.
 
 Successful empty scans remove all interfaces. Changed index or name with the
 same address creates a new generation. Removal and new membership publication
@@ -87,26 +124,62 @@ deletes an adapter before reconciliation to test kernel egress rejection,
 recreates it, and rejects old-generation work. These tests are ignored outside
 the explicitly configured fixture, not silently passed on unsuitable hosts.
 
-This is **not complete closure of #154**:
+The namespace fixture additionally deletes/recreates an adapter with its old
+index, name and address without reconciling in between, then assigns one local
+address to both adapters and verifies both peer namespaces receive responses.
+Linux and Darwin additionally capture a managed outgoing multicast announcement
+from each duplicate-address registration on its opposite peer link. A readiness
+handshake precedes each send; both the source address and the registration's
+unique port must match. Unicast response coverage alone cannot validate
+`IP_MULTICAST_IF`, so these are separate assertions.
 
-* Interface scanning is periodic (five seconds), not an OS change-event stream.
-  Removal/recreation that reuses the same index, name and address entirely
-  between scans cannot be distinguished. Packet-info has no registration
-  generation; data queued before an unobserved replacement can be misattributed.
-* Distinct local addresses on overlapping prefixes are supported. The public
-  interface map is keyed by local IPv4 address; duplicate addresses on different
-  adapters are logged and excluded rather than arbitrarily choosing one.
-* Real two-adapter multicast/removal behavior on macOS and Windows has not been
-  exercised by the Linux fixture. Their normal tests exercise OS packet metadata
-  on loopback and lifecycle handling; compilation is not proof of multihomed
-  behavior.
-* Multicast membership APIs here still select adapters by local address. Address
-  migration during setup is subject to the same polling limitation. Egress setup
-  failures are logged and that registration is not published.
+The macOS and Windows fixture scripts configure distinct adapters on a
+disposable CI runner. macOS sends across paired `feth` ports with explicit
+interface-scoped routes for the overlapping links. A CI-only pinned Scapy/BPF
+helper supplies ARP and UDP peers without assigning their addresses to the host
+kernel, avoiding same-host local routing altogether. Windows uses real multicast
+loop delivery on private virtual-switch adapters, not the loopback pseudo-interface.
+They verify the response registration's unique endpoint and the receiving peer
+adapter index across restarts, then remove/re-add an address with an unchanged
+final identity. macOS also exercises duplicate-address groups.
+Windows provisions private Hyper-V/HNS adapters and adds private aliases without
+disabling DHCP on the runner's existing transport interface.
+The Darwin helper captures on the opposite Ethernet port and verifies the
+sender's unique registered endpoint. Windows also asserts the reply's packet-info
+index matches its peer adapter. This is virtual-link evidence, not an external
+physical-network test. Scapy is only a Python CI-fixture dependency; library
+dependencies and wire encoding do not change.
+The Windows runner rejected the second duplicate IPv4 assignment with native
+error 5010 (`ERROR_OBJECT_ALREADY_EXISTS`). That exact error is reported as
+missing duplicate-address network evidence while overlap/churn assertions still
+run; other setup errors fail. No Windows duplicate-network pass is claimed.
+Both fixtures fail if their required overlap/churn assertions fail.
+These same-host tests are distinct from Linux's independent peer namespaces;
+they do not establish behavior across external physical networks.
 
-Keep #154 open until those acceptance gaps have explicit coverage or an agreed
-scope. Do not label a platform compile or the deterministic selector tests as a
-real multihomed network test.
+Platform fixture results must be checked on the current PR head before claiming
+closure of #154. Neither a compilation nor a deterministic selector test is a
+real multihomed network test. OS notifications and socket syscalls are separate
+operations: packet metadata still contains an index, not an atomic OS generation
+token. This implementation rejects leases after observed raw changes, including
+equal-snapshot changes; it cannot claim atomic exclusion of index reuse during
+the notification-delivery/check/send race itself. Other hosted targets remain
+unsupported for managed discovery, as described above.
+
+On September 9, 2026, CI run `34372516043` passed all three platform jobs:
+Linux's isolated namespaces included forced identical-index replacement and
+duplicate addresses; Darwin's raw Ethernet peers completed all nine exchanges,
+including both duplicate-address adapters; Windows completed overlap/restart/churn
+and explicitly reported its duplicate-address setup rejection. The native serial
+suite passed 347 library and 33 integration tests (Windows has one additional
+SDK-layout assertion). The equal-snapshot regression was also run as a negative
+control: forcing the topology generation to remain zero made its stale-send
+assertion fail; restoring generation checks made it pass.
+
+These results close the polling and address-keyed-storage gaps, but **do not
+claim full closure of #154**: Windows duplicate-network behavior and atomic
+notification/check/send exclusion remain unproven. The Windows configuration
+rejection is not counted as a successful duplicate-address network test.
 
 ## Primary implementation references
 
@@ -119,3 +192,8 @@ real multihomed network test.
   <https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-ip-socket-options>
 * socket2 adapter binding:
   <https://docs.rs/socket2/0.6.5/socket2/struct.Socket.html#method.bind_device_by_index_v4>
+* Darwin indexed multicast:
+  <https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_mcast.c>
+* Windows notifications and cancellation:
+  <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-notifyipinterfacechange>
+  and <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-cancelmibchangenotify2>

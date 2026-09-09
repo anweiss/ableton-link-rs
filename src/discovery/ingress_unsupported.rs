@@ -6,6 +6,13 @@ use std::{
 };
 use tokio::net::UdpSocket;
 
+pub(super) fn set_membership(_socket: &UdpSocket, _index: u32, _join: bool) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "indexed discovery memberships are unavailable",
+    ))
+}
+
 #[derive(Debug)]
 pub(super) struct PacketInfo {
     pub if_index: u64,
