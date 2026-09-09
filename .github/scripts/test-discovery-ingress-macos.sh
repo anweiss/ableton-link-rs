@@ -28,10 +28,8 @@ ifconfig feth1540 peer feth1541
 ifconfig feth1542 peer feth1543
 for name in "${created[@]}"; do ifconfig "$name" up; done
 ifconfig feth1540 inet 10.42.0.1/24 alias
-ifconfig feth1541 inet 10.42.0.130/24 alias
 ifconfig feth1540 inet 10.42.0.9/24 alias
 ifconfig feth1542 inet 10.42.0.129/24 alias
-ifconfig feth1543 inet 10.42.0.2/24 alias
 ifconfig feth1542 inet 10.42.0.9/24 alias
 # Darwin does not create a usable scoped connected route for both copies of an
 # overlapping prefix. Supply each private link's peer route explicitly.

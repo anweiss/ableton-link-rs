@@ -2378,7 +2378,7 @@ mod tests {
         children.shutdown().await;
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(windows)]
     async fn adapter_peer(local: Ipv4Addr, host: &Ipv4Interface, context: &ReceiveContext) {
         eprintln!("peer {} expects response from {:?}", local, host);
         let peer = scan_discovery_interfaces()
@@ -2387,12 +2387,6 @@ mod tests {
             .find(|entry| entry.addr == local)
             .unwrap();
         let socket = PacketSocket::new(SocketAddrV4::new(local, 0), Some(peer.index)).unwrap();
-        // Same-host unicast replies may take lo0. Allow client receipt there;
-        // its outgoing multicast remains independently pinned by index.
-        #[cfg(target_os = "macos")]
-        socket2::SockRef::from(socket.socket.as_ref())
-            .bind_device_by_index_v4(None)
-            .unwrap();
         let expected = interface_socket_entries(&context.interface_sockets)
             .into_iter()
             .find(|entry| entry.identity == *host)
@@ -2439,6 +2433,63 @@ mod tests {
         );
         assert_eq!(
             parse_message_header(&bytes[..size]).unwrap().0.message_type,
+            RESPONSE
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn adapter_peer(local: Ipv4Addr, host: &Ipv4Interface, context: &ReceiveContext) {
+        let peer_port = match host.name.as_str() {
+            "feth1540" => "feth1541",
+            "feth1542" => "feth1543",
+            other => panic!("unexpected fixture adapter {other}"),
+        };
+        let expected = interface_socket_entries(&context.interface_sockets)
+            .into_iter()
+            .find(|entry| entry.identity == *host)
+            .unwrap()
+            .socket
+            .local_addr()
+            .unwrap();
+        let packet = encode_message(
+            NodeId::from_array([42; 8]),
+            1,
+            ALIVE,
+            &Payload::default(),
+            0,
+        )
+        .unwrap();
+        let payload: String = packet.iter().map(|byte| format!("{byte:02x}")).collect();
+        let output = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::process::Command::new(std::env::var("LINK_154_PYTHON").unwrap())
+                .arg(".github/scripts/discovery-feth-peer.py")
+                .args([
+                    "--interface",
+                    peer_port,
+                    "--local",
+                    &local.to_string(),
+                    "--group",
+                    &MULTICAST_ADDR.to_string(),
+                    "--expected",
+                    &expected.to_string(),
+                    "--payload",
+                    &payload,
+                ])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(
+            parse_message_header(&output.stdout).unwrap().0.message_type,
             RESPONSE
         );
     }
