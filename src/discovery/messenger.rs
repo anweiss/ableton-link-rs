@@ -26,6 +26,7 @@ use crate::{
 
 use super::{
     gateway::OnEvent,
+    ingress::PacketSocket,
     messages::{
         encode_message, parse_message_header, parse_payload, MessageHeader, MessageType,
         SessionGroupId, ALIVE, BYEBYE, MAX_MESSAGE_SIZE, RESPONSE,
@@ -33,6 +34,7 @@ use super::{
     peers::PeerState,
     LINK_PORT, MULTICAST_ADDR, MULTICAST_IP_ANY,
 };
+use crate::platform::network::{scan_discovery_interfaces, Ipv4Interface};
 
 // Safe UDP socket creation using socket2 and safe options
 pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> {
@@ -71,10 +73,8 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     // socket's own memberships. That is a filter on *group*, not on interface: the
     // listener joins the discovery group on every interface, so Link traffic
     // arriving on any of them still matches, and the option reports nothing about
-    // which interface a datagram came in on. Response-socket selection in
-    // `socket_for_target` therefore remains a longest-prefix match on the source
-    // address. Closing that gap needs per-interface listeners or arrival metadata
-    // and is tracked in #154.
+    // which interface a datagram came in on. Messenger uses PacketSocket's
+    // ancillary metadata for that separate responsibility.
     //
     // The option is IPv4-only, so it is applied only to IPv4 sockets.
     #[cfg(target_os = "linux")]
@@ -132,6 +132,8 @@ impl Cancel {
 #[derive(Clone)]
 pub struct InterfaceSocket {
     socket: Arc<UdpSocket>,
+    receiver: Arc<PacketSocket>,
+    identity: Ipv4Interface,
     cancel: Cancel,
 }
 
@@ -139,6 +141,7 @@ pub struct InterfaceSocket {
 pub type InterfaceSockets = Arc<Mutex<HashMap<Ipv4Addr, InterfaceSocket>>>;
 
 pub struct Messenger {
+    multicast_receiver: Arc<PacketSocket>,
     pub(crate) gate: Arc<crate::link::controller::DispatchGate>,
     pub interface: Option<Arc<UdpSocket>>,
     /// One ephemeral socket per usable interface, used to send discovery messages
@@ -191,40 +194,68 @@ impl Messenger {
         notifier: Arc<Notify>,
         enabled: Arc<Mutex<bool>>,
     ) -> Result<Self, std::io::Error> {
+        Self::new_with_interfaces(
+            peer_state,
+            tx_event,
+            epoch,
+            notifier,
+            enabled,
+            scan_discovery_interfaces(),
+        )
+    }
+
+    fn new_with_interfaces(
+        peer_state: Arc<Mutex<PeerState>>,
+        tx_event: Sender<OnEvent>,
+        epoch: Instant,
+        notifier: Arc<Notify>,
+        enabled: Arc<Mutex<bool>>,
+        interfaces: std::io::Result<Vec<Ipv4Interface>>,
+    ) -> Result<Self, std::io::Error> {
         // Bind the multicast listener on LINK_PORT. With SO_REUSEADDR/SO_REUSEPORT this
         // should coexist with other Ableton Link instances on the same host, but the
         // bind can still fail (e.g. another process holding the port without the
         // reuse flags, or the OS otherwise rejecting the bind). Propagate the error
         // instead of panicking so callers can decide how to handle it.
-        let socket = Arc::new(new_udp_reuseport(MULTICAST_IP_ANY.into()).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "failed to bind Ableton Link multicast socket on {}: {}",
-                    SocketAddr::from(MULTICAST_IP_ANY),
-                    e
-                ),
-            )
-        })?);
+        let multicast_receiver =
+            Arc::new(PacketSocket::new(MULTICAST_IP_ANY, None).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to bind Ableton Link multicast socket on {}: {}",
+                        SocketAddr::from(MULTICAST_IP_ANY),
+                        e
+                    ),
+                )
+            })?);
+        let socket = multicast_receiver.socket.clone();
         socket.set_multicast_loop_v4(true)?;
 
         let interface_sockets: InterfaceSockets = Arc::new(Mutex::new(HashMap::new()));
         let gateways_changed = Arc::new(AtomicUsize::new(0));
 
-        for addr in usable_interfaces_v4() {
-            match add_interface(&socket, &interface_sockets, addr) {
-                Ok(_) => info!("joined Ableton Link multicast group on interface {}", addr),
-                Err(e) => warn!("failed to set up interface {}: {}", addr, e),
+        let initial_interfaces = match interfaces {
+            Ok(interfaces) => interfaces,
+            Err(error) => {
+                warn!(
+                    "initial discovery interface scan failed; periodic scan will retry: {}",
+                    error
+                );
+                Vec::new()
+            }
+        };
+        for interface in initial_interfaces {
+            match add_interface(&socket, &interface_sockets, interface.clone()) {
+                Ok(_) => info!(
+                    "joined Ableton Link multicast group on interface {}",
+                    interface.addr
+                ),
+                Err(e) => warn!("failed to set up interface {:?}: {}", interface, e),
             }
         }
 
         if lock_map(&interface_sockets, |sockets| sockets.is_empty()).unwrap_or(true) {
-            // No usable interface was found or none of them could be set up (e.g. a
-            // container without external networking). Fall back to the default
-            // interface so discovery keeps working; the periodic scan picks up
-            // interfaces as they appear.
-            warn!("no usable multicast interface found, falling back to the default interface");
-            add_interface(&socket, &interface_sockets, Ipv4Addr::UNSPECIFIED)?;
+            warn!("no identified discovery interface available; waiting for an interface scan");
         }
 
         // Mirrors upstream's `GatewayFactory::gatewaysChanged()` notification, which
@@ -235,6 +266,7 @@ impl Messenger {
         gateways_changed.fetch_add(1, Ordering::Relaxed);
 
         Ok(Messenger {
+            multicast_receiver,
             interface: Some(socket),
             interface_sockets,
             peer_state,
@@ -259,7 +291,7 @@ impl Messenger {
     }
 
     pub(crate) fn listen_owned(&self) -> impl std::future::Future<Output = ()> + '_ {
-        let multicast_socket = self.interface.as_ref().unwrap().clone();
+        let multicast_socket = self.multicast_receiver.clone();
         let interface_sockets = self.interface_sockets.clone();
         let peer_state = self.peer_state.clone();
         let ttl = self.ttl;
@@ -299,13 +331,13 @@ impl Messenger {
         // messages sent through it.
         for entry in interface_socket_entries(&interface_sockets) {
             children.spawn(receive_loop(
-                entry.socket.clone(),
+                entry.receiver.clone(),
                 Some(entry.cancel.clone()),
                 context.clone(),
             ));
         }
 
-        children.spawn(interface_scan(multicast_socket, context));
+        children.spawn(interface_scan(multicast_socket.socket.clone(), context));
 
         let broadcast = broadcast_state_loop(
             self.ttl,
@@ -353,25 +385,6 @@ struct ReceiveContext {
     gateways_changed: Arc<AtomicUsize>,
 }
 
-/// All IPv4 interfaces that can be used for Link discovery.
-fn usable_interfaces_v4() -> Vec<Ipv4Addr> {
-    only_ipv4(crate::platform::network::scan_network_interfaces_blocking())
-}
-
-async fn usable_interfaces_v4_async() -> Vec<Ipv4Addr> {
-    only_ipv4(crate::platform::network::scan_network_interfaces().await)
-}
-
-fn only_ipv4(addrs: Vec<IpAddr>) -> Vec<Ipv4Addr> {
-    addrs
-        .into_iter()
-        .filter_map(|addr| match addr {
-            IpAddr::V4(addr) => Some(addr),
-            IpAddr::V6(_) => None,
-        })
-        .collect()
-}
-
 fn lock_map<T>(
     sockets: &InterfaceSockets,
     f: impl FnOnce(&HashMap<Ipv4Addr, InterfaceSocket>) -> T,
@@ -391,33 +404,36 @@ fn interface_socket_entries(sockets: &InterfaceSockets) -> Vec<InterfaceSocket> 
 fn add_interface(
     multicast_socket: &Arc<UdpSocket>,
     interface_sockets: &InterfaceSockets,
-    addr: Ipv4Addr,
+    identity: Ipv4Interface,
 ) -> Result<InterfaceSocket, std::io::Error> {
-    multicast_socket.join_multicast_v4(MULTICAST_ADDR, addr)?;
-
-    let send_socket = match new_udp_reuseport(SocketAddrV4::new(addr, 0).into()) {
-        Ok(socket) => socket,
-        Err(e) => {
-            let _ = multicast_socket.leave_multicast_v4(MULTICAST_ADDR, addr);
-            return Err(e);
-        }
-    };
-    if let Err(e) = send_socket.set_multicast_loop_v4(true) {
-        let _ = multicast_socket.leave_multicast_v4(MULTICAST_ADDR, addr);
-        return Err(e);
-    }
-
+    let addr = identity.addr;
+    let receiver = Arc::new(PacketSocket::new(
+        SocketAddrV4::new(addr, 0),
+        Some(identity.index),
+    )?);
     let entry = InterfaceSocket {
-        socket: Arc::new(send_socket),
+        socket: receiver.socket.clone(),
+        receiver,
+        identity,
         cancel: Cancel::default(),
     };
 
     match interface_sockets.lock() {
         Ok(mut sockets) => {
+            if sockets.contains_key(&addr) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "interface is already registered",
+                ));
+            }
+            // Serialize queue draining, membership publication, receive/route
+            // capture and sends. Old queued metadata must not acquire a newly
+            // registered socket generation after a scan.
+            multicast_socket.join_multicast_v4(MULTICAST_ADDR, addr)?;
+            drain_socket(multicast_socket);
             sockets.insert(addr, entry.clone());
         }
         Err(_) => {
-            let _ = multicast_socket.leave_multicast_v4(MULTICAST_ADDR, addr);
             return Err(std::io::Error::other("interface socket map is poisoned"));
         }
     }
@@ -430,15 +446,21 @@ fn remove_interface(
     interface_sockets: &InterfaceSockets,
     addr: Ipv4Addr,
 ) {
-    let entry = match interface_sockets.lock() {
-        Ok(mut sockets) => sockets.remove(&addr),
-        Err(_) => None,
-    };
-
-    if let Some(entry) = entry {
-        entry.cancel.cancel();
-        let _ = multicast_socket.leave_multicast_v4(MULTICAST_ADDR, addr);
-        info!("left Ableton Link multicast group on interface {}", addr);
+    match interface_sockets.lock() {
+        Ok(mut sockets) => {
+            if let Some(entry) = sockets.remove(&addr) {
+                entry.cancel.cancel();
+                if let Err(error) = multicast_socket.leave_multicast_v4(MULTICAST_ADDR, addr) {
+                    warn!(
+                        "failed to leave discovery membership on {}: {}",
+                        addr, error
+                    );
+                }
+                drain_socket(multicast_socket);
+                info!("left Ableton Link multicast group on interface {}", addr);
+            }
+        }
+        Err(_) => warn!("cannot remove discovery interface: socket map is poisoned"),
     }
 }
 
@@ -459,70 +481,116 @@ async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContex
             }
         }
 
-        let current = usable_interfaces_v4_async().await;
-        if current.is_empty() {
-            // Keep the existing sockets rather than tearing discovery down while
-            // the host temporarily has no usable interface.
-            continue;
-        }
-
-        let known = lock_map(&context.interface_sockets, |sockets| {
-            sockets.keys().copied().collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-        let stale_addrs: Vec<Ipv4Addr> = known
-            .iter()
-            .filter(|addr| !current.contains(addr))
-            .copied()
-            .collect();
-        let new_addrs: Vec<Ipv4Addr> = current
-            .iter()
-            .filter(|addr| !known.contains(addr))
-            .copied()
-            .collect();
-
-        for addr in &stale_addrs {
-            remove_interface(&multicast_socket, &context.interface_sockets, *addr);
-        }
-
-        for addr in &new_addrs {
-            match add_interface(&multicast_socket, &context.interface_sockets, *addr) {
-                Ok(entry) => {
-                    info!("joined Ableton Link multicast group on interface {}", addr);
-                    children.spawn(receive_loop(
-                        entry.socket.clone(),
-                        Some(entry.cancel.clone()),
-                        context.clone(),
-                    ));
-                }
-                Err(e) => warn!("failed to set up interface {}: {}", addr, e),
+        let current = match tokio::task::spawn_blocking(scan_discovery_interfaces).await {
+            Ok(Ok(current)) => current,
+            Ok(Err(error)) => {
+                warn!("discovery interface scan failed: {}", error);
+                continue;
             }
-        }
+            Err(error) => {
+                warn!("discovery interface scan task failed: {}", error);
+                continue;
+            }
+        };
 
-        // Mirrors upstream's `PeerGateways::Callback::operator()`, which fires
-        // `gatewaysChanged()` once per scan pass (not once per interface) when
-        // the interface set actually changed.
-        if !stale_addrs.is_empty() || !new_addrs.is_empty() {
-            context.gateways_changed.fetch_add(1, Ordering::Relaxed);
-        }
+        reconcile_interfaces(&multicast_socket, &context, &mut children, &current);
     }
 }
 
-/// Pick the socket that is most likely to reach `to`, i.e. the one bound to the
-/// interface address sharing the longest prefix with it.
-fn socket_for_target(interface_sockets: &InterfaceSockets, to: Ipv4Addr) -> Option<Arc<UdpSocket>> {
-    lock_map(interface_sockets, |sockets| {
+fn reconcile_interfaces(
+    multicast_socket: &Arc<UdpSocket>,
+    context: &ReceiveContext,
+    children: &mut tokio::task::JoinSet<()>,
+    current: &[Ipv4Interface],
+) {
+    let known = lock_map(&context.interface_sockets, |sockets| {
         sockets
-            .iter()
-            .max_by_key(|(addr, _)| common_prefix_len(**addr, to))
-            .map(|(_, entry)| entry.socket.clone())
+            .values()
+            .map(|entry| entry.identity.clone())
+            .collect::<Vec<_>>()
     })
-    .flatten()
+    .unwrap_or_default();
+
+    let stale_addrs: Vec<_> = known
+        .iter()
+        .filter(|addr| !current.contains(addr))
+        .cloned()
+        .collect();
+    let new_addrs: Vec<_> = current
+        .iter()
+        .filter(|addr| !known.contains(addr))
+        .cloned()
+        .collect();
+
+    for addr in &stale_addrs {
+        remove_interface(multicast_socket, &context.interface_sockets, addr.addr);
+    }
+
+    let mut changed = !stale_addrs.is_empty();
+    for addr in &new_addrs {
+        match add_interface(multicast_socket, &context.interface_sockets, addr.clone()) {
+            Ok(entry) => {
+                changed = true;
+                info!(
+                    "joined Ableton Link multicast group on interface {}",
+                    addr.addr
+                );
+                children.spawn(receive_loop(
+                    entry.receiver.clone(),
+                    Some(entry.cancel.clone()),
+                    context.clone(),
+                ));
+            }
+            Err(e) => warn!("failed to set up interface {:?}: {}", addr, e),
+        }
+    }
+    // Mirrors upstream's once-per-pass notification, including removal-only
+    // scans, but not failed additions that left the registration set unchanged.
+    if changed {
+        context.gateways_changed.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
-fn common_prefix_len(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
-    (u32::from(a) ^ u32::from(b)).leading_zeros()
+fn socket_for_ingress(
+    sockets: &HashMap<Ipv4Addr, InterfaceSocket>,
+    index: u64,
+    destination: IpAddr,
+) -> Option<InterfaceSocket> {
+    sockets
+        .values()
+        .filter(|entry| u64::from(entry.identity.index) == index && !entry.cancel.is_cancelled())
+        // With multiple addresses on one adapter, prefer the exact unicast
+        // destination, otherwise a stable local address; never use the source.
+        .min_by_key(|entry| {
+            (
+                IpAddr::V4(entry.identity.addr) != destination,
+                entry.identity.addr,
+            )
+        })
+        .cloned()
+}
+
+async fn receive_datagram(
+    receiver: &PacketSocket,
+    sockets: &InterfaceSockets,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr, Option<InterfaceSocket>)> {
+    loop {
+        receiver.readable().await?;
+        let result = {
+            let sockets = sockets
+                .lock()
+                .map_err(|_| std::io::Error::other("interface socket map is poisoned"))?;
+            receiver.try_recv(buf).map(|(size, info)| {
+                let route = socket_for_ingress(&sockets, info.if_index, info.addr_dst);
+                (size, info.addr_src, route)
+            })
+        };
+        match result {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            result => return result,
+        }
+    }
 }
 
 fn drain_socket(socket: &UdpSocket) {
@@ -540,7 +608,7 @@ fn drain_socket(socket: &UdpSocket) {
 }
 
 fn receive_loop(
-    receive_socket: Arc<UdpSocket>,
+    receive_socket: Arc<PacketSocket>,
     cancel: Option<Cancel>,
     context: ReceiveContext,
 ) -> impl std::future::Future<Output = ()> {
@@ -573,7 +641,7 @@ fn receive_loop(
                 biased;
                 _ = &mut cancelled => break,
                 _ = open.closed() => continue,
-                result = receive_socket.recv_from(&mut buf) => result,
+                result = receive_datagram(&receive_socket, &context.interface_sockets, &mut buf) => result,
             };
             #[cfg(test)]
             let received = if context.fail_receive_once.swap(false, Ordering::Relaxed) {
@@ -582,7 +650,7 @@ fn receive_loop(
                 received
             };
 
-            let (amt, src) = match received {
+            let (amt, src, ingress) = match received {
                 Ok(received) => received,
                 Err(e) => {
                     warn!("discovery socket receive failed: {}", e);
@@ -592,6 +660,13 @@ fn receive_loop(
                     continue;
                 }
             };
+            if ingress.is_none() {
+                debug!(
+                    "discarding discovery datagram without a registered ingress from {}",
+                    src
+                );
+                continue;
+            }
 
             let (header, header_len) = match parse_message_header(&buf[..amt]) {
                 Ok(header) => header,
@@ -641,20 +716,11 @@ fn receive_loop(
                                 return;
                             }
 
-                            if let Some(socket) =
-                                socket_for_target(&context.interface_sockets, *src.ip())
-                            {
-                                send_response(
-                                    socket,
-                                    context.peer_state.clone(),
-                                    context.ttl,
-                                    src,
-                                    context.last_broadcast_time.clone(),
-                                    context.group_id,
-                                )
-                                .await;
+                            if let Some(entry) = &ingress {
+                                send_ingress_response(entry, &context, src).await;
                             } else {
-                                warn!("no interface socket available to respond to {}", src);
+                                warn!("no registered ingress interface for response to {}", src);
+                                return;
                             }
 
                             receive_peer_state(
@@ -697,6 +763,13 @@ fn receive_loop(
             select! {
                 biased;
                 _ = open.closed() => {}
+                _ = &mut cancelled => break,
+                _ = async {
+                    match &ingress {
+                        Some(entry) => entry.cancel.cancelled().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
                 _ = handle => {}
             }
         }
@@ -795,7 +868,7 @@ async fn broadcast_state_loop(
                         // Announce ourselves through every interface, so peers on any
                         // of them can discover us.
                         for entry in interface_socket_entries(&interface_sockets) {
-                            send_peer_state(entry.socket.clone(), peer_state.clone(), ttl, ALIVE, to, lbt.clone(), group_id).await;
+                            send_peer_state_via(entry.socket.clone(), peer_state.clone(), ttl, ALIVE, to, lbt.clone(), group_id, Some((&entry, &interface_sockets))).await;
                         }
                     }
                 }
@@ -810,6 +883,24 @@ async fn broadcast_state_loop(
             }
         }
     }
+}
+
+async fn send_ingress_response(
+    entry: &InterfaceSocket,
+    context: &ReceiveContext,
+    to: SocketAddrV4,
+) {
+    send_peer_state_via(
+        entry.socket.clone(),
+        context.peer_state.clone(),
+        context.ttl,
+        RESPONSE,
+        to,
+        context.last_broadcast_time.clone(),
+        context.group_id,
+        Some((entry, &context.interface_sockets)),
+    )
+    .await;
 }
 
 pub async fn send_response(
@@ -841,7 +932,7 @@ pub async fn send_message(
     to: SocketAddrV4,
     group_id: SessionGroupId,
 ) -> std::io::Result<()> {
-    send_message_reporting(socket, from, ttl, message_type, payload, to, group_id)
+    send_message_reporting(socket, from, ttl, message_type, payload, to, group_id, None)
         .await
         .map(|_| ())
 }
@@ -860,10 +951,11 @@ async fn send_message_reporting(
     payload: &Payload,
     to: SocketAddrV4,
     group_id: SessionGroupId,
+    registration: Option<(&InterfaceSocket, &InterfaceSockets)>,
 ) -> std::io::Result<bool> {
-    socket.set_broadcast(true).unwrap();
-    socket.set_multicast_ttl_v4(2).unwrap();
-    socket.set_multicast_loop_v4(true).unwrap();
+    socket.set_broadcast(true)?;
+    socket.set_multicast_ttl_v4(2)?;
+    socket.set_multicast_loop_v4(true)?;
 
     // Matches upstream's `sendUdpMessage`: encoding is inside the fallible
     // path so an oversized/unencodable payload is logged and dropped instead
@@ -876,8 +968,49 @@ async fn send_message_reporting(
         }
     };
 
-    socket.send_to(&message, to).await?;
+    if let Some((entry, sockets)) = registration {
+        send_registered(entry, sockets, &message, to).await?;
+    } else {
+        socket.send_to(&message, to).await?;
+    }
     Ok(true)
+}
+
+async fn send_registered(
+    entry: &InterfaceSocket,
+    sockets: &InterfaceSockets,
+    message: &[u8],
+    to: SocketAddrV4,
+) -> std::io::Result<()> {
+    loop {
+        select! {
+            biased;
+            _ = entry.cancel.cancelled() => {
+                return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "ingress interface was removed"));
+            }
+            result = entry.socket.writable() => result?,
+        }
+        let result = {
+            let sockets = sockets
+                .lock()
+                .map_err(|_| std::io::Error::other("interface socket map is poisoned"))?;
+            let current = sockets.get(&entry.identity.addr).is_some_and(|current| {
+                Arc::ptr_eq(&current.socket, &entry.socket) && !entry.cancel.is_cancelled()
+            });
+            if !current {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "ingress socket generation is no longer registered",
+                ));
+            }
+            // No await between checking the registration and the actual syscall.
+            entry.socket.try_send_to(message, to.into())
+        };
+        match result {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            result => return result.map(|_| ()),
+        }
+    }
 }
 
 pub async fn send_peer_state(
@@ -888,6 +1021,29 @@ pub async fn send_peer_state(
     to: SocketAddrV4,
     last_broadcast_time: Arc<Mutex<Instant>>,
     group_id: SessionGroupId,
+) {
+    send_peer_state_via(
+        socket,
+        peer_state,
+        ttl,
+        message_type,
+        to,
+        last_broadcast_time,
+        group_id,
+        None,
+    )
+    .await;
+}
+
+async fn send_peer_state_via(
+    socket: Arc<UdpSocket>,
+    peer_state: Arc<Mutex<PeerState>>,
+    ttl: u8,
+    message_type: MessageType,
+    to: SocketAddrV4,
+    last_broadcast_time: Arc<Mutex<Instant>>,
+    group_id: SessionGroupId,
+    registration: Option<(&InterfaceSocket, &InterfaceSockets)>,
 ) {
     let (ident, peer_state_clone) = match peer_state.try_lock() {
         Ok(guard) => (guard.ident(), guard.clone()),
@@ -905,6 +1061,7 @@ pub async fn send_peer_state(
         &peer_state_clone.into(),
         to,
         group_id,
+        registration,
     )
     .await
     {
@@ -1026,8 +1183,14 @@ mod tests {
             drain_count: Arc::new(AtomicUsize::new(0)),
             fail_receive_once: Arc::new(AtomicBool::new(false)),
             gate: Arc::new(crate::link::controller::DispatchGate::new_open()),
-            interface_sockets: Arc::new(Mutex::new(HashMap::new())),
-            peer_state: Arc::new(Mutex::new(PeerState::default())),
+            interface_sockets: Arc::new(Mutex::new(HashMap::from([(
+                Ipv4Addr::LOCALHOST,
+                interface_socket(),
+            )]))),
+            peer_state: Arc::new(Mutex::new(PeerState {
+                measurement_endpoint: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+                ..PeerState::default()
+            })),
             ttl: 1,
             tx_event,
             last_broadcast_time: Arc::new(Mutex::new(Instant::now())),
@@ -1038,8 +1201,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_scan_failure_keeps_discovery_available_for_retry() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut context = receive_context(tx.clone());
+        let messenger = Messenger::new_with_interfaces(
+            context.peer_state.clone(),
+            tx,
+            Instant::now(),
+            Arc::new(Notify::new()),
+            context.enabled.clone(),
+            Err(std::io::Error::other("injected initial scan failure")),
+        )
+        .unwrap();
+        assert!(messenger.interface_sockets.lock().unwrap().is_empty());
+        context.interface_sockets = messenger.interface_sockets.clone();
+        let mut children = tokio::task::JoinSet::new();
+        reconcile_interfaces(
+            &messenger.multicast_receiver.socket,
+            &context,
+            &mut children,
+            &[interface_socket().identity],
+        );
+        assert_eq!(messenger.interface_sockets.lock().unwrap().len(), 1);
+        reconcile_interfaces(
+            &messenger.multicast_receiver.socket,
+            &context,
+            &mut children,
+            &[],
+        );
+        children.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn receiver_rearms_and_accepts_the_first_fresh_packet_after_restart() {
-        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let socket =
+            Arc::new(PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap());
         let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let context = receive_context(tx);
@@ -1085,7 +1281,8 @@ mod tests {
     #[tokio::test]
     async fn receiver_keeps_discarding_after_acknowledging_preparation() {
         use std::future::Future;
-        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let socket =
+            Arc::new(PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap());
         let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let context = receive_context(tx);
@@ -1160,7 +1357,8 @@ mod tests {
 
     #[tokio::test]
     async fn transient_receive_error_does_not_remove_the_worker() {
-        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let socket =
+            Arc::new(PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap());
         let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(1);
         let context = receive_context(tx_event);
@@ -1183,10 +1381,32 @@ mod tests {
     }
 
     fn interface_socket() -> InterfaceSocket {
+        use network_interface::NetworkInterfaceConfig;
+        let interface = network_interface::NetworkInterface::show()
+            .unwrap()
+            .into_iter()
+            .find(|interface| {
+                interface
+                    .addr
+                    .iter()
+                    .any(|addr| addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+            })
+            .expect("loopback adapter");
+        let receiver = Arc::new(
+            PacketSocket::new(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+                Some(interface.index),
+            )
+            .unwrap(),
+        );
         InterfaceSocket {
-            socket: Arc::new(
-                new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap(),
-            ),
+            socket: receiver.socket.clone(),
+            receiver,
+            identity: Ipv4Interface {
+                addr: Ipv4Addr::LOCALHOST,
+                index: interface.index,
+                name: interface.name,
+            },
             cancel: Cancel::default(),
         }
     }
@@ -1322,47 +1542,334 @@ mod tests {
             .expect("new_udp_reuseport must support IPv6 callers");
     }
 
-    #[test]
-    fn common_prefix_len_prefers_closest_address() {
-        assert_eq!(
-            common_prefix_len(Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(192, 168, 1, 1)),
-            32
-        );
-        assert!(
-            common_prefix_len(Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(192, 168, 1, 2))
-                > common_prefix_len(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(192, 168, 1, 2))
-        );
+    #[tokio::test]
+    async fn overlapping_prefix_uses_ingress_not_sender_proximity() {
+        let mut wifi = interface_socket();
+        wifi.identity.addr = Ipv4Addr::new(10, 42, 0, 1);
+        wifi.identity.index = 11;
+        let mut ethernet = interface_socket();
+        ethernet.identity.addr = Ipv4Addr::new(10, 42, 0, 129);
+        ethernet.identity.index = 12;
+        let sender = Ipv4Addr::new(10, 42, 0, 130);
+        let sockets = HashMap::from([
+            (wifi.identity.addr, wifi.clone()),
+            (ethernet.identity.addr, ethernet.clone()),
+        ]);
+        // Negative control: the removed algorithm picks the other adapter.
+        let old = sockets
+            .values()
+            .max_by_key(|entry| {
+                (u32::from(entry.identity.addr) ^ u32::from(sender)).leading_zeros()
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&old.socket, &ethernet.socket));
+        let selected = socket_for_ingress(&sockets, 11, IpAddr::V4(MULTICAST_ADDR)).unwrap();
+        assert!(Arc::ptr_eq(&selected.socket, &wifi.socket));
+        let selected = socket_for_ingress(&sockets, 12, IpAddr::V4(MULTICAST_ADDR)).unwrap();
+        assert!(Arc::ptr_eq(&selected.socket, &ethernet.socket));
+        assert!(socket_for_ingress(&sockets, 0, IpAddr::V4(sender)).is_none());
+        assert!(socket_for_ingress(&sockets, 13, IpAddr::V4(sender)).is_none());
     }
 
     #[tokio::test]
-    async fn socket_for_target_picks_matching_interface() {
-        let wifi = Ipv4Addr::new(192, 168, 1, 10);
-        let ethernet = Ipv4Addr::new(10, 0, 0, 10);
+    async fn removed_or_replaced_ingress_never_uses_another_socket() {
+        let old = interface_socket();
+        let sockets: InterfaceSockets = Arc::new(Mutex::new(HashMap::from([(
+            old.identity.addr,
+            old.clone(),
+        )])));
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let SocketAddr::V4(to) = receiver.local_addr().unwrap() else {
+            panic!("IPv4")
+        };
+        send_registered(&old, &sockets, b"before", to)
+            .await
+            .unwrap();
+        let mut buffer = [0; 64];
+        receiver.recv_from(&mut buffer).await.unwrap();
 
-        let mut sockets = HashMap::new();
-        sockets.insert(wifi, interface_socket());
-        sockets.insert(ethernet, interface_socket());
-        let interface_sockets: InterfaceSockets = Arc::new(Mutex::new(sockets));
-
-        let wifi_socket = interface_sockets.lock().unwrap()[&wifi].socket.clone();
-        let ethernet_socket = interface_sockets.lock().unwrap()[&ethernet].socket.clone();
-
-        let selected = socket_for_target(&interface_sockets, Ipv4Addr::new(10, 0, 0, 42)).unwrap();
-        assert!(Arc::ptr_eq(&selected, &ethernet_socket));
-
-        let selected =
-            socket_for_target(&interface_sockets, Ipv4Addr::new(192, 168, 1, 42)).unwrap();
-        assert!(Arc::ptr_eq(&selected, &wifi_socket));
+        sockets.lock().unwrap().clear();
+        assert_eq!(
+            send_registered(&old, &sockets, b"removed", to)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotConnected
+        );
+        let replacement = interface_socket();
+        sockets
+            .lock()
+            .unwrap()
+            .insert(replacement.identity.addr, replacement.clone());
+        assert_eq!(
+            send_registered(&old, &sockets, b"stale", to)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotConnected
+        );
+        assert!(receiver.try_recv_from(&mut buffer).is_err());
+        send_registered(&replacement, &sockets, b"fresh", to)
+            .await
+            .unwrap();
+        let (size, source) = receiver.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..size], b"fresh");
+        assert_eq!(source, replacement.socket.local_addr().unwrap());
     }
 
-    #[test]
-    fn only_ipv4_filters_ipv6_addresses() {
-        let addrs = vec![
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
-            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        ];
+    #[tokio::test]
+    async fn packet_metadata_and_response_source_are_real_os_values() {
+        let route = interface_socket();
+        let listener =
+            Arc::new(PacketSocket::new(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0), None).unwrap());
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (tx, mut events) = tokio::sync::mpsc::channel(2);
+        let context = receive_context(tx);
+        *context.interface_sockets.lock().unwrap() =
+            HashMap::from([(route.identity.addr, route.clone())]);
+        let worker = tokio::spawn(receive_loop(listener.clone(), None, context));
+        let packet = encode_message(
+            NodeId::from_array([42; 8]),
+            1,
+            ALIVE,
+            &Payload::default(),
+            0,
+        )
+        .unwrap();
+        sender
+            .send_to(
+                &packet,
+                (Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()),
+            )
+            .await
+            .unwrap();
+        let mut buffer = [0; MAX_MESSAGE_SIZE];
+        let (size, source) =
+            tokio::time::timeout(Duration::from_secs(5), sender.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(source, route.socket.local_addr().unwrap());
+        assert_eq!(
+            parse_message_header(&buffer[..size])
+                .unwrap()
+                .0
+                .message_type,
+            RESPONSE
+        );
+        assert!(matches!(events.recv().await, Some(OnEvent::PeerState(_))));
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
 
-        assert_eq!(only_ipv4(addrs), vec![Ipv4Addr::new(192, 168, 1, 10)]);
+    #[tokio::test]
+    async fn scan_replaces_identity_drains_old_packets_and_releases_parked_receivers() {
+        let listener =
+            PacketSocket::new(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0), None).unwrap();
+        let (tx, _events) = tokio::sync::mpsc::channel(1);
+        let context = receive_context(tx);
+        let identity = interface_socket().identity;
+        context.interface_sockets.lock().unwrap().clear();
+        context.gate.close();
+        let mut children = tokio::task::JoinSet::new();
+        reconcile_interfaces(
+            &listener.socket,
+            &context,
+            &mut children,
+            std::slice::from_ref(&identity),
+        );
+        let old = context.interface_sockets.lock().unwrap()[&identity.addr].clone();
+        assert_eq!(context.gateways_changed.load(Ordering::Relaxed), 1);
+        let old_receiver = Arc::downgrade(&old.receiver);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        sender
+            .send_to(
+                b"old queued packet",
+                (Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()),
+            )
+            .await
+            .unwrap();
+        listener.readable().await.unwrap();
+        let mut replacement = identity.clone();
+        replacement.name.push_str("-replacement");
+        reconcile_interfaces(&listener.socket, &context, &mut children, &[replacement]);
+        assert!(old.cancel.is_cancelled());
+        assert_eq!(context.gateways_changed.load(Ordering::Relaxed), 2);
+        assert!(!Arc::ptr_eq(
+            &old.socket,
+            &context.interface_sockets.lock().unwrap()[&identity.addr].socket
+        ));
+        let mut buf = [0; 64];
+        assert_eq!(
+            listener.try_recv(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(old);
+        tokio::time::timeout(Duration::from_secs(5), children.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(old_receiver.upgrade().is_none());
+
+        let remaining =
+            Arc::downgrade(&context.interface_sockets.lock().unwrap()[&identity.addr].receiver);
+        reconcile_interfaces(&listener.socket, &context, &mut children, &[]);
+        assert_eq!(context.gateways_changed.load(Ordering::Relaxed), 3);
+        assert!(
+            context.interface_sockets.lock().unwrap().is_empty(),
+            "an empty successful scan must remove vanished interfaces"
+        );
+        tokio::time::timeout(Duration::from_secs(5), children.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(remaining.upgrade().is_none());
+        context.gate.start().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "helper process for the isolated Linux network-namespace fixture"]
+    async fn namespace_peer() {
+        assert_eq!(std::env::var("LINK_154_NETNS").as_deref(), Ok("1"));
+        let local: Ipv4Addr = std::env::var("LINK_154_PEER_IP").unwrap().parse().unwrap();
+        let expected: Ipv4Addr = std::env::var("LINK_154_EXPECTED_IP")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let socket = new_udp_reuseport(SocketAddrV4::new(local, 0).into()).unwrap();
+        let packet = encode_message(
+            NodeId::from_array([42; 8]),
+            1,
+            ALIVE,
+            &Payload::default(),
+            0,
+        )
+        .unwrap();
+        socket
+            .send_to(&packet, (MULTICAST_ADDR, LINK_PORT))
+            .await
+            .unwrap();
+        let mut buf = [0; MAX_MESSAGE_SIZE];
+        let (size, src) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            src.ip(),
+            IpAddr::V4(expected),
+            "response must leave the actual ingress adapter"
+        );
+        assert_eq!(
+            parse_message_header(&buf[..size]).unwrap().0.message_type,
+            RESPONSE
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_namespace_peer(namespace: &str, local: &str, expected: &str) {
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::process::Command::new("ip")
+                .args(["netns", "exec", namespace])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "discovery::messenger::tests::namespace_peer",
+                    "--nocapture",
+                ])
+                .env("LINK_154_PEER_IP", local)
+                .env("LINK_154_EXPECTED_IP", expected)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires .github/scripts/test-discovery-ingress.sh in an isolated network namespace"]
+    async fn multihomed_namespace_ingress_and_churn() {
+        assert_eq!(std::env::var("LINK_154_NETNS").as_deref(), Ok("1"));
+        let listener = Arc::new(PacketSocket::new(MULTICAST_IP_ANY, None).unwrap());
+        let (tx, _events) = tokio::sync::mpsc::channel(32);
+        let context = receive_context(tx);
+        context.interface_sockets.lock().unwrap().clear();
+        let mut children = tokio::task::JoinSet::new();
+        reconcile_interfaces(
+            &listener.socket,
+            &context,
+            &mut children,
+            &scan_discovery_interfaces().unwrap(),
+        );
+        assert_eq!(context.interface_sockets.lock().unwrap().len(), 2);
+        children.spawn(receive_loop(listener.clone(), None, context.clone()));
+        for _ in 0..3 {
+            // Each sender is closer to the *other* adapter's address.
+            run_namespace_peer("link154-a", "10.42.0.130", "10.42.0.1").await;
+            run_namespace_peer("link154-b", "10.42.0.2", "10.42.0.129").await;
+            context.gate.stop().await;
+            context.gate.start().await;
+        }
+        let old = context.interface_sockets.lock().unwrap()[&Ipv4Addr::new(10, 42, 0, 1)].clone();
+        assert!(tokio::process::Command::new("ip")
+            .args(["link", "del", "veth-a"])
+            .status()
+            .await
+            .unwrap()
+            .success());
+        // Before the scanner notices removal, the OS must reject the pinned
+        // egress rather than route this through the still-live overlapping B.
+        assert!(send_registered(
+            &old,
+            &context.interface_sockets,
+            b"must not reroute",
+            SocketAddrV4::new(Ipv4Addr::new(10, 42, 0, 2), 20809)
+        )
+        .await
+        .is_err());
+        reconcile_interfaces(
+            &listener.socket,
+            &context,
+            &mut children,
+            &scan_discovery_interfaces().unwrap(),
+        );
+        assert!(old.cancel.is_cancelled());
+        assert!(tokio::process::Command::new("bash")
+            .args([".github/scripts/test-discovery-ingress.sh", "--replace-a"])
+            .status()
+            .await
+            .unwrap()
+            .success());
+        reconcile_interfaces(
+            &listener.socket,
+            &context,
+            &mut children,
+            &scan_discovery_interfaces().unwrap(),
+        );
+        assert!(send_registered(
+            &old,
+            &context.interface_sockets,
+            b"stale generation",
+            SocketAddrV4::new(Ipv4Addr::new(10, 42, 0, 130), 20809)
+        )
+        .await
+        .is_err());
+        run_namespace_peer("link154-a", "10.42.0.130", "10.42.0.1").await;
+        context.gate.stop().await;
+        reconcile_interfaces(&listener.socket, &context, &mut children, &[]);
+        children.shutdown().await;
     }
 
     // Covers the send path itself, not just `encode_message`. Upstream's
@@ -1406,7 +1913,7 @@ mod tests {
         // The dropped/sent distinction is what keeps `send_peer_state` from
         // advancing `last_broadcast_time` for a message that never went out.
         assert!(
-            !send_message_reporting(socket.clone(), from, 5, ALIVE, &oversized, to, 0)
+            !send_message_reporting(socket.clone(), from, 5, ALIVE, &oversized, to, 0, None)
                 .await
                 .unwrap(),
             "an oversized payload must report as dropped, not sent"
@@ -1417,7 +1924,7 @@ mod tests {
         // payload actually reaches the wire.
         let small = Payload::default();
         assert!(
-            send_message_reporting(socket, from, 5, ALIVE, &small, to, 0)
+            send_message_reporting(socket, from, 5, ALIVE, &small, to, 0, None)
                 .await
                 .unwrap(),
             "a well-formed payload must report as sent"

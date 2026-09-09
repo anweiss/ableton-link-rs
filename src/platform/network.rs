@@ -6,6 +6,49 @@ use network_interface::NetworkInterfaceConfig;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tracing::{debug, error};
 
+/// A discovery registration retains OS identity, not just a routable address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Ipv4Interface {
+    pub addr: Ipv4Addr,
+    pub index: u32,
+    pub name: String,
+}
+
+pub(crate) fn scan_discovery_interfaces() -> std::io::Result<Vec<Ipv4Interface>> {
+    let interfaces = network_interface::NetworkInterface::show().map_err(std::io::Error::other)?;
+    let mut result = Vec::new();
+    for interface in interfaces {
+        for address in interface.addr {
+            if let IpAddr::V4(addr) = address.ip() {
+                if is_usable_ipv4(&addr) && interface.index != 0 {
+                    result.push(Ipv4Interface {
+                        addr,
+                        index: interface.index,
+                        name: interface.name.clone(),
+                    });
+                }
+            }
+        }
+    }
+    result.sort_by_key(|interface| (interface.addr, interface.index));
+    result.dedup();
+    // The public InterfaceSockets map is keyed by local address. Do not choose
+    // an arbitrary adapter when that address belongs to multiple adapters.
+    let ambiguous: Vec<_> = result
+        .windows(2)
+        .filter(|pair| pair[0].addr == pair[1].addr)
+        .map(|pair| pair[0].addr)
+        .collect();
+    for addr in &ambiguous {
+        error!(
+            "discovery cannot register duplicate local IPv4 address {}",
+            addr
+        );
+    }
+    result.retain(|interface| !ambiguous.contains(&interface.addr));
+    Ok(result)
+}
+
 /// Safe Rust implementation using the network-interface crate
 /// This provides cross-platform network interface scanning without unsafe code
 pub async fn scan_network_interfaces() -> Vec<IpAddr> {

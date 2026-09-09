@@ -94,8 +94,10 @@ If nothing safe will do:
 3. Say the same thing in the pull request body. An `#[allow(unsafe_code)]` with
    no stated alternative is a review blocker.
 
-One place does this today: `examples/rusthut.rs` (Windows console mode), which
-names the crates it evaluated and why they were rejected.
+Current exceptions are `examples/rusthut.rs` (Windows console mode) and the
+Linux/Windows `IP_UNICAST_IF` setters in `src/discovery/ingress.rs`. Each names
+the safe alternatives evaluated and why they were rejected. Packet reception
+uses `socket-pktinfo`; do not replace it with a hand-written ancillary-data parser.
 
 Note what is *not* on that list. `src/platform/clock.rs` reads ESP-IDF's
 `esp_timer_get_time` through `esp_idf_svc::timer::EspTaskTimerService::now()`,
