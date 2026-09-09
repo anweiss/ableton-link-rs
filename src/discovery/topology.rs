@@ -173,6 +173,37 @@ mod platform {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_fixture_row_layout_matches_sdk_bindings() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::MIB_UNICASTIPADDRESS_ROW;
+        assert_eq!(std::mem::size_of::<MIB_UNICASTIPADDRESS_ROW>(), 80);
+        assert_eq!(
+            std::mem::offset_of!(MIB_UNICASTIPADDRESS_ROW, InterfaceLuid),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(MIB_UNICASTIPADDRESS_ROW, InterfaceIndex),
+            40
+        );
+        assert_eq!(
+            std::mem::offset_of!(MIB_UNICASTIPADDRESS_ROW, PreferredLifetime),
+            56
+        );
+        assert_eq!(
+            std::mem::offset_of!(MIB_UNICASTIPADDRESS_ROW, OnLinkPrefixLength),
+            60
+        );
+        assert_eq!(
+            std::mem::offset_of!(MIB_UNICASTIPADDRESS_ROW, SkipAsSource),
+            61
+        );
+        assert_eq!(
+            std::mem::offset_of!(MIB_UNICASTIPADDRESS_ROW, CreationTimeStamp),
+            72
+        );
+    }
+
     #[tokio::test]
     async fn dropping_monitor_releases_notification_context() {
         let topology = Topology::new().unwrap();
