@@ -93,10 +93,7 @@ fn pin_egress(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
 #[allow(unsafe_code)]
 fn pin_egress(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
     use std::os::windows::io::AsRawSocket;
-    use winapi::{
-        shared::{ws2def::IPPROTO_IP, ws2ipdef::IP_UNICAST_IF},
-        um::winsock2,
-    };
+    use windows_sys::Win32::Networking::WinSock::{self, IPPROTO_IP, IP_UNICAST_IF};
     if index == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -107,9 +104,9 @@ fn pin_egress(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
     // SAFETY: same synchronous, initialized u32 option contract as on Linux;
     // no pointer escapes and the socket remains owned by the caller.
     let result = unsafe {
-        winsock2::setsockopt(
-            socket.as_raw_socket() as winsock2::SOCKET,
-            IPPROTO_IP as i32,
+        WinSock::setsockopt(
+            socket.as_raw_socket() as WinSock::SOCKET,
+            IPPROTO_IP,
             IP_UNICAST_IF,
             std::ptr::from_ref(&value).cast(),
             std::mem::size_of_val(&value) as i32,
@@ -120,7 +117,7 @@ fn pin_egress(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
     } else {
         // SAFETY: reads this thread's Winsock error immediately after failure.
         Err(io::Error::from_raw_os_error(unsafe {
-            winsock2::WSAGetLastError()
+            WinSock::WSAGetLastError()
         }))
     }
 }

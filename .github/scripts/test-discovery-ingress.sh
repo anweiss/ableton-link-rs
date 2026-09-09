@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Refuse to mutate a host namespace, including the replacement helper.
+[[ "$(readlink /proc/self/ns/net)" != "$(readlink /proc/1/ns/net)" ]]
+[[ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]]
+
 create_a() {
   ip link add veth-a type veth peer name peer-a
   ip link set peer-a netns link154-a
@@ -18,8 +22,6 @@ if [[ "${1:-}" == "--replace-a" ]]; then
 fi
 
 # Refuse to mutate a host namespace: invoke with sudo unshare --mount --net.
-[[ "$(readlink /proc/self/ns/net)" != "$(readlink /proc/1/ns/net)" ]]
-[[ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]]
 test -x "$1"
 mount --make-rprivate /
 mkdir -p /run/netns

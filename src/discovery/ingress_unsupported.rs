@@ -6,6 +6,7 @@ use std::{
 };
 use tokio::net::UdpSocket;
 
+#[derive(Debug)]
 pub(super) struct PacketInfo {
     pub if_index: u64,
     pub addr_src: SocketAddr,

@@ -39,7 +39,8 @@ std = [
     "tokio",
     "thiserror",
     "socket2",
-    "socket-pktinfo",
+    "dep:socket-pktinfo",
+    "dep:windows-sys",
     "tracing-subscriber",
     "async-trait",
     "local-ip-address",
@@ -89,6 +90,7 @@ socket-pktinfo = { version = "0.4.1", optional = true }
 termios = "0.3"
 
 [target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"], optional = true }
 winapi = { version = "0.3", features = [
     "winnt",
     "profileapi",
@@ -101,8 +103,6 @@ winapi = { version = "0.3", features = [
     "consoleapi",
     "wincon",
     "handleapi",
-    "winsock2",
-    "ws2ipdef",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -39,6 +39,10 @@ unsafe code. Other hosted targets return `Unsupported` when constructing managed
 discovery rather than silently reverting to prefix routing; their `no_std` core
 is unaffected. ESP-IDF networking is not validated or supported by this path.
 
+The Windows setter uses target-gated `windows-sys` 0.61.2 bindings (already
+transitive through socket-pktinfo); the older winapi bindings do not expose
+`IP_UNICAST_IF`. This dependency is optional under `std` as well.
+
 ## Registration, queues and lifecycle
 
 Each registration retains index, name, local address and its own socket/Cancel

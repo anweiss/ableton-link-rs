@@ -498,9 +498,11 @@ fn reconcile_interfaces(
         remove_interface(multicast_socket, &context.interface_sockets, addr.addr);
     }
 
+    let mut changed = !stale_addrs.is_empty();
     for addr in &new_addrs {
         match add_interface(multicast_socket, &context.interface_sockets, addr.clone()) {
             Ok(entry) => {
+                changed = true;
                 info!(
                     "joined Ableton Link multicast group on interface {}",
                     addr.addr
@@ -513,13 +515,11 @@ fn reconcile_interfaces(
             }
             Err(e) => warn!("failed to set up interface {:?}: {}", addr, e),
         }
-
-        // Mirrors upstream's `PeerGateways::Callback::operator()`, which fires
-        // `gatewaysChanged()` once per scan pass (not once per interface) when
-        // the interface set actually changed.
-        if !stale_addrs.is_empty() || !new_addrs.is_empty() {
-            context.gateways_changed.fetch_add(1, Ordering::Relaxed);
-        }
+    }
+    // Mirrors upstream's once-per-pass notification, including removal-only
+    // scans, but not failed additions that left the registration set unchanged.
+    if changed {
+        context.gateways_changed.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1332,8 +1332,13 @@ mod tests {
                     .any(|addr| addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
             })
             .expect("loopback adapter");
-        let receiver =
-            Arc::new(PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap());
+        let receiver = Arc::new(
+            PacketSocket::new(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+                Some(interface.index),
+            )
+            .unwrap(),
+        );
         InterfaceSocket {
             socket: receiver.socket.clone(),
             receiver,
@@ -1614,6 +1619,7 @@ mod tests {
             std::slice::from_ref(&identity),
         );
         let old = context.interface_sockets.lock().unwrap()[&identity.addr].clone();
+        assert_eq!(context.gateways_changed.load(Ordering::Relaxed), 1);
         let old_receiver = Arc::downgrade(&old.receiver);
         let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         sender
@@ -1628,6 +1634,7 @@ mod tests {
         replacement.name.push_str("-replacement");
         reconcile_interfaces(&listener.socket, &context, &mut children, &[replacement]);
         assert!(old.cancel.is_cancelled());
+        assert_eq!(context.gateways_changed.load(Ordering::Relaxed), 2);
         assert!(!Arc::ptr_eq(
             &old.socket,
             &context.interface_sockets.lock().unwrap()[&identity.addr].socket
@@ -1648,6 +1655,7 @@ mod tests {
         let remaining =
             Arc::downgrade(&context.interface_sockets.lock().unwrap()[&identity.addr].receiver);
         reconcile_interfaces(&listener.socket, &context, &mut children, &[]);
+        assert_eq!(context.gateways_changed.load(Ordering::Relaxed), 3);
         assert!(
             context.interface_sockets.lock().unwrap().is_empty(),
             "an empty successful scan must remove vanished interfaces"
