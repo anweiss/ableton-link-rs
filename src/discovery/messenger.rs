@@ -109,6 +109,15 @@ struct Cancel {
 }
 
 impl Cancel {
+    async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_cancelled() {
+            notified.await;
+        }
+    }
+
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
         self.notify.notify_waiters();
@@ -130,6 +139,7 @@ pub struct InterfaceSocket {
 pub type InterfaceSockets = Arc<Mutex<HashMap<Ipv4Addr, InterfaceSocket>>>;
 
 pub struct Messenger {
+    pub(crate) gate: Arc<crate::link::controller::DispatchGate>,
     pub interface: Option<Arc<UdpSocket>>,
     /// One ephemeral socket per usable interface, used to send discovery messages
     /// and to listen for the unicast responses they trigger.
@@ -154,6 +164,26 @@ pub struct Messenger {
 }
 
 impl Messenger {
+    pub(crate) fn discard_queued_datagrams(&self) {
+        if let Some(socket) = &self.interface {
+            drain_socket(socket);
+        }
+        for entry in interface_socket_entries(&self.interface_sockets) {
+            drain_socket(&entry.socket);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn socket_probes(&self) -> Vec<std::sync::Weak<UdpSocket>> {
+        let mut sockets = vec![Arc::downgrade(self.interface.as_ref().unwrap())];
+        sockets.extend(
+            interface_socket_entries(&self.interface_sockets)
+                .iter()
+                .map(|entry| Arc::downgrade(&entry.socket)),
+        );
+        sockets
+    }
+
     pub fn new(
         peer_state: Arc<Mutex<PeerState>>,
         tx_event: Sender<OnEvent>,
@@ -216,10 +246,19 @@ impl Messenger {
             enabled,
             group_id: 0,
             gateways_changed,
+            gate: Arc::new(crate::link::controller::DispatchGate::new_open()),
         })
     }
 
     pub async fn listen(&self) {
+        select! {
+            biased;
+            _ = self.notifier.notified() => {}
+            _ = self.listen_owned() => {}
+        }
+    }
+
+    pub(crate) fn listen_owned(&self) -> impl std::future::Future<Output = ()> + '_ {
         let multicast_socket = self.interface.as_ref().unwrap().clone();
         let interface_sockets = self.interface_sockets.clone();
         let peer_state = self.peer_state.clone();
@@ -240,25 +279,35 @@ impl Messenger {
             enabled: enabled.clone(),
             group_id,
             gateways_changed: self.gateways_changed.clone(),
+            gate: self.gate.clone(),
+            #[cfg(test)]
+            fail_receive_once: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            drain_count: Arc::new(AtomicUsize::new(0)),
         };
 
         // The shared multicast socket receives the multicast traffic of every
         // interface it joined.
-        spawn_receive_loop(multicast_socket.clone(), None, context.clone());
+        let mut children = tokio::task::JoinSet::new();
+        children.spawn(receive_loop(
+            multicast_socket.clone(),
+            None,
+            context.clone(),
+        ));
 
         // Each per-interface socket receives the unicast responses triggered by the
         // messages sent through it.
         for entry in interface_socket_entries(&interface_sockets) {
-            spawn_receive_loop(
+            children.spawn(receive_loop(
                 entry.socket.clone(),
                 Some(entry.cancel.clone()),
                 context.clone(),
-            );
+            ));
         }
 
-        spawn_interface_scan(multicast_socket, context);
+        children.spawn(interface_scan(multicast_socket, context));
 
-        broadcast_state(
+        let broadcast = broadcast_state_loop(
             self.ttl,
             self.ttl_ratio,
             self.last_broadcast_time.clone(),
@@ -268,13 +317,32 @@ impl Messenger {
             self.notifier.clone(),
             self.enabled.clone(),
             self.group_id,
-        )
-        .await;
+            false,
+        );
+        async move {
+            tokio::pin!(broadcast);
+            loop {
+                select! {
+                    _ = &mut broadcast => break,
+                    result = children.join_next(), if !children.is_empty() => {
+                        if let Some(Err(error)) = result {
+                            warn!("discovery worker failed: {}", error);
+                        }
+                    }
+                }
+            }
+            children.shutdown().await;
+        }
     }
 }
 
 #[derive(Clone)]
 struct ReceiveContext {
+    #[cfg(test)]
+    drain_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    fail_receive_once: Arc<AtomicBool>,
+    gate: Arc<crate::link::controller::DispatchGate>,
     interface_sockets: InterfaceSockets,
     peer_state: Arc<Mutex<PeerState>>,
     ttl: u8,
@@ -375,63 +443,70 @@ fn remove_interface(
 }
 
 /// Keep the per-interface sockets in sync with the interfaces of the host.
-fn spawn_interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContext) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(INTERFACE_SCAN_PERIOD);
-        interval.tick().await;
+async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContext) {
+    let mut children = tokio::task::JoinSet::new();
+    let mut interval = tokio::time::interval(INTERFACE_SCAN_PERIOD);
+    interval.tick().await;
 
-        loop {
-            interval.tick().await;
-
-            let current = usable_interfaces_v4_async().await;
-            if current.is_empty() {
-                // Keep the existing sockets rather than tearing discovery down while
-                // the host temporarily has no usable interface.
+    loop {
+        select! {
+            _ = interval.tick() => {}
+            result = children.join_next(), if !children.is_empty() => {
+                if let Some(Err(error)) = result {
+                    warn!("interface receive worker failed: {}", error);
+                }
                 continue;
             }
+        }
 
-            let known = lock_map(&context.interface_sockets, |sockets| {
-                sockets.keys().copied().collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let current = usable_interfaces_v4_async().await;
+        if current.is_empty() {
+            // Keep the existing sockets rather than tearing discovery down while
+            // the host temporarily has no usable interface.
+            continue;
+        }
 
-            let stale_addrs: Vec<Ipv4Addr> = known
-                .iter()
-                .filter(|addr| !current.contains(addr))
-                .copied()
-                .collect();
-            let new_addrs: Vec<Ipv4Addr> = current
-                .iter()
-                .filter(|addr| !known.contains(addr))
-                .copied()
-                .collect();
+        let known = lock_map(&context.interface_sockets, |sockets| {
+            sockets.keys().copied().collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
-            for addr in &stale_addrs {
-                remove_interface(&multicast_socket, &context.interface_sockets, *addr);
-            }
+        let stale_addrs: Vec<Ipv4Addr> = known
+            .iter()
+            .filter(|addr| !current.contains(addr))
+            .copied()
+            .collect();
+        let new_addrs: Vec<Ipv4Addr> = current
+            .iter()
+            .filter(|addr| !known.contains(addr))
+            .copied()
+            .collect();
 
-            for addr in &new_addrs {
-                match add_interface(&multicast_socket, &context.interface_sockets, *addr) {
-                    Ok(entry) => {
-                        info!("joined Ableton Link multicast group on interface {}", addr);
-                        spawn_receive_loop(
-                            entry.socket.clone(),
-                            Some(entry.cancel.clone()),
-                            context.clone(),
-                        );
-                    }
-                    Err(e) => warn!("failed to set up interface {}: {}", addr, e),
+        for addr in &stale_addrs {
+            remove_interface(&multicast_socket, &context.interface_sockets, *addr);
+        }
+
+        for addr in &new_addrs {
+            match add_interface(&multicast_socket, &context.interface_sockets, *addr) {
+                Ok(entry) => {
+                    info!("joined Ableton Link multicast group on interface {}", addr);
+                    children.spawn(receive_loop(
+                        entry.socket.clone(),
+                        Some(entry.cancel.clone()),
+                        context.clone(),
+                    ));
                 }
-            }
-
-            // Mirrors upstream's `PeerGateways::Callback::operator()`, which fires
-            // `gatewaysChanged()` once per scan pass (not once per interface) when
-            // the interface set actually changed.
-            if !stale_addrs.is_empty() || !new_addrs.is_empty() {
-                context.gateways_changed.fetch_add(1, Ordering::Relaxed);
+                Err(e) => warn!("failed to set up interface {}: {}", addr, e),
             }
         }
-    });
+
+        // Mirrors upstream's `PeerGateways::Callback::operator()`, which fires
+        // `gatewaysChanged()` once per scan pass (not once per interface) when
+        // the interface set actually changed.
+        if !stale_addrs.is_empty() || !new_addrs.is_empty() {
+            context.gateways_changed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Pick the socket that is most likely to reach `to`, i.e. the one bound to the
@@ -450,34 +525,71 @@ fn common_prefix_len(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
     (u32::from(a) ^ u32::from(b)).leading_zeros()
 }
 
-fn spawn_receive_loop(
+fn drain_socket(socket: &UdpSocket) {
+    let mut buf = [0; MAX_MESSAGE_SIZE];
+    loop {
+        match socket.try_recv_from(&mut buf) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => {
+                warn!("discovery socket drain failed: {}", error);
+                break;
+            }
+        }
+    }
+}
+
+fn receive_loop(
     receive_socket: Arc<UdpSocket>,
     cancel: Option<Cancel>,
     context: ReceiveContext,
-) {
-    tokio::spawn(async move {
+) -> impl std::future::Future<Output = ()> {
+    let mut open = context.gate.subscribe();
+    async move {
         loop {
             let mut buf = [0; MAX_MESSAGE_SIZE];
-
-            let received = match &cancel {
-                Some(cancel) => {
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-
-                    select! {
-                        received = receive_socket.recv_from(&mut buf) => received,
-                        _ = cancel.notify.notified() => break,
-                    }
+            let cancelled = async {
+                match &cancel {
+                    Some(cancel) => cancel.cancelled().await,
+                    None => std::future::pending::<()>().await,
                 }
-                None => receive_socket.recv_from(&mut buf).await,
+            };
+            tokio::pin!(cancelled);
+            select! {
+            biased;
+            _ = &mut cancelled => break,
+            _ = open.wait_open(&context.gate, || {
+                drain_socket(&receive_socket);
+                #[cfg(test)]
+                context.drain_count.fetch_add(1, Ordering::SeqCst);
+            }, || receive_socket.readable()) => {}
+            }
+            let _permit = context.gate.permit().await;
+            if !context.gate.is_open() {
+                continue;
+            }
+
+            let received = select! {
+                biased;
+                _ = &mut cancelled => break,
+                _ = open.closed() => continue,
+                result = receive_socket.recv_from(&mut buf) => result,
+            };
+            #[cfg(test)]
+            let received = if context.fail_receive_once.swap(false, Ordering::Relaxed) {
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            } else {
+                received
             };
 
             let (amt, src) = match received {
                 Ok(received) => received,
                 Err(e) => {
                     warn!("discovery socket receive failed: {}", e);
-                    break;
+                    // UDP errors can be transient. Keep the registered interface's
+                    // receiver alive, but back off to avoid spinning on a bad socket.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
                 }
             };
 
@@ -513,68 +625,82 @@ fn spawn_receive_loop(
                 false
             };
 
-            if let SocketAddr::V4(src) = src {
-                debug!(
-                    "Received message type {} from peer {}",
-                    header.message_type, header.ident
-                );
-                match header.message_type {
-                    ALIVE => {
-                        if !is_enabled {
-                            debug!(
-                                "ignoring ALIVE message from peer {} because Link is disabled",
-                                header.ident
-                            );
-                            continue;
-                        }
+            let handle = async {
+                if let SocketAddr::V4(src) = src {
+                    debug!(
+                        "Received message type {} from peer {}",
+                        header.message_type, header.ident
+                    );
+                    match header.message_type {
+                        ALIVE => {
+                            if !is_enabled {
+                                debug!(
+                                    "ignoring ALIVE message from peer {} because Link is disabled",
+                                    header.ident
+                                );
+                                return;
+                            }
 
-                        if let Some(socket) =
-                            socket_for_target(&context.interface_sockets, *src.ip())
-                        {
-                            send_response(
-                                socket,
-                                context.peer_state.clone(),
-                                context.ttl,
-                                src,
-                                context.last_broadcast_time.clone(),
-                                context.group_id,
+                            if let Some(socket) =
+                                socket_for_target(&context.interface_sockets, *src.ip())
+                            {
+                                send_response(
+                                    socket,
+                                    context.peer_state.clone(),
+                                    context.ttl,
+                                    src,
+                                    context.last_broadcast_time.clone(),
+                                    context.group_id,
+                                )
+                                .await;
+                            } else {
+                                warn!("no interface socket available to respond to {}", src);
+                            }
+
+                            receive_peer_state(
+                                context.tx_event.clone(),
+                                header,
+                                &buf[header_len..amt],
                             )
                             .await;
-                        } else {
-                            warn!("no interface socket available to respond to {}", src);
                         }
-
-                        receive_peer_state(context.tx_event.clone(), header, &buf[header_len..amt])
-                            .await;
-                    }
-                    RESPONSE => {
-                        if !is_enabled {
-                            debug!(
+                        RESPONSE => {
+                            if !is_enabled {
+                                debug!(
                                 "ignoring RESPONSE message from peer {} because Link is disabled",
                                 header.ident
                             );
-                            continue;
-                        }
+                                return;
+                            }
 
-                        receive_peer_state(context.tx_event.clone(), header, &buf[header_len..amt])
+                            receive_peer_state(
+                                context.tx_event.clone(),
+                                header,
+                                &buf[header_len..amt],
+                            )
                             .await;
-                    }
-                    BYEBYE => {
-                        info!("Received BYEBYE message from peer {}", header.ident);
-                        receive_bye_bye(context.tx_event.clone(), header.ident).await;
-                    }
-                    _ => {
-                        tracing::warn!(
-                            "unknown message type {} from peer {}",
-                            header.message_type,
-                            header.ident
-                        );
-                        continue;
+                        }
+                        BYEBYE => {
+                            info!("Received BYEBYE message from peer {}", header.ident);
+                            receive_bye_bye(context.tx_event.clone(), header.ident).await;
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "unknown message type {} from peer {}",
+                                header.message_type,
+                                header.ident
+                            );
+                        }
                     }
                 }
+            };
+            select! {
+                biased;
+                _ = open.closed() => {}
+                _ = handle => {}
             }
         }
-    });
+    }
 }
 
 pub async fn broadcast_state(
@@ -587,6 +713,33 @@ pub async fn broadcast_state(
     n: Arc<Notify>,
     enabled: Arc<Mutex<bool>>,
     group_id: SessionGroupId,
+) {
+    broadcast_state_loop(
+        ttl,
+        ttl_ratio,
+        last_broadcast_time,
+        interface_sockets,
+        peer_state,
+        to,
+        n,
+        enabled,
+        group_id,
+        true,
+    )
+    .await;
+}
+
+async fn broadcast_state_loop(
+    ttl: u8,
+    ttl_ratio: u8,
+    last_broadcast_time: Arc<Mutex<Instant>>,
+    interface_sockets: InterfaceSockets,
+    peer_state: Arc<Mutex<PeerState>>,
+    to: SocketAddrV4,
+    n: Arc<Notify>,
+    enabled: Arc<Mutex<bool>>,
+    group_id: SessionGroupId,
+    stop_on_notify: bool,
 ) {
     let lbt = last_broadcast_time.clone();
 
@@ -648,7 +801,12 @@ pub async fn broadcast_state(
                 }
             }
             _ = n.notified() => {
-                break;
+                if stop_on_notify {
+                    break;
+                }
+                // This shared signal only wakes the owned broadcaster. Terminal
+                // shutdown cancels its parent, never infers intent from enabled.
+                sleep_time = Duration::ZERO;
             }
         }
     }
@@ -802,13 +960,11 @@ pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf:
 
 pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
     info!("Received BYEBYE message from peer {}", node_id);
-    tokio::spawn(async move {
-        if let Err(e) = tx.send(OnEvent::Byebye(node_id)).await {
-            debug!("Failed to send BYEBYE event: {:?}", e);
-        } else {
-            info!("Successfully forwarded BYEBYE event for peer {}", node_id);
-        }
-    });
+    if let Err(e) = tx.send(OnEvent::Byebye(node_id)).await {
+        debug!("Failed to send BYEBYE event: {:?}", e);
+    } else {
+        info!("Successfully forwarded BYEBYE event for peer {}", node_id);
+    }
 }
 
 pub fn send_byebye(node_state: NodeId) {
@@ -845,6 +1001,187 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn public_messenger_listen_preserves_notifier_cancellation() {
+        use std::future::Future;
+        let notifier = Arc::new(Notify::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let messenger = Messenger::new(
+            Arc::new(Mutex::new(PeerState::default())),
+            tx,
+            Instant::now(),
+            notifier.clone(),
+            Arc::new(Mutex::new(false)),
+        )
+        .unwrap();
+        let mut listen = Box::pin(messenger.listen());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(listen.as_mut().poll(&mut context).is_pending());
+        notifier.notify_waiters();
+        assert!(listen.as_mut().poll(&mut context).is_ready());
+    }
+
+    fn receive_context(tx_event: Sender<OnEvent>) -> ReceiveContext {
+        ReceiveContext {
+            drain_count: Arc::new(AtomicUsize::new(0)),
+            fail_receive_once: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(crate::link::controller::DispatchGate::new_open()),
+            interface_sockets: Arc::new(Mutex::new(HashMap::new())),
+            peer_state: Arc::new(Mutex::new(PeerState::default())),
+            ttl: 1,
+            tx_event,
+            last_broadcast_time: Arc::new(Mutex::new(Instant::now())),
+            enabled: Arc::new(Mutex::new(true)),
+            group_id: 0,
+            gateways_changed: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_rearms_and_accepts_the_first_fresh_packet_after_restart() {
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let context = receive_context(tx);
+        let gate = context.gate.clone();
+        let drain_count = context.drain_count.clone();
+        let cancel = Cancel::default();
+        let worker = tokio::spawn(receive_loop(socket.clone(), Some(cancel.clone()), context));
+        for cycle in 0..3 {
+            let node = NodeId::from_array([42 + cycle; 8]);
+            let packet = encode_message(node, 0, BYEBYE, &Payload::default(), 0).unwrap();
+            sender
+                .send_to(&packet, socket.local_addr().unwrap())
+                .await
+                .unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap();
+            assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == node));
+            gate.stop().await;
+            let drained = drain_count.load(Ordering::SeqCst);
+            sender
+                .send_to(&packet, socket.local_addr().unwrap())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while drain_count.load(Ordering::SeqCst) == drained {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            gate.start().await;
+            assert!(rx.try_recv().is_err());
+        }
+        gate.stop().await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn receiver_keeps_discarding_after_acknowledging_preparation() {
+        use std::future::Future;
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let context = receive_context(tx);
+        let gate = context.gate.clone();
+        gate.close();
+        let drain_count = context.drain_count.clone();
+        let worker = tokio::spawn(receive_loop(socket.clone(), None, context));
+        let blocker = gate.subscribe();
+        let mut start = Box::pin(gate.start());
+        let mut poll_context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(start.as_mut().poll(&mut poll_context).is_pending());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while drain_count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let acknowledged = drain_count.load(Ordering::SeqCst);
+        let old = NodeId::from_array([41; 8]);
+        let packet = encode_message(old, 0, BYEBYE, &Payload::default(), 0).unwrap();
+        sender
+            .send_to(&packet, socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while drain_count.load(Ordering::SeqCst) == acknowledged {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("receiver must drain arrivals while another subscriber delays opening");
+        drop(blocker);
+        start.await;
+        let fresh = NodeId::from_array([42; 8]);
+        let packet = encode_message(fresh, 0, BYEBYE, &Payload::default(), 0).unwrap();
+        sender
+            .send_to(&packet, socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap();
+        assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == fresh));
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn blocked_byebye_send_is_cancelled_inside_its_epoch() {
+        use std::future::Future;
+        let gate = crate::link::controller::DispatchGate::new_open();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let old = NodeId::from_array([1; 8]);
+        tx.send(OnEvent::Byebye(old)).await.unwrap();
+        let mut work = Box::pin(gate.run_in_epoch(
+            gate.epoch(),
+            receive_bye_bye(tx.clone(), NodeId::from_array([2; 8])),
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(work.as_mut().poll(&mut context).is_pending());
+        gate.close();
+        assert!(matches!(
+            work.as_mut().poll(&mut context),
+            std::task::Poll::Ready(None)
+        ));
+        drop(work);
+        assert!(matches!(rx.recv().await, Some(OnEvent::Byebye(id)) if id == old));
+        gate.start().await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn transient_receive_error_does_not_remove_the_worker() {
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(1);
+        let context = receive_context(tx_event);
+        context.fail_receive_once.store(true, Ordering::Relaxed);
+        let node = NodeId::from_array([42; 8]);
+        let packet = encode_message(node, 0, BYEBYE, &Payload::default(), 0).unwrap();
+        let worker = tokio::spawn(receive_loop(socket.clone(), None, context));
+        for _ in 0..2 {
+            sender
+                .send_to(&packet, socket.local_addr().unwrap())
+                .await
+                .unwrap();
+        }
+        let event = tokio::time::timeout(Duration::from_secs(5), rx_event.recv())
+            .await
+            .unwrap();
+        assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == node));
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+
     fn interface_socket() -> InterfaceSocket {
         InterfaceSocket {
             socket: Arc::new(
@@ -852,6 +1189,111 @@ mod tests {
             ),
             cancel: Cancel::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn restart_broadcasts_after_disable_notifications() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let SocketAddr::V4(destination) = receiver.local_addr().unwrap() else {
+            panic!("expected IPv4");
+        };
+        let interfaces = Arc::new(Mutex::new(HashMap::from([(
+            Ipv4Addr::LOCALHOST,
+            interface_socket(),
+        )])));
+        let enabled = Arc::new(Mutex::new(true));
+        let notifier = Arc::new(Notify::new());
+        let mut broadcast = Box::pin(broadcast_state_loop(
+            1,
+            1,
+            Arc::new(Mutex::new(Instant::now() - Duration::from_secs(2))),
+            interfaces,
+            Arc::new(Mutex::new(PeerState {
+                measurement_endpoint: Some(destination),
+                ..PeerState::default()
+            })),
+            destination,
+            notifier.clone(),
+            enabled.clone(),
+            0,
+            false,
+        ));
+        let mut buf = [0; MAX_MESSAGE_SIZE];
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::select! {
+                    _ = &mut broadcast => panic!("disable must not terminate broadcasting"),
+                    packet = receiver.recv_from(&mut buf) => {
+                        let (size, _) = packet.unwrap();
+                        let (header, _) = parse_message_header(&buf[..size]).unwrap();
+                        assert_eq!(header.message_type, ALIVE);
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+            *enabled.lock().unwrap() = false;
+            notifier.notify_waiters();
+            // Poll the actual notification path while disabled, without relying
+            // on a sleep to guess when a separately spawned task has processed it.
+            use std::future::Future;
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(broadcast.as_mut().poll(&mut context).is_pending());
+            assert!(receiver.try_recv_from(&mut buf).is_err());
+            *enabled.lock().unwrap() = true;
+
+            // Reproduce a disable notification consumed only after re-enable.
+            *enabled.lock().unwrap() = false;
+            notifier.notify_waiters();
+            *enabled.lock().unwrap() = true;
+            assert!(broadcast.as_mut().poll(&mut context).is_pending());
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_broadcast_still_stops_on_notification() {
+        use std::future::Future;
+
+        let notifier = Arc::new(Notify::new());
+        let mut broadcast = Box::pin(broadcast_state(
+            1,
+            1,
+            Arc::new(Mutex::new(Instant::now())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(PeerState::default())),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1),
+            notifier.clone(),
+            Arc::new(Mutex::new(false)),
+            0,
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(broadcast.as_mut().poll(&mut context).is_pending());
+        notifier.notify_waiters();
+        assert!(broadcast.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[tokio::test]
+    async fn enabled_controller_broadcast_does_not_treat_wakeup_as_terminal() {
+        use std::future::Future;
+
+        let notifier = Arc::new(Notify::new());
+        let mut broadcast = Box::pin(broadcast_state_loop(
+            1,
+            1,
+            Arc::new(Mutex::new(Instant::now())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(PeerState::default())),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1),
+            notifier.clone(),
+            Arc::new(Mutex::new(true)),
+            0,
+            false,
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(broadcast.as_mut().poll(&mut context).is_pending());
+        notifier.notify_waiters();
+        assert!(broadcast.as_mut().poll(&mut context).is_pending());
     }
 
     /// `IP_MULTICAST_ALL=0` is the whole behavioral change in this port, and it is a

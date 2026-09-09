@@ -32,6 +32,7 @@ use crate::{
 
 use super::{
     clock::Clock,
+    controller::{gated_recv, DispatchGate},
     encoding::PayloadEntryHeader,
     ghostxform::GhostXForm,
     linear_regression::linear_regression,
@@ -104,6 +105,25 @@ pub type PongMessage = (Vec<u8>, SocketAddr);
 /// currently expecting PONG messages from it.
 pub type PongDispatch = Arc<Mutex<HashMap<SocketAddr, Sender<PongMessage>>>>;
 
+#[derive(Debug)]
+struct MeasurementServiceTasks {
+    gate: Arc<DispatchGate>,
+    handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for MeasurementServiceTasks {
+    fn drop(&mut self) {
+        self.gate.close();
+        for task in self
+            .handles
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MeasurementService {
     pub measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
@@ -112,6 +132,7 @@ pub struct MeasurementService {
     pub tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     pub shared_socket: Arc<UdpSocket>,
     pong_dispatch: PongDispatch,
+    tasks: Arc<MeasurementServiceTasks>,
 }
 
 impl MeasurementService {
@@ -131,12 +152,16 @@ impl MeasurementService {
         let t_peer = tx_measure_peer_result.clone();
         let socket_loop = ping_responder_unicast_socket.clone();
         let dispatch_loop = pong_dispatch.clone();
+        let gate = Arc::new(DispatchGate::new_open());
+        let task_gate = gate.clone();
+        let mut open = task_gate.subscribe();
 
-        tokio::spawn(async move {
-            loop {
-                let event = rx_measure_peer_state.recv().await;
-                if let Some(MeasurePeerEvent::PeerState(session_id, peer)) = event {
-                    measure_peer_with_socket(
+        let task = tokio::spawn(async move {
+            while let Some((_permit, epoch, event)) =
+                gated_recv(&task_gate, &mut open, &mut rx_measure_peer_state).await
+            {
+                if let MeasurePeerEvent::PeerState(session_id, peer) = event {
+                    let measurement = measure_peer_in_epoch(
                         clock,
                         m_map.clone(),
                         t_peer.clone(),
@@ -145,8 +170,13 @@ impl MeasurementService {
                         notifier.clone(),
                         socket_loop.clone(),
                         dispatch_loop.clone(),
-                    )
-                    .await;
+                        Some((task_gate.clone(), epoch)),
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = open.closed() => {}
+                        _ = measurement => {}
+                    }
                 }
             }
         });
@@ -163,7 +193,19 @@ impl MeasurementService {
             tx_measure_peer: tx_measure_peer_result,
             shared_socket: ping_responder_unicast_socket,
             pong_dispatch,
+            tasks: Arc::new(MeasurementServiceTasks {
+                gate,
+                handles: Mutex::new(vec![task]),
+            }),
         }
+    }
+
+    pub(crate) async fn start(&self) {
+        self.tasks.gate.start().await;
+    }
+
+    pub(crate) async fn stop(&self) {
+        self.tasks.gate.stop().await;
     }
 
     /// Start the single receive loop for the shared unicast socket. Every
@@ -180,7 +222,7 @@ impl MeasurementService {
             socket.local_addr().unwrap()
         );
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 let mut buf = [0; MAX_MESSAGE_SIZE];
 
@@ -199,6 +241,11 @@ impl MeasurementService {
                 }
             }
         });
+        self.tasks
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(task);
     }
 
     pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
@@ -245,6 +292,68 @@ pub async fn measure_peer_with_socket(
     socket: Arc<UdpSocket>,
     pong_dispatch: PongDispatch,
 ) {
+    measure_peer_in_epoch(
+        clock,
+        measurement_map,
+        tx_measure_peer_result,
+        session_id,
+        state,
+        notifier,
+        socket,
+        pong_dispatch,
+        None,
+    )
+    .await;
+}
+
+struct MeasurementRegistration {
+    node_id: NodeId,
+    endpoint: SocketAddr,
+    sender: Sender<PongMessage>,
+    job: Arc<()>,
+    measurements: Arc<Mutex<HashMap<NodeId, Measurement>>>,
+    dispatch: PongDispatch,
+}
+
+impl Drop for MeasurementRegistration {
+    fn drop(&mut self) {
+        let mut measurements = self
+            .measurements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Map and route can be replaced independently (including by a different
+        // node reusing an endpoint). Only remove entries owned by this job.
+        if measurements
+            .get(&self.node_id)
+            .is_some_and(|measurement| Arc::ptr_eq(&measurement.job, &self.job))
+        {
+            measurements.remove(&self.node_id);
+        }
+        if dispatch
+            .get(&self.endpoint)
+            .is_some_and(|sender| sender.same_channel(&self.sender))
+        {
+            dispatch.remove(&self.endpoint);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn measure_peer_in_epoch(
+    clock: Clock,
+    measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
+    tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    session_id: SessionId,
+    state: PeerState,
+    notifier: Arc<Notify>,
+    socket: Arc<UdpSocket>,
+    pong_dispatch: PongDispatch,
+    lifecycle: Option<(Arc<DispatchGate>, u64)>,
+) {
     info!(
         "measuring peer {} at {} for session {}",
         state.node_state.node_id,
@@ -258,60 +367,71 @@ pub async fn measure_peer_with_socket(
     let (tx_measurement, mut rx_measurement) = mpsc::channel(1);
     let (tx_pong, rx_pong) = mpsc::channel(NUMBER_DATA_POINTS);
 
-    pong_dispatch.lock().unwrap().insert(endpoint, tx_pong);
-
-    let measurement =
-        Measurement::with_socket(state, clock, tx_measurement, notifier, socket, rx_pong).await;
-    measurement_map
-        .try_lock()
+    pong_dispatch
+        .lock()
         .unwrap()
+        .insert(endpoint, tx_pong.clone());
+    let registration = MeasurementRegistration {
+        node_id,
+        endpoint,
+        sender: tx_pong,
+        job: Arc::new(()),
+        measurements: measurement_map.clone(),
+        dispatch: pong_dispatch,
+    };
+
+    let mut measurement =
+        Measurement::with_socket(state, clock, tx_measurement, notifier, socket, rx_pong).await;
+    if measurement.cancelled {
+        return;
+    }
+    measurement.job = registration.job.clone();
+    measurement_map
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(node_id, measurement);
 
-    let tx_measure_peer_result_loop = tx_measure_peer_result.clone();
-
-    let measurement_map = measurement_map.clone();
-
     tokio::spawn(async move {
-        loop {
-            if let Some(data) = rx_measurement.recv().await {
-                if data.is_empty() {
-                    tx_measure_peer_result_loop
-                        .send(MeasurePeerEvent::XForm(session_id, GhostXForm::default()))
-                        .await
-                        .unwrap();
-                } else {
-                    let (slope, intercept) = if data.len() >= 3 {
-                        let (reg_slope, reg_intercept) = linear_regression(data.iter().copied());
-                        if reg_intercept.is_finite() {
-                            (1.0 + reg_slope, reg_intercept)
-                        } else {
-                            // Fallback to slope=1.0 with median offset
-                            let offsets: Vec<f64> = data.iter().map(|(_, y)| *y).collect();
-                            (1.0, median(offsets))
-                        }
+        let _registration = registration;
+        let forward = async move {
+            let Some(data) = rx_measurement.recv().await else {
+                return;
+            };
+            let x_form = if data.is_empty() {
+                GhostXForm::default()
+            } else {
+                let (slope, intercept) = if data.len() >= 3 {
+                    let (reg_slope, reg_intercept) = linear_regression(data.iter().copied());
+                    if reg_intercept.is_finite() {
+                        (1.0 + reg_slope, reg_intercept)
                     } else {
-                        // Not enough data for regression, use median offset
-                        let mut offsets: Vec<f64> = data.iter().map(|(_, y)| *y).collect();
-                        offsets
-                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        let mid = offsets[offsets.len() / 2];
-                        (1.0, mid)
-                    };
-                    tx_measure_peer_result_loop
-                        .send(MeasurePeerEvent::XForm(
-                            session_id,
-                            GhostXForm {
-                                slope,
-                                intercept: Duration::microseconds(intercept.round() as i64),
-                            },
-                        ))
-                        .await
-                        .unwrap();
+                        // Fallback to slope=1.0 with median offset
+                        let offsets: Vec<f64> = data.iter().map(|(_, y)| *y).collect();
+                        (1.0, median(offsets))
+                    }
+                } else {
+                    // Not enough data for regression, use median offset
+                    let mut offsets: Vec<f64> = data.iter().map(|(_, y)| *y).collect();
+                    offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let mid = offsets[offsets.len() / 2];
+                    (1.0, mid)
+                };
+                GhostXForm {
+                    slope,
+                    intercept: Duration::microseconds(intercept.round() as i64),
                 }
-
-                measurement_map.try_lock().unwrap().remove(&node_id);
-                pong_dispatch.lock().unwrap().remove(&endpoint);
+            };
+            if let Err(error) = tx_measure_peer_result
+                .send(MeasurePeerEvent::XForm(session_id, x_form))
+                .await
+            {
+                debug!("measurement result consumer closed: {}", error);
             }
+        };
+        if let Some((gate, epoch)) = lifecycle {
+            gate.run_in_epoch(epoch, forward).await;
+        } else {
+            forward.await;
         }
     });
 }
@@ -402,6 +522,23 @@ fn spawn_pong_dispatch(socket: Arc<UdpSocket>, pong_dispatch: PongDispatch) {
 }
 
 #[derive(Debug)]
+struct MeasurementTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl MeasurementTasks {
+    fn abort(&self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for MeasurementTasks {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+#[derive(Debug)]
 pub struct Measurement {
     pub unicast_socket: Option<Arc<UdpSocket>>,
     pub session_id: SessionId,
@@ -412,6 +549,9 @@ pub struct Measurement {
     pub success: Arc<Mutex<bool>>,
     pub init_bytes_sent: usize,
     tx_timer: Sender<()>,
+    tasks: MeasurementTasks,
+    cancelled: bool,
+    job: Arc<()>,
 }
 
 impl Measurement {
@@ -445,6 +585,10 @@ impl Measurement {
         unicast_socket: Arc<UdpSocket>,
         rx_pong: Receiver<PongMessage>,
     ) -> Self {
+        // Register before any await or spawned worker can observe disable.
+        let cancelled = notifier.notified();
+        tokio::pin!(cancelled);
+        cancelled.as_mut().enable();
         let (tx_timer, mut rx_timer) = mpsc::channel(1);
 
         info!(
@@ -466,6 +610,9 @@ impl Measurement {
             success: success.clone(),
             tx_timer,
             init_bytes_sent: 0,
+            tasks: MeasurementTasks(Vec::new()),
+            cancelled: false,
+            job: Arc::new(()),
         };
 
         let ht = HostTime::new(clock.micros());
@@ -478,25 +625,18 @@ impl Measurement {
 
         let fn_loop = finished_notifier.clone();
 
-        tokio::spawn(async move {
-            loop {
-                select! {
-                    Some(_) = rx_timer.recv() => {
-                        fn_loop.notify_one();
-                        finish(
-                            s.clone(),
-                            state.measurement_endpoint.unwrap(),
-                            d.clone(),
-                            t.clone(),
-                        )
-                        .await;
-                    }
-                    _ = notifier.notified() => {
-                        break;
-                    }
-                }
+        measurement.tasks.0.push(tokio::spawn(async move {
+            while rx_timer.recv().await.is_some() {
+                fn_loop.notify_one();
+                finish(
+                    s.clone(),
+                    state.measurement_endpoint.unwrap(),
+                    d.clone(),
+                    t.clone(),
+                )
+                .await;
             }
-        });
+        }));
 
         measurement.listen(rx_pong).await;
 
@@ -524,7 +664,7 @@ impl Measurement {
 
         measurement.init_bytes_sent = init_bytes_sent;
 
-        reset_timer(
+        let timer = reset_timer(
             measurement.measurements_started.clone(),
             clock,
             Some(unicast_socket.clone()),
@@ -532,8 +672,15 @@ impl Measurement {
             data.clone(),
             tx_measurement.clone(),
             finished_notifier.clone(),
-        )
-        .await;
+        );
+        tokio::select! {
+            biased;
+            _ = &mut cancelled => {
+                measurement.cancelled = true;
+                measurement.tasks.abort();
+            }
+            _ = timer => {}
+        }
 
         measurement
     }
@@ -549,7 +696,7 @@ impl Measurement {
 
         info!("listening for pong messages from {}", endpoint);
 
-        tokio::spawn(async move {
+        self.tasks.0.push(tokio::spawn(async move {
             let mut pong_received = false;
 
             // Pongs are dispatched to this measurement by the single receive
@@ -626,13 +773,15 @@ impl Measurement {
                         }
 
                         if data.try_lock().unwrap().len() > NUMBER_DATA_POINTS {
-                            tx_timer.send(()).await.unwrap();
+                            if let Err(error) = tx_timer.send(()).await {
+                                debug!("measurement timer closed during cancellation: {}", error);
+                            }
                             break;
                         }
                     }
                 }
             }
-        });
+        }));
     }
 }
 
@@ -677,7 +826,9 @@ async fn reset_timer(
                     info!("measuring {} failed", measurement_endpoint);
 
                     let data = data.try_lock().unwrap().clone();
-                    tx_measurement.send(data).await.unwrap();
+                    if let Err(error) = tx_measurement.send(data).await {
+                        debug!("measurement result receiver closed during cancellation: {}", error);
+                    }
                     break;
                 }
             }
@@ -698,7 +849,12 @@ async fn finish(
     debug!("measuring {} done", measurement_endpoint);
 
     let d = data.try_lock().unwrap().clone();
-    tx_measurement.send(d).await.unwrap();
+    if let Err(error) = tx_measurement.send(d).await {
+        debug!(
+            "measurement result receiver closed during cancellation: {}",
+            error
+        );
+    }
     data.try_lock().unwrap().clear();
 }
 
@@ -754,6 +910,165 @@ mod tests {
 
     use super::*;
     use chrono::Duration;
+
+    fn inert_measurement(job: Arc<()>, endpoint: SocketAddrV4) -> Measurement {
+        let (tx_timer, _rx_timer) = mpsc::channel(1);
+        Measurement {
+            unicast_socket: None,
+            session_id: SessionId::default(),
+            measurement_endpoint: Some(endpoint),
+            data: Arc::new(Mutex::new(Vec::new())),
+            clock: Clock::new(),
+            measurements_started: Arc::new(Mutex::new(0)),
+            success: Arc::new(Mutex::new(false)),
+            init_bytes_sent: 0,
+            tx_timer,
+            tasks: MeasurementTasks(Vec::new()),
+            cancelled: false,
+            job,
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_cleans_old_node_without_deleting_replacements() {
+        for replace_same_node in [false, true] {
+            let endpoint = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808);
+            let node = NodeId::from_array([1; 8]);
+            let replacement_node = if replace_same_node {
+                node
+            } else {
+                NodeId::from_array([2; 8])
+            };
+            let old_job = Arc::new(());
+            let replacement_job = Arc::new(());
+            let measurements = Arc::new(Mutex::new(HashMap::from([(
+                node,
+                inert_measurement(old_job.clone(), endpoint),
+            )])));
+            let (old_route, _rx_old) = mpsc::channel(1);
+            let (replacement_route, _rx_new) = mpsc::channel(1);
+            let dispatch = Arc::new(Mutex::new(HashMap::from([(
+                SocketAddr::V4(endpoint),
+                replacement_route.clone(),
+            )])));
+            let registration = MeasurementRegistration {
+                node_id: node,
+                endpoint: SocketAddr::V4(endpoint),
+                sender: old_route,
+                job: old_job,
+                measurements: measurements.clone(),
+                dispatch: dispatch.clone(),
+            };
+            measurements.lock().unwrap().insert(
+                replacement_node,
+                inert_measurement(replacement_job.clone(), endpoint),
+            );
+            drop(registration);
+            let entries = measurements.lock().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(Arc::ptr_eq(
+                &entries[&replacement_node].job,
+                &replacement_job
+            ));
+            assert!(dispatch.lock().unwrap()[&SocketAddr::V4(endpoint)]
+                .same_channel(&replacement_route));
+        }
+    }
+
+    #[tokio::test]
+    async fn workers_tolerate_closed_result_channels() {
+        let endpoint = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808);
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let data = Arc::new(Mutex::new(vec![(1.0, 2.0)]));
+        finish(
+            Arc::new(Mutex::new(false)),
+            endpoint,
+            data.clone(),
+            tx.clone(),
+        )
+        .await;
+        assert!(data.lock().unwrap().is_empty());
+        reset_timer(
+            Arc::new(Mutex::new(NUMBER_MEASUREMENTS)),
+            Clock::new(),
+            None,
+            endpoint,
+            data,
+            tx,
+            Arc::new(Notify::new()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pong_worker_tolerates_a_closed_timer_channel() {
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let SocketAddr::V4(endpoint) = socket.local_addr().unwrap() else {
+            panic!("expected IPv4");
+        };
+        let mut measurement = inert_measurement(Arc::new(()), endpoint);
+        measurement.unicast_socket = Some(socket);
+        *measurement.data.lock().unwrap() = vec![(1.0, 2.0); NUMBER_DATA_POINTS + 1];
+        let (tx_pong, rx_pong) = mpsc::channel(1);
+        measurement.listen(rx_pong).await;
+        let packet = encode_message(PONG, &Payload::default()).unwrap();
+        tx_pong
+            .send((packet, SocketAddr::V4(endpoint)))
+            .await
+            .unwrap();
+        let worker = measurement.tasks.0.pop().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .expect("closed timer must not panic the pong worker");
+    }
+
+    #[tokio::test]
+    async fn cancelled_registration_preserves_a_replacement_route() {
+        let dispatch = Arc::new(Mutex::new(HashMap::new()));
+        let measurements = Arc::new(Mutex::new(HashMap::new()));
+        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 20808));
+        let (first, _first_rx) = mpsc::channel(1);
+        let (second, _second_rx) = mpsc::channel(1);
+        dispatch.lock().unwrap().insert(endpoint, first.clone());
+        let registration = MeasurementRegistration {
+            node_id: NodeId::default(),
+            endpoint,
+            sender: first,
+            job: Arc::new(()),
+            measurements,
+            dispatch: dispatch.clone(),
+        };
+        dispatch.lock().unwrap().insert(endpoint, second.clone());
+        drop(registration);
+        assert!(dispatch.lock().unwrap()[&endpoint].same_channel(&second));
+    }
+
+    #[tokio::test]
+    async fn cancelled_registration_removes_its_own_route() {
+        let dispatch = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, mut receiver) = mpsc::channel(1);
+        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 20808));
+        let job = Arc::new(());
+        let node = NodeId::default();
+        let measurements = Arc::new(Mutex::new(HashMap::from([(
+            node,
+            inert_measurement(job.clone(), SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808)),
+        )])));
+        dispatch.lock().unwrap().insert(endpoint, sender.clone());
+        drop(MeasurementRegistration {
+            node_id: node,
+            endpoint,
+            sender,
+            job,
+            measurements: measurements.clone(),
+            dispatch: dispatch.clone(),
+        });
+        assert!(dispatch.lock().unwrap().is_empty());
+        assert!(measurements.lock().unwrap().is_empty());
+        assert!(receiver.recv().await.is_none());
+    }
 
     fn init_tracing() {
         let _ = tracing_subscriber::fmt::try_init();

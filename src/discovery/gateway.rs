@@ -15,20 +15,13 @@ use tokio::{
 };
 use tracing::{debug, info};
 
-use crate::{
-    discovery::{
-        messages::{encode_message, BYEBYE},
-        LINK_PORT, MULTICAST_ADDR,
-    },
-    link::{
-        clock::Clock,
-        controller::SessionPeerCounter,
-        ghostxform::GhostXForm,
-        measurement::{MeasurePeerEvent, MeasurementService},
-        node::{NodeId, NodeState},
-        payload::Payload,
-        state::SessionState,
-    },
+use crate::link::{
+    clock::Clock,
+    controller::{gated_recv, DispatchGate, DispatchReceiver, SessionPeerCounter},
+    ghostxform::GhostXForm,
+    measurement::{MeasurePeerEvent, MeasurementService},
+    node::{NodeId, NodeState},
+    state::SessionState,
 };
 
 use super::{
@@ -40,6 +33,7 @@ use super::{
 };
 
 pub struct PeerGateway {
+    pub(crate) gate: Arc<DispatchGate>,
     pub observer: GatewayObserver,
     pub peer_state: Arc<Mutex<PeerState>>,
     pub session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
@@ -58,6 +52,32 @@ pub enum OnEvent {
 }
 
 impl PeerGateway {
+    pub(crate) fn discard_queued_datagrams(&self) {
+        self.messenger.discard_queued_datagrams();
+    }
+
+    pub(crate) async fn stop(&self) {
+        self.gate.stop().await;
+        self.peer_timeouts.lock().unwrap().clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn event_sender(&self) -> Sender<OnEvent> {
+        self.messenger.tx_event.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn socket_probes(&self) -> Vec<std::sync::Weak<UdpSocket>> {
+        let mut probes = self.messenger.socket_probes();
+        probes.push(Arc::downgrade(&self.measurement_service.shared_socket));
+        probes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn event_state_probe(&self) -> std::sync::Weak<Mutex<Vec<(Instant, NodeId)>>> {
+        Arc::downgrade(&self.peer_timeouts)
+    }
+
     pub async fn new(
         peer_state: Arc<Mutex<PeerState>>,
         session_state: Arc<Mutex<SessionState>>,
@@ -74,6 +94,7 @@ impl PeerGateway {
     ) -> Result<Self, std::io::Error> {
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
+        let gate = Arc::new(DispatchGate::new_open());
         // let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(UNICAST_IP_ANY));
 
         if let Ok(mut state) = peer_state.try_lock() {
@@ -85,23 +106,25 @@ impl PeerGateway {
                 };
         }
 
-        let messenger = Messenger::new(
+        let mut messenger = Messenger::new(
             peer_state.clone(),
             tx_event.clone(),
             epoch,
             notifier.clone(),
             enabled.clone(),
         )?;
+        messenger.gate = gate.clone();
 
         Ok(PeerGateway {
+            gate: gate.clone(),
             epoch,
-            observer: GatewayObserver::new(
+            observer: GatewayObserver::with_dispatch_gate(
                 rx_peer_event,
                 peer_state.clone(),
                 session_peer_counter.clone(),
                 tx_peer_state_change,
                 peers,
-                notifier.clone(),
+                gate,
             )
             .await,
             messenger,
@@ -138,7 +161,31 @@ impl PeerGateway {
         }
     }
 
-    pub async fn listen(&self, mut rx_event: Receiver<OnEvent>, notifier: Arc<Notify>) {
+    pub async fn listen(&self, rx_event: Receiver<OnEvent>, notifier: Arc<Notify>) {
+        select! {
+            biased;
+            _ = notifier.notified() => {}
+            _ = self.listen_with_dispatch(rx_event, notifier.clone(), self.gate.subscribe()) => {}
+        }
+    }
+
+    pub(crate) async fn listen_with_dispatch(
+        &self,
+        rx_event: Receiver<OnEvent>,
+        notifier: Arc<Notify>,
+        open: DispatchReceiver,
+    ) {
+        self.listen_with_signal(rx_event, notifier, open, tokio::signal::ctrl_c())
+            .await;
+    }
+
+    pub(crate) async fn listen_with_signal(
+        &self,
+        mut rx_event: Receiver<OnEvent>,
+        notifier: Arc<Notify>,
+        mut open: DispatchReceiver,
+        signal: impl std::future::Future<Output = std::io::Result<()>>,
+    ) {
         let node_id = self
             .peer_state
             .try_lock()
@@ -156,7 +203,6 @@ impl PeerGateway {
                 .unwrap()
         );
 
-        let ctrl_socket = self.messenger.interface.as_ref().unwrap().clone();
         let peer_state = self.peer_state.clone();
 
         // Get self node ID for filtering self-messages
@@ -171,47 +217,77 @@ impl PeerGateway {
 
         self.measurement_service.listen(notifier.clone()).await;
 
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.unwrap();
-            ctrl_socket.set_broadcast(true).unwrap();
-            ctrl_socket.set_multicast_ttl_v4(2).unwrap();
-
-            let peer_ident = peer_state
-                .try_lock()
-                .map(|state| state.ident())
-                .unwrap_or_default();
-
-            let message = encode_message(peer_ident, 0, BYEBYE, &Payload::default(), 0).unwrap();
-
-            ctrl_socket
-                .send_to(&message, (MULTICAST_ADDR, LINK_PORT))
-                .await
-                .unwrap();
-
-            notifier.notify_waiters();
-        });
-
+        let mut children = tokio::task::JoinSet::new();
         let measurement_notifier = Arc::new(Notify::new());
+        let gate = self.gate.clone();
+        // Register socket receivers before the event consumer can acknowledge
+        // startup; otherwise the first barrier could miss its discovery children.
+        let messenger = self.messenger.listen_owned();
 
-        tokio::spawn(async move {
-            loop {
-                select! {
-                    Some(val) = rx_event.recv() => {
-                        match val {
-                            OnEvent::PeerState(msg) => {
-                                on_peer_state(msg, peer_timeouts.clone(), tx_peer_event.clone(), epoch, measurement_notifier.clone(), self_node_id)
-                                    .await
-                            }
-                            OnEvent::Byebye(node_id) => {
-                                on_byebye(node_id, peer_timeouts.clone(), tx_peer_event.clone(), measurement_notifier.clone()).await
-                            }
+        children.spawn(async move {
+            while let Some((_permit, generation, val)) =
+                gated_recv(&gate, &mut open, &mut rx_event).await
+            {
+                let handle = async {
+                    match val {
+                        OnEvent::PeerState(msg) => {
+                            on_peer_state_in_epoch(
+                                msg,
+                                peer_timeouts.clone(),
+                                tx_peer_event.clone(),
+                                epoch,
+                                measurement_notifier.clone(),
+                                self_node_id,
+                                Some((gate.clone(), generation)),
+                            )
+                            .await
+                        }
+                        OnEvent::Byebye(node_id) => {
+                            on_byebye(
+                                node_id,
+                                peer_timeouts.clone(),
+                                tx_peer_event.clone(),
+                                measurement_notifier.clone(),
+                            )
+                            .await
                         }
                     }
+                };
+                select! {
+                    biased;
+                    _ = open.closed() => {}
+                    _ = handle => {}
                 }
             }
         });
 
-        self.messenger.listen().await;
+        tokio::pin!(messenger);
+        tokio::pin!(signal);
+        let mut signal_available = true;
+        loop {
+            select! {
+                _ = &mut messenger => break,
+                result = &mut signal, if signal_available => {
+                    match result {
+                        Ok(()) => {
+                            send_byebye(peer_state.lock().unwrap().ident());
+                            notifier.notify_waiters();
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!("Ctrl-C listener failed; discovery continues: {}", error);
+                            signal_available = false;
+                        }
+                    }
+                }
+                result = children.join_next(), if !children.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        tracing::warn!("peer gateway worker failed: {}", error);
+                    }
+                }
+            }
+        }
+        children.shutdown().await;
     }
 }
 
@@ -222,6 +298,27 @@ pub async fn on_peer_state(
     epoch: Instant,
     cancel: Arc<Notify>,
     _self_node_id: NodeId,
+) {
+    on_peer_state_in_epoch(
+        msg,
+        peer_timeouts,
+        tx_peer_event,
+        epoch,
+        cancel,
+        _self_node_id,
+        None,
+    )
+    .await;
+}
+
+async fn on_peer_state_in_epoch(
+    msg: PeerStateMessageType,
+    peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
+    tx_peer_event: Sender<PeerEvent>,
+    epoch: Instant,
+    cancel: Arc<Notify>,
+    _self_node_id: NodeId,
+    lifecycle: Option<(Arc<DispatchGate>, u64)>,
 ) {
     debug!("received peer state from messenger");
 
@@ -274,7 +371,14 @@ pub async fn on_peer_state(
     }
 
     cancel.notify_waiters();
-    schedule_next_pruning(peer_timeouts.clone(), epoch, tx_peer_event.clone(), cancel).await;
+    schedule_next_pruning_in_epoch(
+        peer_timeouts.clone(),
+        epoch,
+        tx_peer_event.clone(),
+        cancel,
+        lifecycle,
+    )
+    .await;
 }
 
 pub async fn on_byebye(
@@ -291,13 +395,11 @@ pub async fn on_byebye(
             peer_id
         );
         let peer_event = tx_peer_event.clone();
-        tokio::spawn(async move {
-            if let Err(e) = peer_event.send(PeerEvent::PeerLeft(peer_id)).await {
-                debug!("Failed to send PeerLeft event: {:?}", e);
-            } else {
-                info!("Successfully sent PeerLeft event for peer {}", peer_id);
-            }
-        });
+        if let Err(e) = peer_event.send(PeerEvent::PeerLeft(peer_id)).await {
+            debug!("Failed to send PeerLeft event: {:?}", e);
+        } else {
+            info!("Successfully sent PeerLeft event for peer {}", peer_id);
+        }
 
         if let Ok(mut timeouts) = peer_timeouts.try_lock() {
             timeouts.retain(|(_, id)| id != &peer_id);
@@ -344,6 +446,16 @@ pub async fn schedule_next_pruning(
     tx_peer_event: Sender<PeerEvent>,
     cancel: Arc<Notify>,
 ) {
+    schedule_next_pruning_in_epoch(peer_timeouts, epoch, tx_peer_event, cancel, None).await;
+}
+
+async fn schedule_next_pruning_in_epoch(
+    peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
+    epoch: Instant,
+    tx_peer_event: Sender<PeerEvent>,
+    cancel: Arc<Notify>,
+    lifecycle: Option<(Arc<DispatchGate>, u64)>,
+) {
     let pt = peer_timeouts.clone();
 
     let has_timeouts = peer_timeouts
@@ -375,30 +487,36 @@ pub async fn schedule_next_pruning(
     );
 
     tokio::spawn(async move {
-        select! {
-            _ = tokio::time::sleep_until(timeout_instant) => {
-                let has_timeouts = peer_timeouts.try_lock()
-                    .map(|timeouts| !timeouts.is_empty())
-                    .unwrap_or(false);
+        let prune = async {
+            select! {
+                _ = tokio::time::sleep_until(timeout_instant) => {
+                    let has_timeouts = peer_timeouts.try_lock()
+                        .map(|timeouts| !timeouts.is_empty())
+                        .unwrap_or(false);
 
-                if !has_timeouts {
-                    return;
-                }
-
-                let expired_peers = prune_expired_peers(peer_timeouts.clone(), epoch);
-                for peer in expired_peers.iter() {
-                    info!("pruning peer {}", peer.1);
-                    if let Err(e) = tx_peer_event
-                        .send(PeerEvent::PeerTimedOut(peer.1))
-                        .await
-                    {
-                        debug!("Failed to send PeerTimedOut event: {:?}", e);
-                        // Receiver has been dropped, no point in continuing
+                    if !has_timeouts {
                         return;
                     }
+                    let expired_peers = prune_expired_peers(peer_timeouts.clone(), epoch);
+                    for peer in expired_peers.iter() {
+                        info!("pruning peer {}", peer.1);
+                        if let Err(e) = tx_peer_event
+                            .send(PeerEvent::PeerTimedOut(peer.1))
+                            .await
+                        {
+                            debug!("Failed to send PeerTimedOut event: {:?}", e);
+                            // Receiver has been dropped, no point in continuing
+                            return;
+                        }
+                    }
                 }
+                _ = cancel.notified() => {}
             }
-            _ = cancel.notified() => {}
+        };
+        if let Some((gate, epoch)) = lifecycle {
+            gate.run_in_epoch(epoch, prune).await;
+        } else {
+            prune.await;
         }
     });
 }
@@ -436,6 +554,7 @@ fn prune_expired_peers(
 
 impl Drop for PeerGateway {
     fn drop(&mut self) {
+        self.gate.close();
         if let Ok(state) = self.messenger.peer_state.try_lock() {
             send_byebye(state.ident());
         }

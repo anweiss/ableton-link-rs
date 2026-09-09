@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddrV4},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use chrono::Duration;
@@ -31,8 +31,8 @@ use super::{
 
 pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 
-/// Start/stop gate for the background dispatch loops (join-session and
-/// peer-state-change) spawned in [`Controller::new`]. Rust analogue of
+/// Start/stop gate for the background dispatch loops (measurement results,
+/// join-session and peer-state-change) spawned in [`Controller::new`]. Rust analogue of
 /// upstream's `RtClientStateSetter::start()`/`stop()` (see upstream commits
 /// `57b77a8040d3` and `44d78f2cf3a4`): the loops are constructed once and
 /// gated, rather than torn down, so that a [`Controller::disable`] followed by
@@ -40,77 +40,201 @@ pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
 /// receivers permanently closed.
 ///
 /// [`DispatchGate::stop`] is *acknowledged*: it closes the gate against new
-/// work and then waits for every consumer to release its permit, which a
-/// consumer does only after discarding whatever its queue still held. So once
-/// `stop()` returns, no dispatch work is running against a `Controller` that
-/// has begun tearing down, and nothing produced before the shutdown is left
-/// sitting in a channel waiting to be dispatched into the next lifecycle.
+/// work and then waits for every consumer to release its permit. Once stop
+/// returns, no admitted dispatch is running. Consumers discard queued work
+/// while closed, and the next startup acknowledges that drain before opening.
 ///
-/// A permit is held across the consumer's `recv()`, not taken after it: a
-/// permit acquired after `start()` can only carry work observed in the current
-/// lifecycle, so no generation stamp on the work itself is needed.
+/// A permit is held across the consumer's `recv()`, not taken after it, so
+/// stop can wait for admitted dispatch to release its permit. Asynchronous
+/// measurement forwarders additionally carry their originating epoch.
+///
+/// Startup first asks every registered consumer to drain its disabled queue.
+/// Only after all consumers acknowledge preparation does it admit new work.
+/// Register consumers before spawning their tasks, so the first enable also
+/// waits for consumers that have not yet been polled.
 ///
 /// The gate starts *closed*, matching `Controller`'s `enabled == false` at
 /// construction: dispatch only ever runs between an [`Controller::enable`] and
 /// the [`Controller::disable`] that follows it.
 #[derive(Debug)]
 pub(crate) struct DispatchGate {
-    active: tokio::sync::watch::Sender<bool>,
+    active: tokio::sync::watch::Sender<DispatchState>,
     in_flight: tokio::sync::RwLock<()>,
-    /// Bumped by every [`DispatchGate::start`]. Consumers that carry state
+    subscribers: Mutex<Vec<Weak<std::sync::atomic::AtomicU64>>>,
+    ready: Arc<Notify>,
+    /// Bumped by every reopening in [`DispatchGate::start`]. Consumers that carry state
     /// across loop iterations - state the gate's own drain cannot reach,
     /// because it does not live in a channel - compare this against the epoch
     /// the state was recorded in and discard it when they differ.
     epoch: std::sync::atomic::AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchState {
+    Closed,
+    Preparing(u64),
+    Open,
+}
+
+pub(crate) struct DispatchReceiver {
+    state: tokio::sync::watch::Receiver<DispatchState>,
+    prepared_epoch: Arc<std::sync::atomic::AtomicU64>,
+    ready: Arc<Notify>,
+}
+
+impl DispatchReceiver {
+    pub(crate) async fn wait_open<F, Fut>(
+        &mut self,
+        gate: &DispatchGate,
+        mut drain: impl FnMut(),
+        mut readable: F,
+    ) where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<()>>,
+    {
+        loop {
+            {
+                // A preparation drain must not continue past the final opening
+                // transition and consume the first newly admitted packet.
+                let _registration = gate
+                    .subscribers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let state = *self.state.borrow_and_update();
+                if state == DispatchState::Open {
+                    return;
+                }
+                drain();
+                if let DispatchState::Preparing(epoch) = state {
+                    self.prepared_epoch
+                        .store(epoch, std::sync::atomic::Ordering::Release);
+                    self.ready.notify_one();
+                }
+            }
+            tokio::select! {
+                biased;
+                changed = self.state.changed() => {
+                    if changed.is_err() { return; }
+                }
+                result = readable() => {
+                    if let Err(error) = result {
+                        tracing::warn!("disabled ingress readiness failed: {}", error);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn closed(&mut self) {
+        let _ = self
+            .state
+            .wait_for(|state| *state != DispatchState::Open)
+            .await;
+    }
+}
+
+impl Drop for DispatchReceiver {
+    fn drop(&mut self) {
+        // Mark a departing subscriber ready for any pending start before its
+        // weak registration expires, then wake the startup waiter.
+        self.prepared_epoch
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+        self.ready.notify_one();
+    }
+}
+
 impl DispatchGate {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         DispatchGate {
-            active: tokio::sync::watch::Sender::new(false),
+            active: tokio::sync::watch::Sender::new(DispatchState::Closed),
             in_flight: tokio::sync::RwLock::new(()),
+            subscribers: Mutex::new(Vec::new()),
+            ready: Arc::new(Notify::new()),
             epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    fn epoch(&self) -> u64 {
+    pub(crate) fn new_open() -> Self {
+        let gate = Self::new();
+        gate.active.send_replace(DispatchState::Open);
+        gate
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// A view of the open/closed state for a dispatch loop to park on. `watch`
-    /// is lossless with respect to transitions the receiver has not yet seen,
-    /// so a close that lands between a consumer's open check and its wait
-    /// cannot be missed.
-    fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.active.subscribe()
+    /// Registers a consumer for the startup barrier and subscribes to state.
+    pub(crate) fn subscribe(&self) -> DispatchReceiver {
+        let prepared_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Interface receivers may churn without another start() to clean up.
+        subscribers.retain(|subscriber| subscriber.strong_count() != 0);
+        subscribers.push(Arc::downgrade(&prepared_epoch));
+        DispatchReceiver {
+            state: self.active.subscribe(),
+            prepared_epoch,
+            ready: self.ready.clone(),
+        }
     }
 
     /// Acquires the right to receive and run dispatch work. The permit is held
     /// across the consumer's `recv()`, so [`DispatchGate::stop`] cannot return
     /// while a consumer still holds queued work it has not discarded.
-    async fn permit(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+    pub(crate) async fn permit(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
         self.in_flight.read().await
     }
 
-    fn is_open(&self) -> bool {
-        *self.active.borrow()
+    pub(crate) fn is_open(&self) -> bool {
+        *self.active.borrow() == DispatchState::Open
     }
 
-    fn start(&self) {
-        self.epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-        self.active.send_if_modified(|open| {
-            let changed = !*open;
-            *open = true;
-            changed
-        });
+    pub(crate) async fn start(&self) {
+        self.start_with(|| {}).await;
     }
 
-    async fn stop(&self) {
+    async fn start_with(&self, publish: impl FnOnce()) {
+        if self.is_open() {
+            publish();
+            return;
+        }
+        let epoch = self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        self.active.send_replace(DispatchState::Preparing(epoch));
+        loop {
+            let ready = self.ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            {
+                let mut subscribers = self
+                    .subscribers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                subscribers.retain(|subscriber| subscriber.strong_count() != 0);
+                let all_ready = subscribers.iter().all(|subscriber| {
+                    subscriber.upgrade().is_none_or(|prepared| {
+                        prepared.load(std::sync::atomic::Ordering::Acquire) >= epoch
+                    })
+                });
+                if all_ready {
+                    // Serialize the final readiness check and opening with
+                    // subscribe(), including receivers created by interface scans.
+                    publish();
+                    self.active.send_replace(DispatchState::Open);
+                    return;
+                }
+            }
+            ready.await;
+        }
+    }
+
+    pub(crate) async fn stop(&self) {
         self.close();
-        // Waiting for exclusive access waits out any batch already in flight,
-        // and - because a consumer drains its queue before releasing its permit
-        // - also for the pre-stop queue contents to have been discarded.
+        // Wait for admitted work to complete or cancel. Startup separately
+        // acknowledges draining the queues before admitting fresh work.
         let _ = self.in_flight.write().await;
     }
 
@@ -125,16 +249,33 @@ impl DispatchGate {
     /// `shutdown()`) into `~SessionController()` in `cccaecc9e93b`, so
     /// teardown is requested from the destructor rather than relying solely
     /// on an explicit `disable()` having been called first.
-    fn close(&self) {
-        self.active.send_if_modified(|open| {
-            let changed = *open;
-            *open = false;
+    pub(crate) fn close(&self) {
+        self.active.send_if_modified(|state| {
+            let changed = *state != DispatchState::Closed;
+            *state = DispatchState::Closed;
             changed
         });
     }
+
+    pub(crate) async fn run_in_epoch<F: std::future::Future>(
+        &self,
+        epoch: u64,
+        work: F,
+    ) -> Option<F::Output> {
+        let mut state = self.active.subscribe();
+        let _permit = self.permit().await;
+        if !self.is_open() || self.epoch() != epoch {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = state.wait_for(|state| *state != DispatchState::Open) => None,
+            result = work => Some(result),
+        }
+    }
 }
 
-/// Owns the controller's two dispatch tasks independently of their shared gate.
+/// Owns the controller's dispatch tasks and discovery listener.
 /// Drop requests cancellation; it does not join a task currently being polled
 /// on another runtime thread. Use `Controller::disable` to await dispatch.
 struct DispatchTasks {
@@ -177,21 +318,34 @@ impl Drop for DispatchTasks {
 /// consumer holding state across loop iterations - state no channel drain can
 /// reach - can tell that the batch belongs to a later lifecycle and drop that
 /// state instead of releasing it into it.
-async fn gated_recv<'a, T>(
+pub(crate) async fn gated_recv<'a, T>(
     gate: &'a DispatchGate,
-    open: &mut tokio::sync::watch::Receiver<bool>,
+    open: &mut DispatchReceiver,
     rx: &mut tokio::sync::mpsc::Receiver<T>,
 ) -> Option<(tokio::sync::RwLockReadGuard<'a, ()>, u64, T)> {
     loop {
-        // Park without a permit while the gate is closed, so a disabled
-        // controller's consumers never hold `stop()` up. Anything produced
-        // while it was closed is discarded on the way back in, alongside
-        // whatever was already queued when it closed.
-        if !*open.borrow_and_update() {
-            if open.wait_for(|open| *open).await.is_err() {
-                return None;
-            }
+        let state = *open.state.borrow_and_update();
+        if state != DispatchState::Open {
             drain_pending(rx);
+            if let DispatchState::Preparing(epoch) = state {
+                open.prepared_epoch
+                    .store(epoch, std::sync::atomic::Ordering::Release);
+                open.ready.notify_one();
+            }
+            // Preparation is acknowledged before opening. Draining after open
+            // can erase the first legitimate result produced by a new lifecycle.
+            tokio::select! {
+                biased;
+                changed = open.state.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                work = rx.recv() => {
+                    work?;
+                }
+            }
+            continue;
         }
 
         let permit = gate.permit().await;
@@ -206,12 +360,9 @@ async fn gated_recv<'a, T>(
 
         tokio::select! {
             biased;
-            closed = open.wait_for(|open| !*open) => {
+            _ = open.closed() => {
                 drain_pending(rx);
                 drop(permit);
-                if closed.is_err() {
-                    return None;
-                }
             }
             work = rx.recv() => return work.map(|work| (permit, epoch, work)),
         }
@@ -339,8 +490,11 @@ impl Controller {
             )
             .await?,
         );
+        discovery.measurement_service.stop().await;
+        discovery.stop().await;
 
-        let sessions = Sessions::new(
+        let mut dispatch = DispatchTasks::new();
+        let (sessions, session_task) = Sessions::with_dispatch_gate(
             Session {
                 session_id,
                 timeline,
@@ -357,9 +511,10 @@ impl Controller {
             peers.clone(),
             clock,
             tx_join_session,
-            notifier.clone(),
             rx_measure_peer_result,
+            dispatch.gate.clone(),
         );
+        dispatch.tasks.push(session_task);
 
         let s_state_loop = session_state.clone();
         let c_state_loop = client_state.clone();
@@ -371,11 +526,10 @@ impl Controller {
         let ps_loop = peer_state.clone();
         let tempo_cb_loop = tempo_callback.clone();
 
-        let mut dispatch = DispatchTasks::new();
         let gate_loop = dispatch.gate.clone();
 
+        let mut gate_open = gate_loop.subscribe();
         dispatch.tasks.push(tokio::spawn(async move {
-            let mut gate_open = gate_loop.subscribe();
             while let Some((_permit, _epoch, session)) =
                 gated_recv(&gate_loop, &mut gate_open, &mut rx_join_session).await
             {
@@ -425,8 +579,8 @@ impl Controller {
 
         let gate_loop = dispatch.gate.clone();
 
+        let mut gate_open = gate_loop.subscribe();
         dispatch.tasks.push(tokio::spawn(async move {
-            let mut gate_open = gate_loop.subscribe();
             while let Some((_permit, epoch, peer_state_changes)) =
                 gated_recv(&gate_loop, &mut gate_open, &mut rx_peer_state_change).await
             {
@@ -706,24 +860,23 @@ impl Controller {
     }
 
     pub async fn enable(&mut self) {
-        // Flip the enabled flag *before* reopening the gate, and do it with a
-        // blocking lock rather than a `try_lock`, so the two lifecycle controls
-        // cannot diverge: a failed `try_lock` here used to leave dispatch active
-        // while `is_enabled()` still reported false. Every holder of this lock
-        // takes it for a single bool read or write and never across an await,
-        // so this cannot deadlock; a poisoned lock is recovered from rather
-        // than skipped, since the value it guards is a plain bool.
-        *self
+        if *self
             .enabled
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return;
+        }
 
-        // Reopen the dispatch gate closed by a previous `disable()`, mirroring
-        // upstream's `RtClientStateSetter::start()` being paired with its
-        // `stop()`. Without this, a disable/re-enable cycle would leave the
-        // join-session and peer-state-change loops permanently gated off.
-        self.dispatch.gate.start();
+        // A cancelled enable/disable may leave only some gates open. Quiesce
+        // them before retrying the reset instead of assuming an atomic startup.
+        self.discovery.measurement_service.stop().await;
+        self.discovery.stop().await;
+        self.dispatch.gate.stop().await;
+        self.session_peer_counter.lock().unwrap().session_peer_count = 0;
 
+        // Reset while dispatch and discovery are still disabled. Opening first
+        // lets a resumed result handler race this new lifecycle's state reset.
         reset_state(
             self.peer_state.clone(),
             self.session_state.clone(),
@@ -736,18 +889,44 @@ impl Controller {
         )
         .await;
 
+        self.discovery.measurement_service.start().await;
+        self.dispatch.gate.start().await;
+
         // Only start the discovery listener if it hasn't been started already
         if let Some(rx_event) = self.rx_event.take() {
             let discovery = self.discovery.clone();
             let notifier = self.notifier.clone();
+            let events = discovery.gate.subscribe();
 
-            tokio::spawn(async move {
-                discovery.listen(rx_event, notifier).await;
-            });
+            self.dispatch.tasks.push(tokio::spawn(async move {
+                discovery
+                    .listen_with_dispatch(rx_event, notifier, events)
+                    .await;
+            }));
         }
+        self.discovery
+            .gate
+            .start_with(|| {
+                self.discovery.discard_queued_datagrams();
+                *self
+                    .enabled
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            })
+            .await;
     }
 
     pub async fn disable(&mut self) {
+        // Publish the transition before awaiting, so cancellation cannot leave
+        // is_enabled true with only part of the pipeline running.
+        *self
+            .enabled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        // Stop request intake and cancel active measurements first. Its closed
+        // consumer keeps draining sends from dispatch while those loops wind down.
+        self.discovery.measurement_service.stop().await;
+        self.discovery.stop().await;
         // Stop the background dispatch loops before anything else, mirroring
         // upstream's `mRtClientStateSetter.stop()` at the top of the async
         // shutdown handler (see `44d78f2cf3a4`, "Stop the
@@ -776,20 +955,10 @@ impl Controller {
             info!("Could not read node id, skipping bye-bye message");
         }
 
-        // Symmetrically with `enable()`, take the lock properly rather than
-        // best-effort: a skipped `try_lock` here would leave `enabled` true
-        // behind an already-closed gate.
-        {
-            *self
-                .enabled
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
-            info!("Set Link enabled state to false");
-        }
-
-        // Signal background tasks (broadcast loop, discovery listener) to stop
+        // Cancel this lifecycle's measurements and wake the enabled-gated
+        // broadcaster. The long-lived consumers remain available for enable().
         self.notifier.notify_waiters();
-        info!("Notified background tasks to stop");
+        info!("Notified background tasks of disable");
 
         // Reset peer count to 0 when disabled, like the C++ implementation
         if let Ok(mut counter) = self.session_peer_counter.try_lock() {
@@ -805,12 +974,11 @@ impl Controller {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         info!("Completed Link disable process");
 
-        // NOTE: The join-session and peer-state-change dispatch loops are
+        // NOTE: The measurement-result, join-session and peer-state-change loops are
         // gated off and drained above, before the bye-bye message is sent,
-        // matching upstream's shutdown ordering. Other spawned tasks
-        // (discovery listener, measurement tasks) still observe
-        // `enabled=false` and the notifier signal to wind down on their own,
-        // since they have no equivalent race window during startup.
+        // matching upstream's shutdown ordering. Discovery stays alive but
+        // suppresses traffic while disabled; measurement jobs observe the
+        // notifier. Final drop cancels the owned long-lived tasks.
     }
 
     pub async fn set_state(&self, mut new_client_state: IncomingClientState) {
@@ -1386,9 +1554,549 @@ mod dispatch_gate_tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[tokio::test]
+    async fn restart_waits_for_every_consumer_before_admitting_fresh_work() {
+        let gate = DispatchGate::new();
+        let mut first = gate.subscribe();
+        let mut second = gate.subscribe();
+        let (tx_first, mut rx_first) = tokio::sync::mpsc::channel(2);
+        let (tx_second, mut rx_second) = tokio::sync::mpsc::channel(2);
+        tx_first.try_send(1).unwrap();
+        tx_second.try_send(2).unwrap();
+        let mut first_recv = Box::pin(gated_recv(&gate, &mut first, &mut rx_first));
+        let mut second_recv = Box::pin(gated_recv(&gate, &mut second, &mut rx_second));
+        let mut start = Box::pin(gate.start());
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(start.as_mut().poll(&mut context).is_pending());
+        assert!(first_recv.as_mut().poll(&mut context).is_pending());
+        assert!(start.as_mut().poll(&mut context).is_pending());
+        assert!(!gate.is_open());
+        assert!(second_recv.as_mut().poll(&mut context).is_pending());
+        assert!(start.as_mut().poll(&mut context).is_ready());
+        assert!(gate.is_open());
+
+        tx_first.try_send(3).unwrap();
+        tx_second.try_send(4).unwrap();
+        assert_eq!(first_recv.await.unwrap().2, 3);
+        assert_eq!(second_recv.await.unwrap().2, 4);
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_wait_forever_for_a_departed_consumer() {
+        let gate = DispatchGate::new();
+        let receiver = gate.subscribe();
+        let mut start = Box::pin(gate.start());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(start.as_mut().poll(&mut context).is_pending());
+        drop(receiver);
+        assert!(start.as_mut().poll(&mut context).is_ready());
+        assert!(gate.is_open());
+    }
+
+    fn session_dispatch() -> (
+        DispatchTasks,
+        Sessions,
+        tokio::sync::mpsc::Sender<super::super::measurement::MeasurePeerEvent>,
+        tokio::sync::mpsc::Receiver<Session>,
+    ) {
+        let mut dispatch = DispatchTasks::new();
+        let (tx_request, _rx_request) = tokio::sync::mpsc::channel(1);
+        let (tx_result, rx_result) = tokio::sync::mpsc::channel(1);
+        let (tx_join, rx_join) = tokio::sync::mpsc::channel(1);
+        let (sessions, task) = Sessions::with_dispatch_gate(
+            Session {
+                session_id: SessionId::default(),
+                timeline: Timeline::default(),
+                measurement: SessionMeasurement::default(),
+            },
+            tx_request,
+            Arc::new(Mutex::new(Vec::new())),
+            Clock::new(),
+            tx_join,
+            rx_result,
+            dispatch.gate.clone(),
+        );
+        dispatch.tasks.push(task);
+        (dispatch, sessions, tx_result, rx_join)
+    }
+
+    #[tokio::test]
+    async fn restart_discards_results_buffered_while_disabled() {
+        use crate::link::measurement::MeasurePeerEvent;
+
+        let (dispatch, _, tx, mut joined) = session_dispatch();
+        dispatch.gate.start().await;
+        for cycle in 1..=3 {
+            let x_form = GhostXForm {
+                slope: 1.0,
+                intercept: chrono::Duration::seconds(cycle),
+            };
+            tx.send(MeasurePeerEvent::XForm(SessionId::default(), x_form))
+                .await
+                .unwrap();
+            let session = tokio::time::timeout(TEST_TIMEOUT, joined.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.measurement.x_form, x_form);
+
+            dispatch.gate.stop().await;
+            tx.send(MeasurePeerEvent::XForm(
+                SessionId::default(),
+                GhostXForm {
+                    slope: 1.0,
+                    intercept: chrono::Duration::seconds(100),
+                },
+            ))
+            .await
+            .unwrap();
+            assert!(matches!(
+                joined.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(!dispatch.tasks[0].is_finished());
+            dispatch.gate.start().await;
+        }
+        drop(dispatch);
+        tokio::time::timeout(TEST_TIMEOUT, tx.closed())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_cancels_a_result_handler_blocked_on_a_full_join_queue() {
+        use crate::link::measurement::MeasurePeerEvent;
+
+        let (dispatch, sessions, tx, mut joined) = session_dispatch();
+        dispatch.gate.start().await;
+        for seconds in 1..=2 {
+            let x_form = GhostXForm {
+                slope: 1.0,
+                intercept: chrono::Duration::seconds(seconds),
+            };
+            tx.send(MeasurePeerEvent::XForm(SessionId::default(), x_form))
+                .await
+                .unwrap();
+            tokio::time::timeout(TEST_TIMEOUT, async {
+                while sessions.current.lock().unwrap().measurement.x_form != x_form {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        // The first join fills the queue; the second result has been applied
+        // but its send is blocked. stop() must cancel that send, not deadlock.
+        tokio::time::timeout(TEST_TIMEOUT, dispatch.gate.stop())
+            .await
+            .unwrap();
+        assert!(!dispatch.tasks[0].is_finished());
+        let first = joined.try_recv().unwrap();
+        assert_eq!(
+            first.measurement.x_form.intercept,
+            chrono::Duration::seconds(1)
+        );
+        assert!(joined.try_recv().is_err());
+
+        dispatch.gate.start().await;
+        let fresh = GhostXForm {
+            slope: 1.0,
+            intercept: chrono::Duration::seconds(3),
+        };
+        tx.send(MeasurePeerEvent::XForm(SessionId::default(), fresh))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, joined.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .measurement
+                .x_form,
+            fresh
+        );
+        drop(tx);
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while !dispatch.tasks[0].is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_measures_and_joins_a_peer_after_each_enable() {
+        measures_and_joins_after_each_enable().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_enable_does_not_publish_success_and_can_be_retried() {
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let gate = controller.discovery.gate.clone();
+        let enabled = controller.enabled.clone();
+        let blocker = gate.subscribe();
+        let mut enable = Box::pin(controller.enable());
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::select! {
+                _ = &mut enable => panic!("unacknowledged discovery consumer must block enable"),
+                _ = async {
+                    while gate.epoch() == 0 { tokio::task::yield_now().await; }
+                } => {}
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!*enabled.lock().unwrap());
+        drop(enable);
+        drop(blocker);
+        tokio::time::timeout(TEST_TIMEOUT, controller.enable())
+            .await
+            .unwrap();
+        assert!(controller.is_enabled());
+        assert!(gate.is_open());
+        controller.disable().await;
+    }
+
+    #[tokio::test]
+    async fn enabled_publication_happens_after_preparation_but_before_admission() {
+        let gate = DispatchGate::new();
+        let mut open = gate.subscribe();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let published = std::sync::atomic::AtomicBool::new(false);
+        let mut start = Box::pin(gate.start_with(|| {
+            assert!(
+                gate.subscribers.try_lock().is_err(),
+                "registration must remain serialized through publication and opening"
+            );
+            assert!(
+                !gate.is_open(),
+                "publication must precede receiver admission"
+            );
+            published.store(true, std::sync::atomic::Ordering::Release);
+        }));
+        let mut receive = Box::pin(gated_recv(&gate, &mut open, &mut rx));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(start.as_mut().poll(&mut context).is_pending());
+        assert!(!published.load(std::sync::atomic::Ordering::Acquire));
+        assert!(receive.as_mut().poll(&mut context).is_pending());
+        assert!(start.as_mut().poll(&mut context).is_ready());
+        tx.send(1).await.unwrap();
+        assert_eq!(receive.await.unwrap().2, 1);
+        assert!(published.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn open_gate_prunes_departed_receiver_registrations_during_churn() {
+        let gate = DispatchGate::new_open();
+        let retained = gate.subscribe();
+        for _ in 0..1000 {
+            let receiver = gate.subscribe();
+            assert_eq!(gate.subscribers.lock().unwrap().len(), 2);
+            drop(receiver);
+        }
+        drop(retained);
+        let _receiver = gate.subscribe();
+        assert_eq!(gate.subscribers.lock().unwrap().len(), 1);
+        assert!(gate.is_open());
+    }
+
+    #[tokio::test]
+    async fn retry_enable_clears_peer_count_after_cancelled_disable() {
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        controller.enable().await;
+        controller
+            .session_peer_counter
+            .lock()
+            .unwrap()
+            .session_peer_count = 3;
+        let gate = controller.discovery.gate.clone();
+        let permit = gate.permit().await;
+        let mut disable = Box::pin(controller.disable());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(disable.as_mut().poll(&mut context).is_pending());
+        drop(disable);
+        drop(permit);
+        assert_eq!(controller.num_peers(), 3);
+        controller.enable().await;
+        assert_eq!(controller.num_peers(), 0);
+        assert!(controller.peers.lock().unwrap().is_empty());
+        controller.disable().await;
+    }
+
+    #[tokio::test]
+    async fn public_gateway_listen_preserves_notifier_cancellation() {
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let notifier = controller.notifier.clone();
+        let mut listen = Box::pin(
+            controller
+                .discovery
+                .listen(controller.rx_event.take().unwrap(), notifier.clone()),
+        );
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(listen.as_mut().poll(&mut context).is_pending());
+        notifier.notify_waiters();
+        assert!(listen.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[tokio::test]
+    async fn signal_setup_error_does_not_terminate_the_discovery_listener() {
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let gate = controller.discovery.gate.clone();
+        let mut listen = Box::pin(controller.discovery.listen_with_signal(
+            controller.rx_event.take().unwrap(),
+            controller.notifier.clone(),
+            gate.subscribe(),
+            std::future::ready(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        // Ready errors must neither exit the listener nor be polled repeatedly.
+        assert!(listen.as_mut().poll(&mut context).is_pending());
+        assert!(listen.as_mut().poll(&mut context).is_pending());
+        tokio::time::timeout(TEST_TIMEOUT, gate.start())
+            .await
+            .unwrap();
+        assert!(listen.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_measures_and_joins_on_a_multi_thread_runtime() {
+        measures_and_joins_after_each_enable().await;
+    }
+
+    async fn measures_and_joins_after_each_enable() {
+        use crate::link::pingresponder::{PingResponder, MAX_MESSAGE_SIZE};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let clock = Clock::new();
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), clock)
+            .await
+            .unwrap();
+        let local_ip = controller
+            .discovery
+            .measurement_service
+            .shared_socket
+            .local_addr()
+            .unwrap()
+            .ip();
+        let peer_id = NodeId::from_array([1; 8]);
+        let peer_session = SessionId(peer_id);
+        // Keep source and destination on the same local interface on every platform.
+        let socket = Arc::new(tokio::net::UdpSocket::bind((local_ip, 0)).await.unwrap());
+        let std::net::SocketAddr::V4(endpoint) = socket.local_addr().unwrap() else {
+            panic!("expected an IPv4 measurement endpoint");
+        };
+        let responder = PingResponder::new(
+            socket.clone(),
+            peer_session,
+            GhostXForm {
+                slope: 1.0,
+                intercept: chrono::Duration::seconds(60) - clock.micros(),
+            },
+            clock,
+        );
+        let pings = Arc::new(AtomicUsize::new(0));
+        let peer_pings = pings.clone();
+        let responding = Arc::new(AtomicBool::new(false));
+        let peer_responding = responding.clone();
+        let peer = tokio::spawn(async move {
+            let mut buf = [0; MAX_MESSAGE_SIZE];
+            loop {
+                let (size, from) = socket.recv_from(&mut buf).await.unwrap();
+                peer_pings.fetch_add(1, Ordering::Relaxed);
+                if peer_responding.load(Ordering::Relaxed) {
+                    responder.handle_ping(&buf[..size], from).await;
+                }
+            }
+        });
+
+        let node_id = controller.peer_state.lock().unwrap().ident();
+        // Even disable-before-first-enable must not kill the only result consumer.
+        controller.disable().await;
+
+        controller.enable().await;
+        controller.peers.lock().unwrap().push(ControllerPeer {
+            peer_state: PeerState {
+                node_state: NodeState {
+                    node_id: peer_id,
+                    session_id: peer_session,
+                    timeline: Timeline::default(),
+                    start_stop_state: StartStopState::default(),
+                },
+                measurement_endpoint: Some(endpoint),
+                audio_endpoint: None,
+            },
+        });
+        controller
+            .sessions
+            .saw_session_timeline(peer_session, Timeline::default())
+            .await;
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while pings.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Cancel a measurement that has started but has not received a reply.
+        controller.disable().await;
+        responding.store(true, Ordering::Relaxed);
+
+        for cycle in 0..3 {
+            controller
+                .discovery
+                .event_sender()
+                .send(OnEvent::PeerState(
+                    crate::discovery::peers::PeerStateMessageType {
+                        node_state: NodeState {
+                            node_id: NodeId::from_array([99; 8]),
+                            session_id: SessionId(NodeId::from_array([99; 8])),
+                            timeline: Timeline::default(),
+                            start_stop_state: StartStopState::default(),
+                        },
+                        ttl: 3,
+                        measurement_endpoint: Some(endpoint),
+                        audio_endpoint: None,
+                    },
+                ))
+                .await
+                .unwrap();
+            controller.enable().await;
+            assert!(
+                controller.peers.lock().unwrap().is_empty(),
+                "disabled discovery events must not repopulate reset peers"
+            );
+            assert_eq!(controller.session_id(), SessionId(node_id));
+            let previous_pings = pings.load(Ordering::Relaxed);
+            let timeline = Timeline {
+                tempo: tempo::Tempo::new(135.0 + f64::from(cycle)),
+                ..Timeline::default()
+            };
+            controller.peers.lock().unwrap().push(ControllerPeer {
+                peer_state: PeerState {
+                    node_state: NodeState {
+                        node_id: peer_id,
+                        session_id: peer_session,
+                        timeline,
+                        start_stop_state: StartStopState::default(),
+                    },
+                    measurement_endpoint: Some(endpoint),
+                    audio_endpoint: None,
+                },
+            });
+
+            // Seed discovery without multicast; everything from requesting a
+            // measurement through UDP ping/pong, regression, and joining is real.
+            controller
+                .sessions
+                .saw_session_timeline(peer_session, timeline)
+                .await;
+            tokio::time::timeout(TEST_TIMEOUT, async {
+                while controller.session_id() != peer_session
+                    || controller.num_peers() != 1
+                    || controller.client_state.lock().unwrap().timeline.tempo != timeline.tempo
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("a fresh measurement must join the peer in every lifecycle");
+            assert!(pings.load(Ordering::Relaxed) > previous_pings);
+            assert_eq!(
+                controller.client_state.lock().unwrap().timeline.tempo,
+                timeline.tempo
+            );
+            assert_eq!(controller.num_peers(), 1);
+            assert_eq!(controller.dispatch.tasks.len(), 4);
+
+            controller.enable().await;
+            assert_eq!(controller.session_id(), peer_session);
+            assert_eq!(controller.dispatch.tasks.len(), 4);
+
+            controller.disable().await;
+            assert!(!controller.is_enabled());
+            assert!(controller
+                .dispatch
+                .tasks
+                .iter()
+                .all(|task| !task.is_finished()));
+        }
+
+        let sockets = controller.discovery.socket_probes();
+        let event_state = controller.discovery.event_state_probe();
+        let peer_state = Arc::downgrade(&controller.discovery.peer_state);
+        let peer_counter = Arc::downgrade(&controller.discovery.session_peer_counter);
+        let peers = Arc::downgrade(&controller.peers);
+        let tasks: Vec<_> = controller
+            .dispatch
+            .tasks
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
+        drop(controller);
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while tasks.iter().any(|task| !task.is_finished())
+                || sockets.iter().any(|socket| socket.strong_count() != 0)
+                || event_state.strong_count() != 0
+                || peer_state.strong_count() != 0
+                || peer_counter.strong_count() != 0
+                || peers.strong_count() != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        peer.abort();
+        assert!(peer.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_late_work_from_an_earlier_measurement_epoch() {
+        let gate = DispatchGate::new();
+        gate.start().await;
+        let old_epoch = gate.epoch();
+        gate.stop().await;
+        gate.start().await;
+        let old_work = gate.run_in_epoch(old_epoch, async { panic!("stale result ran") });
+        assert!(old_work.await.is_none());
+        assert_eq!(gate.run_in_epoch(gate.epoch(), async { 7 }).await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn restart_cancels_a_measurement_result_blocked_on_a_full_channel() {
+        let gate = DispatchGate::new();
+        gate.start().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(1).unwrap();
+        let mut result = Box::pin(gate.run_in_epoch(gate.epoch(), tx.send(2)));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(result.as_mut().poll(&mut context).is_pending());
+        let mut stop = Box::pin(gate.stop());
+        assert!(stop.as_mut().poll(&mut context).is_pending());
+        assert!(matches!(
+            result.as_mut().poll(&mut context),
+            std::task::Poll::Ready(None)
+        ));
+        assert!(stop.as_mut().poll(&mut context).is_ready());
+        assert_eq!(rx.try_recv().unwrap(), 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn close_is_idempotent() {
         let gate = DispatchGate::new();
-        gate.start();
+        gate.start().await;
         assert!(gate.is_open());
         gate.close();
         assert!(!gate.is_open());
@@ -1404,9 +2112,9 @@ mod dispatch_gate_tests {
     #[tokio::test]
     async fn close_stops_admitting_queued_work() {
         let gate = DispatchGate::new();
+        gate.start().await;
         let mut open = gate.subscribe();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        gate.start();
         tx.try_send(1).unwrap();
         gate.close();
 
@@ -1417,8 +2125,10 @@ mod dispatch_gate_tests {
         assert!(recv.as_mut().poll(&mut context).is_pending());
 
         // Reopening drains both pre-close and disabled-lifecycle work.
-        gate.start();
+        let mut start = Box::pin(gate.start());
+        assert!(start.as_mut().poll(&mut context).is_pending());
         assert!(recv.as_mut().poll(&mut context).is_pending());
+        assert!(start.as_mut().poll(&mut context).is_ready());
         tx.try_send(3).unwrap();
         let (permit, epoch, work) = recv.await.unwrap();
         assert_eq!(work, 3);
@@ -1433,7 +2143,7 @@ mod dispatch_gate_tests {
         let gate = dispatch.gate.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let (callback_tx, mut callback_rx) = tokio::sync::mpsc::channel(4);
-        gate.start();
+        gate.start().await;
         tx.try_send(7).unwrap();
         let task_gate = gate.clone();
         dispatch.tasks.push(tokio::spawn(async move {
@@ -1457,7 +2167,7 @@ mod dispatch_gate_tests {
         for enabled in [false, true] {
             let mut dispatch = DispatchTasks::new();
             if enabled {
-                dispatch.gate.start();
+                dispatch.gate.start().await;
             }
             let gate = dispatch.gate.clone();
             let task_gate = gate.clone();
@@ -1486,7 +2196,7 @@ mod dispatch_gate_tests {
     async fn drop_cancels_admitted_work_suspended_before_callback() {
         let mut dispatch = DispatchTasks::new();
         let gate = dispatch.gate.clone();
-        gate.start();
+        gate.start().await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let (admitted_tx, admitted_rx) = oneshot::channel();
         let (resume_tx, resume_rx) = oneshot::channel();
@@ -1533,11 +2243,11 @@ mod dispatch_gate_tests {
             .iter()
             .map(tokio::task::JoinHandle::abort_handle)
             .collect();
-        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks.len(), 3);
 
         // Stand in for `enable()`, which additionally starts discovery: the
         // gate state this test is about is exactly what `enable()` sets.
-        gate.start();
+        gate.start().await;
         assert!(gate.is_open());
         drop(controller);
         assert!(!gate.is_open());

@@ -88,10 +88,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Call `link.disable().await` before dropping a Link instance when shutdown must
-wait for its join-session and peer-state-change dispatch work to finish. Dropping
-alone closes dispatch admission and requests cancellation of those two tasks;
+wait for its admitted dispatch work to stop. Disable cancels active measurements
+and parks request intake before stopping the measurement-result,
+join-session, and peer-state-change consumers rather than destroying them, and
+suppresses discovery broadcasts. `link.enable().await` resets session state and
+waits for those consumers to discard disabled-lifecycle queues before admitting
+fresh work. Measurement results are also checked against their originating
+lifecycle so a late result cannot be forwarded after a restart.
+The discovery event and observer queues participate in their own acknowledged
+gate; prior-lifecycle packets, blocked sends, and pruning work cannot refill the
+reset peer list. Session remeasurement has one owned, epoch-scoped retry worker
+rather than accumulating detached schedulers. Transient UDP receive errors retry
+with a short backoff instead of permanently removing an interface receiver.
+Socket reads are cancelled and re-armed across the barrier so the first fresh
+packet is accepted, and BYEBYE forwarding remains inside that cancellation scope.
+Receivers continue discarding during preparation; the final admission transition
+performs another queued-datagram drain before publishing enabled.
+Interrupted enable/disable can be retried. Startup resets peer counts and
+publishes enabled after preparation but before admitting packets; disable clears
+both controller and real-time atomic enabled flags before awaiting shutdown.
+The standalone `Messenger::listen` and `PeerGateway::listen` APIs retain their
+notifier-based terminal cancellation; the controller uses separate owned paths.
+Repeated disable/enable cycles resume peer measurement and session
+joining; enabling an already-enabled instance is a no-op.
+
+Dropping alone closes dispatch admission and requests cancellation of owned
+dispatch, discovery/broadcast (including socket receivers and interface scanning),
+gateway-observer, and measurement tasks. The observer also exits when its input
+channel closes and can be cancelled while its downstream queue is full.
+Temporary-disable notifications cannot terminate the
+owned broadcaster, even when handled after re-enable;
 it does not synchronously join a callback already executing on another runtime
-thread. Disable/re-enable keeps the dispatch tasks alive for reuse.
+thread.
 
 ## Building and Running Examples
 
