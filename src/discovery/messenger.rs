@@ -1942,6 +1942,26 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
+        if std::env::var("LINK_154_BROADCAST").as_deref() == Ok("1") {
+            let socket = new_udp_reuseport(MULTICAST_IP_ANY.into()).unwrap();
+            socket.join_multicast_v4(MULTICAST_ADDR, local).unwrap();
+            println!("LINK154_READY");
+            let mut bytes = [0; MAX_MESSAGE_SIZE];
+            let (size, from) =
+                tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                from.to_string(),
+                std::env::var("LINK_154_EXPECTED_ENDPOINT").unwrap()
+            );
+            assert_eq!(
+                parse_message_header(&bytes[..size]).unwrap().0.message_type,
+                ALIVE
+            );
+            return;
+        }
         let socket = new_udp_reuseport(SocketAddrV4::new(local, 0).into()).unwrap();
         let packet = encode_message(
             NodeId::from_array([42; 8]),
@@ -2121,6 +2141,33 @@ mod tests {
         );
         run_namespace_peer("link154-a", "10.42.0.130", "10.42.0.1").await;
         run_namespace_peer("link154-b", "10.42.0.2", "10.42.0.1").await;
+        for (namespace, local, name) in [
+            ("link154-a", "10.42.0.130", "veth-a"),
+            ("link154-b", "10.42.0.2", "veth-b"),
+        ] {
+            let entry = interface_socket_entries(&context.interface_sockets)
+                .into_iter()
+                .find(|entry| entry.identity.name == name)
+                .unwrap();
+            let mut command = tokio::process::Command::new("ip");
+            command
+                .args(["netns", "exec", namespace])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "discovery::messenger::tests::namespace_peer",
+                    "--nocapture",
+                ])
+                .env("LINK_154_PEER_IP", local)
+                .env("LINK_154_EXPECTED_IP", "10.42.0.1")
+                .env("LINK_154_BROADCAST", "1")
+                .env(
+                    "LINK_154_EXPECTED_ENDPOINT",
+                    entry.socket.local_addr().unwrap().to_string(),
+                );
+            fixture_broadcast(command, &entry, &context).await;
+        }
         context.gate.stop().await;
         reconcile_interfaces(&listener.socket, &context, &mut children, &[]);
         children.shutdown().await;
@@ -2373,6 +2420,16 @@ mod tests {
             )
             .await;
         }
+        #[cfg(target_os = "macos")]
+        for entry in interface_socket_entries(&context.interface_sockets) {
+            let mut command = feth_peer_command(Ipv4Addr::UNSPECIFIED, &entry.identity, &context);
+            command.arg("--broadcast");
+            let output = fixture_broadcast(command, &entry, &context).await;
+            assert_eq!(
+                parse_message_header(&output.stdout).unwrap().0.message_type,
+                ALIVE
+            );
+        }
         context.gate.stop().await;
         reconcile_interfaces(&listener.socket, &context, &mut children, &[]);
         children.shutdown().await;
@@ -2437,8 +2494,69 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn fixture_broadcast(
+        mut command: tokio::process::Command,
+        entry: &InterfaceSocket,
+        context: &ReceiveContext,
+    ) -> std::process::Output {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut child = command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut reader = BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                assert_ne!(
+                    reader.read_line(&mut line).await.unwrap(),
+                    0,
+                    "broadcast peer exited before readiness"
+                );
+                if line.trim() == "LINK154_READY" {
+                    break;
+                }
+                line.clear();
+            }
+            send_peer_state_via(
+                entry.socket.clone(),
+                context.peer_state.clone(),
+                1,
+                ALIVE,
+                SocketAddrV4::new(MULTICAST_ADDR, LINK_PORT),
+                context.last_broadcast_time.clone(),
+                0,
+                Some((entry, &context.interface_sockets)),
+            )
+            .await;
+            let mut bytes = Vec::new();
+            let (read, output) =
+                tokio::join!(reader.read_to_end(&mut bytes), child.wait_with_output());
+            read.unwrap();
+            let mut output = output.unwrap();
+            output.stdout = bytes;
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            output
+        })
+        .await
+        .unwrap()
+    }
+
     #[cfg(target_os = "macos")]
-    async fn adapter_peer(local: Ipv4Addr, host: &Ipv4Interface, context: &ReceiveContext) {
+    fn feth_peer_command(
+        local: Ipv4Addr,
+        host: &Ipv4Interface,
+        context: &ReceiveContext,
+    ) -> tokio::process::Command {
         let peer_port = match host.name.as_str() {
             "feth1540" => "feth1541",
             "feth1542" => "feth1543",
@@ -2460,24 +2578,30 @@ mod tests {
         )
         .unwrap();
         let payload: String = packet.iter().map(|byte| format!("{byte:02x}")).collect();
+        let mut command = tokio::process::Command::new(std::env::var("LINK_154_PYTHON").unwrap());
+        command
+            .arg(".github/scripts/discovery-feth-peer.py")
+            .args([
+                "--interface",
+                peer_port,
+                "--local",
+                &local.to_string(),
+                "--group",
+                &MULTICAST_ADDR.to_string(),
+                "--expected",
+                &expected.to_string(),
+                "--payload",
+                &payload,
+            ])
+            .kill_on_drop(true);
+        command
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn adapter_peer(local: Ipv4Addr, host: &Ipv4Interface, context: &ReceiveContext) {
         let output = tokio::time::timeout(
             Duration::from_secs(20),
-            tokio::process::Command::new(std::env::var("LINK_154_PYTHON").unwrap())
-                .arg(".github/scripts/discovery-feth-peer.py")
-                .args([
-                    "--interface",
-                    peer_port,
-                    "--local",
-                    &local.to_string(),
-                    "--group",
-                    &MULTICAST_ADDR.to_string(),
-                    "--expected",
-                    &expected.to_string(),
-                    "--payload",
-                    &payload,
-                ])
-                .kill_on_drop(true)
-                .output(),
+            feth_peer_command(local, host, context).output(),
         )
         .await
         .unwrap()

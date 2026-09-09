@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--group", required=True)
     parser.add_argument("--expected", required=True)
     parser.add_argument("--payload", required=True)
+    parser.add_argument("--broadcast", action="store_true")
     args = parser.parse_args()
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.geteuid() != 0:
         raise RuntimeError("requires the disposable, privileged CI fixture")
@@ -38,7 +39,9 @@ def main():
                 op=2, hwsrc=mac, psrc=args.local, hwdst=arp.hwsrc, pdst=arp.psrc
             )
             sendp(reply, iface=args.interface, verbose=False)
-        if IP in packet and UDP in packet and packet[IP].dst == args.local and packet[UDP].dport == 20809:
+        destination = args.group if args.broadcast else args.local
+        port = 20808 if args.broadcast else 20809
+        if IP in packet and UDP in packet and packet[IP].dst == destination and packet[UDP].dport == port:
             replies.append(packet)
             received.set()
 
@@ -60,7 +63,10 @@ def main():
             / UDP(sport=20809, dport=20808)
             / bytes.fromhex(args.payload)
         )
-        sendp(announcement, iface=args.interface, verbose=False)
+        if args.broadcast:
+            print("LINK154_READY", flush=True)
+        else:
+            sendp(announcement, iface=args.interface, verbose=False)
         if not received.wait(5):
             raise RuntimeError("no discovery response reached raw peer " + args.interface)
         reply = replies[0]

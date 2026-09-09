@@ -127,6 +127,11 @@ the explicitly configured fixture, not silently passed on unsuitable hosts.
 The namespace fixture additionally deletes/recreates an adapter with its old
 index, name and address without reconciling in between, then assigns one local
 address to both adapters and verifies both peer namespaces receive responses.
+Linux and Darwin additionally capture a managed outgoing multicast announcement
+from each duplicate-address registration on its opposite peer link. A readiness
+handshake precedes each send; both the source address and the registration's
+unique port must match. Unicast response coverage alone cannot validate
+`IP_MULTICAST_IF`, so these are separate assertions.
 
 The macOS and Windows fixture scripts configure distinct adapters on a
 disposable CI runner. macOS sends across paired `feth` ports with explicit
