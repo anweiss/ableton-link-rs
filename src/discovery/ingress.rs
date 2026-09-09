@@ -22,11 +22,15 @@ impl PacketSocket {
     pub fn new(addr: SocketAddrV4, index: Option<u32>) -> io::Result<Self> {
         let info = PktInfoUdpSocket::new(socket2::Domain::IPV4)?;
         info.set_nonblocking(true)?;
-        let std_socket = info.try_clone_std()?;
-        let options = socket2::SockRef::from(&std_socket);
-        options.set_reuse_address(true)?;
+        info.set_reuse_address(true)?;
         #[cfg(unix)]
-        options.set_reuse_port(true)?;
+        info.set_reuse_port(true)?;
+        // Winsock's duplicated descriptor must be created after bind; a clone
+        // of the unbound descriptor does not acquire the later local endpoint.
+        info.bind(&addr.into())?;
+        let std_socket = info.try_clone_std()?;
+        std_socket.set_nonblocking(true)?;
+        let options = socket2::SockRef::from(&std_socket);
         #[cfg(target_os = "linux")]
         options.set_multicast_all_v4(false)?;
         options.set_multicast_loop_v4(true)?;
@@ -36,7 +40,6 @@ impl PacketSocket {
             pin_egress(&std_socket, index)?;
             options.set_multicast_if_v4(addr.ip())?;
         }
-        info.bind(&addr.into())?;
         Ok(Self {
             socket: Arc::new(UdpSocket::from_std(std_socket)?),
             info,
@@ -119,5 +122,39 @@ fn pin_egress(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(unsafe {
             WinSock::WSAGetLastError()
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[tokio::test]
+    async fn packet_info_and_tokio_handles_share_the_bound_endpoint() {
+        let socket = PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap();
+        let packet_info_endpoint = socket.info.try_clone_std().unwrap().local_addr().unwrap();
+        assert_ne!(packet_info_endpoint.port(), 0);
+        assert_eq!(socket.local_addr().unwrap(), packet_info_endpoint);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        sender
+            .send_to(b"metadata", packet_info_endpoint)
+            .await
+            .unwrap();
+        let mut buffer = [0; 32];
+        let (size, metadata) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                socket.readable().await.unwrap();
+                match socket.try_recv(&mut buffer) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                    result => break result.unwrap(),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(&buffer[..size], b"metadata");
+        assert_eq!(metadata.addr_src, sender.local_addr().unwrap());
+        assert_ne!(metadata.if_index, 0);
     }
 }

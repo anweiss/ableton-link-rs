@@ -18,9 +18,11 @@ The pin and upstream backlog are not changed by this implementation.
 `socket-pktinfo` 0.4.1 supplies safe `recvmsg` / `WSARecvMsg` wrappers, including
 the interface index. Its MSRV is 1.71, below this library's floor. The dependency
 is optional under `std` and target-gated to Linux, macOS and Windows. A cloned
-standard socket is registered with Tokio; both handles refer to the same kernel
+standard socket is created after binding and registered with Tokio; both handles refer to the same kernel
 queue. Custom receives use `UdpSocket::try_io`, including WouldBlock readiness
 clearing. The ordinary Tokio receive path drains disabled queues.
+An explicit endpoint/receive regression covers the Winsock requirement not to
+duplicate the unbound socket and assume a later bind updates the clone.
 
 | Platform | Arrival identity | Forced response egress |
 | --- | --- | --- |

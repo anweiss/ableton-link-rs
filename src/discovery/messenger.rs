@@ -194,6 +194,24 @@ impl Messenger {
         notifier: Arc<Notify>,
         enabled: Arc<Mutex<bool>>,
     ) -> Result<Self, std::io::Error> {
+        Self::new_with_interfaces(
+            peer_state,
+            tx_event,
+            epoch,
+            notifier,
+            enabled,
+            scan_discovery_interfaces(),
+        )
+    }
+
+    fn new_with_interfaces(
+        peer_state: Arc<Mutex<PeerState>>,
+        tx_event: Sender<OnEvent>,
+        epoch: Instant,
+        notifier: Arc<Notify>,
+        enabled: Arc<Mutex<bool>>,
+        interfaces: std::io::Result<Vec<Ipv4Interface>>,
+    ) -> Result<Self, std::io::Error> {
         // Bind the multicast listener on LINK_PORT. With SO_REUSEADDR/SO_REUSEPORT this
         // should coexist with other Ableton Link instances on the same host, but the
         // bind can still fail (e.g. another process holding the port without the
@@ -216,7 +234,17 @@ impl Messenger {
         let interface_sockets: InterfaceSockets = Arc::new(Mutex::new(HashMap::new()));
         let gateways_changed = Arc::new(AtomicUsize::new(0));
 
-        for interface in scan_discovery_interfaces()? {
+        let initial_interfaces = match interfaces {
+            Ok(interfaces) => interfaces,
+            Err(error) => {
+                warn!(
+                    "initial discovery interface scan failed; periodic scan will retry: {}",
+                    error
+                );
+                Vec::new()
+            }
+        };
+        for interface in initial_interfaces {
             match add_interface(&socket, &interface_sockets, interface.clone()) {
                 Ok(_) => info!(
                     "joined Ableton Link multicast group on interface {}",
@@ -1170,6 +1198,38 @@ mod tests {
             group_id: 0,
             gateways_changed: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[tokio::test]
+    async fn initial_scan_failure_keeps_discovery_available_for_retry() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut context = receive_context(tx.clone());
+        let messenger = Messenger::new_with_interfaces(
+            context.peer_state.clone(),
+            tx,
+            Instant::now(),
+            Arc::new(Notify::new()),
+            context.enabled.clone(),
+            Err(std::io::Error::other("injected initial scan failure")),
+        )
+        .unwrap();
+        assert!(messenger.interface_sockets.lock().unwrap().is_empty());
+        context.interface_sockets = messenger.interface_sockets.clone();
+        let mut children = tokio::task::JoinSet::new();
+        reconcile_interfaces(
+            &messenger.multicast_receiver.socket,
+            &context,
+            &mut children,
+            &[interface_socket().identity],
+        );
+        assert_eq!(messenger.interface_sockets.lock().unwrap().len(), 1);
+        reconcile_interfaces(
+            &messenger.multicast_receiver.socket,
+            &context,
+            &mut children,
+            &[],
+        );
+        children.shutdown().await;
     }
 
     #[tokio::test]
