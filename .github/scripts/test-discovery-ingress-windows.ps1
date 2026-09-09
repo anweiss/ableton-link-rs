@@ -42,22 +42,46 @@ if ($Churn) {
     exit
 }
 if (!(Test-Path $TestBinary -PathType Leaf)) { throw 'Missing test binary' }
-$adapters = @(Get-NetAdapter | Where-Object Status -eq Up | Sort-Object ifIndex)
-if ($adapters.Count -lt 2) { throw 'Two active, distinct network adapters are required' }
-$a = $adapters[0].ifIndex
-$b = $adapters[1].ifIndex
-$assignments = @(
-    @($a, '10.42.0.1'), @($a, '10.42.0.130'), @($a, '10.42.0.9'),
-    @($b, '10.42.0.129'), @($b, '10.42.0.2'), @($b, '10.42.0.9')
-)
 if (@(Get-NetIPAddress -AddressFamily IPv4 | Where-Object IPAddress -like '10.42.0.*').Count) {
     throw 'Refusing to alter pre-existing fixture addresses'
 }
 $created = @()
+$switches = @()
+$networks = @()
 $rule = 'ableton-link-154-fixture'
 try {
+    Get-NetAdapter | Format-Table Name, ifIndex, Status
+    Get-NetIPInterface -AddressFamily IPv4 | Format-Table InterfaceAlias, InterfaceIndex, ConnectionState
+    # Do not assume an Up adapter has an IPv4 interface in this compartment.
+    # Provision private networks instead of changing runner transport adapters.
+    if (Get-Command New-VMSwitch -ErrorAction SilentlyContinue) {
+        foreach ($name in @('link154-a', 'link154-b')) {
+            if (Get-VMSwitch -Name $name -ErrorAction SilentlyContinue) { throw "Existing switch $name" }
+            New-VMSwitch -Name $name -SwitchType Internal | Out-Null
+            $switches += $name
+        }
+        $a = (Get-NetAdapter -Name 'vEthernet (link154-a)').ifIndex
+        $b = (Get-NetAdapter -Name 'vEthernet (link154-b)').ifIndex
+    } elseif (Get-Command New-HnsNetwork -ErrorAction SilentlyContinue) {
+        foreach ($suffix in @('a', 'b')) {
+            $name = "link154-$suffix"
+            if (Get-HnsNetwork | Where-Object Name -eq $name) { throw "Existing network $name" }
+            $octet = if ($suffix -eq 'a') { 154 } else { 155 }
+            $network = New-HnsNetwork -Name $name -Type NAT -AddressPrefix "10.254.$octet.0/24" -Gateway "10.254.$octet.1"
+            $networks += $network
+        }
+        $a = (Get-NetIPAddress -IPAddress '10.254.154.1').InterfaceIndex
+        $b = (Get-NetIPAddress -IPAddress '10.254.155.1').InterfaceIndex
+    } else {
+        throw 'Runner cannot provision isolated adapters: neither New-VMSwitch nor New-HnsNetwork is available'
+    }
+    $assignments = @(
+        @($a, '10.42.0.1'), @($a, '10.42.0.130'), @($a, '10.42.0.9'),
+        @($b, '10.42.0.129'), @($b, '10.42.0.2'), @($b, '10.42.0.9')
+    )
     New-NetFirewallRule -Name $rule -DisplayName $rule -Direction Inbound -Action Allow -Protocol UDP -Program $TestBinary | Out-Null
     foreach ($entry in $assignments) {
+        Write-Host "Adding $($entry[1]) to interface $($entry[0])"
         [FixtureAddress]::Set($entry[0], $entry[1], $true)
         $created += ,$entry
     }
@@ -70,5 +94,7 @@ try {
     foreach ($entry in $created) {
         [FixtureAddress]::Set($entry[0], $entry[1], $false)
     }
-    Remove-NetFirewallRule -Name $rule
+    if (Get-NetFirewallRule -Name $rule -ErrorAction SilentlyContinue) { Remove-NetFirewallRule -Name $rule }
+    foreach ($name in $switches) { Remove-VMSwitch -Name $name -Force }
+    foreach ($network in $networks) { $network | Remove-HnsNetwork }
 }

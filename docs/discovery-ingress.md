@@ -45,8 +45,13 @@ The Windows setter uses target-gated `windows-sys` 0.61.2 bindings (already
 transitive through socket-pktinfo); the older winapi bindings do not expose
 `IP_UNICAST_IF`. This dependency is optional under `std` as well.
 
-Memberships use socket2's safe `join_multicast_v4_n` / `leave_multicast_v4_n`
-with an interface index, once per adapter even if it has multiple local aliases.
+Linux/Windows memberships use socket2's safe indexed membership methods.
+Darwin requires `MCAST_JOIN_GROUP` / `MCAST_LEAVE_GROUP` with `group_req`:
+its `IP_ADD_MEMBERSHIP` consumes only `ip_mreq`, ignoring the index appended by
+socket2's `join_multicast_v4_n`. The real two-adapter fixture exposed this as an
+incorrect first membership and `EADDRINUSE` on the second. Neither socket2 nor
+nix provides the needed RFC 3678 wrapper, so it is a narrow local exception.
+Memberships are joined once per adapter even with multiple local aliases.
 Outgoing multicast uses `IP_MULTICAST_IF` with `ip_mreqn` on Linux/macOS and
 Winsock's indexed `0.x.x.x` form on Windows. The Unix setter is another narrow
 unsafe exception: socket2 and nix expose address-only outgoing multicast
@@ -128,7 +133,8 @@ disposable CI runner. They use real multicast loop delivery on those adapters
 (not `lo0` / the loopback pseudo-interface), verify response source and arrival
 index across restarts, remove/re-add an address with an unchanged final identity,
 and exercise duplicate-address groups. macOS uses temporary `feth` pairs;
-Windows requires two active runner adapters and temporarily adds private aliases.
+Windows provisions private Hyper-V/HNS adapters and adds private aliases without
+disabling DHCP on the runner's existing transport interface.
 Both fixtures fail rather than skip if the prerequisites or assertions fail.
 These same-host tests are distinct from Linux's independent peer namespaces;
 they do not establish behavior across external physical networks.

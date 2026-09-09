@@ -26,7 +26,7 @@ use crate::{
 
 use super::{
     gateway::OnEvent,
-    ingress::PacketSocket,
+    ingress::{set_membership, PacketSocket},
     messages::{
         encode_message, parse_message_header, parse_payload, MessageHeader, MessageType,
         SessionGroupId, ALIVE, BYEBYE, MAX_MESSAGE_SIZE, RESPONSE,
@@ -511,10 +511,7 @@ fn add_interface(
                 .flat_map(InterfaceSocket::registrations)
                 .any(|other| other.identity.index == entry.identity.index)
             {
-                socket2::SockRef::from(multicast_socket.as_ref()).join_multicast_v4_n(
-                    &MULTICAST_ADDR,
-                    &socket2::InterfaceIndexOrAddress::Index(entry.identity.index),
-                )?;
+                set_membership(multicast_socket, entry.identity.index, true)?;
             }
             drain_socket(multicast_socket);
             match sockets.get_mut(&addr) {
@@ -565,12 +562,7 @@ fn remove_interface(
                     .flat_map(InterfaceSocket::registrations)
                     .any(|other| other.identity.index == identity.index)
                 {
-                    if let Err(error) = socket2::SockRef::from(multicast_socket.as_ref())
-                        .leave_multicast_v4_n(
-                            &MULTICAST_ADDR,
-                            &socket2::InterfaceIndexOrAddress::Index(identity.index),
-                        )
-                    {
+                    if let Err(error) = set_membership(multicast_socket, identity.index, false) {
                         warn!(
                             "failed to leave discovery membership on {}: {}",
                             identity.addr, error

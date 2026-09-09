@@ -95,6 +95,64 @@ impl PacketSocket {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+pub(super) fn set_membership(socket: &UdpSocket, index: u32, join: bool) -> io::Result<()> {
+    let socket = socket2::SockRef::from(socket);
+    let interface = socket2::InterfaceIndexOrAddress::Index(index);
+    if join {
+        socket.join_multicast_v4_n(&super::MULTICAST_ADDR, &interface)
+    } else {
+        socket.leave_multicast_v4_n(&super::MULTICAST_ADDR, &interface)
+    }
+}
+
+// Darwin IP_ADD_MEMBERSHIP reads only ip_mreq, silently ignoring the extra
+// ip_mreqn index passed by socket2's _v4_n API. nix has no group_req wrapper.
+// RFC 3678 MCAST_JOIN/LEAVE_GROUP is required for indexed memberships here.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub(super) fn set_membership(socket: &UdpSocket, index: u32, join: bool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // Darwin SDK netinet/in.h defines these under #pragma pack(4).
+    // libc does not currently publish the Darwin group_req or constants.
+    #[repr(C, packed(4))]
+    struct GroupRequest {
+        interface: u32,
+        group: libc::sockaddr_storage,
+    }
+    const MCAST_JOIN_GROUP: libc::c_int = 80;
+    const MCAST_LEAVE_GROUP: libc::c_int = 81;
+    let mut address =
+        socket2::SockAddr::from(SocketAddrV4::new(super::MULTICAST_ADDR, 0)).as_storage();
+    // SAFETY: SockAddr constructed the fully initialized native sockaddr storage;
+    // view_as uses that same native type, not a reinterpretation of another ABI.
+    let request = GroupRequest {
+        interface: index,
+        group: unsafe { *address.view_as::<libc::sockaddr_storage>() },
+    };
+    let option = if join {
+        MCAST_JOIN_GROUP
+    } else {
+        MCAST_LEAVE_GROUP
+    };
+    // SAFETY: synchronous option call borrows a live socket and initialized
+    // group_req of the platform's own layout. No pointer escapes.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            option,
+            std::ptr::from_ref(&request).cast(),
+            std::mem::size_of_val(&request) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn pin_egress(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
     let index = std::num::NonZeroU32::new(index)

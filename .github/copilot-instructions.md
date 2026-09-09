@@ -96,7 +96,7 @@ If nothing safe will do:
 
 Current exceptions are `examples/rusthut.rs` (Windows console mode), the
 Linux/Windows `IP_UNICAST_IF` and Unix indexed `IP_MULTICAST_IF` setters in
-`src/discovery/ingress.rs`, and Windows notification registration/cancellation in
+`src/discovery/ingress.rs` (including Darwin RFC 3678 group memberships), and Windows notification registration/cancellation in
 `src/discovery/topology.rs`. Each names
 the safe alternatives evaluated and why they were rejected. Packet reception
 uses `socket-pktinfo`; do not replace it with a hand-written ancillary-data parser.
