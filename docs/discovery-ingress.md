@@ -128,17 +128,20 @@ The namespace fixture additionally deletes/recreates an adapter with its old
 index, name and address without reconciling in between, then assigns one local
 address to both adapters and verifies both peer namespaces receive responses.
 
-The macOS and Windows fixture scripts configure two distinct adapters on a
-disposable CI runner. They use real multicast loop delivery on those adapters
-(not `lo0` / the loopback pseudo-interface), verify the selected registration's
-response source address and unique port across restarts, remove/re-add an address with an unchanged final identity,
-and exercise duplicate-address groups. macOS uses temporary `feth` pairs;
+The macOS and Windows fixture scripts configure distinct adapters on a
+disposable CI runner. macOS sends across paired `feth` ports with explicit
+interface-scoped routes for the overlapping links. Windows uses real multicast
+loop delivery on private virtual-switch adapters, not the loopback pseudo-interface.
+They verify the response registration's unique endpoint and the receiving peer
+adapter index across restarts, then remove/re-add an address with an unchanged
+final identity. macOS also exercises duplicate-address groups.
 Windows provisions private Hyper-V/HNS adapters and adds private aliases without
 disabling DHCP on the runner's existing transport interface.
-Same-host unicast replies can take local delivery through `lo0`; the Darwin
-client does not apply `IP_BOUND_IF` to receipt. Outgoing multicast remains pinned.
-The endpoint assertion proves which registered socket responded, not
-external-wire unicast traversal.
+The Darwin client does not apply `IP_BOUND_IF` to receipt; outgoing multicast
+remains independently pinned. The fixture nevertheless asserts the observed
+reply index matches the configured peer port, as well as checking the sender's
+unique registered endpoint. This is virtual-link evidence, not an external
+physical-network test.
 The Windows runner rejected the second duplicate IPv4 assignment with native
 error 5010 (`ERROR_OBJECT_ALREADY_EXISTS`). That exact error is reported as
 missing duplicate-address network evidence while overlap/churn assertions still

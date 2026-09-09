@@ -2428,7 +2428,11 @@ mod tests {
             info.addr_src, expected,
             "response must use the ingress registration's unique endpoint"
         );
-        assert_ne!(info.if_index, 0);
+        assert_eq!(
+            info.if_index,
+            u64::from(peer.index),
+            "reply must arrive on the configured peer adapter"
+        );
         eprintln!(
             "response endpoint {:?}, local delivery index {}",
             info.addr_src, info.if_index
