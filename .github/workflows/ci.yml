@@ -94,6 +94,21 @@ jobs:
           cargo test --lib --all-features --no-run --message-format=json > /tmp/link-test-artifacts.json
           test_binary="$(jq -r 'select(.profile.test == true and .executable != null) | .executable' /tmp/link-test-artifacts.json)"
           sudo unshare --mount --net bash .github/scripts/test-discovery-ingress.sh "$test_binary"
+      - name: Real multihomed discovery on macOS adapters
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo test --lib --all-features --no-run --message-format=json > /tmp/link-test-artifacts.json
+          test_binary="$(jq -r 'select(.profile.test == true and .executable != null) | .executable' /tmp/link-test-artifacts.json)"
+          sudo env GITHUB_ACTIONS=true bash .github/scripts/test-discovery-ingress-macos.sh "$test_binary"
+      - name: Real multihomed discovery on Windows adapters
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $artifacts = cargo test --lib --all-features --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { throw 'Test compilation failed' }
+          $binary = $artifacts | ConvertFrom-Json | Where-Object { $_.profile.test -and $_.executable } | Select-Object -ExpandProperty executable
+          & .github/scripts/test-discovery-ingress-windows.ps1 -TestBinary $binary
 
   default-build:
     name: Default feature build

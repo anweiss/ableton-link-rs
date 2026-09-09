@@ -45,6 +45,13 @@ The Windows setter uses target-gated `windows-sys` 0.61.2 bindings (already
 transitive through socket-pktinfo); the older winapi bindings do not expose
 `IP_UNICAST_IF`. This dependency is optional under `std` as well.
 
+Memberships use socket2's safe `join_multicast_v4_n` / `leave_multicast_v4_n`
+with an interface index, once per adapter even if it has multiple local aliases.
+Outgoing multicast uses `IP_MULTICAST_IF` with `ip_mreqn` on Linux/macOS and
+Winsock's indexed `0.x.x.x` form on Windows. The Unix setter is another narrow
+unsafe exception: socket2 and nix expose address-only outgoing multicast
+setters, which are ambiguous when two adapters share an address.
+
 ## Registration, queues and lifecycle
 
 Each registration retains index, name, local address and its own socket/Cancel
@@ -54,6 +61,31 @@ across await points. Immediately before the nonblocking send, the map lock
 protects the generation check and syscall together. Removal cancels parked
 receivers and pending response/event forwarding; no lookup substitutes another
 registration when the original has disappeared.
+
+Before initial enumeration, discovery subscribes to raw topology notifications:
+Linux route-netlink link/IPv4-address groups, macOS routing-socket interface and
+address messages, and Windows IP Helper interface/address callbacks. Unix uses
+safe nix sockets and Tokio `AsyncFd`; only the Windows callback ownership needs
+local unsafe code. `netwatcher` was evaluated but rejected: its drain followed by
+snapshot-diff delivery collapses remove/add events whose final snapshot is
+identical. This monitor conservatively advances a global generation for relevant
+raw events, without comparing snapshots. Unrelated interface changes therefore
+also rebuild discovery registrations.
+
+Receive/send boundaries check the event stream and lease generation. The
+scanner wakes on events; its five-second tick remains a retry mechanism, not the
+only source of lifetime changes. Enumeration is bracketed by generation checks,
+and registration refuses a stale snapshot. Stream errors invalidate leases and
+are logged, rather than allowing stale sends. Windows callback cancellation
+waits for callbacks before freeing their context; a failed native cancellation
+is logged and retains that context instead of risking use-after-free.
+
+The public `InterfaceSockets` alias remains address-keyed. Each value privately
+groups the distinct adapters sharing that address; all managed receive, send,
+broadcast and reconciliation paths visit the complete group. Captured leases
+omit sibling entries, so removing one adapter does not retain another adapter's
+receiver through unrelated pending work. The map's length is an address count,
+not an adapter count.
 
 Successful empty scans remove all interfaces. Changed index or name with the
 same address creates a new generation. Removal and new membership publication
@@ -87,26 +119,28 @@ deletes an adapter before reconciliation to test kernel egress rejection,
 recreates it, and rejects old-generation work. These tests are ignored outside
 the explicitly configured fixture, not silently passed on unsuitable hosts.
 
-This is **not complete closure of #154**:
+The namespace fixture additionally deletes/recreates an adapter with its old
+index, name and address without reconciling in between, then assigns one local
+address to both adapters and verifies both peer namespaces receive responses.
 
-* Interface scanning is periodic (five seconds), not an OS change-event stream.
-  Removal/recreation that reuses the same index, name and address entirely
-  between scans cannot be distinguished. Packet-info has no registration
-  generation; data queued before an unobserved replacement can be misattributed.
-* Distinct local addresses on overlapping prefixes are supported. The public
-  interface map is keyed by local IPv4 address; duplicate addresses on different
-  adapters are logged and excluded rather than arbitrarily choosing one.
-* Real two-adapter multicast/removal behavior on macOS and Windows has not been
-  exercised by the Linux fixture. Their normal tests exercise OS packet metadata
-  on loopback and lifecycle handling; compilation is not proof of multihomed
-  behavior.
-* Multicast membership APIs here still select adapters by local address. Address
-  migration during setup is subject to the same polling limitation. Egress setup
-  failures are logged and that registration is not published.
+The macOS and Windows fixture scripts configure two distinct adapters on a
+disposable CI runner. They use real multicast loop delivery on those adapters
+(not `lo0` / the loopback pseudo-interface), verify response source and arrival
+index across restarts, remove/re-add an address with an unchanged final identity,
+and exercise duplicate-address groups. macOS uses temporary `feth` pairs;
+Windows requires two active runner adapters and temporarily adds private aliases.
+Both fixtures fail rather than skip if the prerequisites or assertions fail.
+These same-host tests are distinct from Linux's independent peer namespaces;
+they do not establish behavior across external physical networks.
 
-Keep #154 open until those acceptance gaps have explicit coverage or an agreed
-scope. Do not label a platform compile or the deterministic selector tests as a
-real multihomed network test.
+Platform fixture results must be checked on the current PR head before claiming
+closure of #154. Neither a compilation nor a deterministic selector test is a
+real multihomed network test. OS notifications and socket syscalls are separate
+operations: packet metadata still contains an index, not an atomic OS generation
+token. This implementation rejects leases after observed raw changes, including
+equal-snapshot changes; it cannot claim atomic exclusion of index reuse during
+the notification-delivery/check/send race itself. Other hosted targets remain
+unsupported for managed discovery, as described above.
 
 ## Primary implementation references
 
@@ -119,3 +153,8 @@ real multihomed network test.
   <https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-ip-socket-options>
 * socket2 adapter binding:
   <https://docs.rs/socket2/0.6.5/socket2/struct.Socket.html#method.bind_device_by_index_v4>
+* Darwin indexed multicast:
+  <https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_mcast.c>
+* Windows notifications and cancellation:
+  <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-notifyipinterfacechange>
+  and <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-cancelmibchangenotify2>

@@ -38,12 +38,55 @@ impl PacketSocket {
         options.set_broadcast(true)?;
         if let Some(index) = index {
             pin_egress(&std_socket, index)?;
-            options.set_multicast_if_v4(addr.ip())?;
+            Self::pin_multicast(&std_socket, index)?;
         }
         Ok(Self {
             socket: Arc::new(UdpSocket::from_std(std_socket)?),
             info,
         })
+    }
+
+    // socket2/nix expose address-only outgoing IPv4 multicast options. Their safe
+    // indexed membership methods do not select the outgoing multicast interface.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(unsafe_code)]
+    fn pin_multicast(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let value = libc::ip_mreqn {
+            imr_multiaddr: libc::in_addr { s_addr: 0 },
+            imr_address: libc::in_addr { s_addr: 0 },
+            imr_ifindex: index.try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "interface index out of range")
+            })?,
+        };
+        // SAFETY: IP_MULTICAST_IF accepts a fully initialized ip_mreqn on both
+        // platforms. The live socket and option remain borrowed for the syscall.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MULTICAST_IF,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(windows)]
+    fn pin_multicast(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
+        if index == 0 || index > 0x00ff_ffff {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multicast interface index out of range",
+            ));
+        }
+        // Winsock interprets 0.x.x.x as a network-byte-order interface index.
+        socket2::SockRef::from(socket).set_multicast_if_v4(&std::net::Ipv4Addr::from(index))
     }
 
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<(usize, PktInfo)> {

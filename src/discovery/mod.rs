@@ -12,6 +12,7 @@ pub mod messages;
 pub mod messenger;
 pub mod multi_interface_messenger;
 pub mod peers;
+mod topology;
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
