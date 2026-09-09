@@ -14,8 +14,15 @@ public static class FixtureAddress {
         [FieldOffset(4)] public uint Address;
         [FieldOffset(32)] public ulong Luid;
         [FieldOffset(40)] public uint Index;
+        [FieldOffset(44)] public uint PrefixOrigin;
+        [FieldOffset(48)] public uint SuffixOrigin;
+        [FieldOffset(52)] public uint ValidLifetime;
+        [FieldOffset(56)] public uint PreferredLifetime;
         [FieldOffset(60)] public byte Prefix;
         [FieldOffset(61)] public byte SkipAsSource;
+        [FieldOffset(64)] public uint DadState;
+        [FieldOffset(68)] public uint ScopeId;
+        [FieldOffset(72)] public long CreationTimeStamp;
     }
     [DllImport("iphlpapi.dll")] static extern void InitializeUnicastIpAddressEntry(out Row row);
     [DllImport("iphlpapi.dll")] static extern uint CreateUnicastIpAddressEntry(ref Row row);
@@ -31,17 +38,29 @@ public static class FixtureAddress {
         if (lookup != 0) throw new System.ComponentModel.Win32Exception((int)lookup);
         row.Prefix = 24;
         row.SkipAsSource = 1;
+        row.ValidLifetime = UInt32.MaxValue;
+        row.PreferredLifetime = UInt32.MaxValue;
         uint error = add ? CreateUnicastIpAddressEntry(ref row) : DeleteUnicastIpAddressEntry(ref row);
         if (error != 0) throw new System.ComponentModel.Win32Exception((int)error);
     }
 }
 '@
+function Wait-FixtureAddresses {
+    $deadline = (Get-Date).AddSeconds(20)
+    do {
+        $addresses = @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object IPAddress -like '10.42.0.*')
+        if (@($addresses | Where-Object AddressState -ne Preferred).Count -eq 0) { break }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    $addresses | Format-Table IPAddress, InterfaceIndex, AddressState, ValidLifetime
+    if (@($addresses | Where-Object AddressState -ne Preferred).Count) { throw 'Fixture addresses did not become usable after DAD' }
+}
 if ($Churn) {
     if ($env:LINK_154_ADAPTER_FIXTURE -ne '1') { throw 'Fixture not active' }
     $index = [int]$env:LINK_154_ADAPTER_A
     [FixtureAddress]::Set($index, '10.42.0.1', $false)
     [FixtureAddress]::Set($index, '10.42.0.1', $true)
-    Start-Sleep -Seconds 3
+    Wait-FixtureAddresses
     exit
 }
 if (!(Test-Path $TestBinary -PathType Leaf)) { throw 'Missing test binary' }
@@ -95,7 +114,7 @@ try {
             } else { throw }
         }
     }
-    Start-Sleep -Seconds 3
+    Wait-FixtureAddresses
     $env:LINK_154_ADAPTER_A = "$a"
     $env:LINK_154_ADAPTER_FIXTURE = '1'
     & $TestBinary --ignored --exact discovery::messenger::tests::multihomed_adapter_ingress_and_churn --nocapture

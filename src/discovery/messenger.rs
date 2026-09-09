@@ -2381,7 +2381,12 @@ mod tests {
     #[cfg(any(target_os = "macos", windows))]
     async fn adapter_peer(local: Ipv4Addr, host: &Ipv4Interface, context: &ReceiveContext) {
         eprintln!("peer {} expects response from {:?}", local, host);
-        let socket = PacketSocket::new(SocketAddrV4::new(local, 0), Some(host.index)).unwrap();
+        let peer = scan_discovery_interfaces()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.addr == local)
+            .unwrap();
+        let socket = PacketSocket::new(SocketAddrV4::new(local, 0), Some(peer.index)).unwrap();
         // Same-host unicast replies may take lo0. Allow client receipt there;
         // its outgoing multicast remains independently pinned by index.
         #[cfg(target_os = "macos")]

@@ -28,10 +28,10 @@ ifconfig feth1540 peer feth1541
 ifconfig feth1542 peer feth1543
 for name in "${created[@]}"; do ifconfig "$name" up; done
 ifconfig feth1540 inet 10.42.0.1/24 alias
-ifconfig feth1540 inet 10.42.0.130/24 alias
+ifconfig feth1541 inet 10.42.0.130/24 alias
 ifconfig feth1540 inet 10.42.0.9/24 alias
 ifconfig feth1542 inet 10.42.0.129/24 alias
-ifconfig feth1542 inet 10.42.0.2/24 alias
+ifconfig feth1543 inet 10.42.0.2/24 alias
 ifconfig feth1542 inet 10.42.0.9/24 alias
 export LINK_154_ADAPTER_FIXTURE=1
 "$1" --ignored --exact discovery::messenger::tests::multihomed_adapter_ingress_and_churn --nocapture
