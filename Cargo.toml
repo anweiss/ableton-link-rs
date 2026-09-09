@@ -100,7 +100,7 @@ winapi = { version = "0.3", features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-mach2 = "0.6"
+mach2 = "0.7"
 
 # Supplies the safe `EspTaskTimerService::now()` wrapper that `platform::clock`
 # uses instead of declaring `esp_timer_get_time` as a raw C symbol. Gated to the
