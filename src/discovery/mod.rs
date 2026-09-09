@@ -1,6 +1,11 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod gateway;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod ingress;
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[path = "ingress_unsupported.rs"]
+mod ingress;
 pub mod interface_scanner;
 pub mod ip_interface;
 pub mod messages;

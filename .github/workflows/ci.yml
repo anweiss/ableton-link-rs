@@ -87,6 +87,13 @@ jobs:
       # --all-features is required to compile and run the optional `audio`
       # (LinkAudio) module; without it none of src/link_audio/ is exercised.
       - run: cargo test --all --all-features -- --nocapture --test-threads=1
+      - name: Real multihomed discovery and interface churn
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo test --lib --all-features --no-run --message-format=json > /tmp/link-test-artifacts.json
+          test_binary="$(jq -r 'select(.profile.test == true and .executable != null) | .executable' /tmp/link-test-artifacts.json)"
+          sudo unshare --mount --net bash .github/scripts/test-discovery-ingress.sh "$test_binary"
 
   default-build:
     name: Default feature build
