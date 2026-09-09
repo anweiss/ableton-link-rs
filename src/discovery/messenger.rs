@@ -1183,7 +1183,7 @@ async fn send_registered(
         select! {
             biased;
             _ = entry.invalidated() => {
-                return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "ingress interface was removed"));
+                return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "ingress lease was invalidated"));
             }
             result = entry.socket.writable() => result?,
         }

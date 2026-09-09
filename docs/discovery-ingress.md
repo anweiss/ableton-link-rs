@@ -161,6 +161,21 @@ equal-snapshot changes; it cannot claim atomic exclusion of index reuse during
 the notification-delivery/check/send race itself. Other hosted targets remain
 unsupported for managed discovery, as described above.
 
+On September 9, 2026, CI run `34372516043` passed all three platform jobs:
+Linux's isolated namespaces included forced identical-index replacement and
+duplicate addresses; Darwin's raw Ethernet peers completed all nine exchanges,
+including both duplicate-address adapters; Windows completed overlap/restart/churn
+and explicitly reported its duplicate-address setup rejection. The native serial
+suite passed 347 library and 33 integration tests (Windows has one additional
+SDK-layout assertion). The equal-snapshot regression was also run as a negative
+control: forcing the topology generation to remain zero made its stale-send
+assertion fail; restoring generation checks made it pass.
+
+These results close the polling and address-keyed-storage gaps, but **do not
+claim full closure of #154**: Windows duplicate-network behavior and atomic
+notification/check/send exclusion remain unproven. The Windows configuration
+rejection is not counted as a successful duplicate-address network test.
+
 ## Primary implementation references
 
 * Upstream: `vendor/ableton-link/include/ableton/discovery/IpInterface.hpp`,
