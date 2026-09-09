@@ -33,5 +33,9 @@ ifconfig feth1540 inet 10.42.0.9/24 alias
 ifconfig feth1542 inet 10.42.0.129/24 alias
 ifconfig feth1543 inet 10.42.0.2/24 alias
 ifconfig feth1542 inet 10.42.0.9/24 alias
+# Darwin does not create a usable scoped connected route for both copies of an
+# overlapping prefix. Supply each private link's peer route explicitly.
+route -n add -host 10.42.0.130 -interface feth1540 -ifscope feth1540
+route -n add -host 10.42.0.2 -interface feth1542 -ifscope feth1542
 export LINK_154_ADAPTER_FIXTURE=1
 "$1" --ignored --exact discovery::messenger::tests::multihomed_adapter_ingress_and_churn --nocapture
