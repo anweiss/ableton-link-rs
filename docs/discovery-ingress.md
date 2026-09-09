@@ -130,12 +130,20 @@ address to both adapters and verifies both peer namespaces receive responses.
 
 The macOS and Windows fixture scripts configure two distinct adapters on a
 disposable CI runner. They use real multicast loop delivery on those adapters
-(not `lo0` / the loopback pseudo-interface), verify response source and arrival
-index across restarts, remove/re-add an address with an unchanged final identity,
+(not `lo0` / the loopback pseudo-interface), verify the selected registration's
+response source address and unique port across restarts, remove/re-add an address with an unchanged final identity,
 and exercise duplicate-address groups. macOS uses temporary `feth` pairs;
 Windows provisions private Hyper-V/HNS adapters and adds private aliases without
 disabling DHCP on the runner's existing transport interface.
-Both fixtures fail rather than skip if the prerequisites or assertions fail.
+Same-host unicast replies can take local delivery through `lo0`; the Darwin
+client does not apply `IP_BOUND_IF` to receipt. Outgoing multicast remains pinned.
+The endpoint assertion proves which registered socket responded, not
+external-wire unicast traversal.
+The Windows runner rejected the second duplicate IPv4 assignment with native
+error 5010 (`ERROR_OBJECT_ALREADY_EXISTS`). That exact error is reported as
+missing duplicate-address network evidence while overlap/churn assertions still
+run; other setup errors fail. No Windows duplicate-network pass is claimed.
+Both fixtures fail if their required overlap/churn assertions fail.
 These same-host tests are distinct from Linux's independent peer namespaces;
 they do not establish behavior across external physical networks.
 

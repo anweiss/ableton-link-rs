@@ -20,12 +20,15 @@ public static class FixtureAddress {
     [DllImport("iphlpapi.dll")] static extern void InitializeUnicastIpAddressEntry(out Row row);
     [DllImport("iphlpapi.dll")] static extern uint CreateUnicastIpAddressEntry(ref Row row);
     [DllImport("iphlpapi.dll")] static extern uint DeleteUnicastIpAddressEntry(ref Row row);
+    [DllImport("iphlpapi.dll")] static extern uint ConvertInterfaceIndexToLuid(uint index, out ulong luid);
     public static void Set(uint index, string address, bool add) {
         Row row;
         InitializeUnicastIpAddressEntry(out row);
         row.Family = 2;
         row.Address = BitConverter.ToUInt32(IPAddress.Parse(address).GetAddressBytes(), 0);
         row.Index = index;
+        uint lookup = ConvertInterfaceIndexToLuid(index, out row.Luid);
+        if (lookup != 0) throw new System.ComponentModel.Win32Exception((int)lookup);
         row.Prefix = 24;
         row.SkipAsSource = 1;
         uint error = add ? CreateUnicastIpAddressEntry(ref row) : DeleteUnicastIpAddressEntry(ref row);
@@ -82,8 +85,15 @@ try {
     New-NetFirewallRule -Name $rule -DisplayName $rule -Direction Inbound -Action Allow -Protocol UDP -Program $TestBinary | Out-Null
     foreach ($entry in $assignments) {
         Write-Host "Adding $($entry[1]) to interface $($entry[0])"
-        [FixtureAddress]::Set($entry[0], $entry[1], $true)
-        $created += ,$entry
+        try {
+            [FixtureAddress]::Set($entry[0], $entry[1], $true)
+            $created += ,$entry
+        } catch {
+            if ($entry[0] -eq $b -and $entry[1] -eq '10.42.0.9' -and $_.Exception.InnerException.NativeErrorCode -eq 5010) {
+                $env:LINK_154_DUPLICATE_REJECTED = '5010'
+                Write-Warning 'Runner rejected duplicate-address setup; this is NOT evidence of duplicate-address network coverage'
+            } else { throw }
+        }
     }
     Start-Sleep -Seconds 3
     $env:LINK_154_ADAPTER_A = "$a"
