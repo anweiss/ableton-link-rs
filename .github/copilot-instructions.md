@@ -122,6 +122,10 @@ When modifying this module:
 3. **Keep the default build working.** Verify with `cargo check --all-targets` that an audio-only change has not broken the audio-less configuration most users get.
 4. **Wire format.** `src/link_audio/{messages,payload,encoding,codec}.rs` put bytes on the network. LinkAudio length-prefixes strings and vectors with a **u32**, unlike Link Classic. The `aep4` peer-state entry (`src/link/audio_endpoint.rs`) is Link Classic wire format and is how audio peers discover each other.
 5. The runnable demo is `examples/link_audio.rs` (`cargo run --example link_audio --features audio`).
+6. `LinkAudio` constructs its engine and peer-sync task on the core's owned IO
+   runtime. Keep both there: abort plus a bounded send-gate wait is not task
+   completion. Final core join covers their cleanup; reentrant drop uses the
+   same owned join service. Standalone `AudioEngine` remains caller-managed.
 
 ## CI and Branch Protection
 

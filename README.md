@@ -122,6 +122,11 @@ channel closes and can be cancelled while its downstream queue is full.
 Temporary-disable notifications cannot terminate the
 owned broadcaster, even when handled after re-enable;
 external drop waits for an executing core callback and for owned runtime cleanup.
+LinkAudio constructs its audio engine and peer-sync task on that same executor.
+It closes audio admission first, then the core join waits for both subsystems;
+the audio engine's bounded best-effort BYEBYE cleanup is not a substitute for
+that join. Channel callbacks use nonblocking publication, and managed source
+callbacks retain the shutdown check even when replaced.
 If a core callback drops its own controller, that invocation may finish but no
 later invocation is admitted. A process-wide, owned join service retains the IO
 thread handle and joins it after the callback returns; it is not self-joined.

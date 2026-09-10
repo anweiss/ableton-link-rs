@@ -432,6 +432,18 @@ impl Drop for Controller {
 }
 
 impl Controller {
+    #[cfg(feature = "audio")]
+    pub(crate) fn spawn_on_io<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.io
+            .as_ref()
+            .expect("published Controller owns its IO context")
+            .spawn(future)
+    }
+
     pub async fn new(tempo: tempo::Tempo, clock: Clock) -> Result<Self, std::io::Error> {
         let io = crate::platform::io_context::IoContext::new()?;
         let mut controller = io

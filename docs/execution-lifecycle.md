@@ -26,7 +26,8 @@ attempts restoration. Calls after shutdown return an error.
 
 This is an IO-execution hook, not a claim about audio playback threads or
 measured drift. `LinkAudio` exposes it through BasicLink; its separate audio
-engine remains on its existing execution path. The example opts in only when
+engine and peer-sync task share the owned IO executor. Standalone `AudioEngine`
+instances remain caller-managed. The example opts in only when
 `LINK_IO_REALTIME=1`. Existing ThreadPriority best-effort methods remain available,
 alongside error-returning `try_set_high` / `try_reset`.
 
@@ -62,11 +63,18 @@ thread panic. Its service thread remains available for the process lifetime.
 Application code must not block callbacks waiting on their own IO executor, or
 hold locks during external drop that an executing callback needs to finish.
 
-This contract covers core background tempo/audio-endpoint callbacks. Initial
+This contract covers core background tempo/audio-endpoint callbacks and
+LinkAudio's background channel/source callbacks. Initial
 registration callbacks and app-state callbacks remain synchronous calls by the
-application. It does not rewrite standalone public helpers or the separate
-LinkAudio engine. LinkAudio still explicitly shuts down its engine before
-dropping the core. `disable` remains asynchronous and restartable, retaining the
+application. It does not rewrite standalone public helpers. LinkAudio closes
+its engine before dropping the core; the core's join then waits for both audio
+and core work, including the peer-sync task, before core fields are released.
+Audio's existing bounded best-effort BYEBYE/state cleanup is not used as proof
+of task completion. Reentrant audio teardown has the same one-invocation
+exception as core teardown. Source admission is attached to the Source object,
+so replacing its callback cannot remove the shutdown check. Channel publication
+uses a nonblocking callback lock, including recursive shutdown publication.
+`disable` remains asynchronous and restartable, retaining the
 existing acknowledged gates, disabled drains and epoch cancellation.
 
 BYEBYE cleanup constructs a nonblocking standard socket directly, so final drop
@@ -80,6 +88,13 @@ contended callback suppression, callback-initiated Controller drop,
 owned-thread identity (including descendants), parked-task release, cross-runtime
 loopback UDP, and real OS priority request/restore results. Existing restart and
 measurement regressions remain required.
+
+Real UDP audio-announcement regressions hold a receive callback with a channel
+acknowledgment, verify its thread matches the core executor, and demonstrate
+external drop waits on current-thread and multithread caller runtimes. Another
+real receive callback drops LinkAudio itself and observes final core-resource
+release. Restoring caller-runtime audio construction makes the current-thread
+regression time out; restoring owned construction passes.
 
 The Linux CI job additionally requires a successful priority request and reset
 in a disposable privileged test process; its ordinary unprivileged serial run

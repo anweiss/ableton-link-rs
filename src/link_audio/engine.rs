@@ -262,8 +262,13 @@ impl AudioEngine {
     }
 
     pub fn set_channels_changed_callback(&self, callback: ChannelsChangedCallback) {
+        let shutdown = self.shutdown.clone();
         if let Ok(mut current) = self.channels_changed.lock() {
-            *current = Some(callback);
+            *current = Some(Box::new(move || {
+                if !shutdown.load(AtomicOrdering::Acquire) {
+                    callback();
+                }
+            }));
         }
     }
 
@@ -524,7 +529,11 @@ impl AudioEngine {
         channel_id: Id,
         callback: super::source::SourceCallback,
     ) -> Arc<Source> {
-        let source = Arc::new(Source::new(channel_id, callback));
+        let source = Arc::new(Source::new_managed(
+            channel_id,
+            callback,
+            self.shutdown.clone(),
+        ));
         self.with_state(|state| {
             state.sources.push(SourceEntry {
                 source: source.clone(),
@@ -638,29 +647,7 @@ impl AudioEngine {
     }
 
     fn publish_channels(&self) {
-        let (session_id, channels) =
-            self.with_state(|state| (state.session_id, state.channels.all_channels()));
-
-        // Session channels first, so the API list is ordered like upstream's.
-        let mut ordered: Vec<Channel> = channels
-            .iter()
-            .filter(|c| c.session_id == session_id)
-            .cloned()
-            .collect();
-        ordered.extend(channels.into_iter().filter(|c| c.session_id != session_id));
-
-        if let Ok(mut api_channels) = self.api_channels.lock() {
-            if *api_channels == ordered {
-                return;
-            }
-            *api_channels = ordered;
-        }
-
-        if let Ok(callback) = self.channels_changed.lock() {
-            if let Some(callback) = callback.as_ref() {
-                callback();
-            }
-        }
+        publish(&self.state, &self.api_channels, &self.channels_changed);
     }
 
     fn spawn_tasks(&mut self) {
@@ -1144,7 +1131,7 @@ fn publish(
         Err(poisoned) => *poisoned.into_inner() = ordered,
     }
 
-    if let Ok(callback) = channels_changed.lock() {
+    if let Ok(callback) = channels_changed.try_lock() {
         if let Some(callback) = callback.as_ref() {
             callback();
         }
