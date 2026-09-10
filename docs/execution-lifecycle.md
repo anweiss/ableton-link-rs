@@ -53,7 +53,10 @@ callback serialization itself still uses the callback's public mutex. After
 acquiring that mutex, a pending tempo notification is checked against current
 session tempo; an overtaken notification is suppressed rather than delivered
 after a newer value. The state check is also nonblocking and releases its guard
-before invoking user code.
+before invoking user code. The managed wrapper repeats validation against client
+tempo after acquiring the actual user-callback mutex, shared with the public
+application-state callback path. The wrapper mutex alone does not serialize
+those two paths.
 
 Reentrant drop cannot join the executing thread. It closes admission and signals
 stop immediately, then transfers the thread handle to a retained process-wide
@@ -73,7 +76,11 @@ Audio's existing bounded best-effort BYEBYE/state cleanup is not used as proof
 of task completion. Reentrant audio teardown has the same one-invocation
 exception as core teardown. Source admission is attached to the Source object,
 so replacing its callback cannot remove the shutdown check. Channel publication
-uses a nonblocking callback lock, including recursive shutdown publication.
+records a pending notification while a callback is active; repeated changes
+coalesce and drain after that callback returns. Callback registration/replacement
+holds only a short state lock, never a lock across user code. Reentrant
+publication is deferred, not lost, and shutdown discards further notifications.
+The active-callback guard restores ownership even on unwind.
 `disable` remains asynchronous and restartable, retaining the
 existing acknowledged gates, disabled drains and epoch cancellation.
 
@@ -95,6 +102,10 @@ external drop waits on current-thread and multithread caller runtimes. Another
 real receive callback drops LinkAudio itself and observes final core-resource
 release. Restoring caller-runtime audio construction makes the current-thread
 regression time out; restoring owned construction passes.
+Production-wrapper and real UDP regressions also cover a newer synchronous
+application tempo overtaking a managed notification, and a final channel
+disappearance while its previous callback is running. Both fail with their
+respective final check/pending-notification behavior removed.
 
 The Linux CI job additionally requires a successful priority request and reset
 in a disposable privileged test process; its ordinary unprivileged serial run

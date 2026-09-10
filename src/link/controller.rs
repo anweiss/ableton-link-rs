@@ -466,12 +466,16 @@ impl Controller {
 
     async fn new_on_io(tempo: tempo::Tempo, clock: Clock) -> Result<Self, std::io::Error> {
         let node_id = NodeId::new();
+        let session_id = SessionId(node_id);
+        let s_state = init_session_state(tempo, clock);
+        let client_state = Arc::new(Mutex::new(init_client_state(s_state, session_id)));
         let tempo_callback: Arc<Mutex<Option<TempoCallback>>> = Arc::new(Mutex::new(None));
         let audio_endpoint_callback: Arc<Mutex<Option<AudioEndpointCallback>>> =
             Arc::new(Mutex::new(None));
         let callbacks_closed = Arc::new(AtomicBool::new(false));
         let callback = tempo_callback.clone();
         let closed = callbacks_closed.clone();
+        let current_client = client_state.clone();
         let managed: TempoCallback = Arc::new(Mutex::new(Box::new(move |bpm| {
             let callback = callback
                 .try_lock()
@@ -479,7 +483,10 @@ impl Controller {
                 .and_then(|callback| callback.clone());
             if let Some(callback) = callback {
                 if let Ok(callback) = callback.try_lock() {
-                    if !closed.load(Ordering::Acquire) {
+                    let current = current_client
+                        .try_lock()
+                        .is_ok_and(|state| state.timeline.tempo.bpm() == bpm);
+                    if current && !closed.load(Ordering::Acquire) {
                         callback(bpm);
                     }
                 }
@@ -500,9 +507,6 @@ impl Controller {
             })));
         let managed_audio_callback = Arc::new(Mutex::new(Some(managed)));
         let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
-        let session_id = SessionId(node_id);
-        let s_state = init_session_state(tempo, clock);
-        let client_state = Arc::new(Mutex::new(init_client_state(s_state, session_id)));
 
         let enabled = Arc::new(Mutex::new(false));
         let start_stop_sync_enabled = Arc::new(Mutex::new(false));
@@ -1656,6 +1660,31 @@ mod dispatch_gate_tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+    #[tokio::test]
+    async fn managed_tempo_cannot_follow_a_newer_public_app_callback() {
+        let mut link = crate::link::BasicLink::new(121.0).await.unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let values = observed.clone();
+        link.set_tempo_callback(move |bpm| values.lock().unwrap().push(bpm));
+        let pending = link.controller.session_state.lock().unwrap().timeline.tempo;
+        let managed = link
+            .controller
+            .managed_tempo_callback
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+
+        let mut state = link.capture_app_session_state();
+        state.set_tempo(122.0, link.clock().micros());
+        link.commit_app_session_state(state).await;
+        let delivered = observed.lock().unwrap().clone();
+        assert_eq!(delivered.last(), Some(&122.0));
+        // Resume at the production wrapper after an earlier session check.
+        managed.lock().unwrap()(pending.bpm());
+        assert_eq!(*observed.lock().unwrap(), delivered);
+    }
+
     #[test]
     fn overtaken_tempo_notification_cannot_follow_the_newer_callback() {
         let clock = Clock::new();
@@ -2006,8 +2035,8 @@ mod dispatch_gate_tests {
             .clone()
             .unwrap();
         controller.io.as_ref().unwrap().spawn(async move {
-            callback.lock().unwrap()(121.0);
-            callback.lock().unwrap()(122.0);
+            callback.lock().unwrap()(120.0);
+            callback.lock().unwrap()(120.0);
         });
         running.recv_timeout(TEST_TIMEOUT).unwrap();
         let closed = controller.callbacks_closed.clone();
@@ -2053,7 +2082,7 @@ mod dispatch_gate_tests {
         let (admitted, admission) = mpsc::sync_channel(1);
         controller.io.as_ref().unwrap().spawn(async move {
             admitted.send(()).unwrap();
-            callback.lock().unwrap()(121.0);
+            callback.lock().unwrap()(120.0);
         });
         admission.recv_timeout(TEST_TIMEOUT).unwrap();
         let closed = controller.callbacks_closed.clone();
@@ -2099,8 +2128,8 @@ mod dispatch_gate_tests {
         let (finished, done) = mpsc::sync_channel(1);
         controller.io.as_ref().unwrap().spawn(async move {
             released.await.unwrap();
-            callback.lock().unwrap()(121.0);
-            callback.lock().unwrap()(122.0);
+            callback.lock().unwrap()(120.0);
+            callback.lock().unwrap()(120.0);
             finished.send(()).unwrap();
         });
         *slot.lock().unwrap() = Some(controller);

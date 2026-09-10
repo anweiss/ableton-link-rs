@@ -555,6 +555,34 @@ mod tests {
         assert!(engine.upgrade().is_none());
     }
 
+    #[tokio::test]
+    async fn final_channel_disappearance_is_delivered_after_a_running_callback() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        let link = LinkAudio::new(120.0, "notification witness").await.unwrap();
+        let (peer, packet) = announcement_peer(&link);
+        let engine = Arc::downgrade(&link.engine);
+        let calls = AtomicUsize::new(0);
+        let (observed, notifications) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        link.set_channels_changed_callback(move || {
+            observed
+                .send(engine.upgrade().unwrap().channels().len())
+                .unwrap();
+            if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                released.recv_timeout(SHUTDOWN_TIMEOUT).unwrap();
+            }
+        });
+        peer.send_to(&packet, link.audio_endpoint()).unwrap();
+        assert_eq!(notifications.recv_timeout(SHUTDOWN_TIMEOUT).unwrap(), 1);
+        link.engine.end_peer_sync();
+        assert!(link.channels().is_empty());
+        release.send(()).unwrap();
+        assert_eq!(notifications.recv_timeout(SHUTDOWN_TIMEOUT).unwrap(), 0);
+    }
+
     fn session_state() -> SessionState {
         to_session_state(
             &ClientState {

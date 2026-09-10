@@ -125,7 +125,8 @@ external drop waits for an executing core callback and for owned runtime cleanup
 LinkAudio constructs its audio engine and peer-sync task on that same executor.
 It closes audio admission first, then the core join waits for both subsystems;
 the audio engine's bounded best-effort BYEBYE cleanup is not a substitute for
-that join. Channel callbacks use nonblocking publication, and managed source
+that join. Channel notifications coalesce while a callback is running and drain
+after it returns; no registration lock is held across user code. Managed source
 callbacks retain the shutdown check even when replaced.
 If a core callback drops its own controller, that invocation may finish but no
 later invocation is admitted. A process-wide, owned join service retains the IO
@@ -434,7 +435,9 @@ captured scheduling. Default construction does not request elevated priority.
 The method returns OS errors and shutdown attempts to restore priority on the
 same thread, logging restoration failures. Tempo callbacks remain nonblocking;
 overtaken notifications are suppressed after acquiring the callback mutex so
-an older tempo cannot be delivered after a newer callback.
+an older tempo cannot be delivered after a newer callback. The managed wrapper
+also rechecks client tempo after taking the actual user-callback mutex, which
+serializes it with synchronous application callbacks.
 It never changes a shared caller-runtime worker or an audio playback thread.
 The `link_audio` example opts in with `LINK_IO_REALTIME=1`.
 
