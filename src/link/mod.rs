@@ -148,6 +148,13 @@ impl BasicLink {
 
 #[cfg(feature = "std")]
 impl BasicLink {
+    /// Requests or restores real-time scheduling on this instance's owned Link
+    /// IO thread. This is opt-in and never changes a caller-runtime worker.
+    /// Permission/platform errors are returned; shutdown restores priority.
+    pub async fn set_io_thread_priority(&self, high: bool) -> std::io::Result<()> {
+        self.controller.set_io_thread_priority(high).await
+    }
+
     /// Enables discovery and dispatch, including after a previous [`Self::disable`].
     /// Waits for consumers to prepare the new lifecycle before returning.
     /// Calling this while already enabled leaves the current session unchanged.

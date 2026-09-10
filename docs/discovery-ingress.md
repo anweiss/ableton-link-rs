@@ -52,10 +52,10 @@ socket2's `join_multicast_v4_n`. The real two-adapter fixture exposed this as an
 incorrect first membership and `EADDRINUSE` on the second. Neither socket2 nor
 nix provides the needed RFC 3678 wrapper, so it is a narrow local exception.
 Memberships are joined once per adapter even with multiple local aliases.
-Outgoing multicast uses `IP_MULTICAST_IF` with `ip_mreqn` on Linux/macOS and
-Winsock's indexed `0.x.x.x` form on Windows. The Unix setter is another narrow
-unsafe exception: socket2 and nix expose address-only outgoing multicast
-setters, which are ambiguous when two adapters share an address.
+Outgoing multicast uses rustix's safe indexed `IP_MULTICAST_IF` wrapper on
+Linux/macOS and Winsock's indexed `0.x.x.x` form through socket2 on Windows.
+Address-only outgoing multicast setters are ambiguous when two adapters share
+an address. The Unix setter no longer needs repository-owned unsafe code.
 
 ## Registration, queues and lifecycle
 

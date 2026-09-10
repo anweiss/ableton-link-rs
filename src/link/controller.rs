@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddrV4},
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex, Weak},
 };
 
@@ -393,8 +394,11 @@ pub(crate) fn dispatch_audio_endpoint_change(
 }
 
 pub struct Controller {
-    // Drop this owner before releasing the controller's other fields.
+    // Retains cancellation handles; Controller::drop also joins the IO runtime.
     dispatch: DispatchTasks,
+    io: Option<crate::platform::io_context::IoContext>,
+    callbacks_closed: Arc<AtomicBool>,
+    managed_tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
     pub tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
     /// Invoked whenever a peer's discovered audio endpoint changes. Rust
     /// analogue of upstream's `Controller::SawAudioEndpointCallback`. Set via
@@ -416,12 +420,73 @@ pub struct Controller {
     notifier: Arc<Notify>,
 }
 
+impl Drop for Controller {
+    fn drop(&mut self) {
+        self.callbacks_closed.store(true, Ordering::Release);
+        self.dispatch.gate.close();
+        self.discovery.gate.close();
+        if let Some(mut io) = self.io.take() {
+            io.shutdown();
+        }
+    }
+}
+
 impl Controller {
     pub async fn new(tempo: tempo::Tempo, clock: Clock) -> Result<Self, std::io::Error> {
+        let io = crate::platform::io_context::IoContext::new()?;
+        let mut controller = io
+            .spawn(Self::new_on_io(tempo, clock))
+            .await
+            .map_err(|error| std::io::Error::other(format!("Link IO startup failed: {error}")))??;
+        controller.io = Some(io);
+        Ok(controller)
+    }
+
+    /// Requests/restores priority only on this controller's owned IO thread.
+    /// Defaults to ordinary scheduling. Permission errors are returned.
+    pub async fn set_io_thread_priority(&self, high: bool) -> std::io::Result<()> {
+        self.io
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("Link IO context unavailable"))?
+            .set_priority(high)
+            .await
+    }
+
+    async fn new_on_io(tempo: tempo::Tempo, clock: Clock) -> Result<Self, std::io::Error> {
         let node_id = NodeId::new();
         let tempo_callback: Arc<Mutex<Option<TempoCallback>>> = Arc::new(Mutex::new(None));
         let audio_endpoint_callback: Arc<Mutex<Option<AudioEndpointCallback>>> =
             Arc::new(Mutex::new(None));
+        let callbacks_closed = Arc::new(AtomicBool::new(false));
+        let callback = tempo_callback.clone();
+        let closed = callbacks_closed.clone();
+        let managed: TempoCallback = Arc::new(Mutex::new(Box::new(move |bpm| {
+            let callback = callback
+                .try_lock()
+                .ok()
+                .and_then(|callback| callback.clone());
+            if let Some(callback) = callback {
+                if let Ok(callback) = callback.try_lock() {
+                    if !closed.load(Ordering::Acquire) {
+                        callback(bpm);
+                    }
+                }
+            }
+        })));
+        let managed_tempo_callback = Arc::new(Mutex::new(Some(managed)));
+        let callback = audio_endpoint_callback.clone();
+        let closed = callbacks_closed.clone();
+        let managed: AudioEndpointCallback =
+            Arc::new(Mutex::new(Box::new(move |peer, endpoint| {
+                let callback = callback.lock().unwrap().clone();
+                if let Some(callback) = callback {
+                    let callback = callback.lock().unwrap();
+                    if !closed.load(Ordering::Acquire) {
+                        callback(peer, endpoint);
+                    }
+                }
+            })));
+        let managed_audio_callback = Arc::new(Mutex::new(Some(managed)));
         let session_peer_counter = Arc::new(Mutex::new(SessionPeerCounter::default()));
         let session_id = SessionId(node_id);
         let s_state = init_session_state(tempo, clock);
@@ -524,7 +589,7 @@ impl Controller {
         let s_peer_counter_loop = session_peer_counter.clone();
         let s_loop = sessions.clone();
         let ps_loop = peer_state.clone();
-        let tempo_cb_loop = tempo_callback.clone();
+        let tempo_cb_loop = managed_tempo_callback.clone();
 
         let gate_loop = dispatch.gate.clone();
 
@@ -558,8 +623,8 @@ impl Controller {
         let p_loop = peers.clone();
         let s_peer_counter_loop = session_peer_counter.clone();
         let peer_state_loop = peer_state.clone();
-        let tempo_cb_loop = tempo_callback.clone();
-        let audio_endpoint_cb_loop = audio_endpoint_callback.clone();
+        let tempo_cb_loop = managed_tempo_callback.clone();
+        let audio_endpoint_cb_loop = managed_audio_callback;
 
         // An audio-endpoint notification held back because the
         // `SessionMembership` change it was queued behind could not be applied
@@ -842,6 +907,9 @@ impl Controller {
 
         Ok(Self {
             dispatch,
+            io: None,
+            callbacks_closed,
+            managed_tempo_callback,
             tempo_callback,
             audio_endpoint_callback,
             peer_state,
@@ -885,7 +953,7 @@ impl Controller {
             self.sessions.clone(),
             self.clock,
             self.start_stop_sync_enabled.clone(),
-            self.tempo_callback.clone(),
+            self.managed_tempo_callback.clone(),
         )
         .await;
 
@@ -898,11 +966,13 @@ impl Controller {
             let notifier = self.notifier.clone();
             let events = discovery.gate.subscribe();
 
-            self.dispatch.tasks.push(tokio::spawn(async move {
-                discovery
-                    .listen_with_dispatch(rx_event, notifier, events)
-                    .await;
-            }));
+            self.dispatch
+                .tasks
+                .push(self.io.as_ref().expect("initialized IO").spawn(async move {
+                    discovery
+                        .listen_with_dispatch(rx_event, notifier, events)
+                        .await;
+                }));
         }
         self.discovery
             .gate
@@ -1059,7 +1129,7 @@ impl Controller {
                 ghost_x_form,
                 self.clock,
                 self.start_stop_sync_enabled.clone(),
-                self.tempo_callback.clone(),
+                self.managed_tempo_callback.clone(),
                 peer_session_id,
             );
 
@@ -1410,6 +1480,7 @@ pub fn update_session_timing(
     session_id: SessionId,
 ) {
     let new_timeline = clamp_tempo(new_timeline);
+    let mut changed_tempo = None;
 
     if let Ok(mut session_state) = session_state.try_lock() {
         let old_timeline = session_state.timeline;
@@ -1444,13 +1515,18 @@ pub fn update_session_timing(
             }
 
             if old_timeline.tempo != new_timeline.tempo {
-                if let Ok(callback_guard) = tempo_callback.try_lock() {
-                    if let Some(ref callback) = *callback_guard {
-                        if let Ok(cb) = callback.try_lock() {
-                            cb(new_timeline.tempo.bpm());
-                        }
-                    }
-                }
+                changed_tempo = Some(new_timeline.tempo.bpm());
+            }
+        }
+    }
+    if let Some(bpm) = changed_tempo {
+        let callback = tempo_callback
+            .try_lock()
+            .ok()
+            .and_then(|callback| callback.clone());
+        if let Some(callback) = callback {
+            if let Ok(callback) = callback.try_lock() {
+                callback(bpm);
             }
         }
     }
@@ -1829,6 +1905,141 @@ mod dispatch_gate_tests {
     }
 
     #[tokio::test]
+    async fn drop_joins_running_callback_and_rejects_the_next_invocation() {
+        use std::sync::{atomic::AtomicUsize, mpsc};
+        let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let (started, running) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        *controller.tempo_callback.lock().unwrap() =
+            Some(Arc::new(Mutex::new(Box::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                started.send(()).unwrap();
+                released.recv_timeout(TEST_TIMEOUT).unwrap();
+            }))));
+        let callback = controller
+            .managed_tempo_callback
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        controller.io.as_ref().unwrap().spawn(async move {
+            callback.lock().unwrap()(121.0);
+            callback.lock().unwrap()(122.0);
+        });
+        running.recv_timeout(TEST_TIMEOUT).unwrap();
+        let closed = controller.callbacks_closed.clone();
+        let (finished, completion) = mpsc::sync_channel(1);
+        let dropper = std::thread::spawn(move || {
+            drop(controller);
+            finished.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+        while !closed.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(
+            completion.try_recv().is_err(),
+            "drop must await the running callback"
+        );
+        release.send(()).unwrap();
+        completion.recv_timeout(TEST_TIMEOUT).unwrap();
+        dropper.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn contended_tempo_callback_does_not_deadlock_external_drop() {
+        use std::sync::{atomic::AtomicUsize, mpsc};
+        let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let user: TempoCallback = Arc::new(Mutex::new(Box::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        })));
+        *controller.tempo_callback.lock().unwrap() = Some(user.clone());
+        let lock = user.lock().unwrap();
+        let callback = controller
+            .managed_tempo_callback
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let (admitted, admission) = mpsc::sync_channel(1);
+        controller.io.as_ref().unwrap().spawn(async move {
+            admitted.send(()).unwrap();
+            callback.lock().unwrap()(121.0);
+        });
+        admission.recv_timeout(TEST_TIMEOUT).unwrap();
+        let closed = controller.callbacks_closed.clone();
+        let (finished, completion) = mpsc::sync_channel(1);
+        let dropper = std::thread::spawn(move || {
+            drop(controller);
+            finished.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+        while !closed.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        completion.recv_timeout(TEST_TIMEOUT).unwrap();
+        drop(lock);
+        dropper.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn callback_can_drop_its_controller_without_self_join_or_later_callbacks() {
+        use std::sync::{atomic::AtomicUsize, mpsc};
+        let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let slot = Arc::new(Mutex::new(None::<Controller>));
+        let owner = slot.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        *controller.tempo_callback.lock().unwrap() =
+            Some(Arc::new(Mutex::new(Box::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                drop(owner.lock().unwrap().take());
+            }))));
+        let callback = controller
+            .managed_tempo_callback
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let session = Arc::downgrade(&controller.session_state);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (finished, done) = mpsc::sync_channel(1);
+        controller.io.as_ref().unwrap().spawn(async move {
+            released.await.unwrap();
+            callback.lock().unwrap()(121.0);
+            callback.lock().unwrap()(122.0);
+            finished.send(()).unwrap();
+        });
+        *slot.lock().unwrap() = Some(controller);
+        release.send(()).unwrap();
+        done.recv_timeout(TEST_TIMEOUT).unwrap();
+        assert!(slot.lock().unwrap().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+        while session.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime retained controller state"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[tokio::test]
     async fn public_gateway_listen_preserves_notifier_cancellation() {
         let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
             .await
@@ -1907,6 +2118,8 @@ mod dispatch_gate_tests {
         );
         let pings = Arc::new(AtomicUsize::new(0));
         let peer_pings = pings.clone();
+        let received_ping = Arc::new(Notify::new());
+        let received = received_ping.clone();
         let responding = Arc::new(AtomicBool::new(false));
         let peer_responding = responding.clone();
         let peer = tokio::spawn(async move {
@@ -1914,6 +2127,7 @@ mod dispatch_gate_tests {
             loop {
                 let (size, from) = socket.recv_from(&mut buf).await.unwrap();
                 peer_pings.fetch_add(1, Ordering::Relaxed);
+                received.notify_one();
                 if peer_responding.load(Ordering::Relaxed) {
                     responder.handle_ping(&buf[..size], from).await;
                 }
@@ -1943,7 +2157,7 @@ mod dispatch_gate_tests {
             .await;
         tokio::time::timeout(TEST_TIMEOUT, async {
             while pings.load(Ordering::Relaxed) == 0 {
-                tokio::task::yield_now().await;
+                received_ping.notified().await;
             }
         })
         .await

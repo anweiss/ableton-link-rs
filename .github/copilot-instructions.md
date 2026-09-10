@@ -94,12 +94,14 @@ If nothing safe will do:
 3. Say the same thing in the pull request body. An `#[allow(unsafe_code)]` with
    no stated alternative is a review blocker.
 
-Current exceptions are `examples/rusthut.rs` (Windows console mode), the
-Linux/Windows `IP_UNICAST_IF` and Unix indexed `IP_MULTICAST_IF` setters in
-`src/discovery/ingress.rs` (including Darwin RFC 3678 group memberships), and Windows notification registration/cancellation in
+Current exceptions are the Linux/Windows `IP_UNICAST_IF` setters and Darwin
+RFC 3678 group memberships in `src/discovery/ingress.rs`, and Windows notification registration/cancellation in
 `src/discovery/topology.rs`. Each names
 the safe alternatives evaluated and why they were rejected. Packet reception
 uses `socket-pktinfo`; do not replace it with a hand-written ancillary-data parser.
+Unix indexed multicast egress now uses `rustix`; the Windows console example
+uses dev-only `crossterm`. Do not reintroduce local unsafe wrappers for either.
+The owned IO executor is also entirely safe Rust.
 
 Note what is *not* on that list. `src/platform/clock.rs` reads ESP-IDF's
 `esp_timer_get_time` through `esp_idf_svc::timer::EspTaskTimerService::now()`,

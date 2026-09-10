@@ -46,35 +46,21 @@ impl PacketSocket {
         })
     }
 
-    // socket2/nix expose address-only outgoing IPv4 multicast options. Their safe
-    // indexed membership methods do not select the outgoing multicast interface.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[allow(unsafe_code)]
     fn pin_multicast(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
-        let value = libc::ip_mreqn {
-            imr_multiaddr: libc::in_addr { s_addr: 0 },
-            imr_address: libc::in_addr { s_addr: 0 },
-            imr_ifindex: index.try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "interface index out of range")
-            })?,
-        };
-        // SAFETY: IP_MULTICAST_IF accepts a fully initialized ip_mreqn on both
-        // platforms. The live socket and option remain borrowed for the syscall.
-        let result = unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::IPPROTO_IP,
-                libc::IP_MULTICAST_IF,
-                std::ptr::from_ref(&value).cast(),
-                std::mem::size_of_val(&value) as libc::socklen_t,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        if index == 0 || index > i32::MAX as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "interface index out of range",
+            ));
         }
+        rustix::net::sockopt::set_ip_multicast_if_with_ifindex(
+            socket,
+            &std::net::Ipv4Addr::UNSPECIFIED,
+            &std::net::Ipv4Addr::UNSPECIFIED,
+            index,
+        )?;
+        Ok(())
     }
 
     #[cfg(windows)]

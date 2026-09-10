@@ -13,7 +13,7 @@ A native Rust implementation of [Ableton Link](https://ableton.github.io/link), 
 * **Platform-Specific Timing**: High-resolution clocks using `mach_absolute_time` (macOS), `clock_gettime` (Linux), and `QueryPerformanceCounter` (Windows)
 * **Session Management**: Automatic peer discovery, session state synchronization, and callbacks for tempo and peer audio-endpoint changes
 * **Start/Stop Sync**: Synchronization of play/stop states across devices
-* **Memory Safe**: Uses Rust's ownership system for safe concurrent networking. The package sets `unsafe_code = "deny"` in `[lints.rust]`, covering examples and tests as well as the library. Platform integration uses wrapper crates where available; narrowly scoped exceptions cover indexed discovery egress options, Windows topology notification ownership and Windows example console mode, with alternatives and safety contracts documented at each exception
+* **Memory Safe**: Uses Rust's ownership system for safe concurrent networking. The package sets `unsafe_code = "deny"` in `[lints.rust]`, covering examples and tests as well as the library. Unix indexed multicast egress uses safe `rustix` APIs; Windows example console mode uses the dev-only `crossterm` wrapper. Remaining narrowly scoped exceptions cover unicast egress options, Darwin indexed memberships and Windows topology notifications; this is not yet an entirely safe-Rust codebase
 * **Ingress-Aware Discovery**: On Linux, macOS and Windows, managed discovery receives the OS interface index with each datagram and selects that interface's registered response socket, not a source-address prefix match. Raw topology notifications invalidate older leases even when the final interface snapshot is unchanged. Address-keyed groups retain duplicate-address adapters; memberships and egress select the interface by index. Optional `std` dependencies include `socket-pktinfo`, Unix `nix`, and Windows SDK bindings. See [discovery interface behavior and evidence](docs/discovery-ingress.md) for platform fixtures and remaining limits
 * **LinkAudio (optional)**: Stream PCM audio between Link peers, aligned to the shared beat grid, behind the optional `audio` feature — a fully safe-Rust port of the upstream LinkAudio subsystem
 
@@ -58,7 +58,7 @@ use ableton_link_rs::link::BasicLink;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a new Link instance with 120 BPM
-    let mut link = BasicLink::new(120.0).await;
+    let mut link = BasicLink::new(120.0).await?;
 
     // Set up callbacks
     link.set_tempo_callback(|bpm| println!("Tempo changed: {bpm} BPM"));
@@ -88,8 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Call `link.disable().await` before dropping a Link instance when shutdown must
-wait for its admitted dispatch work to stop. Disable cancels active measurements
+Each controller owns a dedicated `Link IO` thread and current-thread Tokio runtime.
+External drop closes callback admission and joins that thread before returning.
+`link.disable().await` remains the restartable way to quiesce dispatch.
+Disable cancels active measurements
 and parks request intake before stopping the measurement-result,
 join-session, and peer-state-change consumers rather than destroying them, and
 suppresses discovery broadcasts. `link.enable().await` resets session state and
@@ -113,14 +115,20 @@ notifier-based terminal cancellation; the controller uses separate owned paths.
 Repeated disable/enable cycles resume peer measurement and session
 joining; enabling an already-enabled instance is a no-op.
 
-Dropping alone closes dispatch admission and requests cancellation of owned
+Dropping alone closes callback/dispatch admission and cancels owned
 dispatch, discovery/broadcast (including socket receivers and interface scanning),
 gateway-observer, and measurement tasks. The observer also exits when its input
 channel closes and can be cancelled while its downstream queue is full.
 Temporary-disable notifications cannot terminate the
 owned broadcaster, even when handled after re-enable;
-it does not synchronously join a callback already executing on another runtime
-thread.
+external drop waits for an executing core callback and for owned runtime cleanup.
+If a core callback drops its own controller, that invocation may finish but no
+later invocation is admitted. A process-wide, owned join service retains the IO
+thread handle and joins it after the callback returns; it is not self-joined.
+Do not block a callback on work that requires its own IO thread, or hold an
+application lock across drop that the callback needs to finish.
+See [execution and shutdown contracts](docs/execution-lifecycle.md) for scope,
+reentrancy, and the distinction between core and standalone execution.
 
 ## Building and Running Examples
 
@@ -413,16 +421,19 @@ case the crate's behaviour is given first, then upstream's:
 
 None is network-visible — this is host-side scheduling only.
 
-Upstream invokes `ThreadPriority` only from its `linkaudiohut` example, through
-`link.callOnLinkThread` — never from the library. This port has no
-`callOnLinkThread` equivalent: Link work runs as tasks on a shared Tokio
-runtime, and raising the priority of a shared worker would boost unrelated
-tasks. `ThreadPriority` is therefore public API for callers who drive
-time-critical Link work on a thread they own, in the same way `ThreadFactory`
-is exported without internal call sites.
+Upstream invokes `ThreadPriority` from its `linkaudiohut` example through
+`link.callOnLinkThread`. This port offers
+`link.set_io_thread_priority(true).await` on `BasicLink` (also through `LinkAudio`).
+It sends the request to that controller's owned IO thread; `false` restores its
+captured scheduling. Default construction does not request elevated priority.
+The method returns OS errors and shutdown restores priority on the same thread.
+It never changes a shared caller-runtime worker or an audio playback thread.
+The `link_audio` example opts in with `LINK_IO_REALTIME=1`.
 
-Failures are not reported: as upstream, both methods are best-effort and never
-panic or return an error. They are logged at `debug` level.
+The lower-level `ThreadPriority::set_high` and `reset` remain best-effort APIs;
+`try_set_high` and `try_reset` return errors. Promotion failures are logged at
+debug level by the legacy wrapper; restoration failures are logged as errors.
+Successful scheduling requests are not evidence of measured clock accuracy.
 
 [atp]: https://crates.io/crates/audio_thread_priority
 

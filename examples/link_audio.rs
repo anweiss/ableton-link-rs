@@ -175,6 +175,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max(1);
 
     let mut link = LinkAudio::new(120.0, name.clone()).await?;
+    if std::env::var("LINK_IO_REALTIME").as_deref() == Ok("1") {
+        if let Err(error) = link.set_io_thread_priority(true).await {
+            eprintln!("Link IO priority request failed; continuing at ordinary priority: {error}");
+        }
+    }
     link.enable().await;
     link.enable_link_audio(true);
 
