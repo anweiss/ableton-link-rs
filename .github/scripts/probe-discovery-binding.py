@@ -22,7 +22,9 @@ ETH_IP = 0x0800
 
 
 def run(*args, **kwargs):
-    return subprocess.run(args, check=True, text=True, capture_output=True, **kwargs)
+    return subprocess.run(
+        args, check=True, text=True, capture_output=True, timeout=20, **kwargs
+    )
 
 
 def line(process):
@@ -55,6 +57,8 @@ def peer():
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+        finally:
+            process.stdout.close()
 
 
 def packet_socket():

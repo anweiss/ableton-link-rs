@@ -33,7 +33,7 @@ duplicate the unbound socket and assume a later bind updates the clone.
 Binding only a source IP is insufficient on weak-host systems. Linux/Windows
 therefore have narrowly scoped `setsockopt` wrappers for `IP_UNICAST_IF`, in
 network byte order. socket2 lacks that option; its Linux `SO_BINDTOIFINDEX`
-alternative needs privileges and a newer kernel. `nix` has no typed
+alternative also identifies an interface by a reusable integer. `nix` has no typed
 `IP_UNICAST_IF` option, and socket-pktinfo wraps reception, not egress options.
 The socket remains owned during each synchronous call and each argument points
 to an initialized, correctly sized integer. Packet decoding does not use local
@@ -194,8 +194,10 @@ Linux `do_ip_setsockopt(IP_UNICAST_IF)` looks up the device, releases the device
 reference with `dev_put`, then stores the integer in `inet->uc_index`.
 `IP_MULTICAST_IF` similarly stores `mc_index`. Microsoft specifies
 `IP_UNICAST_IF` as a network-order `IF_INDEX`, not a LUID or generation-bearing
-handle. Retaining a userspace socket or registration Arc therefore does not
-establish the required kernel identity lifetime on those paths.
+handle. That public parameter type does not reveal Windows's internal storage;
+Linux's storage must not be assumed to describe Windows. Neither that Windows
+API description nor retaining a userspace registration Arc establishes the
+required kernel identity lifetime.
 
 Darwin is different: `inp_bindif` resolves an interface pointer and
 `inp_bindif_common` stores `inp_boundifp`. This is not evidence that Darwin has
@@ -214,6 +216,70 @@ preserve raw changes even when the final address set is identical.
 flag, then its public stream emits an address-set difference, so it loses that
 case just as the rejected snapshot watcher does. No local FFI was moved into a
 shim dependency or replaced by an unsupported-platform success path.
+
+### Driverless candidate investigation (September 10, 2026)
+
+Additional capture drivers are not an acceptable deployment prerequisite.
+This investigation has not produced a validated cross-platform production fix.
+
+The executable `.github/scripts/probe-discovery-binding.py` compares three
+Linux native mechanisms inside the existing private mount/network namespace
+fixture. After positive-control deliveries, it deletes and recreates `veth-a`
+with the same index, name and IPv4 address. It then sends through the retained
+handles without checking topology again. The replacement's independent peer
+namespace acknowledges each delivered datagram. This tests the missing
+check/send boundary rather than the existing userspace generation rejection.
+The Python probe reproduces the socket mechanisms; it does not exercise the
+Rust `send_registered` function, the discovery receive path, or its lifecycle.
+
+At research commit `29a5cb75274c2f315b7c029529262f6519465438`,
+[native run 34505284097](https://github.com/anweiss/ableton-link-rs/actions/runs/34505284097)
+observed stale packets reach the replacement through both `IP_UNICAST_IF` and
+`SO_BINDTODEVICE`. A retained `AF_PACKET` handle, using `send` without a
+destination sockaddr, instead returned `ENXIO`. A freshly bound packet handle
+delivered successfully. The probe intentionally expects the current UDP flaw;
+a green research job is **not** a fixed-discovery or cross-platform closure test.
+No additional driver or packet-capture library was installed.
+
+Linux v6.8 source explains the distinction: `packet_snd` uses
+`packet_cached_dev_get` when no destination sockaddr is supplied, while its
+explicit-destination path resolves an index again. `packet_notifier` clears the
+cached device and binding on `NETDEV_UNREGISTER`. A packet-based implementation
+must preserve the former path, not silently use `sendto` and reintroduce the
+lookup. This establishes a candidate kernel mechanism, not a complete Link
+transport; framing, multicast, address ownership, receive identity, non-Ethernet
+interfaces and owned shutdown would still need implementation and proof.
+
+Darwin's built-in BPF is another source-supported candidate: `bpfdetach` waits
+for active reads/writes, detaches each descriptor, and wakes waiters;
+`bpfwrite` rejects a descriptor without `bd_bif` with `ENXIO`. Its send path
+passes the retained interface pointer to `dlil_output`. No new Darwin native
+experiment was run for this candidate; the previous UDP fixtures are not BPF
+transport lifetime evidence.
+
+Windows is still the unproved part:
+
+* WinRT `DatagramSocket.BindServiceNameAsync(String, NetworkAdapter)` explicitly
+  describes adapter selection as best-effort and allows use of another adapter
+  in configurations including weak-host/forwarding. It is not an unconditional
+  lifetime guarantee.
+* A native WFP condition can match `IP_LOCAL_INTERFACE` by `NET_LUID`, but NDIS
+  explicitly permits a freed LUID index to be allocated to another interface.
+  Comparing a larger identifier alone does not establish an incarnation lease.
+  The WFP interface-quarantine epoch condition is reserved, not a documented
+  application-controlled lifetime token.
+* These observations do **not** prove that every possible driverless Windows
+  design is impossible. No documented and exercised kernel-lifetime mechanism
+  satisfying the required boundary has been established here.
+
+Microsoft's `CreateUnicastIpAddressEntry` documentation describes error 5010
+for a duplicate on the specified interface, not a universal prohibition on
+duplicate addresses across distinct adapters. The earlier two-provider fixture
+rejection must therefore remain missing evidence, not an authoritative global
+configuration limit.
+
+The research branch adds no production transport, dependency, driver installer,
+unsafe exception, wire change or public API change. #154 remains open.
 
 ## Primary implementation references
 
@@ -235,3 +301,15 @@ shim dependency or replaced by an unsupported-platform success path.
 * Windows notifications and cancellation:
   <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-notifyipinterfacechange>
   and <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-cancelmibchangenotify2>
+* Linux v6.8 packet send and unregister:
+  <https://github.com/torvalds/linux/blob/v6.8/net/packet/af_packet.c>
+* Darwin built-in BPF:
+  <https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/bpf.c>
+* WinRT adapter-binding qualification:
+  <https://learn.microsoft.com/en-us/uwp/api/windows.networking.sockets.datagramsocket.bindservicenameasync>
+* WFP condition types and reserved epoch:
+  <https://learn.microsoft.com/en-us/windows/win32/fwp/filtering-condition-identifiers->
+* NDIS LUID allocation and reuse:
+  <https://learn.microsoft.com/en-us/windows-hardware/drivers/network/using-a-net-luid-index>
+* Windows duplicate-address API error contract:
+  <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-createunicastipaddressentry>
