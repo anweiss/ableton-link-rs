@@ -1,0 +1,25 @@
+name: Driverless lifetime research
+
+on:
+  push:
+    branches: [fix/154-packet-lifetime]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-boundary:
+    name: Linux kernel send boundary (not closure evidence for Windows/macOS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate probe syntax
+        run: |
+          python3 -m py_compile .github/scripts/probe-discovery-binding.py
+          bash -n .github/scripts/test-discovery-ingress.sh
+      - name: Compare retained native handles across exact interface reuse
+        run: |
+          sudo unshare --mount --net bash .github/scripts/test-discovery-ingress.sh \
+            --probe-driverless .github/scripts/probe-discovery-binding.py

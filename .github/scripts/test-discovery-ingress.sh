@@ -25,7 +25,14 @@ if [[ "${1:-}" == "--replace-a" || "${1:-}" == "--reuse-a" ]]; then
 fi
 
 # Refuse to mutate a host namespace: invoke with sudo unshare --mount --net.
-test -x "$1"
+probe=0
+if [[ "${1:-}" == "--probe-driverless" ]]; then
+  probe=1
+  shift
+  test -f "$1"
+else
+  test -x "$1"
+fi
 mount --make-rprivate /
 mkdir -p /run/netns
 mount -t tmpfs tmpfs /run/netns
@@ -48,4 +55,8 @@ ip netns exec link154-b ip route add 224.0.0.0/4 dev peer-b
 # Disable reverse-path filtering only inside these temporary namespaces.
 sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
 sysctl -qw net.ipv4.conf.veth-a.rp_filter=0 net.ipv4.conf.veth-b.rp_filter=0
-"$1" --ignored --exact discovery::messenger::tests::multihomed_namespace_ingress_and_churn --nocapture
+if [[ "$probe" == 1 ]]; then
+  python3 "$1"
+else
+  "$1" --ignored --exact discovery::messenger::tests::multihomed_namespace_ingress_and_churn --nocapture
+fi
