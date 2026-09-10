@@ -120,18 +120,19 @@ impl ChannelNotifications {
     }
 
     fn drain(&self) {
+        let mut failure = None;
         loop {
-            let active = {
+            let mut active = {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 if self.closed.load(AtomicOrdering::Acquire) {
                     state.pending = false;
-                    return;
+                    break;
                 }
                 if state.running || !state.pending {
-                    return;
+                    break;
                 }
                 let Some(callback) = state.callback.take() else {
-                    return;
+                    break;
                 };
                 state.pending = false;
                 state.running = true;
@@ -140,12 +141,27 @@ impl ChannelNotifications {
                     callback: Some(callback),
                 }
             };
-            if !self.closed.load(AtomicOrdering::Acquire) {
-                active.callback.as_ref().expect("active callback")();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if !self.closed.load(AtomicOrdering::Acquire) {
+                    active.callback.as_ref().expect("active callback")();
+                }
+            }));
+            if let Err(payload) = outcome {
+                tracing::error!("LinkAudio channel callback panicked; removing failed callback");
+                // Never retry a callback that panicked. Keep a concurrently
+                // installed replacement, and drain its pending work before
+                // propagating the original failure.
+                active.callback.take();
+                if failure.is_none() {
+                    failure = Some(payload);
+                }
             }
             // Return ownership even on unwind. Reentrant/concurrent publication
             // leaves a coalesced pending notification for the next iteration.
             drop(active);
+        }
+        if let Some(payload) = failure {
+            std::panic::resume_unwind(payload);
         }
     }
 }
@@ -1510,6 +1526,58 @@ mod tests {
             count.fetch_add(1, Ordering::AcqRel);
         }));
         notifications.notify();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn channel_notification_panic_drains_an_already_pending_replacement() {
+        let notifications = Arc::new(ChannelNotifications::new(Arc::new(AtomicBool::new(false))));
+        let (entered, running) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        notifications.set(Box::new(move || {
+            entered.send(()).unwrap();
+            released.recv_timeout(StdDuration::from_secs(5)).unwrap();
+            panic!("original callback failure");
+        }));
+        let worker_notifications = notifications.clone();
+        let worker = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_notifications.notify()
+            }))
+        });
+        running.recv_timeout(StdDuration::from_secs(5)).unwrap();
+        notifications.notify();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        notifications.set(Box::new(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+        }));
+        release.send(()).unwrap();
+        let failure = worker.join().unwrap().unwrap_err();
+        assert_eq!(
+            failure.downcast_ref::<&str>(),
+            Some(&"original callback failure")
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn panicking_callback_is_not_retried_and_pending_work_survives_until_replacement() {
+        let notifications = Arc::new(ChannelNotifications::new(Arc::new(AtomicBool::new(false))));
+        let nested = Arc::downgrade(&notifications);
+        notifications.set(Box::new(move || {
+            nested.upgrade().unwrap().notify();
+            panic!("failed callback must not be retried");
+        }));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            notifications.notify();
+        }))
+        .is_err());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        notifications.set(Box::new(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+        }));
         assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 

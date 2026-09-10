@@ -128,6 +128,9 @@ the audio engine's bounded best-effort BYEBYE cleanup is not a substitute for
 that join. Channel notifications coalesce while a callback is running and drain
 after it returns; no registration lock is held across user code. Managed source
 callbacks retain the shutdown check even when replaced.
+If a channel callback panics, it is removed, pending work is drained through any
+registered replacement, and the original panic propagates. A failed callback
+is not retried automatically.
 If a core callback drops its own controller, that invocation may finish but no
 later invocation is admitted. A process-wide, owned join service retains the IO
 thread handle and joins it after the callback returns; it is not self-joined.

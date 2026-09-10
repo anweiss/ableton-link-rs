@@ -80,7 +80,12 @@ records a pending notification while a callback is active; repeated changes
 coalesce and drain after that callback returns. Callback registration/replacement
 holds only a short state lock, never a lock across user code. Reentrant
 publication is deferred, not lost, and shutdown discards further notifications.
-The active-callback guard restores ownership even on unwind.
+The active-callback guard restores registry ownership even on unwind. A callback
+panic is logged and the failed callback is removed rather than retried. Pending
+work is drained through an already registered replacement before the original
+panic propagates; without a replacement it remains pending until registration.
+Shutdown still discards pending work. This does not swallow the panic or restart
+the underlying task that panicked.
 `disable` remains asynchronous and restartable, retaining the
 existing acknowledged gates, disabled drains and epoch cancellation.
 
