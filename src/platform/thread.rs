@@ -35,8 +35,8 @@ impl ThreadFactory {
 /// `set_high` captures the thread's current scheduling parameters on the first
 /// call and is a no-op on subsequent calls until `reset` is called; `reset`
 /// restores the captured parameters and is a no-op if nothing was captured.
-/// Both are best-effort: as upstream, a failure to change scheduling is
-/// ignored rather than reported.
+/// Both legacy methods are best-effort and log failures. The `try_set_high`
+/// and `try_reset` variants additionally return the OS error to the caller.
 ///
 /// # Implementation
 ///

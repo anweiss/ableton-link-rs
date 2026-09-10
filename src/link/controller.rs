@@ -1515,18 +1515,33 @@ pub fn update_session_timing(
             }
 
             if old_timeline.tempo != new_timeline.tempo {
-                changed_tempo = Some(new_timeline.tempo.bpm());
+                changed_tempo = Some(new_timeline.tempo);
             }
         }
     }
-    if let Some(bpm) = changed_tempo {
-        let callback = tempo_callback
-            .try_lock()
-            .ok()
-            .and_then(|callback| callback.clone());
-        if let Some(callback) = callback {
-            if let Ok(callback) = callback.try_lock() {
-                callback(bpm);
+    if let Some(tempo) = changed_tempo {
+        dispatch_current_tempo(&session_state, &tempo_callback, tempo);
+    }
+}
+
+fn dispatch_current_tempo(
+    session_state: &Arc<Mutex<SessionState>>,
+    tempo_callback: &Arc<Mutex<Option<TempoCallback>>>,
+    tempo: tempo::Tempo,
+) {
+    let callback = tempo_callback
+        .try_lock()
+        .ok()
+        .and_then(|callback| callback.clone());
+    if let Some(callback) = callback {
+        if let Ok(callback) = callback.try_lock() {
+            // Validate after serializing notifications, but release the state
+            // guard before user code. An overtaken update must not arrive last.
+            let current = session_state
+                .try_lock()
+                .is_ok_and(|state| state.timeline.tempo == tempo);
+            if current {
+                callback(tempo.bpm());
             }
         }
     }
@@ -1628,6 +1643,58 @@ mod dispatch_gate_tests {
     use tokio::sync::oneshot;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn overtaken_tempo_notification_cannot_follow_the_newer_callback() {
+        let clock = Clock::new();
+        let state = Arc::new(Mutex::new(init_session_state(
+            tempo::Tempo::new(121.0),
+            clock,
+        )));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let values = observed.clone();
+        let callback: TempoCallback = Arc::new(Mutex::new(Box::new(move |bpm| {
+            values.lock().unwrap().push(bpm);
+        })));
+        let callback = Arc::new(Mutex::new(Some(callback)));
+        let (ready, overtaken) = std::sync::mpsc::sync_channel(1);
+        let (release, proceed) = std::sync::mpsc::sync_channel(1);
+        let old_state = state.clone();
+        let old_callback = callback.clone();
+        let old = std::thread::spawn(move || {
+            let tempo = old_state.lock().unwrap().timeline.tempo;
+            ready.send(()).unwrap();
+            proceed.recv_timeout(TEST_TIMEOUT).unwrap();
+            dispatch_current_tempo(&old_state, &old_callback, tempo);
+        });
+        overtaken.recv_timeout(TEST_TIMEOUT).unwrap();
+        state.lock().unwrap().timeline.tempo = tempo::Tempo::new(122.0);
+        dispatch_current_tempo(&state, &callback, tempo::Tempo::new(122.0));
+        release.send(()).unwrap();
+        old.join().unwrap();
+        assert_eq!(*observed.lock().unwrap(), vec![122.0]);
+    }
+
+    #[test]
+    fn tempo_callback_runs_without_the_session_state_lock() {
+        let state = Arc::new(Mutex::new(init_session_state(
+            tempo::Tempo::new(121.0),
+            Clock::new(),
+        )));
+        let observed = Arc::new(AtomicBool::new(false));
+        let called = observed.clone();
+        let callback_state = state.clone();
+        let callback: TempoCallback = Arc::new(Mutex::new(Box::new(move |_| {
+            assert!(callback_state.try_lock().is_ok());
+            called.store(true, Ordering::Release);
+        })));
+        dispatch_current_tempo(
+            &state,
+            &Arc::new(Mutex::new(Some(callback))),
+            tempo::Tempo::new(121.0),
+        );
+        assert!(observed.load(Ordering::Acquire));
+    }
 
     #[tokio::test]
     async fn restart_waits_for_every_consumer_before_admitting_fresh_work() {

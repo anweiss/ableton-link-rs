@@ -93,6 +93,7 @@ jobs:
         run: |
           cargo test --lib --all-features --no-run --message-format=json > /tmp/link-test-artifacts.json
           test_binary="$(jq -r 'select(.profile.test == true and .executable != null) | .executable' /tmp/link-test-artifacts.json)"
+          sudo env LINK_IO_REQUIRE_PRIORITY=1 "$test_binary" --exact platform::io_context::tests::real_priority_request_and_restore_stay_on_owned_thread --nocapture
           sudo unshare --mount --net bash .github/scripts/test-discovery-ingress.sh "$test_binary"
       - name: Real multihomed discovery on macOS adapters
         if: runner.os == 'macOS'

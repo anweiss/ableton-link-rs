@@ -201,7 +201,14 @@ mod tests {
     async fn real_priority_request_and_restore_stay_on_owned_thread() {
         let io = IoContext::new().unwrap();
         let before = io.spawn(async { thread::current().id() }).await.unwrap();
-        match io.set_priority(true).await {
+        let outcome = io.set_priority(true).await;
+        if std::env::var_os("LINK_IO_REQUIRE_PRIORITY").is_some() {
+            assert!(
+                outcome.is_ok(),
+                "privileged priority request failed: {outcome:?}"
+            );
+        }
+        match outcome {
             Ok(()) => {
                 println!("Link IO real-time priority: OS request accepted");
                 io.set_priority(true).await.unwrap();
@@ -215,6 +222,15 @@ mod tests {
         let after = io.spawn(async { thread::current().id() }).await.unwrap();
         assert_eq!(before, after);
         assert_ne!(after, thread::current().id());
+    }
+
+    #[tokio::test]
+    async fn repeated_shutdown_rejects_priority_commands() {
+        let mut io = IoContext::new().unwrap();
+        io.shutdown();
+        io.shutdown();
+        assert!(io.set_priority(true).await.is_err());
+        assert!(io.set_priority(false).await.is_err());
     }
 
     #[tokio::test]

@@ -154,6 +154,12 @@ error 5010 (`ERROR_OBJECT_ALREADY_EXISTS`). That exact error is reported as
 missing duplicate-address network evidence while overlap/churn assertions still
 run; other setup errors fail. No Windows duplicate-network pass is claimed.
 Both fixtures fail if their required overlap/churn assertions fail.
+The fixture also tries the independent NetTCPIP `New-NetIPAddress` provider
+when the native IP Helper call returns 5010. This is confined to the adapters
+it created, never the runner's transport adapter. Provider success must pass
+the existing duplicate-network assertions; a matching 5010 is still missing
+evidence, and any other failure fails setup. This tests a second provisioning
+API, not a different Windows network stack or an independent physical topology.
 These same-host tests are distinct from Linux's independent peer namespaces;
 they do not establish behavior across external physical networks.
 
@@ -181,6 +187,34 @@ claim full closure of #154**: Windows duplicate-network behavior and atomic
 notification/check/send exclusion remain unproven. The Windows configuration
 rejection is not counted as a successful duplicate-address network test.
 
+### Remaining lifetime and safe-wrapper blockers
+
+The September 10 investigation checked kernel storage, not only option names.
+Linux `do_ip_setsockopt(IP_UNICAST_IF)` looks up the device, releases the device
+reference with `dev_put`, then stores the integer in `inet->uc_index`.
+`IP_MULTICAST_IF` similarly stores `mc_index`. Microsoft specifies
+`IP_UNICAST_IF` as a network-order `IF_INDEX`, not a LUID or generation-bearing
+handle. Retaining a userspace socket or registration Arc therefore does not
+establish the required kernel identity lifetime on those paths.
+
+Darwin is different: `inp_bindif` resolves an interface pointer and
+`inp_bindif_common` stores `inp_boundifp`. This is not evidence that Darwin has
+the same integer-only storage as Linux; nor does that snippet establish the
+complete receive-to-egress lifetime guarantee. It has not been promoted into a
+cross-platform closure claim. More user-space checks, or replacing the listener
+while retaining the same indexed send options, would not prove atomic exclusion
+on the Linux/Windows paths.
+
+Complete repository-owned unsafe removal is also unfinished. `rustix` replaced
+Unix multicast egress and `crossterm` replaced the Windows example console calls.
+The remaining unicast/membership options still lack suitable safe APIs in the
+evaluated socket2/nix/rustix interfaces. Windows notification replacement must
+preserve raw changes even when the final address set is identical.
+`if-watch` 3.2.2 was independently evaluated: its Windows callback sets a resync
+flag, then its public stream emits an address-set difference, so it loses that
+case just as the rejected snapshot watcher does. No local FFI was moved into a
+shim dependency or replaced by an unsupported-platform success path.
+
 ## Primary implementation references
 
 * Upstream: `vendor/ableton-link/include/ableton/discovery/IpInterface.hpp`,
@@ -194,6 +228,10 @@ rejection is not counted as a successful duplicate-address network test.
   <https://docs.rs/socket2/0.6.5/socket2/struct.Socket.html#method.bind_device_by_index_v4>
 * Darwin indexed multicast:
   <https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_mcast.c>
+* Darwin bound-interface storage:
+  <https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_pcb.c>
+* Evaluated Windows watcher:
+  <https://docs.rs/crate/if-watch/3.2.2/source/src/win.rs>
 * Windows notifications and cancellation:
   <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-notifyipinterfacechange>
   and <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-cancelmibchangenotify2>

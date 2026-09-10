@@ -20,7 +20,9 @@ send a command to the owned thread. Ordinary scheduling remains the default.
 Both promotion and restoration use the existing safe `audio_thread_priority`
 backend, with its documented parameter differences from upstream. The command
 returns the OS result, and a thread-local guard attempts restoration during
-normal shutdown or unwind. No shared caller worker is boosted.
+normal shutdown or unwind. No shared caller worker is boosted. Cancelling the
+request future does not retract an already queued command; shutdown still
+attempts restoration. Calls after shutdown return an error.
 
 This is an IO-execution hook, not a claim about audio playback threads or
 measured drift. `LinkAudio` exposes it through BasicLink; its separate audio
@@ -46,7 +48,11 @@ contention (including recursive invocation) skips the callback rather than
 blocking another executor or deadlocking on the same callback. External
 drop cannot return while an admitted invocation is running. The state-update
 helper releases session and registration locks before invoking user code;
-callback serialization itself still uses the callback's public mutex.
+callback serialization itself still uses the callback's public mutex. After
+acquiring that mutex, a pending tempo notification is checked against current
+session tempo; an overtaken notification is suppressed rather than delivered
+after a newer value. The state check is also nonblocking and releases its guard
+before invoking user code.
 
 Reentrant drop cannot join the executing thread. It closes admission and signals
 stop immediately, then transfers the thread handle to a retained process-wide
@@ -74,6 +80,13 @@ contended callback suppression, callback-initiated Controller drop,
 owned-thread identity (including descendants), parked-task release, cross-runtime
 loopback UDP, and real OS priority request/restore results. Existing restart and
 measurement regressions remain required.
+
+The Linux CI job additionally requires a successful priority request and reset
+in a disposable privileged test process; its ordinary unprivileged serial run
+also exercises permission denial. macOS and Windows execute the same native
+request/reset test, reporting accepted or denied results rather than inferring
+scheduler behavior from compilation. No latency or clock-drift improvement has
+been measured.
 
 The network-ingress contract and the remaining index-reuse/platform evidence
 limits are separate: see [discovery ingress](discovery-ingress.md). Neither

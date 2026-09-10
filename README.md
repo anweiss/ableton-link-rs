@@ -426,7 +426,10 @@ Upstream invokes `ThreadPriority` from its `linkaudiohut` example through
 `link.set_io_thread_priority(true).await` on `BasicLink` (also through `LinkAudio`).
 It sends the request to that controller's owned IO thread; `false` restores its
 captured scheduling. Default construction does not request elevated priority.
-The method returns OS errors and shutdown restores priority on the same thread.
+The method returns OS errors and shutdown attempts to restore priority on the
+same thread, logging restoration failures. Tempo callbacks remain nonblocking;
+overtaken notifications are suppressed after acquiring the callback mutex so
+an older tempo cannot be delivered after a newer callback.
 It never changes a shared caller-runtime worker or an audio playback thread.
 The `link_audio` example opts in with `LINK_IO_REALTIME=1`.
 
