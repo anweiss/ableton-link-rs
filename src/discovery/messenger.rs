@@ -39,6 +39,10 @@ use crate::platform::network::{scan_discovery_interfaces, Ipv4Interface};
 
 // Safe UDP socket creation using socket2 and safe options
 pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> {
+    new_std_udp_reuseport(addr)?.try_into()
+}
+
+fn new_std_udp_reuseport(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -94,9 +98,7 @@ pub fn new_udp_reuseport(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     udp_sock.set_nonblocking(true)?;
     udp_sock.bind(&socket2::SockAddr::from(addr))?;
 
-    // Convert to std::net::UdpSocket and then to tokio::net::UdpSocket
-    let std_socket: std::net::UdpSocket = udp_sock.into();
-    std_socket.try_into()
+    Ok(udp_sock.into())
 }
 
 /// How often the set of usable network interfaces is re-scanned.
@@ -1326,15 +1328,20 @@ pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
 pub fn send_byebye(node_state: NodeId) {
     info!("sending bye bye");
 
-    let socket = match new_udp_reuseport(MULTICAST_IP_ANY.into()) {
+    let socket = match new_std_udp_reuseport(MULTICAST_IP_ANY.into()) {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to create socket for BYEBYE: {}", e);
             return;
         }
     };
-    let _ = socket.set_broadcast(true);
-    let _ = socket.set_multicast_ttl_v4(2);
+    if let Err(error) = socket
+        .set_broadcast(true)
+        .and_then(|()| socket.set_multicast_ttl_v4(2))
+    {
+        warn!("Failed to configure BYEBYE socket: {}", error);
+        return;
+    }
 
     let message = match encode_message(node_state, 0, BYEBYE, &Payload::default(), 0) {
         Ok(m) => m,
@@ -1344,10 +1351,8 @@ pub fn send_byebye(node_state: NodeId) {
         }
     };
 
-    if let Ok(std_socket) = socket.into_std() {
-        if let Err(e) = std_socket.send_to(&message, (MULTICAST_ADDR, LINK_PORT)) {
-            warn!("Failed to send BYEBYE: {}", e);
-        }
+    if let Err(e) = socket.send_to(&message, (MULTICAST_ADDR, LINK_PORT)) {
+        warn!("Failed to send BYEBYE: {}", e);
     }
 }
 

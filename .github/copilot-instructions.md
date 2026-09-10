@@ -94,12 +94,14 @@ If nothing safe will do:
 3. Say the same thing in the pull request body. An `#[allow(unsafe_code)]` with
    no stated alternative is a review blocker.
 
-Current exceptions are `examples/rusthut.rs` (Windows console mode), the
-Linux/Windows `IP_UNICAST_IF` and Unix indexed `IP_MULTICAST_IF` setters in
-`src/discovery/ingress.rs` (including Darwin RFC 3678 group memberships), and Windows notification registration/cancellation in
+Current exceptions are the Linux/Windows `IP_UNICAST_IF` setters and Darwin
+RFC 3678 group memberships in `src/discovery/ingress.rs`, and Windows notification registration/cancellation in
 `src/discovery/topology.rs`. Each names
 the safe alternatives evaluated and why they were rejected. Packet reception
 uses `socket-pktinfo`; do not replace it with a hand-written ancillary-data parser.
+Unix indexed multicast egress now uses `rustix`; the Windows console example
+uses dev-only `crossterm`. Do not reintroduce local unsafe wrappers for either.
+The owned IO executor is also entirely safe Rust.
 
 Note what is *not* on that list. `src/platform/clock.rs` reads ESP-IDF's
 `esp_timer_get_time` through `esp_idf_svc::timer::EspTaskTimerService::now()`,
@@ -120,6 +122,10 @@ When modifying this module:
 3. **Keep the default build working.** Verify with `cargo check --all-targets` that an audio-only change has not broken the audio-less configuration most users get.
 4. **Wire format.** `src/link_audio/{messages,payload,encoding,codec}.rs` put bytes on the network. LinkAudio length-prefixes strings and vectors with a **u32**, unlike Link Classic. The `aep4` peer-state entry (`src/link/audio_endpoint.rs`) is Link Classic wire format and is how audio peers discover each other.
 5. The runnable demo is `examples/link_audio.rs` (`cargo run --example link_audio --features audio`).
+6. `LinkAudio` constructs its engine and peer-sync task on the core's owned IO
+   runtime. Keep both there: abort plus a bounded send-gate wait is not task
+   completion. Final core join covers their cleanup; reentrant drop uses the
+   same owned join service. Standalone `AudioEngine` remains caller-managed.
 
 ## CI and Branch Protection
 

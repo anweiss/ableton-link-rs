@@ -2,7 +2,10 @@
 //!
 //! Ported from `ableton/link_audio/Source.hpp`.
 
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use super::{buffer::BufferCallbackHandle, payload::Id};
 
@@ -12,6 +15,7 @@ pub type SourceCallback = Box<dyn FnMut(BufferCallbackHandle<'_>) + Send + 'stat
 pub struct Source {
     id: Id,
     callback: Mutex<SourceCallback>,
+    closed: Option<Arc<AtomicBool>>,
 }
 
 impl Source {
@@ -19,6 +23,15 @@ impl Source {
         Source {
             id,
             callback: Mutex::new(callback),
+            closed: None,
+        }
+    }
+
+    pub(super) fn new_managed(id: Id, callback: SourceCallback, closed: Arc<AtomicBool>) -> Self {
+        Self {
+            id,
+            callback: Mutex::new(callback),
+            closed: Some(closed),
         }
     }
 
@@ -34,9 +47,16 @@ impl Source {
     }
 
     pub fn invoke(&self, buffer: BufferCallbackHandle<'_>) {
-        match self.callback.lock() {
-            Ok(mut callback) => callback(buffer),
-            Err(poisoned) => (poisoned.into_inner())(buffer),
+        let mut callback = self
+            .callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self
+            .closed
+            .as_ref()
+            .is_some_and(|closed| closed.load(Ordering::Acquire))
+        {
+            callback(buffer);
         }
     }
 }
@@ -95,5 +115,17 @@ mod tests {
             info: info(),
         });
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn managed_callback_replacement_cannot_bypass_shutdown() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let source = Source::new_managed(Id::default(), Box::new(|_| {}), closed.clone());
+        closed.store(true, Ordering::Release);
+        source.set_callback(Box::new(|_| panic!("callback admitted after shutdown")));
+        source.invoke(BufferCallbackHandle {
+            samples: &[],
+            info: info(),
+        });
     }
 }

@@ -109,8 +109,18 @@ try {
             $created += ,$entry
         } catch {
             if ($entry[0] -eq $b -and $entry[1] -eq '10.42.0.9' -and $_.Exception.InnerException.NativeErrorCode -eq 5010) {
-                $env:LINK_154_DUPLICATE_REJECTED = '5010'
-                Write-Warning 'Runner rejected duplicate-address setup; this is NOT evidence of duplicate-address network coverage'
+                # These adapters were created above; changing DHCP on them
+                # cannot alter the runner's physical transport. Independently
+                # exercise the supported NetTCPIP provider, not just our ABI.
+                try {
+                    New-NetIPAddress -InterfaceIndex $b -IPAddress '10.42.0.9' -PrefixLength 24 -SkipAsSource $true -PolicyStore ActiveStore | Out-Null
+                    $created += ,$entry
+                    Write-Host 'NetTCPIP provider accepted the duplicate address; require full network assertions'
+                } catch {
+                    if ($_.FullyQualifiedErrorId -notmatch 'Windows System Error 5010,New-NetIPAddress$') { throw }
+                    $env:LINK_154_DUPLICATE_REJECTED = '5010'
+                    Write-Warning 'Native IP Helper and NetTCPIP both rejected duplicate assignment; duplicate network behavior remains unvalidated'
+                }
             } else { throw }
         }
     }

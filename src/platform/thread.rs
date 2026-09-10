@@ -35,8 +35,8 @@ impl ThreadFactory {
 /// `set_high` captures the thread's current scheduling parameters on the first
 /// call and is a no-op on subsequent calls until `reset` is called; `reset`
 /// restores the captured parameters and is a no-op if nothing was captured.
-/// Both are best-effort: as upstream, a failure to change scheduling is
-/// ignored rather than reported.
+/// Both legacy methods are best-effort and log failures. The `try_set_high`
+/// and `try_reset` variants additionally return the OS error to the caller.
 ///
 /// # Implementation
 ///
@@ -101,26 +101,38 @@ impl ThreadPriority {
     /// parameters so `reset` can restore them. No-op if a priority has already
     /// been captured and not yet reset.
     pub fn set_high(&mut self) {
-        if self.handle.is_some() {
-            return;
+        if let Err(error) = self.try_set_high() {
+            tracing::debug!("could not raise Link thread priority: {error}");
         }
+    }
 
-        match audio_thread_priority::promote_current_thread_to_real_time(48, 48_000) {
-            Ok(handle) => self.handle = Some(handle),
-            Err(e) => {
-                tracing::debug!("could not raise Link thread priority: {e}");
-            }
+    /// Requests real-time scheduling and reports permission/platform errors.
+    pub fn try_set_high(&mut self) -> std::io::Result<()> {
+        if self.handle.is_some() {
+            return Ok(());
         }
+        self.handle = Some(
+            audio_thread_priority::promote_current_thread_to_real_time(48, 48_000)
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+        );
+        Ok(())
     }
 
     /// Restores the scheduling priority captured by `set_high`. No-op if
     /// nothing was captured.
     pub fn reset(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            if let Err(e) = audio_thread_priority::demote_current_thread_from_real_time(handle) {
-                tracing::debug!("could not restore Link thread priority: {e}");
-            }
+        if let Err(error) = self.try_reset() {
+            tracing::error!("could not restore Link thread priority: {error}");
         }
+    }
+
+    /// Restores captured scheduling and reports an OS failure to the caller.
+    pub fn try_reset(&mut self) -> std::io::Result<()> {
+        if let Some(handle) = self.handle.take() {
+            audio_thread_priority::demote_current_thread_from_real_time(handle)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        Ok(())
     }
 }
 

@@ -63,6 +63,109 @@ pub const REQUEST_PERIOD: StdDuration = StdDuration::from_secs(TTL as u64);
 /// Callback invoked when the set of available channels changes.
 pub type ChannelsChangedCallback = Box<dyn Fn() + Send + 'static>;
 
+#[derive(Default)]
+struct ChannelNotificationState {
+    callback: Option<ChannelsChangedCallback>,
+    pending: bool,
+    running: bool,
+}
+
+struct ChannelNotifications {
+    state: Mutex<ChannelNotificationState>,
+    closed: Arc<AtomicBool>,
+}
+
+struct ActiveChannelCallback<'a> {
+    owner: &'a ChannelNotifications,
+    callback: Option<ChannelsChangedCallback>,
+}
+
+impl Drop for ActiveChannelCallback<'_> {
+    fn drop(&mut self) {
+        let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.running = false;
+        if state.callback.is_none() {
+            state.callback = self.callback.take();
+        }
+        // A replaced callback is dropped after this guard, outside the lock.
+    }
+}
+
+impl ChannelNotifications {
+    fn new(closed: Arc<AtomicBool>) -> Self {
+        Self {
+            state: Mutex::new(ChannelNotificationState::default()),
+            closed,
+        }
+    }
+
+    fn set(&self, callback: ChannelsChangedCallback) {
+        let previous = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.callback.replace(callback)
+        };
+        drop(previous);
+        self.drain();
+    }
+
+    fn notify(&self) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.callback.is_none() && !state.running {
+                return;
+            }
+            state.pending = true;
+        }
+        self.drain();
+    }
+
+    fn drain(&self) {
+        let mut failure = None;
+        loop {
+            let mut active = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if self.closed.load(AtomicOrdering::Acquire) {
+                    state.pending = false;
+                    break;
+                }
+                if state.running || !state.pending {
+                    break;
+                }
+                let Some(callback) = state.callback.take() else {
+                    break;
+                };
+                state.pending = false;
+                state.running = true;
+                ActiveChannelCallback {
+                    owner: self,
+                    callback: Some(callback),
+                }
+            };
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if !self.closed.load(AtomicOrdering::Acquire) {
+                    active.callback.as_ref().expect("active callback")();
+                }
+            }));
+            if let Err(payload) = outcome {
+                tracing::error!("LinkAudio channel callback panicked; removing failed callback");
+                // Never retry a callback that panicked. Keep a concurrently
+                // installed replacement, and drain its pending work before
+                // propagating the original failure.
+                active.callback.take();
+                if failure.is_none() {
+                    failure = Some(payload);
+                }
+            }
+            // Return ownership even on unwind. Reentrant/concurrent publication
+            // leaves a coalesced pending notification for the next iteration.
+            drop(active);
+        }
+        if let Some(payload) = failure {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PeerReceiver {
     peer_id: NodeId,
@@ -172,7 +275,7 @@ pub struct AudioEngine {
     endpoint: SocketAddrV4,
     state: Arc<Mutex<EngineState>>,
     api_channels: Arc<Mutex<Vec<Channel>>>,
-    channels_changed: Arc<Mutex<Option<ChannelsChangedCallback>>>,
+    channels_changed: Arc<ChannelNotifications>,
     /// Identifies the current run of peer synchronisation. Writes carrying a
     /// stale epoch are dropped, which is what makes teardown ordering hold
     /// against a `JoinHandle::abort()` that has not taken effect yet.
@@ -213,14 +316,15 @@ impl AudioEngine {
             announced_channels: Vec::new(),
         }));
 
+        let shutdown = Arc::new(AtomicBool::new(false));
         let mut engine = AudioEngine {
             socket,
             endpoint,
             state,
             api_channels: Arc::new(Mutex::new(Vec::new())),
-            channels_changed: Arc::new(Mutex::new(None)),
+            channels_changed: Arc::new(ChannelNotifications::new(shutdown.clone())),
             sync_epoch: Arc::new(AtomicU64::new(1)),
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown,
             send_gate: Arc::new(RwLock::new(())),
             tasks: Arc::new(Mutex::new(Vec::new())),
         };
@@ -262,9 +366,7 @@ impl AudioEngine {
     }
 
     pub fn set_channels_changed_callback(&self, callback: ChannelsChangedCallback) {
-        if let Ok(mut current) = self.channels_changed.lock() {
-            *current = Some(callback);
-        }
+        self.channels_changed.set(callback);
     }
 
     /// The audio channels currently available in the session.
@@ -524,7 +626,11 @@ impl AudioEngine {
         channel_id: Id,
         callback: super::source::SourceCallback,
     ) -> Arc<Source> {
-        let source = Arc::new(Source::new(channel_id, callback));
+        let source = Arc::new(Source::new_managed(
+            channel_id,
+            callback,
+            self.shutdown.clone(),
+        ));
         self.with_state(|state| {
             state.sources.push(SourceEntry {
                 source: source.clone(),
@@ -638,29 +744,7 @@ impl AudioEngine {
     }
 
     fn publish_channels(&self) {
-        let (session_id, channels) =
-            self.with_state(|state| (state.session_id, state.channels.all_channels()));
-
-        // Session channels first, so the API list is ordered like upstream's.
-        let mut ordered: Vec<Channel> = channels
-            .iter()
-            .filter(|c| c.session_id == session_id)
-            .cloned()
-            .collect();
-        ordered.extend(channels.into_iter().filter(|c| c.session_id != session_id));
-
-        if let Ok(mut api_channels) = self.api_channels.lock() {
-            if *api_channels == ordered {
-                return;
-            }
-            *api_channels = ordered;
-        }
-
-        if let Ok(callback) = self.channels_changed.lock() {
-            if let Some(callback) = callback.as_ref() {
-                callback();
-            }
-        }
+        publish(&self.state, &self.api_channels, &self.channels_changed);
     }
 
     fn spawn_tasks(&mut self) {
@@ -1117,38 +1201,29 @@ fn split_byes(ids: &[Id]) -> Vec<ChannelByes> {
 fn publish(
     state: &Arc<Mutex<EngineState>>,
     api_channels: &Arc<Mutex<Vec<Channel>>>,
-    channels_changed: &Arc<Mutex<Option<ChannelsChangedCallback>>>,
+    channels_changed: &Arc<ChannelNotifications>,
 ) {
-    let (session_id, channels) = {
+    {
         let state = match state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        (state.session_id, state.channels.all_channels())
-    };
+        let session_id = state.session_id;
+        let channels = state.channels.all_channels();
+        let mut ordered: Vec<Channel> = channels
+            .iter()
+            .filter(|c| c.session_id == session_id)
+            .cloned()
+            .collect();
+        ordered.extend(channels.into_iter().filter(|c| c.session_id != session_id));
 
-    let mut ordered: Vec<Channel> = channels
-        .iter()
-        .filter(|c| c.session_id == session_id)
-        .cloned()
-        .collect();
-    ordered.extend(channels.into_iter().filter(|c| c.session_id != session_id));
-
-    match api_channels.lock() {
-        Ok(mut current) => {
-            if *current == ordered {
-                return;
-            }
-            *current = ordered;
+        let mut current = api_channels.lock().unwrap_or_else(|e| e.into_inner());
+        if *current == ordered {
+            return;
         }
-        Err(poisoned) => *poisoned.into_inner() = ordered,
+        *current = ordered;
     }
-
-    if let Ok(callback) = channels_changed.lock() {
-        if let Some(callback) = callback.as_ref() {
-            callback();
-        }
-    }
+    channels_changed.notify();
 }
 
 /// Dispatches a received message. Returns `true` if the visible set of
@@ -1389,6 +1464,122 @@ mod tests {
     use super::*;
     use crate::link::{beats::Beats, tempo::Tempo, timeline::Timeline};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn channel_notifications_coalesce_during_active_callback_and_registration() {
+        let notifications = Arc::new(ChannelNotifications::new(Arc::new(AtomicBool::new(false))));
+        let (entered, running) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        notifications.set(Box::new(move || {
+            entered.send(()).unwrap();
+            released.recv_timeout(StdDuration::from_secs(5)).unwrap();
+        }));
+        let worker_notifications = notifications.clone();
+        let worker = std::thread::spawn(move || worker_notifications.notify());
+        running.recv_timeout(StdDuration::from_secs(5)).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        notifications.set(Box::new(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+        }));
+        notifications.notify();
+        notifications.notify();
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn channel_notifications_preserve_reentrant_change_but_stop_after_close() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let notifications = Arc::new(ChannelNotifications::new(closed.clone()));
+        let nested = Arc::downgrade(&notifications);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        notifications.set(Box::new(move || {
+            if count.fetch_add(1, Ordering::AcqRel) == 0 {
+                nested.upgrade().unwrap().notify();
+            } else {
+                closed.store(true, Ordering::Release);
+                nested.upgrade().unwrap().notify();
+            }
+        }));
+        notifications.notify();
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        notifications.notify();
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn channel_notifications_survive_registration_and_callback_unwind() {
+        let notifications = ChannelNotifications::new(Arc::new(AtomicBool::new(false)));
+        notifications.notify();
+        notifications.set(Box::new(|| panic!("callback failure")));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            notifications.notify();
+        }))
+        .is_err());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        notifications.set(Box::new(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+        }));
+        notifications.notify();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn channel_notification_panic_drains_an_already_pending_replacement() {
+        let notifications = Arc::new(ChannelNotifications::new(Arc::new(AtomicBool::new(false))));
+        let (entered, running) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        notifications.set(Box::new(move || {
+            entered.send(()).unwrap();
+            released.recv_timeout(StdDuration::from_secs(5)).unwrap();
+            panic!("original callback failure");
+        }));
+        let worker_notifications = notifications.clone();
+        let worker = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_notifications.notify()
+            }))
+        });
+        running.recv_timeout(StdDuration::from_secs(5)).unwrap();
+        notifications.notify();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        notifications.set(Box::new(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+        }));
+        release.send(()).unwrap();
+        let failure = worker.join().unwrap().unwrap_err();
+        assert_eq!(
+            failure.downcast_ref::<&str>(),
+            Some(&"original callback failure")
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn panicking_callback_is_not_retried_and_pending_work_survives_until_replacement() {
+        let notifications = Arc::new(ChannelNotifications::new(Arc::new(AtomicBool::new(false))));
+        let nested = Arc::downgrade(&notifications);
+        notifications.set(Box::new(move || {
+            nested.upgrade().unwrap().notify();
+            panic!("failed callback must not be retried");
+        }));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            notifications.notify();
+        }))
+        .is_err());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        notifications.set(Box::new(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+        }));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
 
     fn addr() -> Ipv4Addr {
         Ipv4Addr::LOCALHOST

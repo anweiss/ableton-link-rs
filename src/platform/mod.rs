@@ -3,6 +3,7 @@
 // Now using 100% safe Rust implementations!
 
 pub mod clock;
+pub(crate) mod io_context;
 pub mod network;
 pub mod thread;
 

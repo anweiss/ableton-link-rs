@@ -48,14 +48,16 @@ impl LinkAudio {
     pub async fn new(bpm: f64, name: impl Into<String>) -> std::io::Result<Self> {
         let link = BasicLink::new(bpm).await?;
         let addr = local_ipv4()?;
+        let node_id = link.controller().node_id();
+        let session_id = link.controller().session_id();
+        let name = name.into();
         let engine = Arc::new(
-            AudioEngine::new(
-                addr,
-                link.controller().node_id(),
-                link.controller().session_id(),
-                name,
-            )
-            .await?,
+            link.controller()
+                .spawn_on_io(async move { AudioEngine::new(addr, node_id, session_id, name).await })
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!("LinkAudio startup failed: {error}"))
+                })??,
         );
 
         Ok(LinkAudio {
@@ -160,7 +162,7 @@ impl LinkAudio {
         let peers = self.link.controller().peers();
         let controller_peer_state = self.link.controller().peer_state.clone();
 
-        tokio::spawn(async move {
+        self.link.controller().spawn_on_io(async move {
             let mut interval = tokio::time::interval(PEER_SYNC_PERIOD);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -225,9 +227,9 @@ impl Drop for LinkAudio {
         if let Some(task) = self.sync_task.take() {
             task.abort();
         }
-        // `shutdown` sends the byes before it clears peers, and is idempotent,
-        // so it stays correct whether or not a sink or source is still holding
-        // the engine alive past this point.
+        // Close audio before core shutdown. Its tasks share the core executor:
+        // the following field drop joins both, even if an audio callback was
+        // already running or a source/sink retains the engine.
         self.engine.shutdown();
     }
 }
@@ -421,6 +423,165 @@ mod tests {
         to_session_state,
     };
     use chrono::Duration;
+
+    const SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+    fn announcement_peer(link: &LinkAudio) -> (std::net::UdpSocket, Vec<u8>) {
+        use crate::link_audio::{
+            messages::{encode_message, PEER_ANNOUNCEMENT},
+            payload::{ChannelAnnouncement, ChannelAnnouncements, Entry},
+        };
+        let socket = std::net::UdpSocket::bind((*link.audio_endpoint().ip(), 0)).unwrap();
+        let std::net::SocketAddr::V4(endpoint) = socket.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let peer = NodeId::new();
+        link.engine.saw_link_audio_endpoint(peer, Some(endpoint));
+        let payload = ChannelAnnouncements {
+            channels: vec![ChannelAnnouncement {
+                id: NodeId::new(),
+                name: "shutdown witness".into(),
+            }],
+        }
+        .to_payload();
+        (
+            socket,
+            encode_message(peer, 5, PEER_ANNOUNCEMENT, &payload).unwrap(),
+        )
+    }
+
+    async fn external_audio_drop_joins_real_receive_callback() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        let link = LinkAudio::new(120.0, "join witness").await.unwrap();
+        let expected = link
+            .controller()
+            .spawn_on_io(async { std::thread::current().id() })
+            .await
+            .unwrap();
+        let (peer, packet) = announcement_peer(&link);
+        let engine = link.engine.clone();
+        let epoch = engine.sync_epoch();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let (started, running) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        link.set_channels_changed_callback(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+            started.send(std::thread::current().id()).unwrap();
+            released.recv_timeout(SHUTDOWN_TIMEOUT).unwrap();
+        });
+        peer.send_to(&packet, link.audio_endpoint()).unwrap();
+        // Blocking the caller runtime proves this is real owned-executor work.
+        assert_eq!(running.recv_timeout(SHUTDOWN_TIMEOUT).unwrap(), expected);
+        let (finished, done) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(link);
+            finished.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        while engine.sync_epoch() == epoch {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audio admission did not close"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release.send(()).unwrap();
+        done.recv_timeout(SHUTDOWN_TIMEOUT).unwrap();
+        dropper.join().unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn audio_drop_joins_receive_callback_with_current_thread_caller() {
+        external_audio_drop_joins_real_receive_callback().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audio_drop_joins_receive_callback_with_multithread_caller() {
+        external_audio_drop_joins_real_receive_callback().await;
+    }
+
+    #[tokio::test]
+    async fn audio_receive_callback_can_drop_link_without_self_join() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc, Mutex,
+        };
+        let link = LinkAudio::new(120.0, "reentrant witness").await.unwrap();
+        let (peer, packet) = announcement_peer(&link);
+        let endpoint = link.audio_endpoint();
+        let session = Arc::downgrade(&link.controller().session_state);
+        let owner = Arc::new(Mutex::new(None::<LinkAudio>));
+        let current = owner.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let (finished, done) = mpsc::channel();
+        link.set_channels_changed_callback(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+            drop(current.lock().unwrap().take());
+            finished.send(()).unwrap();
+        });
+        *owner.lock().unwrap() = Some(link);
+        peer.send_to(&packet, endpoint).unwrap();
+        done.recv_timeout(SHUTDOWN_TIMEOUT).unwrap();
+        let deadline = std::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        while session.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reentrant core cleanup did not finish"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn audio_drop_completes_peer_sync_cancellation_without_caller_progress() {
+        let mut link = LinkAudio::new(120.0, "sync witness").await.unwrap();
+        for _ in 0..3 {
+            link.enable_link_audio(true);
+            link.enable_link_audio(false);
+        }
+        link.enable_link_audio(true);
+        let task = link.sync_task.as_ref().unwrap().abort_handle();
+        let engine = Arc::downgrade(&link.engine);
+        drop(link);
+        assert!(task.is_finished());
+        assert!(engine.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn final_channel_disappearance_is_delivered_after_a_running_callback() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        let link = LinkAudio::new(120.0, "notification witness").await.unwrap();
+        let (peer, packet) = announcement_peer(&link);
+        let engine = Arc::downgrade(&link.engine);
+        let calls = AtomicUsize::new(0);
+        let (observed, notifications) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        link.set_channels_changed_callback(move || {
+            observed
+                .send(engine.upgrade().unwrap().channels().len())
+                .unwrap();
+            if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                released.recv_timeout(SHUTDOWN_TIMEOUT).unwrap();
+            }
+        });
+        peer.send_to(&packet, link.audio_endpoint()).unwrap();
+        assert_eq!(notifications.recv_timeout(SHUTDOWN_TIMEOUT).unwrap(), 1);
+        link.engine.end_peer_sync();
+        assert!(link.channels().is_empty());
+        release.send(()).unwrap();
+        assert_eq!(notifications.recv_timeout(SHUTDOWN_TIMEOUT).unwrap(), 0);
+    }
 
     fn session_state() -> SessionState {
         to_session_state(
