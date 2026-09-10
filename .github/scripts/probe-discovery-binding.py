@@ -6,9 +6,9 @@ expects the current indexed UDP mechanism to send through a replacement.
 """
 
 import contextlib
+import errno
 import json
 import os
-from pathlib import Path
 import selectors
 import socket
 import struct
@@ -60,7 +60,7 @@ def peer():
 def packet_socket():
     result = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_IP))
     try:
-        result.bind(("veth-a", 0))
+        result.bind(("veth-a", ETH_IP))
     except BaseException:
         result.close()
         raise
@@ -77,7 +77,8 @@ def checksum(data):
 
 
 def frame(source_port, payload):
-    host = bytes.fromhex(Path("/sys/class/net/veth-a/address").read_text().strip().replace(":", ""))
+    local = json.loads(run("ip", "-j", "link", "show", "veth-a").stdout)[0]
+    host = bytes.fromhex(local["address"].replace(":", ""))
     remote = json.loads(run("ip", "-n", "link154-a", "-j", "link", "show", "peer-a").stdout)[0]
     destination = bytes.fromhex(remote["address"].replace(":", ""))
     udp = struct.pack("!HHHH", source_port, PORT, 8 + len(payload), 0) + payload
@@ -144,7 +145,7 @@ def main():
             try:
                 packet.send(frame(udp.getsockname()[1], b"stale-bound-packet"))
             except OSError as error:
-                if error.errno != 6:  # ENXIO: cached device was cleared on unregister.
+                if error.errno != errno.ENXIO:
                     raise
                 packet_error = {"errno": error.errno, "message": str(error)}
             else:
