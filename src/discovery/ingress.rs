@@ -22,9 +22,13 @@ impl PacketSocket {
     pub fn new(addr: SocketAddrV4, index: Option<u32>) -> io::Result<Self> {
         let info = PktInfoUdpSocket::new(socket2::Domain::IPV4)?;
         info.set_nonblocking(true)?;
-        info.set_reuse_address(true)?;
-        #[cfg(unix)]
-        info.set_reuse_port(true)?;
+        // Preserve sharing for explicit ports, including the discovery listener.
+        // Ephemeral sockets must not opt into sharing their unicast receive queue.
+        if addr.port() != 0 {
+            info.set_reuse_address(true)?;
+            #[cfg(unix)]
+            info.set_reuse_port(true)?;
+        }
         // Winsock's duplicated descriptor must be created after bind; a clone
         // of the unbound descriptor does not acquire the later local endpoint.
         info.bind(&addr.into())?;
@@ -215,7 +219,10 @@ fn pin_egress(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use crate::discovery::socket_test_support::{
+        assert_ephemeral_socket_is_unshared, shared_loopback_socket,
+    };
+    use std::net::{Ipv4Addr, SocketAddr};
 
     #[tokio::test]
     async fn packet_info_and_tokio_handles_share_the_bound_endpoint() {
@@ -243,5 +250,27 @@ mod tests {
         assert_eq!(&buffer[..size], b"metadata");
         assert_eq!(metadata.addr_src, sender.local_addr().unwrap());
         assert_ne!(metadata.if_index, 0);
+    }
+
+    #[tokio::test]
+    async fn an_ephemeral_bind_keeps_its_port_to_itself() {
+        let socket = PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap();
+        assert_ephemeral_socket_is_unshared(&socket);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_port_can_still_be_shared() {
+        let reservation = shared_loopback_socket(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into());
+        let SocketAddr::V4(endpoint) = reservation.local_addr().unwrap().as_socket().unwrap()
+        else {
+            panic!("expected IPv4");
+        };
+        assert_ne!(endpoint.port(), 0);
+        let socket = PacketSocket::new(endpoint, None).unwrap();
+        assert_eq!(socket.local_addr().unwrap(), SocketAddr::V4(endpoint));
+        let options = socket2::SockRef::from(socket.socket.as_ref());
+        assert!(options.reuse_address().unwrap());
+        #[cfg(unix)]
+        assert!(options.reuse_port().unwrap());
     }
 }
