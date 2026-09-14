@@ -262,9 +262,14 @@ mod tests {
         };
         let intruder = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)
             .and_then(|intruder| {
-                intruder.set_reuse_address(true)?;
+                // Winsock lets `SO_REUSEADDR` take over an endpoint whatever the
+                // first socket asked for, so the intruder claims nothing there
+                // and the bind alone reports whether the port is exclusive.
                 #[cfg(unix)]
-                intruder.set_reuse_port(true)?;
+                {
+                    intruder.set_reuse_address(true)?;
+                    intruder.set_reuse_port(true)?;
+                }
                 intruder.bind(&endpoint.into())?;
                 Ok(intruder)
             });
