@@ -22,9 +22,16 @@ impl PacketSocket {
     pub fn new(addr: SocketAddrV4, index: Option<u32>) -> io::Result<Self> {
         let info = PktInfoUdpSocket::new(socket2::Domain::IPV4)?;
         info.set_nonblocking(true)?;
-        info.set_reuse_address(true)?;
-        #[cfg(unix)]
-        info.set_reuse_port(true)?;
+        // Only the fixed discovery port is shared, by the listener and by other
+        // Link instances on the host. Requesting port sharing for an ephemeral
+        // bind buys nothing and costs correctness: the kernel may then hand out a
+        // port another `SO_REUSEPORT` socket already holds, and the resulting
+        // reuseport group delivers each datagram to just one of its members.
+        if addr.port() != 0 {
+            info.set_reuse_address(true)?;
+            #[cfg(unix)]
+            info.set_reuse_port(true)?;
+        }
         // Winsock's duplicated descriptor must be created after bind; a clone
         // of the unbound descriptor does not acquire the later local endpoint.
         info.bind(&addr.into())?;
@@ -215,7 +222,7 @@ fn pin_egress(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr};
 
     #[tokio::test]
     async fn packet_info_and_tokio_handles_share_the_bound_endpoint() {
@@ -243,5 +250,27 @@ mod tests {
         assert_eq!(&buffer[..size], b"metadata");
         assert_eq!(metadata.addr_src, sender.local_addr().unwrap());
         assert_ne!(metadata.if_index, 0);
+    }
+
+    #[tokio::test]
+    async fn an_ephemeral_bind_keeps_its_port_to_itself() {
+        // A shared ephemeral port is never wanted, and a reuseport group would
+        // hand each arriving datagram to only one of its members.
+        let socket = PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap();
+        let SocketAddr::V4(endpoint) = socket.local_addr().unwrap() else {
+            panic!("expected IPv4");
+        };
+        let intruder = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)
+            .and_then(|intruder| {
+                intruder.set_reuse_address(true)?;
+                #[cfg(unix)]
+                intruder.set_reuse_port(true)?;
+                intruder.bind(&endpoint.into())?;
+                Ok(intruder)
+            });
+        assert!(
+            intruder.is_err(),
+            "another socket joined the ephemeral port of a discovery socket"
+        );
     }
 }

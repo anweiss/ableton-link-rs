@@ -51,12 +51,21 @@ fn new_std_udp_reuseport(addr: SocketAddr) -> std::io::Result<std::net::UdpSocke
 
     let udp_sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
 
-    udp_sock.set_reuse_address(true)?;
+    // Port sharing is only ever wanted for the fixed discovery port, where the
+    // listener, `send_byebye` and other Link instances must all bind the same
+    // number. An ephemeral bind cannot share a port deliberately, and asking for
+    // it is harmful: the kernel is then free to hand out a port another
+    // `SO_REUSEPORT` socket already holds, which silently joins both into one
+    // reuseport group and delivers each datagram to only one of them.
+    if addr.port() != 0 {
+        udp_sock.set_reuse_address(true)?;
 
-    // Set SO_REUSEPORT on Unix systems so multiple sockets (discovery listener,
-    // send_byebye, etc.) can bind to the same multicast port concurrently.
-    #[cfg(unix)]
-    udp_sock.set_reuse_port(true)?;
+        // Set SO_REUSEPORT on Unix systems so multiple sockets (discovery
+        // listener, send_byebye, etc.) can bind to the same multicast port
+        // concurrently.
+        #[cfg(unix)]
+        udp_sock.set_reuse_port(true)?;
+    }
 
     // On Linux, a socket bound to a port receives datagrams for *any* multicast
     // group joined by any socket on the host, including groups this socket never
