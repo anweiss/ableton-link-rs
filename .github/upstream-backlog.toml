@@ -280,6 +280,17 @@ retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "`encodeMessage` is now inside the `try` block so encoding errors (e.g. oversized payload) are caught and logged instead of propagating; previously only the `send()` call was guarded. Ported: `encode_message` now returns `EncodeError::MessageTooLarge` (an additive variant on the already-`non_exhaustive` `EncodeError`, so the public `Error` enum is unchanged) instead of panicking, and `send_message` logs and returns `Ok(())` on that error instead of unwrapping. The submodule pin was not advanced past this commit because several outstanding backlog items (e.g. `have-peers-notify-on-audioendpoint-changes`, `increase-thread-priority-on-link-io-thread`) sit earlier in upstream ancestry and remain unaudited."
 impact = "Only the send itself was protected against failure, not the step that builds the packet. A peer state too large to fit in one packet - many advertised addresses, a long name - would therefore abort the process rather than being logged and dropped."
 
+[[port]]
+id = "linkaudio-foundational-session-and-channel-discovery-messages"
+title = "Understand and re-emit the earliest audio-sharing session and channel-discovery messages"
+upstream = ["5f10939170e6", "bdf289c877d7", "5a43a7d7373a", "0e5d381d8bcd", "f8bd7b27db80", "5b9b31c84926", "c33a3aab6e6a", "07d7afb52027", "5f871bea5fb2"]
+rust = ["src/link_audio/api.rs", "src/link_audio/engine.rs", "src/link_audio/messages.rs", "src/link_audio/payload.rs"]
+risk = "wire-format"
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
+why = "These commits laid the first foundations of upstream's LinkAudio subsystem: `link_audio::Controller`/`SessionController` (`5f10939170e6`), the public `LinkAudio` API surface and its `enable`/`isEnabled` pair (`bdf289c877d7`, `5a43a7d7373a`), the `v1::Messages` header/message-type constants (`0e5d381d8bcd`), the `PeerInfo` payload entry carrying a truncated peer name (`f8bd7b27db80`), `PeerAnnouncement` bundling node id, session id and peer info (`5b9b31c84926`), `link_audio::Id` as an alias for `link::NodeId` (`c33a3aab6e6a`), and `ChannelAnnouncements` plus folding it into `PeerAnnouncement` (`07d7afb52027`, `5f871bea5fb2`). All of this predates and is superseded by this crate's full LinkAudio port (PR #70, merged after this backlog item was first drafted as an undifferentiated undecided block): `src/link_audio/messages.rs` defines the same message-type/header constants, `src/link_audio/payload.rs` defines `PeerInfo`, `ChannelAnnouncement(s)` and `PeerAnnouncement` with matching fields (`payload::Id = NodeId`), and `src/link_audio/api.rs`'s `LinkAudio::enable_link_audio`/`is_link_audio_enabled` mirror upstream's `enableLinkAudio`/`isLinkAudioEnabled`. Retired without further action; `dfc04253b0ce` (the `LinkAudioHut` example added alongside the enable API) is filed separately as not-applicable since it only touches `examples/linkaudiohut/main.cpp`."
+impact = "No user-visible effect from this reclassification: these commits are the earliest building blocks of Ableton's optional audio-streaming feature - a peer announcing itself, its session, and the channels it offers - and this crate already ships that feature today behind its optional audio cargo feature, added in a prior release. This entry only corrects the bookkeeping so the commits stop appearing as an open question."
+
 # ---------------------------------------------------------------------------
 # Commits seen and consciously parked. Kept so that coverage stays provable:
 # a commit nobody mentions is not deferred, it is deleted the moment the pin
@@ -288,16 +299,6 @@ impact = "Only the send itself was protected against failure, not the step that 
 
 [[undecided]]
 upstream = [
-  "5f10939170e6",
-  "bdf289c877d7",
-  "dfc04253b0ce",
-  "5a43a7d7373a",
-  "0e5d381d8bcd",
-  "f8bd7b27db80",
-  "5b9b31c84926",
-  "c33a3aab6e6a",
-  "07d7afb52027",
-  "5f871bea5fb2",
   "62c7f1f5af18",
   "44d30cb2718c",
   "adcee8b31d1c",
@@ -366,7 +367,7 @@ upstream = [
   "d8a47ba239f6",
 ]
 note = """
-Note: these commits predate `src/link_audio/` landing in this crate (PR #70, merged after this list was first drafted). LinkAudio is now ported behind the optional `audio` feature and its commits should be triaged normally against the module map on future runs, not re-parked here. Left verbatim pending a full re-triage pass; no new LinkAudio commits appeared in this run's drift range to reconcile against.
+Note: these commits predate `src/link_audio/` landing in this crate (PR #70, merged after this list was first drafted). LinkAudio is now ported behind the optional `audio` feature and its commits should be triaged normally against the module map on future runs, not re-parked here. This run reclassified the earliest 9 of these (Controller/SessionController, the enable API, v1::Messages, PeerInfo, PeerAnnouncement, link_audio::Id, ChannelAnnouncements) into the `linkaudio-foundational-session-and-channel-discovery-messages` port item above, and its accompanying example commit `dfc04253b0ce` into not_applicable, since all are already covered by the existing port. The remainder of this list — channel discovery, sink/source processors, buffering, codecs, thread priority, and the abl_link C extension work — is left verbatim pending a further re-triage pass against the module map.
 """
 
 # Confined to deliberately-not-ported paths (ASIO, ESP32 platform, C++
@@ -375,6 +376,10 @@ Note: these commits predate `src/link_audio/` landing in this crate (PR #70, mer
 [[not_applicable]]
 upstream = ["4c0893746cd1"]
 reason = "Update asio to version 1.36.0 (ASIO submodule + wrapper)"
+
+[[not_applicable]]
+upstream = ["dfc04253b0ce"]
+reason = "Add LinkAudioHut example (examples/linkaudiohut/main.cpp only)"
 
 [[not_applicable]]
 upstream = ["9fb266242ffa"]
