@@ -88,6 +88,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Discovery, measurement, and reply sockets bound to port `0` leave address/port
+reuse disabled so ephemeral unicast sockets do not opt into port sharing.
+Explicit nonzero ports retain sharing, including the discovery listener on UDP
+20808. This is not a Windows `SO_EXCLUSIVEADDRUSE` guarantee against another
+application forcibly binding with `SO_REUSEADDR`.
+
 Each controller owns a dedicated `Link IO` thread and current-thread Tokio runtime.
 External drop closes callback admission and joins that thread before returning.
 `link.disable().await` remains the restartable way to quiesce dispatch.
