@@ -53,7 +53,7 @@ tools:
     - "sed:*"
     - "ls:*"
     - "rg:*"
-    - "python3:*"
+    - "/usr/bin/python3:*"
 
 safe-outputs:
   create-pull-request:
@@ -108,6 +108,8 @@ imports:
   - shared/link-upstream-context.md
 
 steps:
+  - name: Verify backlog validator runtime
+    run: /usr/bin/python3 -c "import sys, tomllib; assert sys.version_info >= (3, 11)"
   - name: Compute upstream drift
     run: ./.github/scripts/link-upstream-drift.sh
 ---
@@ -128,9 +130,9 @@ The backlog is the file `.github/upstream-backlog.toml`, checked out in the repo
 you are working in. Read it first. Your output is a **pull request that edits that
 file** — nothing else.
 
-- If triage changes nothing (every commit in `commits.txt` is already accounted for in
-  the file, and nothing retired since the last run), say so in one line and stop. Do
-  not open an empty pull request.
+- If triage changes nothing after the bounded pass below (every commit in
+  `commits.txt` is accounted for, nothing retired, and no historical classification
+  changed), call `noop` with a one-line summary. Do not open an empty pull request.
 - Otherwise, edit the file and let `create-pull-request` propose it. Title it as a
   conventional commit, e.g. `chore: triage upstream drift through <short-sha>`.
 
@@ -230,15 +232,52 @@ file cannot be trusted on its own and why
 range on every push. Run it yourself before you finish:
 
 ```bash
-python3 .github/scripts/validate-upstream-backlog.py
+/usr/bin/python3 .github/scripts/validate-upstream-backlog.py
 ```
 
 If it exits non-zero, fix the file until it does not. Do not open a pull request that
 fails it — that check is required on `main`, so it will not merge anyway.
 
+Use **`/usr/bin/python3` for all Python commands**, including TOML reads. The runner's
+system interpreter has `tomllib`; bare `python3` can resolve to an older PyPy from the
+hosted tool cache. Do not install packages, inject a TOML shim, or replace the
+validator with a hand-written coverage check. If the approved interpreter cannot run
+the validator, report the error with `missing_tool` and stop without proposing a PR.
+Do not retry denied commands through alternate paths or wrappers.
+
 ## How to triage
 
-Work through `/tmp/gh-aw/agent/upstream/commits.txt` oldest first. For each commit,
+### Bound the work before reading diffs
+
+The 120 LLM invocations are a **pooled per-run budget**, not a separate allowance for
+each agent. Work in this agent only; do not delegate or launch background sub-agents.
+
+Read the backlog and drift list once using `/usr/bin/python3` and `tomllib`. Compare
+the drift SHAs with the `upstream` arrays in **all three buckets**, not just ports.
+Separate newly uncovered commits from existing classifications before reading diffs:
+
+1. Account for **every newly uncovered commit**, oldest first. Coverage remains
+   mandatory; the batch limit below never permits dropping a new SHA.
+2. Carry existing classifications forward rather than re-reading every historical
+   diff. Preserve live port items and maintainer `blocked_on` text as required below.
+   Retire items whose SHAs have all passed the pin and refresh the watermark.
+3. Only after covering new commits, revisit at most **10 existing undecided SHAs**
+   whose rationale is obsolete (for example, that LinkAudio is not ported). Choose
+   them in drift order. Keep every unprocessed SHA and its existing note in
+   `[[undecided]]` for a later run; never reclassify it without evidence. Report the
+   number left for later in the PR body, without claiming the backlog is fully
+   re-triaged. This is not permission to put new LinkAudio work in `[[undecided]]`.
+
+Batch related diff reads and keep summaries compact. Reserve the final **20
+invocations** for editing, running the validator, reviewing the diff, and calling
+`create-pull-request`. Stop optional historical re-triage before that reserve.
+If mandatory new-commit coverage cannot be completed within the budget, use the
+`create-issue` escape hatch to report the incomplete triage and stop; do not submit
+an invalid or watermark-only PR, or call `noop` as though triage succeeded.
+
+### Classify the selected commits
+
+Work through the selected commits oldest first. For each commit,
 use `git -C vendor/ableton-link show --stat <sha>` to see what it touched, then read
 the actual diff for anything that lands in a mapped path. Put each commit in exactly
 one bucket:
@@ -305,20 +344,18 @@ Five things have to be true of the diff you propose.
 The port workflow advances the submodule pin, and once the pin moves past a commit that
 commit is gone from the next drift report for good. A commit you never mention is
 therefore not "deferred", it is deleted. So coverage is the property that matters most
-here, ahead of how neatly the file reads.
+here, ahead of how neatly the file reads. Historical undecided SHAs carried forward
+by the bounded pass still have a bucket; an unmentioned new SHA does not.
 
 The validator computes this for you, and fails the pull request if a commit in the
-drift range appears nowhere in the file. Run it rather than eyeballing coverage. If
-you want the check before you have finished editing:
+drift range appears nowhere in the file. Run it rather than eyeballing coverage,
+including when you want to check before you have finished editing:
 
 ```bash
-cut -f1 /tmp/gh-aw/agent/upstream/commits.txt | grep . | while read sha; do
-  grep -qiF "${sha:0:7}" .github/upstream-backlog.toml || echo "UNACCOUNTED $sha"
-done
+/usr/bin/python3 .github/scripts/validate-upstream-backlog.py
 ```
 
-Every line that command prints is a commit you are about to drop on the floor. Go back
-and classify it, then run it again.
+Classify every commit reported as missing, then run it again.
 
 A group must name each SHA it covers rather than trailing off with "and related
 commits" — the validator matches on full SHAs, so an unnamed one reads as unaccounted.
