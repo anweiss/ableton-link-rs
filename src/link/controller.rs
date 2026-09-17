@@ -1254,11 +1254,22 @@ impl Controller {
     }
 
     /// Announces a LinkAudio endpoint in this node's peer state, so that peers
-    /// can discover where to send audio traffic.
+    /// can discover where to send audio traffic. Passing `None` withdraws it.
+    ///
+    /// Unlike the read-only accessors above, this one blocks on the lock
+    /// rather than skipping on contention. A dropped read returns a stale
+    /// answer to one caller; a dropped write is a lost state transition: the
+    /// audio-sharing lifecycle in `LinkAudio` would believe the endpoint
+    /// withdrawn while peers kept seeing it announced, and no later call would
+    /// correct it. No holder of this mutex keeps its guard across an await or
+    /// does blocking work under it — every critical section is a few field
+    /// reads or a clone — so the wait here is bounded.
     pub fn set_audio_endpoint(&self, endpoint: Option<SocketAddrV4>) {
-        if let Ok(mut peer_state) = self.peer_state.try_lock() {
-            peer_state.audio_endpoint = endpoint;
-        }
+        let mut peer_state = self
+            .peer_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        peer_state.audio_endpoint = endpoint;
     }
 }
 

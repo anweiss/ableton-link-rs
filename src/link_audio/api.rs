@@ -718,6 +718,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_is_withdrawn_even_while_peer_state_is_locked() {
+        // Withdrawing the endpoint is a state transition, not a reading of
+        // one: if the write is dropped because the peer-state lock happened to
+        // be held, the peer-sync task stops while peers keep seeing this
+        // peer's endpoint announced, and nothing later corrects it — clearing
+        // the request afterwards is a no-op, so the next enable re-advertises
+        // an endpoint that was supposed to be gone.
+        let mut link = LinkAudio::new(120.0, "contention witness").await.unwrap();
+        link.enable().await;
+        link.enable_link_audio(true);
+        assert!(link
+            .link
+            .controller()
+            .peer_state
+            .lock()
+            .unwrap()
+            .audio_endpoint
+            .is_some());
+
+        let peer_state = link.link.controller().peer_state.clone();
+        let holder = std::thread::spawn(move || {
+            let guard = peer_state.lock().unwrap();
+            std::thread::sleep(StdDuration::from_millis(100));
+            drop(guard);
+        });
+        // Give the holder time to actually take the lock, so the teardown
+        // below runs into real contention rather than racing it.
+        std::thread::sleep(StdDuration::from_millis(20));
+
+        link.disable().await;
+        holder.join().unwrap();
+
+        assert!(link
+            .link
+            .controller()
+            .peer_state
+            .lock()
+            .unwrap()
+            .audio_endpoint
+            .is_none());
+        assert!(link.sync_task.is_none());
+    }
+
+    #[tokio::test]
     async fn final_channel_disappearance_is_delivered_after_a_running_callback() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
