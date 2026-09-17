@@ -39,6 +39,11 @@ pub struct LinkAudio {
     link: BasicLink,
     engine: Arc<AudioEngine>,
     sync_task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether the application asked for audio sharing via
+    /// [`LinkAudio::enable_link_audio`]. Audio is only *effectively* running
+    /// while this is also true and the underlying [`BasicLink`] is enabled —
+    /// see [`LinkAudio::update_is_link_audio_enabled`].
+    audio_enabled_by_user: bool,
 }
 
 impl LinkAudio {
@@ -64,23 +69,52 @@ impl LinkAudio {
             link,
             engine,
             sync_task: None,
+            audio_enabled_by_user: false,
         })
     }
 
-    /// Is audio sharing currently enabled?
+    /// Is audio sharing currently enabled? Reflects the request made through
+    /// [`LinkAudio::enable_link_audio`], regardless of whether the underlying
+    /// [`BasicLink`] is itself enabled.
     pub fn is_link_audio_enabled(&self) -> bool {
-        self.sync_task.is_some()
+        self.audio_enabled_by_user
     }
 
     /// Enables or disables audio sharing. While enabled, this peer's audio
     /// endpoint is announced to the session in the Link `aep4` payload entry
     /// and peers' endpoints are tracked.
+    ///
+    /// Audio sharing only actually runs while the underlying [`BasicLink`] is
+    /// also enabled: disabling Link (see [`LinkAudio::disable`]) stops audio
+    /// too, and re-enabling Link resumes it if this is still `true`. Ported
+    /// from upstream's `fcaefc6d3bec` ("Set LinkAudio to disabled when Link is
+    /// disabled").
     pub fn enable_link_audio(&mut self, enable: bool) {
-        if enable == self.is_link_audio_enabled() {
+        if enable == self.audio_enabled_by_user {
             return;
         }
 
-        if enable {
+        self.audio_enabled_by_user = enable;
+        self.update_is_link_audio_enabled();
+    }
+
+    /// Whether audio sharing is actually running: requested by the
+    /// application *and* the underlying [`BasicLink`] is enabled.
+    fn is_link_audio_effectively_enabled(&self) -> bool {
+        self.sync_task.is_some()
+    }
+
+    /// Starts or stops audio sharing to match `audio_enabled_by_user &&
+    /// self.link.is_enabled()`, mirroring upstream's
+    /// `updateIsLinkAudioEnabled`.
+    fn update_is_link_audio_enabled(&mut self) {
+        let should_be_enabled = self.audio_enabled_by_user && self.link.is_enabled();
+
+        if should_be_enabled == self.is_link_audio_effectively_enabled() {
+            return;
+        }
+
+        if should_be_enabled {
             let epoch = self.engine.begin_peer_sync();
             self.link
                 .controller()
@@ -93,6 +127,23 @@ impl LinkAudio {
             }
             self.engine.end_peer_sync();
         }
+    }
+
+    /// Enables discovery and dispatch on the underlying [`BasicLink`], and
+    /// resumes audio sharing if [`LinkAudio::enable_link_audio`] had been
+    /// requested while Link was disabled.
+    pub async fn enable(&mut self) {
+        self.link.enable().await;
+        self.update_is_link_audio_enabled();
+    }
+
+    /// Disables discovery and dispatch on the underlying [`BasicLink`]. Audio
+    /// sharing is stopped for as long as Link remains disabled, even if it
+    /// was requested via [`LinkAudio::enable_link_audio`]; a later
+    /// [`LinkAudio::enable`] resumes it.
+    pub async fn disable(&mut self) {
+        self.link.disable().await;
+        self.update_is_link_audio_enabled();
     }
 
     /// The local peer name used for identification in the session.
@@ -543,6 +594,7 @@ mod tests {
     #[tokio::test]
     async fn audio_drop_completes_peer_sync_cancellation_without_caller_progress() {
         let mut link = LinkAudio::new(120.0, "sync witness").await.unwrap();
+        link.enable().await;
         for _ in 0..3 {
             link.enable_link_audio(true);
             link.enable_link_audio(false);
@@ -553,6 +605,29 @@ mod tests {
         drop(link);
         assert!(task.is_finished());
         assert!(engine.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn audio_sharing_does_not_run_while_link_is_disabled() {
+        // Ported from upstream's `fcaefc6d3bec` ("Set LinkAudio to disabled
+        // when Link is disabled"): requesting audio sharing before Link is
+        // enabled must not start it, and disabling Link must stop it even
+        // though the application never asked to turn audio off.
+        let mut link = LinkAudio::new(120.0, "enablement witness").await.unwrap();
+
+        link.enable_link_audio(true);
+        assert!(link.is_link_audio_enabled());
+        assert!(link.sync_task.is_none());
+
+        link.enable().await;
+        assert!(link.sync_task.is_some());
+
+        link.disable().await;
+        assert!(link.is_link_audio_enabled());
+        assert!(link.sync_task.is_none());
+
+        link.enable().await;
+        assert!(link.sync_task.is_some());
     }
 
     #[tokio::test]
