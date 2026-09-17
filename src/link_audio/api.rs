@@ -8,7 +8,7 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    ops::{Deref, DerefMut},
+    ops::Deref,
     sync::Arc,
     time::Duration as StdDuration,
 };
@@ -33,8 +33,18 @@ const PEER_SYNC_PERIOD: StdDuration = StdDuration::from_millis(250);
 
 /// Link with audio sharing.
 ///
-/// `LinkAudio` derefs to [`BasicLink`], so the entire Link API is available on
-/// it. Use [`LinkAudio::enable_link_audio`] to start sharing audio.
+/// `LinkAudio` derefs to [`BasicLink`], so the read-only parts of the Link API
+/// are available on it directly. The parts of `BasicLink` that take `&mut self`
+/// — [`LinkAudio::enable`], [`LinkAudio::disable`], the callback setters,
+/// [`LinkAudio::enable_start_stop_sync`] and
+/// [`LinkAudio::commit_app_session_state`] — are forwarded explicitly rather
+/// than through `DerefMut`. That is deliberate: audio sharing may only run
+/// while Link itself is enabled, and a public `DerefMut` would hand out a
+/// `&mut BasicLink` on which `disable` could be called directly, disabling Link
+/// while the peer-sync task and this peer's announced audio endpoint stayed
+/// live.
+///
+/// Use [`LinkAudio::enable_link_audio`] to start sharing audio.
 pub struct LinkAudio {
     link: BasicLink,
     engine: Arc<AudioEngine>,
@@ -121,12 +131,20 @@ impl LinkAudio {
                 .set_audio_endpoint(Some(self.engine.endpoint()));
             self.sync_task = Some(self.spawn_peer_sync(epoch));
         } else {
-            self.link.controller().set_audio_endpoint(None);
-            if let Some(task) = self.sync_task.take() {
-                task.abort();
-            }
-            self.engine.end_peer_sync();
+            self.stop_audio_sharing();
         }
+    }
+
+    /// Withdraws the audio endpoint and stops the peer-sync task, leaving
+    /// `audio_enabled_by_user` alone so a later
+    /// [`LinkAudio::update_is_link_audio_enabled`] can resume sharing.
+    /// Synchronous and idempotent, so it can run before an await point.
+    fn stop_audio_sharing(&mut self) {
+        self.link.controller().set_audio_endpoint(None);
+        if let Some(task) = self.sync_task.take() {
+            task.abort();
+        }
+        self.engine.end_peer_sync();
     }
 
     /// Enables discovery and dispatch on the underlying [`BasicLink`], and
@@ -142,8 +160,58 @@ impl LinkAudio {
     /// was requested via [`LinkAudio::enable_link_audio`]; a later
     /// [`LinkAudio::enable`] resumes it.
     pub async fn disable(&mut self) {
+        // `BasicLink::disable` publishes its disabled state before its first
+        // await so that cancelling the future cannot leave Link reporting
+        // enabled with only part of the pipeline stopped. Audio teardown has
+        // to sit on the same side of that await for the same reason: dropping
+        // this future while it is pending would otherwise leave the peer-sync
+        // task running and this peer's audio endpoint announced against a
+        // disabled session. The request is preserved, so a later
+        // `LinkAudio::enable` resumes sharing.
+        self.stop_audio_sharing();
         self.link.disable().await;
-        self.update_is_link_audio_enabled();
+    }
+
+    /// Forwards to [`BasicLink::enable_start_stop_sync`].
+    pub fn enable_start_stop_sync(&mut self, enable: bool) {
+        self.link.enable_start_stop_sync(enable);
+    }
+
+    /// Forwards to [`BasicLink::set_num_peers_callback`].
+    pub fn set_num_peers_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(usize) + Send + 'static,
+    {
+        self.link.set_num_peers_callback(callback);
+    }
+
+    /// Forwards to [`BasicLink::set_tempo_callback`].
+    pub fn set_tempo_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(f64) + Send + 'static,
+    {
+        self.link.set_tempo_callback(callback);
+    }
+
+    /// Forwards to [`BasicLink::set_start_stop_callback`].
+    pub fn set_start_stop_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(bool) + Send + 'static,
+    {
+        self.link.set_start_stop_callback(callback);
+    }
+
+    /// Forwards to [`BasicLink::set_audio_endpoint_callback`].
+    pub fn set_audio_endpoint_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(crate::link::node::NodeId, Option<SocketAddrV4>) + Send + 'static,
+    {
+        self.link.set_audio_endpoint_callback(callback);
+    }
+
+    /// Forwards to [`BasicLink::commit_app_session_state`].
+    pub async fn commit_app_session_state(&mut self, state: SessionState) {
+        self.link.commit_app_session_state(state).await;
     }
 
     /// The local peer name used for identification in the session.
@@ -257,12 +325,6 @@ impl Deref for LinkAudio {
 
     fn deref(&self) -> &Self::Target {
         &self.link
-    }
-}
-
-impl DerefMut for LinkAudio {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.link
     }
 }
 
@@ -628,6 +690,31 @@ mod tests {
 
         link.enable().await;
         assert!(link.sync_task.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_disable_still_stops_audio_sharing() {
+        // `BasicLink::disable` publishes its disabled state before its first
+        // await so cancellation cannot leave Link half-disabled. Audio
+        // teardown has to be on the same side of that await, or a dropped
+        // `disable` future leaves the peer-sync task running and this peer's
+        // audio endpoint announced against a disabled session.
+        use std::{future::Future, task::Poll};
+
+        let mut link = LinkAudio::new(120.0, "cancellation witness").await.unwrap();
+        link.enable().await;
+        link.enable_link_audio(true);
+        assert!(link.sync_task.is_some());
+
+        {
+            let mut disabling = Box::pin(link.disable());
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(matches!(disabling.as_mut().poll(&mut cx), Poll::Pending));
+        }
+
+        assert!(link.sync_task.is_none());
+        assert!(link.is_link_audio_enabled());
     }
 
     #[tokio::test]
