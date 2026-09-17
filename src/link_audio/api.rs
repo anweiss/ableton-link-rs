@@ -8,7 +8,7 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    ops::{Deref, DerefMut},
+    ops::Deref,
     sync::Arc,
     time::Duration as StdDuration,
 };
@@ -33,12 +33,27 @@ const PEER_SYNC_PERIOD: StdDuration = StdDuration::from_millis(250);
 
 /// Link with audio sharing.
 ///
-/// `LinkAudio` derefs to [`BasicLink`], so the entire Link API is available on
-/// it. Use [`LinkAudio::enable_link_audio`] to start sharing audio.
+/// `LinkAudio` derefs to [`BasicLink`], so the read-only parts of the Link API
+/// are available on it directly. The parts of `BasicLink` that take `&mut self`
+/// — [`LinkAudio::enable`], [`LinkAudio::disable`], the callback setters,
+/// [`LinkAudio::enable_start_stop_sync`] and
+/// [`LinkAudio::commit_app_session_state`] — are forwarded explicitly rather
+/// than through `DerefMut`. That is deliberate: audio sharing may only run
+/// while Link itself is enabled, and a public `DerefMut` would hand out a
+/// `&mut BasicLink` on which `disable` could be called directly, disabling Link
+/// while the peer-sync task and this peer's announced audio endpoint stayed
+/// live.
+///
+/// Use [`LinkAudio::enable_link_audio`] to start sharing audio.
 pub struct LinkAudio {
     link: BasicLink,
     engine: Arc<AudioEngine>,
     sync_task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether the application asked for audio sharing via
+    /// [`LinkAudio::enable_link_audio`]. Audio is only *effectively* running
+    /// while this is also true and the underlying [`BasicLink`] is enabled —
+    /// see [`LinkAudio::update_is_link_audio_enabled`].
+    audio_enabled_by_user: bool,
 }
 
 impl LinkAudio {
@@ -64,35 +79,139 @@ impl LinkAudio {
             link,
             engine,
             sync_task: None,
+            audio_enabled_by_user: false,
         })
     }
 
-    /// Is audio sharing currently enabled?
+    /// Is audio sharing currently enabled? Reflects the request made through
+    /// [`LinkAudio::enable_link_audio`], regardless of whether the underlying
+    /// [`BasicLink`] is itself enabled.
     pub fn is_link_audio_enabled(&self) -> bool {
-        self.sync_task.is_some()
+        self.audio_enabled_by_user
     }
 
     /// Enables or disables audio sharing. While enabled, this peer's audio
     /// endpoint is announced to the session in the Link `aep4` payload entry
     /// and peers' endpoints are tracked.
+    ///
+    /// Audio sharing only actually runs while the underlying [`BasicLink`] is
+    /// also enabled: disabling Link (see [`LinkAudio::disable`]) stops audio
+    /// too, and re-enabling Link resumes it if this is still `true`. Ported
+    /// from upstream's `fcaefc6d3bec` ("Set LinkAudio to disabled when Link is
+    /// disabled").
     pub fn enable_link_audio(&mut self, enable: bool) {
-        if enable == self.is_link_audio_enabled() {
+        if enable == self.audio_enabled_by_user {
             return;
         }
 
-        if enable {
+        self.audio_enabled_by_user = enable;
+        self.update_is_link_audio_enabled();
+    }
+
+    /// Whether audio sharing is actually running: requested by the
+    /// application *and* the underlying [`BasicLink`] is enabled.
+    fn is_link_audio_effectively_enabled(&self) -> bool {
+        self.sync_task.is_some()
+    }
+
+    /// Starts or stops audio sharing to match `audio_enabled_by_user &&
+    /// self.link.is_enabled()`, mirroring upstream's
+    /// `updateIsLinkAudioEnabled`.
+    fn update_is_link_audio_enabled(&mut self) {
+        let should_be_enabled = self.audio_enabled_by_user && self.link.is_enabled();
+
+        if should_be_enabled == self.is_link_audio_effectively_enabled() {
+            return;
+        }
+
+        if should_be_enabled {
             let epoch = self.engine.begin_peer_sync();
             self.link
                 .controller()
                 .set_audio_endpoint(Some(self.engine.endpoint()));
             self.sync_task = Some(self.spawn_peer_sync(epoch));
         } else {
-            self.link.controller().set_audio_endpoint(None);
-            if let Some(task) = self.sync_task.take() {
-                task.abort();
-            }
-            self.engine.end_peer_sync();
+            self.stop_audio_sharing();
         }
+    }
+
+    /// Withdraws the audio endpoint and stops the peer-sync task, leaving
+    /// `audio_enabled_by_user` alone so a later
+    /// [`LinkAudio::update_is_link_audio_enabled`] can resume sharing.
+    /// Synchronous and idempotent, so it can run before an await point.
+    fn stop_audio_sharing(&mut self) {
+        self.link.controller().set_audio_endpoint(None);
+        if let Some(task) = self.sync_task.take() {
+            task.abort();
+        }
+        self.engine.end_peer_sync();
+    }
+
+    /// Enables discovery and dispatch on the underlying [`BasicLink`], and
+    /// resumes audio sharing if [`LinkAudio::enable_link_audio`] had been
+    /// requested while Link was disabled.
+    pub async fn enable(&mut self) {
+        self.link.enable().await;
+        self.update_is_link_audio_enabled();
+    }
+
+    /// Disables discovery and dispatch on the underlying [`BasicLink`]. Audio
+    /// sharing is stopped for as long as Link remains disabled, even if it
+    /// was requested via [`LinkAudio::enable_link_audio`]; a later
+    /// [`LinkAudio::enable`] resumes it.
+    pub async fn disable(&mut self) {
+        // `BasicLink::disable` publishes its disabled state before its first
+        // await so that cancelling the future cannot leave Link reporting
+        // enabled with only part of the pipeline stopped. Audio teardown has
+        // to sit on the same side of that await for the same reason: dropping
+        // this future while it is pending would otherwise leave the peer-sync
+        // task running and this peer's audio endpoint announced against a
+        // disabled session. The request is preserved, so a later
+        // `LinkAudio::enable` resumes sharing.
+        self.stop_audio_sharing();
+        self.link.disable().await;
+    }
+
+    /// Forwards to [`BasicLink::enable_start_stop_sync`].
+    pub fn enable_start_stop_sync(&mut self, enable: bool) {
+        self.link.enable_start_stop_sync(enable);
+    }
+
+    /// Forwards to [`BasicLink::set_num_peers_callback`].
+    pub fn set_num_peers_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(usize) + Send + 'static,
+    {
+        self.link.set_num_peers_callback(callback);
+    }
+
+    /// Forwards to [`BasicLink::set_tempo_callback`].
+    pub fn set_tempo_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(f64) + Send + 'static,
+    {
+        self.link.set_tempo_callback(callback);
+    }
+
+    /// Forwards to [`BasicLink::set_start_stop_callback`].
+    pub fn set_start_stop_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(bool) + Send + 'static,
+    {
+        self.link.set_start_stop_callback(callback);
+    }
+
+    /// Forwards to [`BasicLink::set_audio_endpoint_callback`].
+    pub fn set_audio_endpoint_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(crate::link::node::NodeId, Option<SocketAddrV4>) + Send + 'static,
+    {
+        self.link.set_audio_endpoint_callback(callback);
+    }
+
+    /// Forwards to [`BasicLink::commit_app_session_state`].
+    pub async fn commit_app_session_state(&mut self, state: SessionState) {
+        self.link.commit_app_session_state(state).await;
     }
 
     /// The local peer name used for identification in the session.
@@ -206,12 +325,6 @@ impl Deref for LinkAudio {
 
     fn deref(&self) -> &Self::Target {
         &self.link
-    }
-}
-
-impl DerefMut for LinkAudio {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.link
     }
 }
 
@@ -543,6 +656,7 @@ mod tests {
     #[tokio::test]
     async fn audio_drop_completes_peer_sync_cancellation_without_caller_progress() {
         let mut link = LinkAudio::new(120.0, "sync witness").await.unwrap();
+        link.enable().await;
         for _ in 0..3 {
             link.enable_link_audio(true);
             link.enable_link_audio(false);
@@ -553,6 +667,98 @@ mod tests {
         drop(link);
         assert!(task.is_finished());
         assert!(engine.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn audio_sharing_does_not_run_while_link_is_disabled() {
+        // Ported from upstream's `fcaefc6d3bec` ("Set LinkAudio to disabled
+        // when Link is disabled"): requesting audio sharing before Link is
+        // enabled must not start it, and disabling Link must stop it even
+        // though the application never asked to turn audio off.
+        let mut link = LinkAudio::new(120.0, "enablement witness").await.unwrap();
+
+        link.enable_link_audio(true);
+        assert!(link.is_link_audio_enabled());
+        assert!(link.sync_task.is_none());
+
+        link.enable().await;
+        assert!(link.sync_task.is_some());
+
+        link.disable().await;
+        assert!(link.is_link_audio_enabled());
+        assert!(link.sync_task.is_none());
+
+        link.enable().await;
+        assert!(link.sync_task.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_disable_still_stops_audio_sharing() {
+        // `BasicLink::disable` publishes its disabled state before its first
+        // await so cancellation cannot leave Link half-disabled. Audio
+        // teardown has to be on the same side of that await, or a dropped
+        // `disable` future leaves the peer-sync task running and this peer's
+        // audio endpoint announced against a disabled session.
+        use std::{future::Future, task::Poll};
+
+        let mut link = LinkAudio::new(120.0, "cancellation witness").await.unwrap();
+        link.enable().await;
+        link.enable_link_audio(true);
+        assert!(link.sync_task.is_some());
+
+        {
+            let mut disabling = Box::pin(link.disable());
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(matches!(disabling.as_mut().poll(&mut cx), Poll::Pending));
+        }
+
+        assert!(link.sync_task.is_none());
+        assert!(link.is_link_audio_enabled());
+    }
+
+    #[tokio::test]
+    async fn endpoint_is_withdrawn_even_while_peer_state_is_locked() {
+        // Withdrawing the endpoint is a state transition, not a reading of
+        // one: if the write is dropped because the peer-state lock happened to
+        // be held, the peer-sync task stops while peers keep seeing this
+        // peer's endpoint announced, and nothing later corrects it — clearing
+        // the request afterwards is a no-op, so the next enable re-advertises
+        // an endpoint that was supposed to be gone.
+        let mut link = LinkAudio::new(120.0, "contention witness").await.unwrap();
+        link.enable().await;
+        link.enable_link_audio(true);
+        assert!(link
+            .link
+            .controller()
+            .peer_state
+            .lock()
+            .unwrap()
+            .audio_endpoint
+            .is_some());
+
+        let peer_state = link.link.controller().peer_state.clone();
+        let holder = std::thread::spawn(move || {
+            let guard = peer_state.lock().unwrap();
+            std::thread::sleep(StdDuration::from_millis(100));
+            drop(guard);
+        });
+        // Give the holder time to actually take the lock, so the teardown
+        // below runs into real contention rather than racing it.
+        std::thread::sleep(StdDuration::from_millis(20));
+
+        link.disable().await;
+        holder.join().unwrap();
+
+        assert!(link
+            .link
+            .controller()
+            .peer_state
+            .lock()
+            .unwrap()
+            .audio_endpoint
+            .is_none());
+        assert!(link.sync_task.is_none());
     }
 
     #[tokio::test]

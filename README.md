@@ -264,7 +264,13 @@ assert_eq!(state_a, state_b);
 
 ### LinkAudio (`feature = "audio"`)
 
-`LinkAudio` derefs to `BasicLink`, so the entire Link API remains available. On top of that it publishes
+`LinkAudio` derefs to `BasicLink`, so the read-only Link API remains available directly. The
+`&mut self` parts of `BasicLink` — `enable`, `disable`, `enable_start_stop_sync`,
+`commit_app_session_state` and the callback setters — are forwarded as inherent methods on
+`LinkAudio` instead of through `DerefMut`, which `LinkAudio` deliberately does not implement: audio
+sharing only runs while Link itself is enabled, and handing out a `&mut BasicLink` would let
+`disable` be called behind `LinkAudio`'s back, leaving the peer-sync task and this peer's announced
+audio endpoint live against a disabled session. On top of that it publishes
 audio channels (sinks) and subscribes to channels published by peers (sources). Audio is interleaved
 16-bit signed PCM, and buffers carry the beat time and tempo needed to align them across peers.
 
