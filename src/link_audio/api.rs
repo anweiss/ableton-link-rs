@@ -719,6 +719,8 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_is_withdrawn_even_while_peer_state_is_locked() {
+        use std::{future::Future, sync::mpsc, task::Context};
+
         // Withdrawing the endpoint is a state transition, not a reading of
         // one: if the write is dropped because the peer-state lock happened to
         // be held, the peer-sync task stops while peers keep seeing this
@@ -738,17 +740,32 @@ mod tests {
             .is_some());
 
         let peer_state = link.link.controller().peer_state.clone();
-        let holder = std::thread::spawn(move || {
-            let guard = peer_state.lock().unwrap();
-            std::thread::sleep(StdDuration::from_millis(100));
-            drop(guard);
-        });
-        // Give the holder time to actually take the lock, so the teardown
-        // below runs into real contention rather than racing it.
-        std::thread::sleep(StdDuration::from_millis(20));
+        let guard = peer_state.lock().unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::scope(|scope| {
+            let (started, starting) = mpsc::channel();
+            let (polled, polling) = mpsc::channel();
+            let link = &mut link;
+            let disabler = scope.spawn(move || {
+                let _runtime = runtime.enter();
+                let mut disabling = Box::pin(link.disable());
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                started.send(()).unwrap();
+                let _ = disabling.as_mut().poll(&mut cx);
+                polled.send(()).unwrap();
+            });
 
-        link.disable().await;
-        holder.join().unwrap();
+            let start = starting.recv_timeout(SHUTDOWN_TIMEOUT);
+            let first_poll = polling.recv_timeout(SHUTDOWN_TIMEOUT);
+            // Release before asserting or joining so a failure cannot deadlock the worker.
+            drop(guard);
+            disabler.join().unwrap();
+            start.unwrap();
+            assert!(
+                matches!(first_poll, Err(mpsc::RecvTimeoutError::Timeout)),
+                "disable polled past endpoint withdrawal while peer_state was locked"
+            );
+        });
 
         assert!(link
             .link

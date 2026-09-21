@@ -526,6 +526,10 @@ Without `std`, only core types and math are available (requires `alloc`).
 | Windows | Windows 10+ |
 | ESP32 | ESP-IDF v5.3+, espup toolchain |
 
+Linux and macOS networking enable both the `net` and `time` features of `rustix`,
+including the time types used by its socket timeout helpers. This dependency
+remains optional under `std`; `no_std` builds do not enable it.
+
 ## Contributing
 
 Contributions are welcome! This project uses [conventional commits](https://www.conventionalcommits.org/) for automated releases.
