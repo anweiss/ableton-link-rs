@@ -51,12 +51,17 @@ fn new_std_udp_reuseport(addr: SocketAddr) -> std::io::Result<std::net::UdpSocke
 
     let udp_sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
 
-    udp_sock.set_reuse_address(true)?;
+    // Preserve sharing for explicit ports, including the discovery listener.
+    // Ephemeral measurement and reply sockets must not opt into port sharing.
+    if addr.port() != 0 {
+        udp_sock.set_reuse_address(true)?;
 
-    // Set SO_REUSEPORT on Unix systems so multiple sockets (discovery listener,
-    // send_byebye, etc.) can bind to the same multicast port concurrently.
-    #[cfg(unix)]
-    udp_sock.set_reuse_port(true)?;
+        // Set SO_REUSEPORT on Unix systems so multiple sockets (discovery
+        // listener, send_byebye, etc.) can bind to the same multicast port
+        // concurrently.
+        #[cfg(unix)]
+        udp_sock.set_reuse_port(true)?;
+    }
 
     // On Linux, a socket bound to a port receives datagrams for *any* multicast
     // group joined by any socket on the host, including groups this socket never
@@ -1361,6 +1366,38 @@ mod tests {
     use std::net::Ipv6Addr;
 
     use super::*;
+    use crate::discovery::socket_test_support::{
+        assert_ephemeral_socket_is_unshared, shared_loopback_socket,
+    };
+
+    #[tokio::test]
+    async fn ephemeral_udp_sockets_do_not_enable_port_sharing() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let socket = new_udp_reuseport(SocketAddr::new(ip, 0)).unwrap();
+            assert_ephemeral_socket_is_unshared(&socket);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_udp_ports_can_still_be_shared() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let reservation = shared_loopback_socket(SocketAddr::new(ip, 0));
+            let endpoint = reservation.local_addr().unwrap().as_socket().unwrap();
+            assert_ne!(endpoint.port(), 0);
+            let socket = new_udp_reuseport(endpoint).unwrap();
+            assert_eq!(socket.local_addr().unwrap(), endpoint);
+            let options = socket2::SockRef::from(&socket);
+            assert!(options.reuse_address().unwrap());
+            #[cfg(unix)]
+            assert!(options.reuse_port().unwrap());
+        }
+    }
 
     #[tokio::test]
     async fn public_messenger_listen_preserves_notifier_cancellation() {
