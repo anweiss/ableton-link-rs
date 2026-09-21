@@ -37,14 +37,25 @@ schema_version = 1
 # the submodule pin, and the validator fails if this drifts from it.
 [watermark]
 pinned = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
-upstream = "902aef95bf94af49746fdda5369b42cdcfa1e6d2"
-commits_behind = 113
+upstream = "13c5744cf1705d05b9a93b8b652ba2ce29b3dcfc"
+commits_behind = 115
 
 # ---------------------------------------------------------------------------
 # Port items, in upstream ancestry order (oldest first). The port workflow
 # takes the earliest outstanding item and advances a monotonic watermark, so
 # this order is load-bearing: do not reorder by theme.
 # ---------------------------------------------------------------------------
+
+[[port]]
+id = "fix-linkaudio-resizer-packet-sizing-and-beat-rounding"
+title = "Fix packet sizing and beat rounding bugs in the audio chunk resizer"
+upstream = ["96952c029658d8df8998d11c82bfcf56acd1027d", "13c5744cf1705d05b9a93b8b652ba2ce29b3dcfc"]
+rust = ["src/link_audio/resizer.rs"]
+risk = "behavior"
+status = "outstanding"
+retired_at_pin = ""
+why = "Upstream commit 96952c029658 reworks Resizer::operator() (include/ableton/link_audio/Resizer.hpp): (1) extracts a flush() helper called both on format change and when a chunk fills up; (2) moves the numFrames==0 early return to *after* the format-change flush check, so an empty call still flushes pending audio for a stale format/session, whereas Rust's src/link_audio/resizer.rs process() currently returns early on num_frames==0 before the format-change flush runs; (3) fixes `tempo != mChunks.back().tempo && beginBeats != chunkEndBeats(mChunks.back())` to use `||` instead of `&&` -- Rust's else-if branch (`if let Some(last) = self.chunks.last().copied() { if tempo != last.tempo && begin_beats != self.chunk_end_beats(&last) {...} }`) still has the buggy `&&`, so it under-opens new chunks when only one of tempo or beat position actually changed; (4) replaces the flat `frames_per_message = kMaxNumSamples / mNumChannels` admission check (mirrored today by Rust's `frames_per_message` local in `process`) with a running `mAvailableFrames` computed inside `newChunk`, which subtracts the wire byte cost of every already-queued chunk header (`sizeInByteStream(chunk)` per chunk) from `KMaxNumBytes` before converting the remainder to frames, so packets stay correctly sized once more than one timing chunk lands in the same buffer; port this into `Resizer::new_chunk` in resizer.rs, replacing the fixed `frames_per_message` computation in `process` with a per-chunk-aware available-frames field updated in `new_chunk`. Upstream commit 13c5744cf170 further edits the same condition fixed by (3), adding a 1-microbeat tolerance -- `abs(beginBeats - chunkEndBeats(mChunks.back())) > Beats{1}` (Beats' underlying representation is in micro-beats) -- because the timeline computes beats via absolute-time conversion in one path and incremental frame counting in the other, and the two floating-point paths can diverge enough to open a new chunk on almost every callback; port as an epsilon-tolerant comparison (approximately one micro-beat) in the analogous Rust else-if branch instead of the current exact `!=` comparison. Port both commits together since the second only makes sense against the condition the first just corrected."
+impact = "The optional audio-streaming feature's outgoing packet batching used inverted logic, only starting a new timing segment when both tempo and timing had drifted, instead of when either did, and sized packets with a flat frame count that ignored extra header bytes from additional timing segments. A related fix tolerates tiny floating point rounding differences in beat position, which previously forced a new segment on almost every audio callback. Until ported, this may cause unnecessary segment boundaries or oversized packets."
 
 [[port]]
 id = "catch-exception-in-udpmessenger-send-path"
