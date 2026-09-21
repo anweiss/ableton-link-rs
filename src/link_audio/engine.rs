@@ -280,6 +280,7 @@ pub struct AudioEngine {
     /// stale epoch are dropped, which is what makes teardown ordering hold
     /// against a `JoinHandle::abort()` that has not taken effect yet.
     sync_epoch: Arc<AtomicU64>,
+    sharing_active: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     send_gate: SendGate,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -324,6 +325,7 @@ impl AudioEngine {
             api_channels: Arc::new(Mutex::new(Vec::new())),
             channels_changed: Arc::new(ChannelNotifications::new(shutdown.clone())),
             sync_epoch: Arc::new(AtomicU64::new(1)),
+            sharing_active: Arc::new(AtomicBool::new(true)),
             shutdown,
             send_gate: Arc::new(RwLock::new(())),
             tasks: Arc::new(Mutex::new(Vec::new())),
@@ -435,8 +437,17 @@ impl AudioEngine {
         state.peers.retain(|p| peers.contains(&p.peer_id));
         for sink in &mut state.sinks {
             sink.receivers.retain_peers(peers);
+            sink.sink.set_is_connected(!sink.receivers.is_empty());
         }
         state.channels.prune_peer_channels(peers)
+    }
+
+    fn discard_sink_buffers(state: &mut EngineState) {
+        for entry in &mut state.sinks {
+            entry.reader.discard_pending();
+            entry.outbox.drain();
+            entry.encoder = Encoder::new(entry.outbox.clone(), entry.sink.id());
+        }
     }
 
     /// The current peer-sync epoch. Pass it to the `_at` methods from a task
@@ -445,31 +456,42 @@ impl AudioEngine {
         self.sync_epoch.load(AtomicOrdering::Acquire)
     }
 
-    /// Starts a run of peer synchronisation, returning the epoch that run must
-    /// quote. Any earlier run is invalidated.
+    /// Resumes audio activity and starts a run of peer synchronisation,
+    /// returning the epoch that run must quote. Any earlier run is invalidated.
     pub fn begin_peer_sync(&self) -> u64 {
         // Under the state lock, so this is serialised against the epoch bump in
         // `shutdown`/`end_peer_sync` rather than racing it.
-        self.with_state(|_| {
+        self.with_state(|state| {
             if self.shutdown.load(AtomicOrdering::Acquire) {
                 // Epochs start at 1, so 0 is never current: a caller that races
                 // shutdown gets an epoch whose writes are all discarded.
                 return 0;
             }
-            self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel) + 1
+            let epoch = self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+            Self::discard_sink_buffers(state);
+            self.socket.set_send_epoch(Some(epoch));
+            self.sharing_active.store(true, AtomicOrdering::Release);
+            epoch
         })
     }
 
-    /// Ends peer synchronisation and forgets the session's peers.
+    /// Pauses audio activity, ends peer synchronisation and forgets the peers.
     ///
     /// The epoch is bumped before the peers are cleared, and both happen under
     /// the state lock, so a write from the previous run either lands first or
     /// is discarded — it can never repopulate peers afterwards.
     pub fn end_peer_sync(&self) {
+        self.sharing_active.store(false, AtomicOrdering::Release);
+        self.socket.set_send_epoch(None);
+        let gate = self.close_send_gate();
         let changed = self.with_state(|state| {
+            self.sharing_active.store(false, AtomicOrdering::Release);
+            self.socket.set_send_epoch(None);
             self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+            Self::discard_sink_buffers(state);
             Self::prune_peers(state, &[])
         });
+        drop(gate);
         if changed {
             self.publish_channels();
         }
@@ -497,6 +519,8 @@ impl AudioEngine {
         if self.shutdown.swap(true, AtomicOrdering::AcqRel) {
             return;
         }
+        self.sharing_active.store(false, AtomicOrdering::Release);
+        self.socket.set_send_epoch(None);
         // Invalidate every epoch quoted before now, unconditionally and without
         // the state lock. The bounded acquires below can time out; if the bump
         // rode along inside one of them, a timeout would leave the pre-shutdown
@@ -533,21 +557,21 @@ impl AudioEngine {
         self.try_end_peer_sync();
     }
 
-    /// The current epoch, or 0 (never current) once shut down — so the
-    /// convenience wrappers cannot quote their way past teardown.
     fn is_shut_down(&self) -> bool {
         self.shutdown.load(AtomicOrdering::Acquire)
     }
 
+    /// The current epoch, or 0 (never current) while paused or shut down.
     fn live_epoch(&self) -> u64 {
-        if self.is_shut_down() {
+        if self.is_shut_down() || !self.sharing_active.load(AtomicOrdering::Acquire) {
             return 0;
         }
         self.sync_epoch()
     }
 
     /// Takes the write side of the send gate, giving up after ~50ms. See the
-    /// call site in `shutdown` for why this must not block forever.
+    /// call site in `shutdown` for why this must not block forever, including
+    /// when a channel callback pauses sharing while holding a read guard.
     fn close_send_gate(&self) -> Option<std::sync::RwLockWriteGuard<'_, ()>> {
         const ATTEMPTS: u32 = 50;
         for _ in 0..ATTEMPTS {
@@ -561,7 +585,7 @@ impl AudioEngine {
                 }
             }
         }
-        debug!("shutdown gave up waiting for in-flight sends");
+        debug!("audio teardown gave up waiting for in-flight activity");
         None
     }
 
@@ -584,7 +608,9 @@ impl AudioEngine {
     }
 
     fn epoch_is_current(&self, epoch: u64) -> bool {
-        self.sync_epoch.load(AtomicOrdering::Acquire) == epoch
+        self.sharing_active.load(AtomicOrdering::Acquire)
+            && !self.is_shut_down()
+            && self.sync_epoch.load(AtomicOrdering::Acquire) == epoch
     }
 
     /// Adds a sink, publishing a new channel to the session.
@@ -710,9 +736,13 @@ impl AudioEngine {
     /// and suppressing one would be worse than sending it late — a bye that is
     /// never sent leaves a stale channel at every peer until it expires.
     fn send_channel_requests(&self) {
-        if self.is_shut_down() {
+        let Some(_gate) = enter_active_gate(&self.send_gate, &self.shutdown, &self.sharing_active)
+        else {
             return;
-        }
+        };
+        let Some(epoch) = self.socket.send_epoch() else {
+            return;
+        };
         let (node_id, requests) = self.with_state(|state| {
             let requests: Vec<(Id, Option<SocketAddrV4>)> = state
                 .sources
@@ -731,8 +761,9 @@ impl AudioEngine {
                     peer_id: node_id,
                     channel_id,
                 };
-                send_message(
+                send_message_at(
                     &self.socket,
+                    epoch,
                     node_id,
                     CHANNEL_REQUEST,
                     TTL,
@@ -773,6 +804,7 @@ impl AudioEngine {
 
     fn spawn_receive_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let sharing_active = self.sharing_active.clone();
         let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
@@ -803,12 +835,16 @@ impl AudioEngine {
                 // or channels: `receive_channel_request` repopulates a sink's
                 // receivers without consulting `state.peers`, so the epoch
                 // gate does not cover this path.
-                let _gate = match enter_gate(&send_gate, &shutdown) {
+                let _gate = match enter_active_gate(&send_gate, &shutdown, &sharing_active) {
                     Some(gate) => gate,
-                    None => return,
+                    None if shutdown.load(AtomicOrdering::Acquire) => return,
+                    None => continue,
+                };
+                let Some(epoch) = socket.send_epoch() else {
+                    continue;
                 };
 
-                let changed = handle_message(&socket, &state, &buffer[..num_bytes], from);
+                let changed = handle_message(&socket, &state, epoch, &buffer[..num_bytes], from);
                 if changed {
                     publish(&state, &api_channels, &channels_changed);
                 }
@@ -818,6 +854,7 @@ impl AudioEngine {
 
     fn spawn_announce_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let sharing_active = self.sharing_active.clone();
         let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
@@ -829,9 +866,13 @@ impl AudioEngine {
             loop {
                 interval.tick().await;
 
-                let _gate = match enter_gate(&send_gate, &shutdown) {
+                let _gate = match enter_active_gate(&send_gate, &shutdown, &sharing_active) {
                     Some(gate) => gate,
-                    None => return,
+                    None if shutdown.load(AtomicOrdering::Acquire) => return,
+                    None => continue,
+                };
+                let Some(epoch) = socket.send_epoch() else {
+                    continue;
                 };
 
                 let (node_id, announcements, endpoints, byes) = {
@@ -839,6 +880,9 @@ impl AudioEngine {
                         Ok(state) => state,
                         Err(poisoned) => poisoned.into_inner(),
                     };
+                    if socket.send_epoch() != Some(epoch) {
+                        continue;
+                    }
 
                     let announcements = state.announcements();
                     let current: Vec<ChannelAnnouncement> = announcements
@@ -866,7 +910,15 @@ impl AudioEngine {
                 for byes in split_byes(&byes) {
                     let payload = byes.to_payload();
                     for endpoint in &endpoints {
-                        send_message(&socket, node_id, CHANNEL_BYES, TTL, &payload, *endpoint);
+                        send_message_at(
+                            &socket,
+                            epoch,
+                            node_id,
+                            CHANNEL_BYES,
+                            TTL,
+                            &payload,
+                            *endpoint,
+                        );
                     }
                 }
 
@@ -881,8 +933,9 @@ impl AudioEngine {
                             HostTime { time: ping_time }.encode(&mut payload);
                             should_send_ping = false;
                         }
-                        send_message(
+                        send_message_at(
                             &socket,
+                            epoch,
                             node_id,
                             PEER_ANNOUNCEMENT,
                             TTL,
@@ -897,6 +950,7 @@ impl AudioEngine {
 
     fn spawn_process_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let sharing_active = self.sharing_active.clone();
         let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
@@ -910,9 +964,13 @@ impl AudioEngine {
             loop {
                 interval.tick().await;
 
-                let _gate = match enter_gate(&send_gate, &shutdown) {
+                let _gate = match enter_active_gate(&send_gate, &shutdown, &sharing_active) {
                     Some(gate) => gate,
-                    None => return,
+                    None if shutdown.load(AtomicOrdering::Acquire) => return,
+                    None => continue,
+                };
+                let Some(epoch) = socket.send_epoch() else {
+                    continue;
                 };
 
                 let (node_id, messages, channels_changed_now) = {
@@ -920,6 +978,9 @@ impl AudioEngine {
                         Ok(state) => state,
                         Err(poisoned) => poisoned.into_inner(),
                     };
+                    if socket.send_epoch() != Some(epoch) {
+                        continue;
+                    }
                     let now = Instant::now();
                     let node_id = state.node_id;
                     let mut messages: Vec<(Vec<u8>, SocketAddrV4)> = Vec::new();
@@ -972,9 +1033,7 @@ impl AudioEngine {
 
                 let _ = node_id;
                 for (message, endpoint) in messages {
-                    if let Err(e) = socket.send_to(&message, endpoint) {
-                        debug!("failed to send audio buffer: {}", e);
-                    }
+                    socket.send_to_at(epoch, &message, endpoint);
                 }
 
                 if channels_changed_now {
@@ -986,6 +1045,7 @@ impl AudioEngine {
 
     fn spawn_request_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let sharing_active = self.sharing_active.clone();
         let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
@@ -997,9 +1057,13 @@ impl AudioEngine {
             loop {
                 interval.tick().await;
 
-                let _gate = match enter_gate(&send_gate, &shutdown) {
+                let _gate = match enter_active_gate(&send_gate, &shutdown, &sharing_active) {
                     Some(gate) => gate,
-                    None => return,
+                    None if shutdown.load(AtomicOrdering::Acquire) => return,
+                    None => continue,
+                };
+                let Some(epoch) = socket.send_epoch() else {
+                    continue;
                 };
 
                 let (node_id, requests) = {
@@ -1007,6 +1071,9 @@ impl AudioEngine {
                         Ok(state) => state,
                         Err(poisoned) => poisoned.into_inner(),
                     };
+                    if socket.send_epoch() != Some(epoch) {
+                        continue;
+                    }
                     let requests: Vec<(Id, Option<SocketAddrV4>)> = state
                         .sources
                         .iter()
@@ -1024,8 +1091,9 @@ impl AudioEngine {
                             peer_id: node_id,
                             channel_id,
                         };
-                        send_message(
+                        send_message_at(
                             &socket,
+                            epoch,
                             node_id,
                             CHANNEL_REQUEST,
                             TTL,
@@ -1071,6 +1139,17 @@ fn enter_gate<'a>(
     Some(guard)
 }
 
+fn enter_active_gate<'a>(
+    gate: &'a SendGate,
+    shutdown: &AtomicBool,
+    sharing_active: &AtomicBool,
+) -> Option<std::sync::RwLockReadGuard<'a, ()>> {
+    let guard = enter_gate(gate, shutdown)?;
+    sharing_active
+        .load(AtomicOrdering::Acquire)
+        .then_some(guard)
+}
+
 /// The engine's UDP socket.
 ///
 /// Receives are driven by tokio, but sends go straight to the OS through a
@@ -1082,6 +1161,7 @@ fn enter_gate<'a>(
 struct EngineSocket {
     rx: UdpSocket,
     tx: std::net::UdpSocket,
+    send_epoch: Mutex<Option<u64>>,
 }
 
 impl EngineSocket {
@@ -1093,6 +1173,7 @@ impl EngineSocket {
         Ok(EngineSocket {
             rx: UdpSocket::from_std(std_socket)?,
             tx,
+            send_epoch: Mutex::new(Some(1)),
         })
     }
 
@@ -1104,10 +1185,25 @@ impl EngineSocket {
         self.rx.recv_from(buf).await
     }
 
-    /// Sends a datagram. Never blocks: a `WouldBlock` here is real kernel
-    /// backpressure and the datagram is dropped, as it was before.
-    fn send_to(&self, buf: &[u8], to: SocketAddrV4) -> std::io::Result<usize> {
-        self.send_to_with(buf, to, Retry::No)
+    fn send_epoch(&self) -> Option<u64> {
+        *self.send_epoch.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_send_epoch(&self, epoch: Option<u64>) {
+        *self.send_epoch.lock().unwrap_or_else(|e| e.into_inner()) = epoch;
+    }
+
+    /// The admission check and nonblocking syscall share a lock with pause.
+    /// No callbacks, state locks, retries or awaits occur while it is held.
+    /// Closing admission waits for at most the current syscall, not a batch.
+    fn send_to_at(&self, epoch: u64, buf: &[u8], to: SocketAddrV4) {
+        let current = self.send_epoch.lock().unwrap_or_else(|e| e.into_inner());
+        if *current != Some(epoch) {
+            return;
+        }
+        if let Err(e) = self.tx.send_to(buf, SocketAddr::V4(to)) {
+            debug!("failed to send link audio message: {}", e);
+        }
     }
 
     fn send_to_with(&self, buf: &[u8], to: SocketAddrV4, retry: Retry) -> std::io::Result<usize> {
@@ -1157,6 +1253,21 @@ fn send_message(
     to: SocketAddrV4,
 ) {
     send_message_with(socket, node_id, message_type, ttl, payload, to, Retry::No);
+}
+
+fn send_message_at(
+    socket: &EngineSocket,
+    epoch: u64,
+    node_id: NodeId,
+    message_type: u8,
+    ttl: u8,
+    payload: &[u8],
+    to: SocketAddrV4,
+) {
+    match encode_message(node_id, ttl, message_type, payload) {
+        Ok(message) => socket.send_to_at(epoch, &message, to),
+        Err(e) => debug!("failed to encode link audio message: {}", e),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1231,6 +1342,7 @@ fn publish(
 fn handle_message(
     socket: &EngineSocket,
     state: &Arc<Mutex<EngineState>>,
+    epoch: u64,
     data: &[u8],
     from: SocketAddrV4,
 ) -> bool {
@@ -1248,6 +1360,9 @@ fn handle_message(
         Ok(state) => state,
         Err(poisoned) => poisoned.into_inner(),
     };
+    if socket.send_epoch() != Some(epoch) {
+        return false;
+    }
 
     // Ignore messages from ourselves.
     if header.ident == state.node_id {
@@ -1257,7 +1372,7 @@ fn handle_message(
     match header.message_type {
         PEER_ANNOUNCEMENT => {
             let changed = receive_announcement(&mut state, header.ident, payload, from, header.ttl);
-            receive_ping(socket, &state, payload, from);
+            receive_ping(socket, epoch, &state, payload, from);
             changed
         }
         CHANNEL_BYES => receive_channel_byes(&mut state, payload),
@@ -1329,7 +1444,13 @@ fn receive_announcement(
     )
 }
 
-fn receive_ping(socket: &EngineSocket, state: &EngineState, payload: &[u8], from: SocketAddrV4) {
+fn receive_ping(
+    socket: &EngineSocket,
+    epoch: u64,
+    state: &EngineState,
+    payload: &[u8],
+    from: SocketAddrV4,
+) {
     let mut host_time = None;
     let _ = parse_payload(payload, |key, reader| {
         if key == HOST_TIME_KEY {
@@ -1339,8 +1460,9 @@ fn receive_ping(socket: &EngineSocket, state: &EngineState, payload: &[u8], from
     });
 
     if let Some(host_time) = host_time {
-        send_message(
+        send_message_at(
             socket,
+            epoch,
             state.node_id,
             PONG,
             TTL,
@@ -1817,6 +1939,78 @@ mod tests {
     /// `JoinHandle::abort()` does not stop a task that is between awaits, so a
     /// peer-sync pass already in flight can run to completion *after* teardown.
     /// The epoch is what makes that harmless.
+    #[tokio::test]
+    async fn paused_generation_cannot_send_after_gate_drain_times_out_or_resume() {
+        let engine = engine("generation witness").await;
+        engine.abort_tasks();
+        let peer = UdpSocket::bind(SocketAddrV4::new(addr(), 0)).await.unwrap();
+        let SocketAddr::V4(endpoint) = peer.local_addr().unwrap() else {
+            unreachable!();
+        };
+        let old = engine.begin_peer_sync();
+        let held = engine.send_gate.read().unwrap();
+
+        engine.end_peer_sync();
+        engine.socket.send_to_at(old, b"old while paused", endpoint);
+        let new = engine.begin_peer_sync();
+        assert_ne!(old, new);
+        engine.socket.send_to_at(old, b"old after resume", endpoint);
+        engine.socket.send_to_at(new, b"new", endpoint);
+        drop(held);
+
+        let mut bytes = [0; 64];
+        let size = tokio::time::timeout(StdDuration::from_secs(2), peer.recv(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes[..size], b"new");
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), peer.recv(&mut bytes))
+                .await
+                .is_err(),
+            "old-generation packets escaped after pause"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_recycle_queued_audio_and_clear_encoded_output() {
+        let engine = engine("buffer witness").await;
+        engine.abort_tasks();
+        let sink = engine.add_sink("drums", 64);
+        sink.set_is_connected(true);
+        let session = engine.with_state(|state| state.session_id.0);
+        let mut buffer = sink.retain_buffer().unwrap();
+        buffer.samples_mut().fill(42);
+        assert!(buffer.commit(&timeline(), session, 0.0, 4.0, 32, 2, 44100));
+        // Also retain an application buffer across pause and resume. Even a
+        // commit after reconnect must not deliver that old-generation audio.
+        let retained = sink.retain_buffer().unwrap();
+        engine.with_state(|state| {
+            let entry = &mut state.sinks[0];
+            assert!(entry.reader.retain_slot());
+            entry.outbox.send(&AudioBuffer::default());
+        });
+
+        engine.end_peer_sync();
+        assert!(!sink.is_connected());
+        engine.with_state(|state| {
+            let entry = &mut state.sinks[0];
+            assert_eq!(entry.reader.num_retained_slots(), 0);
+            assert!(!entry.reader.retain_slot());
+            assert!(entry.outbox.drain().is_empty());
+        });
+        engine.begin_peer_sync();
+        assert!(retained.commit(&timeline(), session, 0.0, 4.0, 32, 2, 44100));
+        engine.with_state(|state| {
+            assert!(!state.sinks[0].reader.retain_slot());
+        });
+        sink.set_is_connected(true);
+        assert!(
+            sink.retain_buffer().is_some(),
+            "flushed slots were not recycled"
+        );
+    }
+
     #[tokio::test]
     async fn stale_peer_sync_writes_cannot_repopulate_peers() {
         let engine = engine("rust").await;

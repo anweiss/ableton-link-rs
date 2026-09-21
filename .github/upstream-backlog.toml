@@ -291,6 +291,17 @@ retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "These commits laid the first foundations of upstream's LinkAudio subsystem: `link_audio::Controller`/`SessionController` (`5f10939170e6`), the public `LinkAudio` API surface and its `enable`/`isEnabled` pair (`bdf289c877d7`, `5a43a7d7373a`), the `v1::Messages` header/message-type constants (`0e5d381d8bcd`), the `PeerInfo` payload entry carrying a truncated peer name (`f8bd7b27db80`), `PeerAnnouncement` bundling node id, session id and peer info (`5b9b31c84926`), `link_audio::Id` as an alias for `link::NodeId` (`c33a3aab6e6a`), and `ChannelAnnouncements` plus folding it into `PeerAnnouncement` (`07d7afb52027`, `5f871bea5fb2`). All of this predates and is superseded by this crate's full LinkAudio port (PR #70, merged after this backlog item was first drafted as an undifferentiated undecided block): `src/link_audio/messages.rs` defines the same message-type/header constants, `src/link_audio/payload.rs` defines `PeerInfo`, `ChannelAnnouncement(s)` and `PeerAnnouncement` with matching fields (`payload::Id = NodeId`), and `src/link_audio/api.rs`'s `LinkAudio::enable_link_audio`/`is_link_audio_enabled` mirror upstream's `enableLinkAudio`/`isLinkAudioEnabled`. Retired without further action; `dfc04253b0ce` (the `LinkAudioHut` example added alongside the enable API) is filed separately as not-applicable since it only touches `examples/linkaudiohut/main.cpp`."
 impact = "No user-visible effect from this reclassification: these commits are the earliest building blocks of Ableton's optional audio-streaming feature - a peer announcing itself, its session, and the channels it offers - and this crate already ships that feature today behind its optional audio cargo feature, added in a prior release. This entry only corrects the bookkeeping so the commits stop appearing as an open question."
 
+[[port]]
+id = "disable-linkaudio-when-link-is-disabled"
+title = "Stop sharing audio while the Link session itself is turned off"
+upstream = ["fcaefc6d3bec"]
+rust = ["src/link_audio/api.rs", "src/link_audio/engine.rs", "src/link_audio/queue.rs", "src/link/controller.rs"]
+risk = "behavior"
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
+why = "Upstream separates `mIsLinkAudioEnabledByUser` from effective audio sharing and recomputes the latter from Link enablement and the user's request. `LinkAudio` preserves that request across disable/enable cycles, removes `DerefMut` to prevent lifecycle bypass, and forwards mutable `BasicLink` methods explicitly. Audio teardown precedes `BasicLink::disable().await` for cancellation safety. Enabled-state reads and normal endpoint withdrawal wait for their mutexes; final destruction uses best-effort withdrawal before core shutdown/join to avoid caller-held-lock deadlock. The managed engine starts paused. Ending peer sync closes receive admission and generation-fences individual nonblocking UDP sends, invalidates sync and buffer epochs, resets queued/encoded audio, and clears peers/receivers. Old application-held buffers are rejected even if committed after resume. Beginning peer sync resumes existing engine tasks; final shutdown stays irreversible. Tests cover cancellation, contention, reentrant destruction, late channel requests, gate-drain timeout, pause/resume, stale buffers and slot recycling."
+impact = "An application that turned audio sharing on before enabling Link, or that disabled Link mid-session after a dropout or a pause, kept announcing its audio endpoint against a session that was no longer discoverable, so peers saw a stale, unreachable endpoint. Audio sharing now follows Link's own enabled state, and stops even if the caller abandons the disable operation partway. Code that reached the mutable side of the plain Link API by dereferencing the audio type must now call those methods on the audio type instead."
+
 # ---------------------------------------------------------------------------
 # Commits seen and consciously parked. Kept so that coverage stays provable:
 # a commit nobody mentions is not deferred, it is deleted the moment the pin
@@ -350,7 +361,6 @@ upstream = [
   "902a4b6e1714",
   "d7581807c7d2",
   "08331bfbdc2e",
-  "fcaefc6d3bec",
   "addb7dae3953",
   "b8bbd352d348",
   "939f835af9e1",
@@ -367,7 +377,7 @@ upstream = [
   "d8a47ba239f6",
 ]
 note = """
-Note: these commits predate `src/link_audio/` landing in this crate (PR #70, merged after this list was first drafted). LinkAudio is now ported behind the optional `audio` feature and its commits should be triaged normally against the module map on future runs, not re-parked here. This run reclassified the earliest 9 of these (Controller/SessionController, the enable API, v1::Messages, PeerInfo, PeerAnnouncement, link_audio::Id, ChannelAnnouncements) into the `linkaudio-foundational-session-and-channel-discovery-messages` port item above, and its accompanying example commit `dfc04253b0ce` into not_applicable, since all are already covered by the existing port. The remainder of this list — channel discovery, sink/source processors, buffering, codecs, thread priority, and the abl_link C extension work — is left verbatim pending a further re-triage pass against the module map.
+These commits predate `src/link_audio/` landing in PR #70 and need re-triage against the current implementation. The foundational session/channel-discovery commits are covered by the retired item above; `dfc04253b0ce` is not applicable. This run retired only `fcaefc6d3bec` into `disable-linkaudio-when-link-is-disabled`, with the lifecycle, contention and engine-admission changes described there. `addb7dae3953` remains undecided: Rust prunes disconnected peers, but peer sync still includes discovered peers from other sessions, so a session switch does not yet match upstream's `sessionPeers(mSessionId)` pruning. `eefe514d1846` is already owned by the retired thread-priority item, which outranks this block. Channel discovery, sink/source processors, buffering, codecs and the abl_link C extension work remain pending re-triage.
 """
 
 # Confined to deliberately-not-ported paths (ASIO, ESP32 platform, C++

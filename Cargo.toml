@@ -93,7 +93,8 @@ termios = "0.3"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["socket", "fs", "net"], optional = true }
-rustix = { version = "1.1.4", features = ["net"], optional = true }
+# Socket timeout helpers in rustix 1.1.5 need the shared time types.
+rustix = { version = "1.1.4", features = ["net", "time"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"], optional = true }

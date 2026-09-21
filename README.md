@@ -270,7 +270,23 @@ assert_eq!(state_a, state_b);
 
 ### LinkAudio (`feature = "audio"`)
 
-`LinkAudio` derefs to `BasicLink`, so the entire Link API remains available. On top of that it publishes
+Audio sharing is initially paused. Requesting it with `enable_link_audio(true)`
+starts network activity only while Link is enabled; disabling either pauses
+audio receive/send activity and disconnects sink receivers. Re-enabling Link
+resumes a preserved audio-sharing request without recreating the engine.
+Pause fences individual UDP sends by generation and discards queued/encoded
+audio, including buffers retained by the application before pause but committed
+after resume. Normal endpoint withdrawal waits for contention; final destruction
+uses best-effort withdrawal before shutting down and joining discovery, so a
+caller-held peer-state guard cannot deadlock destruction.
+
+`LinkAudio` derefs to `BasicLink`, so the read-only Link API remains available directly. The
+`&mut self` parts of `BasicLink` — `enable`, `disable`, `enable_start_stop_sync`,
+`commit_app_session_state` and the callback setters — are forwarded as inherent methods on
+`LinkAudio` instead of through `DerefMut`, which `LinkAudio` deliberately does not implement: audio
+sharing only runs while Link itself is enabled, and handing out a `&mut BasicLink` would let
+`disable` be called behind `LinkAudio`'s back, leaving the peer-sync task and this peer's announced
+audio endpoint live against a disabled session. On top of that it publishes
 audio channels (sinks) and subscribes to channels published by peers (sources). Audio is interleaved
 16-bit signed PCM, and buffers carry the beat time and tempo needed to align them across peers.
 
@@ -525,6 +541,10 @@ Without `std`, only core types and math are available (requires `alloc`).
 | Linux | glibc 2.28+, `libasound2-dev` (for `rodio`) |
 | Windows | Windows 10+ |
 | ESP32 | ESP-IDF v5.3+, espup toolchain |
+
+Linux and macOS networking enable both the `net` and `time` features of `rustix`,
+including the time types used by its socket timeout helpers. This dependency
+remains optional under `std`; `no_std` builds do not enable it.
 
 ## Contributing
 
