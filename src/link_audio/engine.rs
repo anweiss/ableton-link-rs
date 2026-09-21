@@ -280,6 +280,7 @@ pub struct AudioEngine {
     /// stale epoch are dropped, which is what makes teardown ordering hold
     /// against a `JoinHandle::abort()` that has not taken effect yet.
     sync_epoch: Arc<AtomicU64>,
+    sharing_active: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     send_gate: SendGate,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -324,6 +325,7 @@ impl AudioEngine {
             api_channels: Arc::new(Mutex::new(Vec::new())),
             channels_changed: Arc::new(ChannelNotifications::new(shutdown.clone())),
             sync_epoch: Arc::new(AtomicU64::new(1)),
+            sharing_active: Arc::new(AtomicBool::new(true)),
             shutdown,
             send_gate: Arc::new(RwLock::new(())),
             tasks: Arc::new(Mutex::new(Vec::new())),
@@ -435,6 +437,7 @@ impl AudioEngine {
         state.peers.retain(|p| peers.contains(&p.peer_id));
         for sink in &mut state.sinks {
             sink.receivers.retain_peers(peers);
+            sink.sink.set_is_connected(!sink.receivers.is_empty());
         }
         state.channels.prune_peer_channels(peers)
     }
@@ -445,8 +448,8 @@ impl AudioEngine {
         self.sync_epoch.load(AtomicOrdering::Acquire)
     }
 
-    /// Starts a run of peer synchronisation, returning the epoch that run must
-    /// quote. Any earlier run is invalidated.
+    /// Resumes audio activity and starts a run of peer synchronisation,
+    /// returning the epoch that run must quote. Any earlier run is invalidated.
     pub fn begin_peer_sync(&self) -> u64 {
         // Under the state lock, so this is serialised against the epoch bump in
         // `shutdown`/`end_peer_sync` rather than racing it.
@@ -456,20 +459,26 @@ impl AudioEngine {
                 // shutdown gets an epoch whose writes are all discarded.
                 return 0;
             }
-            self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel) + 1
+            let epoch = self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+            self.sharing_active.store(true, AtomicOrdering::Release);
+            epoch
         })
     }
 
-    /// Ends peer synchronisation and forgets the session's peers.
+    /// Pauses audio activity, ends peer synchronisation and forgets the peers.
     ///
     /// The epoch is bumped before the peers are cleared, and both happen under
     /// the state lock, so a write from the previous run either lands first or
     /// is discarded — it can never repopulate peers afterwards.
     pub fn end_peer_sync(&self) {
+        self.sharing_active.store(false, AtomicOrdering::Release);
+        let gate = self.close_send_gate();
         let changed = self.with_state(|state| {
+            self.sharing_active.store(false, AtomicOrdering::Release);
             self.sync_epoch.fetch_add(1, AtomicOrdering::AcqRel);
             Self::prune_peers(state, &[])
         });
+        drop(gate);
         if changed {
             self.publish_channels();
         }
@@ -497,6 +506,7 @@ impl AudioEngine {
         if self.shutdown.swap(true, AtomicOrdering::AcqRel) {
             return;
         }
+        self.sharing_active.store(false, AtomicOrdering::Release);
         // Invalidate every epoch quoted before now, unconditionally and without
         // the state lock. The bounded acquires below can time out; if the bump
         // rode along inside one of them, a timeout would leave the pre-shutdown
@@ -533,21 +543,21 @@ impl AudioEngine {
         self.try_end_peer_sync();
     }
 
-    /// The current epoch, or 0 (never current) once shut down — so the
-    /// convenience wrappers cannot quote their way past teardown.
     fn is_shut_down(&self) -> bool {
         self.shutdown.load(AtomicOrdering::Acquire)
     }
 
+    /// The current epoch, or 0 (never current) while paused or shut down.
     fn live_epoch(&self) -> u64 {
-        if self.is_shut_down() {
+        if self.is_shut_down() || !self.sharing_active.load(AtomicOrdering::Acquire) {
             return 0;
         }
         self.sync_epoch()
     }
 
     /// Takes the write side of the send gate, giving up after ~50ms. See the
-    /// call site in `shutdown` for why this must not block forever.
+    /// call site in `shutdown` for why this must not block forever, including
+    /// when a channel callback pauses sharing while holding a read guard.
     fn close_send_gate(&self) -> Option<std::sync::RwLockWriteGuard<'_, ()>> {
         const ATTEMPTS: u32 = 50;
         for _ in 0..ATTEMPTS {
@@ -561,7 +571,7 @@ impl AudioEngine {
                 }
             }
         }
-        debug!("shutdown gave up waiting for in-flight sends");
+        debug!("audio teardown gave up waiting for in-flight activity");
         None
     }
 
@@ -584,7 +594,9 @@ impl AudioEngine {
     }
 
     fn epoch_is_current(&self, epoch: u64) -> bool {
-        self.sync_epoch.load(AtomicOrdering::Acquire) == epoch
+        self.sharing_active.load(AtomicOrdering::Acquire)
+            && !self.is_shut_down()
+            && self.sync_epoch.load(AtomicOrdering::Acquire) == epoch
     }
 
     /// Adds a sink, publishing a new channel to the session.
@@ -710,9 +722,10 @@ impl AudioEngine {
     /// and suppressing one would be worse than sending it late — a bye that is
     /// never sent leaves a stale channel at every peer until it expires.
     fn send_channel_requests(&self) {
-        if self.is_shut_down() {
+        let Some(_gate) = enter_active_gate(&self.send_gate, &self.shutdown, &self.sharing_active)
+        else {
             return;
-        }
+        };
         let (node_id, requests) = self.with_state(|state| {
             let requests: Vec<(Id, Option<SocketAddrV4>)> = state
                 .sources
@@ -773,6 +786,7 @@ impl AudioEngine {
 
     fn spawn_receive_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let sharing_active = self.sharing_active.clone();
         let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
@@ -803,12 +817,14 @@ impl AudioEngine {
                 // or channels: `receive_channel_request` repopulates a sink's
                 // receivers without consulting `state.peers`, so the epoch
                 // gate does not cover this path.
-                let _gate = match enter_gate(&send_gate, &shutdown) {
+                let _gate = match enter_active_gate(&send_gate, &shutdown, &sharing_active) {
                     Some(gate) => gate,
-                    None => return,
+                    None if shutdown.load(AtomicOrdering::Acquire) => return,
+                    None => continue,
                 };
 
-                let changed = handle_message(&socket, &state, &buffer[..num_bytes], from);
+                let changed =
+                    handle_message(&socket, &state, &sharing_active, &buffer[..num_bytes], from);
                 if changed {
                     publish(&state, &api_channels, &channels_changed);
                 }
@@ -818,6 +834,7 @@ impl AudioEngine {
 
     fn spawn_announce_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let sharing_active = self.sharing_active.clone();
         let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
@@ -829,9 +846,10 @@ impl AudioEngine {
             loop {
                 interval.tick().await;
 
-                let _gate = match enter_gate(&send_gate, &shutdown) {
+                let _gate = match enter_active_gate(&send_gate, &shutdown, &sharing_active) {
                     Some(gate) => gate,
-                    None => return,
+                    None if shutdown.load(AtomicOrdering::Acquire) => return,
+                    None => continue,
                 };
 
                 let (node_id, announcements, endpoints, byes) = {
@@ -839,6 +857,9 @@ impl AudioEngine {
                         Ok(state) => state,
                         Err(poisoned) => poisoned.into_inner(),
                     };
+                    if !sharing_active.load(AtomicOrdering::Acquire) {
+                        continue;
+                    }
 
                     let announcements = state.announcements();
                     let current: Vec<ChannelAnnouncement> = announcements
@@ -897,6 +918,7 @@ impl AudioEngine {
 
     fn spawn_process_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let sharing_active = self.sharing_active.clone();
         let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
@@ -910,9 +932,10 @@ impl AudioEngine {
             loop {
                 interval.tick().await;
 
-                let _gate = match enter_gate(&send_gate, &shutdown) {
+                let _gate = match enter_active_gate(&send_gate, &shutdown, &sharing_active) {
                     Some(gate) => gate,
-                    None => return,
+                    None if shutdown.load(AtomicOrdering::Acquire) => return,
+                    None => continue,
                 };
 
                 let (node_id, messages, channels_changed_now) = {
@@ -920,6 +943,9 @@ impl AudioEngine {
                         Ok(state) => state,
                         Err(poisoned) => poisoned.into_inner(),
                     };
+                    if !sharing_active.load(AtomicOrdering::Acquire) {
+                        continue;
+                    }
                     let now = Instant::now();
                     let node_id = state.node_id;
                     let mut messages: Vec<(Vec<u8>, SocketAddrV4)> = Vec::new();
@@ -986,6 +1012,7 @@ impl AudioEngine {
 
     fn spawn_request_task(&self) -> JoinHandle<()> {
         let shutdown = self.shutdown.clone();
+        let sharing_active = self.sharing_active.clone();
         let send_gate = self.send_gate.clone();
         let socket = self.socket.clone();
         let state = self.state.clone();
@@ -997,9 +1024,10 @@ impl AudioEngine {
             loop {
                 interval.tick().await;
 
-                let _gate = match enter_gate(&send_gate, &shutdown) {
+                let _gate = match enter_active_gate(&send_gate, &shutdown, &sharing_active) {
                     Some(gate) => gate,
-                    None => return,
+                    None if shutdown.load(AtomicOrdering::Acquire) => return,
+                    None => continue,
                 };
 
                 let (node_id, requests) = {
@@ -1007,6 +1035,9 @@ impl AudioEngine {
                         Ok(state) => state,
                         Err(poisoned) => poisoned.into_inner(),
                     };
+                    if !sharing_active.load(AtomicOrdering::Acquire) {
+                        continue;
+                    }
                     let requests: Vec<(Id, Option<SocketAddrV4>)> = state
                         .sources
                         .iter()
@@ -1069,6 +1100,17 @@ fn enter_gate<'a>(
         return None;
     }
     Some(guard)
+}
+
+fn enter_active_gate<'a>(
+    gate: &'a SendGate,
+    shutdown: &AtomicBool,
+    sharing_active: &AtomicBool,
+) -> Option<std::sync::RwLockReadGuard<'a, ()>> {
+    let guard = enter_gate(gate, shutdown)?;
+    sharing_active
+        .load(AtomicOrdering::Acquire)
+        .then_some(guard)
 }
 
 /// The engine's UDP socket.
@@ -1231,6 +1273,7 @@ fn publish(
 fn handle_message(
     socket: &EngineSocket,
     state: &Arc<Mutex<EngineState>>,
+    sharing_active: &AtomicBool,
     data: &[u8],
     from: SocketAddrV4,
 ) -> bool {
@@ -1248,6 +1291,9 @@ fn handle_message(
         Ok(state) => state,
         Err(poisoned) => poisoned.into_inner(),
     };
+    if !sharing_active.load(AtomicOrdering::Acquire) {
+        return false;
+    }
 
     // Ignore messages from ourselves.
     if header.ident == state.node_id {

@@ -68,7 +68,11 @@ impl LinkAudio {
         let name = name.into();
         let engine = Arc::new(
             link.controller()
-                .spawn_on_io(async move { AudioEngine::new(addr, node_id, session_id, name).await })
+                .spawn_on_io(async move {
+                    let engine = AudioEngine::new(addr, node_id, session_id, name).await?;
+                    engine.end_peer_sync();
+                    Ok::<_, std::io::Error>(engine)
+                })
                 .await
                 .map_err(|error| {
                     std::io::Error::other(format!("LinkAudio startup failed: {error}"))
@@ -540,6 +544,8 @@ mod tests {
     const SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
     fn announcement_peer(link: &LinkAudio) -> (std::net::UdpSocket, Vec<u8>) {
+        // These shutdown witnesses inject engine traffic without running discovery.
+        link.engine.begin_peer_sync();
         use crate::link_audio::{
             messages::{encode_message, PEER_ANNOUNCEMENT},
             payload::{ChannelAnnouncement, ChannelAnnouncements, Entry},
@@ -690,6 +696,68 @@ mod tests {
 
         link.enable().await;
         assert!(link.sync_task.is_some());
+    }
+
+    #[tokio::test]
+    async fn disabled_audio_rejects_requests_and_resumes_without_recreating_the_engine() {
+        use crate::link_audio::{
+            messages::{encode_message, CHANNEL_REQUEST},
+            payload::ChannelRequest,
+        };
+
+        let mut link = LinkAudio::new(120.0, "paused witness").await.unwrap();
+        let sink = link.engine.add_sink("drums", 64);
+        let endpoint = link.audio_endpoint();
+        let peer = tokio::net::UdpSocket::bind((*endpoint.ip(), 0))
+            .await
+            .unwrap();
+        let peer_id = NodeId::new();
+        let packet = encode_message(
+            peer_id,
+            5,
+            CHANNEL_REQUEST,
+            &ChannelRequest {
+                peer_id,
+                channel_id: sink.id(),
+            }
+            .to_payload(),
+        )
+        .unwrap();
+
+        let assert_paused = || async {
+            for _ in 0..20 {
+                peer.send_to(&packet, endpoint).await.unwrap();
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+                assert!(
+                    !sink.is_connected(),
+                    "a late request resumed disabled audio"
+                );
+            }
+        };
+        let connect = || async {
+            tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+                while !sink.is_connected() {
+                    peer.send_to(&packet, endpoint).await.unwrap();
+                    tokio::time::sleep(StdDuration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("audio did not resume");
+        };
+
+        assert_paused().await;
+        link.enable_link_audio(true);
+        assert_paused().await;
+        link.enable().await;
+        connect().await;
+        link.disable().await;
+        assert_paused().await;
+        link.enable().await;
+        connect().await;
+        link.enable_link_audio(false);
+        assert_paused().await;
+        link.enable_link_audio(true);
+        connect().await;
     }
 
     #[tokio::test]

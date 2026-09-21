@@ -1205,10 +1205,10 @@ impl Controller {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.enabled
-            .try_lock()
-            .map(|enabled| *enabled)
-            .unwrap_or(false)
+        *self
+            .enabled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn is_start_stop_sync_enabled(&self) -> bool {
@@ -1256,7 +1256,7 @@ impl Controller {
     /// Announces a LinkAudio endpoint in this node's peer state, so that peers
     /// can discover where to send audio traffic. Passing `None` withdraws it.
     ///
-    /// Unlike the read-only accessors above, this one blocks on the lock
+    /// Unlike the best-effort peer snapshot accessors above, this blocks on the lock
     /// rather than skipping on contention. A dropped read returns a stale
     /// answer to one caller; a dropped write is a lost state transition: the
     /// audio-sharing lifecycle in `LinkAudio` would believe the endpoint
@@ -1923,6 +1923,34 @@ mod dispatch_gate_tests {
     #[tokio::test]
     async fn restart_measures_and_joins_a_peer_after_each_enable() {
         measures_and_joins_after_each_enable().await;
+    }
+
+    #[tokio::test]
+    async fn enabled_state_read_waits_for_contention() {
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        controller.enable().await;
+        let enabled = controller.enabled.clone();
+        let guard = enabled.lock().unwrap();
+        let (started, starting) = std::sync::mpsc::channel();
+        let (finished, finishing) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            finished.send(controller.is_enabled()).unwrap();
+            controller
+        });
+        let start = starting.recv_timeout(TEST_TIMEOUT);
+        let early = finishing.recv_timeout(TEST_TIMEOUT);
+        drop(guard);
+        let mut controller = reader.join().unwrap();
+        start.unwrap();
+        assert!(matches!(
+            early,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(finishing.recv_timeout(TEST_TIMEOUT).unwrap());
+        controller.disable().await;
     }
 
     #[tokio::test]

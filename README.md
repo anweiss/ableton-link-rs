@@ -270,6 +270,11 @@ assert_eq!(state_a, state_b);
 
 ### LinkAudio (`feature = "audio"`)
 
+Audio sharing is initially paused. Requesting it with `enable_link_audio(true)`
+starts network activity only while Link is enabled; disabling either pauses
+audio receive/send activity and disconnects sink receivers. Re-enabling Link
+resumes a preserved audio-sharing request without recreating the engine.
+
 `LinkAudio` derefs to `BasicLink`, so the read-only Link API remains available directly. The
 `&mut self` parts of `BasicLink` — `enable`, `disable`, `enable_start_stop_sync`,
 `commit_app_session_state` and the callback setters — are forwarded as inherent methods on
