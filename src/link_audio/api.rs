@@ -340,7 +340,15 @@ impl Drop for LinkAudio {
         // `Controller`) is dropped and its own discovery/session teardown
         // begins. Struct field order alone doesn't guarantee this, since
         // `link` is declared before `engine`, so we do it explicitly here.
-        self.link.controller().set_audio_endpoint(None);
+        match self.link.controller().peer_state.try_lock() {
+            Ok(mut state) => state.audio_endpoint = None,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                error.into_inner().audio_endpoint = None;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::debug!("final audio endpoint withdrawal skipped: peer state is locked");
+            }
+        }
         if let Some(task) = self.sync_task.take() {
             task.abort();
         }
@@ -783,6 +791,22 @@ mod tests {
 
         assert!(link.sync_task.is_none());
         assert!(link.is_link_audio_enabled());
+    }
+
+    #[tokio::test]
+    async fn drop_does_not_wait_for_a_peer_state_guard_owned_by_the_caller() {
+        let link = LinkAudio::new(120.0, "contended drop").await.unwrap();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let peer_state = link.controller().peer_state.clone();
+            let _guard = peer_state.lock().unwrap();
+            drop(link);
+            finished.send(()).unwrap();
+        });
+        completion
+            .recv_timeout(SHUTDOWN_TIMEOUT)
+            .expect("LinkAudio drop blocked behind its caller's peer-state guard");
+        worker.join().unwrap();
     }
 
     #[tokio::test]

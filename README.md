@@ -274,6 +274,11 @@ Audio sharing is initially paused. Requesting it with `enable_link_audio(true)`
 starts network activity only while Link is enabled; disabling either pauses
 audio receive/send activity and disconnects sink receivers. Re-enabling Link
 resumes a preserved audio-sharing request without recreating the engine.
+Pause fences individual UDP sends by generation and discards queued/encoded
+audio, including buffers retained by the application before pause but committed
+after resume. Normal endpoint withdrawal waits for contention; final destruction
+uses best-effort withdrawal before shutting down and joining discovery, so a
+caller-held peer-state guard cannot deadlock destruction.
 
 `LinkAudio` derefs to `BasicLink`, so the read-only Link API remains available directly. The
 `&mut self` parts of `BasicLink` — `enable`, `disable`, `enable_start_stop_sync`,

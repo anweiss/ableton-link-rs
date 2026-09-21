@@ -1261,9 +1261,9 @@ impl Controller {
     /// answer to one caller; a dropped write is a lost state transition: the
     /// audio-sharing lifecycle in `LinkAudio` would believe the endpoint
     /// withdrawn while peers kept seeing it announced, and no later call would
-    /// correct it. No holder of this mutex keeps its guard across an await or
-    /// does blocking work under it — every critical section is a few field
-    /// reads or a clone — so the wait here is bounded.
+    /// correct it. Callers must not hold `peer_state` while invoking this
+    /// setter. Final `LinkAudio` destruction uses a best-effort withdrawal
+    /// instead, before closing and joining discovery.
     pub fn set_audio_endpoint(&self, endpoint: Option<SocketAddrV4>) {
         let mut peer_state = self
             .peer_state

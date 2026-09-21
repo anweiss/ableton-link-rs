@@ -10,6 +10,11 @@
 //! The writer retains a slot, fills it, and releases it to the reader. The
 //! reader retains it, consumes it, and releases it back into the free pool.
 
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
 use tokio::sync::mpsc::{
     channel,
     error::{TryRecvError, TrySendError},
@@ -19,16 +24,19 @@ use tokio::sync::mpsc::{
 /// The producing half of the queue.
 pub struct Writer<T> {
     free_rx: Receiver<T>,
-    filled_tx: Sender<T>,
+    filled_tx: Sender<(u64, T)>,
     current: Option<T>,
+    current_epoch: u64,
+    epoch: Arc<AtomicU64>,
     num_slots: usize,
 }
 
 /// The consuming half of the queue.
 pub struct Reader<T> {
-    filled_rx: Receiver<T>,
+    filled_rx: Receiver<(u64, T)>,
     free_tx: Sender<T>,
     current: Option<T>,
+    epoch: Arc<AtomicU64>,
     num_slots: usize,
 }
 
@@ -38,6 +46,7 @@ pub fn queue<T: Clone>(num_slots: usize, value: T) -> (Writer<T>, Reader<T>) {
     let num_slots = num_slots.max(1);
     let (free_tx, free_rx) = channel(num_slots);
     let (filled_tx, filled_rx) = channel(num_slots);
+    let epoch = Arc::new(AtomicU64::new(0));
 
     for _ in 0..num_slots {
         // The channel was created with exactly this capacity.
@@ -49,12 +58,15 @@ pub fn queue<T: Clone>(num_slots: usize, value: T) -> (Writer<T>, Reader<T>) {
             free_rx,
             filled_tx,
             current: None,
+            current_epoch: 0,
+            epoch: epoch.clone(),
             num_slots,
         },
         Reader {
             filled_rx,
             free_tx,
             current: None,
+            epoch,
             num_slots,
         },
     )
@@ -68,9 +80,11 @@ impl<T> Writer<T> {
         if self.current.is_some() {
             return false;
         }
+        let epoch = self.epoch.load(Ordering::Acquire);
         match self.free_rx.try_recv() {
             Ok(slot) => {
                 self.current = Some(slot);
+                self.current_epoch = epoch;
                 true
             }
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => false,
@@ -82,7 +96,7 @@ impl<T> Writer<T> {
     pub fn release_slot(&mut self) {
         if let Some(slot) = self.current.take() {
             if let Err(TrySendError::Closed(_) | TrySendError::Full(_)) =
-                self.filled_tx.try_send(slot)
+                self.filled_tx.try_send((self.current_epoch, slot))
             {
                 // The reader is gone or saturated; dropping the slot only
                 // shrinks the pool for the lifetime of this queue.
@@ -111,12 +125,33 @@ impl<T> Reader<T> {
         if self.current.is_some() {
             return false;
         }
-        match self.filled_rx.try_recv() {
-            Ok(slot) => {
-                self.current = Some(slot);
-                true
+        for _ in 0..self.num_slots {
+            match self.filled_rx.try_recv() {
+                Ok((epoch, slot)) if epoch == self.epoch.load(Ordering::Acquire) => {
+                    self.current = Some(slot);
+                    return true;
+                }
+                Ok((_, slot)) => {
+                    let _ = self.free_tx.try_send(slot);
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return false,
             }
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => false,
+        }
+        false
+    }
+
+    /// Recycles queued data and invalidates a slot still held by the writer.
+    /// A late release of that slot is recycled on read, never delivered.
+    pub fn discard_pending(&mut self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.release_slot();
+        for _ in 0..self.num_slots {
+            match self.filled_rx.try_recv() {
+                Ok((_, slot)) => {
+                    let _ = self.free_tx.try_send(slot);
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
         }
     }
 
@@ -144,6 +179,34 @@ impl<T> Reader<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discard_recycles_queued_and_late_released_slots() {
+        let (mut writer, mut reader) = queue(3, 0u8);
+        assert!(writer.retain_slot());
+        writer.release_slot();
+        assert!(reader.retain_slot());
+        assert!(writer.retain_slot());
+        writer.release_slot();
+        assert!(writer.retain_slot());
+        *writer.slot_mut().unwrap() = 42;
+
+        reader.discard_pending();
+        writer.release_slot();
+        assert!(!reader.retain_slot(), "a pre-discard writer slot survived");
+        assert_eq!(reader.num_retained_slots(), 0);
+
+        for value in 1..=3 {
+            assert!(writer.retain_slot(), "discard lost a pool slot");
+            *writer.slot_mut().unwrap() = value;
+            writer.release_slot();
+        }
+        for value in 1..=3 {
+            assert!(reader.retain_slot());
+            assert_eq!(*reader.slot_mut().unwrap(), value);
+            reader.release_slot();
+        }
+    }
 
     #[test]
     fn slots_travel_from_writer_to_reader() {
