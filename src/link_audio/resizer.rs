@@ -40,15 +40,23 @@ where
 
 pub struct Resizer<S> {
     successor: S,
-    max_num_samples: usize,
+    max_num_bytes: usize,
     cache: Vec<i16>,
     cached_frames: u32,
+    available_frames: u32,
     num_channels: u32,
     sample_rate: u32,
     session_id: Id,
     chunks: Vec<Chunk>,
     count: u64,
 }
+
+/// A tolerance (in micro-beats) for comparing a chunk's expected end beat
+/// against the next callback's begin beat. `Timeline::beat_at_time` derives
+/// beats from absolute time while `chunk_end_beats` accumulates them from a
+/// running frame count; the two floating-point paths can diverge by a
+/// fraction of a micro-beat on every callback without this margin.
+const BEAT_TIMING_TOLERANCE: Beats = Beats { value: 1 };
 
 impl<S: ResizerSink> Resizer<S> {
     /// Creates a resizer that emits at most `max_num_bytes` of encoded audio
@@ -57,9 +65,10 @@ impl<S: ResizerSink> Resizer<S> {
         let max_num_samples = max_num_bytes / core::mem::size_of::<i16>();
         Resizer {
             successor,
-            max_num_samples,
+            max_num_bytes,
             cache: vec![0; max_num_samples],
             cached_frames: 0,
+            available_frames: 0,
             num_channels: 0,
             sample_rate: 0,
             session_id: Id::default(),
@@ -79,7 +88,7 @@ impl<S: ResizerSink> Resizer<S> {
         tempo: Tempo,
         session_id: Id,
     ) {
-        if num_channels == 0 || num_frames == 0 {
+        if num_channels == 0 {
             return;
         }
 
@@ -91,6 +100,10 @@ impl<S: ResizerSink> Resizer<S> {
             self.flush();
         }
 
+        if num_frames == 0 {
+            return;
+        }
+
         if self.cached_frames == 0 {
             self.sample_rate = sample_rate;
             self.num_channels = num_channels;
@@ -98,12 +111,12 @@ impl<S: ResizerSink> Resizer<S> {
             self.chunks.clear();
             self.new_chunk(begin_beats, tempo);
         } else if let Some(last) = self.chunks.last().copied() {
-            if tempo != last.tempo && begin_beats != self.chunk_end_beats(&last) {
+            if tempo != last.tempo
+                || (begin_beats - self.chunk_end_beats(&last)).abs() > BEAT_TIMING_TOLERANCE
+            {
                 self.new_chunk(begin_beats, tempo);
             }
         }
-
-        let frames_per_message = (self.max_num_samples / num_channels as usize) as u32;
 
         for frame in 0..num_frames {
             for channel in 0..num_channels {
@@ -119,7 +132,7 @@ impl<S: ResizerSink> Resizer<S> {
                 last.num_frames += 1;
             }
 
-            if self.cached_frames >= frames_per_message {
+            if self.cached_frames >= self.available_frames {
                 let next_chunk_begin_beats = self
                     .chunks
                     .last()
@@ -165,12 +178,27 @@ impl<S: ResizerSink> Resizer<S> {
 
     fn new_chunk(&mut self, beats: Beats, tempo: Tempo) {
         self.count += 1;
-        self.chunks.push(Chunk {
+        let chunk = Chunk {
             count: self.count,
             num_frames: 0,
             begin_beats: beats,
             tempo,
-        });
+        };
+        let chunk_bytes = Chunk::SIZE as usize;
+        let bytes_per_frame = self.num_channels as usize * core::mem::size_of::<i16>();
+
+        // The audio allowance already accounts for one chunk. Additional
+        // chunks share that allowance with samples, including at least one
+        // frame for the new chunk.
+        if (self.cached_frames as usize + 1) * bytes_per_frame + self.chunks.len() * chunk_bytes
+            > self.max_num_bytes
+        {
+            self.flush();
+        }
+
+        self.chunks.push(chunk);
+        let extra_chunk_bytes = (self.chunks.len() - 1) * chunk_bytes;
+        self.available_frames = ((self.max_num_bytes - extra_chunk_bytes) / bytes_per_frame) as u32;
     }
 }
 
@@ -331,5 +359,160 @@ mod tests {
             Id::default(),
         );
         assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn zero_length_input_still_flushes_a_stale_format() {
+        // Ported from upstream's PacketSizeWithFrequentTimingChanges flush
+        // step: an empty callback with a changed format must still emit the
+        // previously cached audio for the old format/session.
+        let (captured, sink) = collector();
+        let mut resizer = Resizer::new(sink, 64);
+        resizer.process(
+            &[1, 2],
+            1,
+            2,
+            44100,
+            Beats::new(0.0),
+            Tempo::new(120.0),
+            Id::default(),
+        );
+        assert!(captured.lock().unwrap().is_empty());
+
+        resizer.process(
+            &[],
+            0,
+            2,
+            48000,
+            Beats::new(0.0),
+            Tempo::new(120.0),
+            Id::default(),
+        );
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].samples, vec![1, 2]);
+        assert_eq!(captured[0].sample_rate, 44100);
+    }
+
+    /// Ported from upstream's `Resizer` test, `InputTimingChanges` section:
+    /// a tempo change or a beat-position jump beyond the rounding tolerance
+    /// must each independently open a new chunk, not only when both change
+    /// together.
+    #[test]
+    fn input_timing_changes_open_a_new_chunk() {
+        fn check_timing(next_begin: Beats, next_tempo: Tempo) {
+            const NUM_CHANNELS: u32 = 2;
+            const SAMPLE_RATE: u32 = 100;
+            let (captured, sink) = collector();
+            let mut resizer = Resizer::new(sink, 512);
+
+            let samples: Vec<i16> = (0..128).collect();
+            let first_begin = Beats::new(10.0);
+            let first_tempo = Tempo::new(120.0);
+
+            resizer.process(
+                &samples,
+                32,
+                NUM_CHANNELS,
+                SAMPLE_RATE,
+                first_begin,
+                first_tempo,
+                Id::default(),
+            );
+            resizer.process(
+                &samples[64..],
+                32,
+                NUM_CHANNELS,
+                SAMPLE_RATE,
+                next_begin,
+                next_tempo,
+                Id::default(),
+            );
+            resizer.process(
+                &samples,
+                0,
+                NUM_CHANNELS,
+                SAMPLE_RATE + 1,
+                Beats::new(0.0),
+                Tempo::new(0.0),
+                Id::default(),
+            );
+
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].chunks.len(), 2);
+            assert_eq!(captured[0].chunks[0].num_frames, 32);
+            assert_eq!(captured[0].chunks[0].begin_beats, first_begin);
+            assert_eq!(captured[0].chunks[0].tempo, first_tempo);
+            assert_eq!(captured[0].chunks[1].num_frames, 32);
+            assert_eq!(captured[0].chunks[1].begin_beats, next_begin);
+            assert_eq!(captured[0].chunks[1].tempo, next_tempo);
+        }
+
+        // Forward gap at unchanged tempo.
+        check_timing(Beats::new(12.64), Tempo::new(120.0));
+        // Backward jump at unchanged tempo.
+        check_timing(Beats::new(8.64), Tempo::new(120.0));
+        // Tempo change at continuous beat time: the first 32 frames at
+        // 100 Hz and 120 BPM end at beat 10.64.
+        check_timing(Beats::new(10.64), Tempo::new(90.0));
+    }
+
+    /// Ported from upstream's `Resizer` test, `BeatTimingRoundingTolerance`
+    /// section: a begin-beat that drifts from the expected chunk end by no
+    /// more than one micro-beat (due to independent floating-point paths for
+    /// computing beat position) must not open a spurious new chunk.
+    #[test]
+    fn beat_timing_rounding_tolerance_does_not_open_a_new_chunk() {
+        const NUM_CHANNELS: u32 = 1;
+        const SAMPLE_RATE: u32 = 44100;
+        const NUM_FRAMES: u32 = 128;
+        let (captured, sink) = collector();
+        let mut resizer = Resizer::new(sink, 1024);
+
+        let samples: Vec<i16> = vec![1; 2 * NUM_FRAMES as usize];
+        let begin_beats = Beats::new(10.0);
+        let tempo = Tempo::new(120.0);
+
+        let micros_per_beat = tempo.micros_per_beat().num_microseconds().unwrap();
+        let host_time_delta = (NUM_FRAMES as f64 * 1e6 / SAMPLE_RATE as f64).round() as i64;
+        let next_begin_beats =
+            begin_beats + Beats::new(host_time_delta as f64 / micros_per_beat as f64);
+
+        resizer.process(
+            &samples[..NUM_FRAMES as usize],
+            NUM_FRAMES,
+            NUM_CHANNELS,
+            SAMPLE_RATE,
+            begin_beats,
+            tempo,
+            Id::default(),
+        );
+        resizer.process(
+            &samples[NUM_FRAMES as usize..],
+            NUM_FRAMES,
+            NUM_CHANNELS,
+            SAMPLE_RATE,
+            next_begin_beats,
+            tempo,
+            Id::default(),
+        );
+        // Force a flush by changing the sample rate.
+        resizer.process(
+            &[],
+            0,
+            NUM_CHANNELS,
+            SAMPLE_RATE + 1,
+            Beats::new(0.0),
+            Tempo::new(0.0),
+            Id::default(),
+        );
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].chunks.len(), 1);
+        assert_eq!(captured[0].chunks[0].num_frames, 2 * NUM_FRAMES as u16);
+        assert_eq!(captured[0].samples, samples);
     }
 }
