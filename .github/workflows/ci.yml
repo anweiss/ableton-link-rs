@@ -13,6 +13,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  upstream-automation:
+    name: Upstream automation tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: node --test .github/scripts/test-upstream-automation.cjs
+
   fmt:
     name: Format check
     runs-on: ubuntu-latest

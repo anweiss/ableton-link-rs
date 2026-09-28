@@ -595,9 +595,10 @@ that list is the highest-value part of reviewing one of these PRs.
 | `link-upstream-watch.md` | Weekly, Monday | Triages upstream commits landed since the pin and proposes a pull request against [`.github/upstream-backlog.toml`](.github/upstream-backlog.toml) |
 | `link-upstream-port.md` | Weekly, Thursday | Takes the earliest outstanding backlog item it can actually port — skipping ones that are `blocked_on` a design decision, `api-break`, or wire-format without a portable byte-level test — ports it, runs the full CI suite, and opens a draft PR |
 | `upstream-backlog-issues.yml` | On pushes touching the backlog file, plus daily | Reconciles one tracking issue per outstanding backlog item from the file. Deterministic `github-script`, not an agent |
-| `auto-merge-upstream-port.yml` | On every port PR event | Marks a qualifying port PR ready for review and enables auto-merge, so it lands once branch protection is satisfied |
-| `copilot-review-loop.yml` | On port PR events, plus a periodic sweep | Approves held CI runs, requests Copilot code review, batches its comments to `Copilot Review Fix`, and marks the PR `copilot-reviewed` when the loop finishes |
+| `auto-merge-upstream-port.yml` | On upstream PR events and pushes to main | Marks a qualifying port or backlog-only triage PR ready for review and enables auto-merge once the review loop signs off |
+| `copilot-review-loop.yml` | On watch/port/fix workflow completion, plus a five-minute scheduled sweep | Requests Copilot review, routes findings to the appropriate fix agent, and signs off the reviewed head; also approves held CI runs on same-repository bot branches |
 | `copilot-review-fix.md` | Dispatched by the review loop only | Fixes a batch of Copilot review comments on Opus 5 and pushes to the port PR's branch. Never picks its own PR; the loop owns that decision |
+| `copilot-triage-review-fix.md` | Dispatched by the review loop only | Fixes triage review findings on Opus 5 with an exclusive backlog-file allowlist; cannot change source, README, workflows, or the upstream pin |
 
 Both compute their input with `.github/scripts/link-upstream-drift.sh`, which is
 plain shell and runnable locally:
@@ -708,15 +709,17 @@ from the PR's Checks tab or with
 `gh api -X POST repos/anweiss/ableton-link-rs/actions/runs/<id>/approve`. Nothing is
 wrong with the PR when this happens.
 
-**The Copilot review loop.** Before a port PR is allowed to merge it goes through
+**The Copilot review loop.** Before a port or backlog-only triage PR is allowed to
+auto-merge it goes through
 `copilot-review-loop.yml`, which on each qualifying PR:
 
 1. approves any workflow runs held in `action_required`, so the required checks
    actually report;
 2. requests a review from Copilot code review of the **current head commit**;
 3. when Copilot has reviewed that exact commit, hands every comment from that review
-   to `Copilot Review Fix` as a single dispatch, so it fixes them in one pass. That
-   workflow is a gh-aw agent pinned to `claude-opus-5` - the fixing model is chosen
+   to `Copilot Review Fix` (ports) or `Copilot Triage Review Fix` (triage) as a
+   single dispatch, so it fixes them in one pass. Both
+   workflows are gh-aw agents pinned to `claude-opus-5` - the fixing model is chosen
    deliberately rather than left to the cloud agent's default, because most comments
    here are about whether a decode path is faithful to the upstream C++;
 4. when the agent pushes, the head moves, so step 2 runs again against the new commit
@@ -737,10 +740,14 @@ applied, the workflow removes it **and cancels the queued auto-merge**, because 
 keeps auto-merge armed regardless of what happens to labels afterwards. Without that,
 anything pushed after sign-off could merge unreviewed.
 
-**Why the `copilot-reviewed` label exists.** Nothing in branch protection makes a port
-PR wait for review. Copilot code review always leaves a *comment* review, never an
-approval or a change request, and comment reviews do not block merging; `main` also
-requires zero approving reviews. So auto-merge would otherwise fire the moment the
+**Why the `copilot-reviewed` label exists.** Nothing in branch protection makes an
+upstream PR wait for review: `main` requires zero approving reviews. Copilot can
+approve, request changes, or leave a neutral comment review, but an approval alone
+does not establish that every finding was addressed. The loop also checks unresolved
+inline findings and the overview verdict; a non-green overview with only body
+findings requires a human. An approving review with suppressed comments produces a
+warning rather than blocking sign-off. Without its
+explicit sign-off, auto-merge could fire the moment the
 required checks went green — typically before Copilot had read the diff, leaving the
 review to land on an already-merged PR. The label is an additional gate layered on top
 of the required checks, not a replacement for any of them.
@@ -751,19 +758,27 @@ missing, if Copilot never reviews, if the agent never pushes, or if Copilot stil
 comments after two agent passes, that comment says so and the label stays off, so the
 PR parks visibly instead of merging unreviewed. Stalls are called out after six hours.
 
-**Auto-merge.** Port PRs are merged for you.
+**Auto-merge.** Port and backlog-only triage PRs are merged for you.
 [`auto-merge-upstream-port.yml`](.github/workflows/auto-merge-upstream-port.yml)
 watches for a pull request that targets `main`, comes from a branch in this
-repository, was opened by `github-actions[bot]`, and carries the `upstream-sync`,
-`automation` and `copilot-reviewed` labels — which is exactly the shape
-`link-upstream-port.md` produces once the review loop has signed off, and nothing
-else. release-please PRs (`autorelease: pending`) and Dependabot PRs do not match. For
+repository, was opened by `github-actions[bot]`, and carries `automation`,
+`copilot-reviewed`, and **exactly one** of `upstream-sync` (ports) or
+`upstream-triage` (triage). release-please PRs (`autorelease: pending`) and Dependabot
+PRs do not match. For
 a PR that matches, it marks the draft ready for review and turns on squash auto-merge.
+
+Both gates require a triage diff to modify only `.github/upstream-backlog.toml`,
+with no added, deleted, or renamed files. Out-of-scope changes, unreadable triage
+diffs, and loss of eligibility revoke sign-off and queued auto-merge. Triage review
+fixes use a separate workflow with `upstream-triage` + `automation` authorization
+and the same single-file allowlist. Never add `upstream-sync` to make a triage PR
+qualify: that label blocks further port runs, and carrying both labels is rejected.
+Threat flags and wire-format holds still prevent automated fixes and merging.
 
 It also cross-checks the SHA. The label says a sign-off happened, not *which* commit
 was signed off, so before queuing anything auto-merge reads the review loop's status
-comment and requires the recorded `reviewedSha` to equal the current head. Both
-workflows fire on the same `synchronize`, and without that check auto-merge could
+comment and requires the recorded `reviewedSha` to equal the current head. The
+merge workflow can see `synchronize` before the next review sweep, and without that check it could
 qualify a new head against a label the review loop was in the middle of revoking. It
 fails closed: unreadable state means no auto-merge.
 

@@ -50,6 +50,8 @@ name: Copilot review loop for port PRs
 # any queued auto-merge is cancelled, because GitHub does not cancel auto-merge
 # when a label goes away. That also makes a maintainer pushing a manual fix a
 # first-class path rather than a permanent stall.
+# Backlog-only upstream-triage PRs share this loop but dispatch a separately
+# constrained fix workflow; they never acquire the upstream-sync port label.
 #
 # Why a PAT is required, and what happens without one
 # ===================================================
@@ -113,7 +115,7 @@ on:
   # `workflow_run` run executes on `main` in the base repo, so it is never held
   # for approval the way a `pull_request` run on a bot PR is.
   workflow_run:
-    workflows: ["Link Upstream Port", "Copilot Review Fix"]
+    workflows: ["Link Upstream Port", "Link Upstream Watch", "Copilot Review Fix", "Copilot Triage Review Fix"]
     types: [completed]
   # The sweep is not a backstop here, it is the primary path for every hop
   # after the PR opens, because the event triggers that would have driven
@@ -149,7 +151,8 @@ jobs:
     steps:
       # Runs BEFORE the review loop and independently of it, because the loop
       # only ever looks at pull requests `disqualify` accepts: opened by
-      # `github-actions[bot]`, labelled `upstream-sync` + `automation`, and
+      # `github-actions[bot]`, labelled `automation` plus exactly one of
+      # `upstream-sync` / `upstream-triage`, and
       # explicitly NOT `autorelease: pending`. Held runs are not that narrow.
       # Every release-please pull request is opened by the same bot and so has
       # all five of its `pull_request` runs held, and nothing in this repo ever
@@ -380,6 +383,16 @@ jobs:
               return files.some(f => WIRE_FORMAT_PATHS.includes(f.filename));
             }
 
+            async function triageScopeViolation(pr) {
+              if (!labelsOf(pr).includes('upstream-triage')) return false;
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: pr.number, per_page: 100,
+              });
+              return files.length !== 1 ||
+                files[0].filename !== '.github/upstream-backlog.toml' ||
+                files[0].status !== 'modified' || !!files[0].previous_filename;
+            }
+
             // The single gate for "a human decides this one, not the loop".
             //
             // Both reasons withhold sign-off *and* refuse to hand the pull
@@ -403,6 +416,13 @@ jobs:
             // is seen by neither the hold nor the head check.
             async function holdReason(pr) {
               if (labelsOf(pr).includes(THREAT_LABEL)) return 'threat';
+              if (disqualify(pr)) return 'eligibility';
+              try {
+                if (await triageScopeViolation(pr)) return 'triage-scope';
+              } catch (error) {
+                await revoke(pr);
+                throw error;
+              }
               if (await isWireFormat(pr)) return 'wire-format';
               return null;
             }
@@ -412,6 +432,18 @@ jobs:
             // at the gate that parks a flagged pull request before any review
             // is asked for at all.
             function holdNote(reason, outstanding, short) {
+              if (reason === 'triage-scope') {
+                return 'Triage automation only permits a modification of ' +
+                  '`.github/upstream-backlog.toml`, with no added, deleted, or ' +
+                  'renamed files. This diff exceeds that scope. Agent fixes ' +
+                  'and auto-merge are withheld; remove the extra changes and ' +
+                  'get a new review, or handle the PR manually.';
+              }
+              if (reason === 'eligibility') {
+                return 'This PR no longer meets the upstream automation author, ' +
+                  'base, repository, or label requirements. Sign-off and ' +
+                  'auto-merge have been revoked.';
+              }
               if (reason === 'threat') {
                 const tail = outstanding === null
                   ? `No automation has run against \`${short}\`: this loop stopped before ` +
@@ -581,10 +613,11 @@ jobs:
               // No branch-name check. The port workflow's branch name is chosen
               // by the model per run, not fixed by link-upstream-port.md: #69,
               // #76 and #83 happened to use `port/`, but #86 used
-              // `chore/advance-submodule-...` and was skipped entirely. The
-              // `upstream-sync` + `automation` label pair below is the actual
-              // contract, and it is applied only by the port workflow.
-              if (!labels.includes('upstream-sync') || !labels.includes('automation')) {
+              // `chore/advance-submodule-...` and was skipped entirely.
+              // Exactly one upstream kind plus automation. Keep triage out of
+              // the upstream-sync set that blocks further port PRs.
+              if (!labels.includes('automation') ||
+                  labels.includes('upstream-sync') === labels.includes('upstream-triage')) {
                 return `labels are [${labels.join(', ')}]`;
               }
               if (labels.includes('autorelease: pending')) return 'it is a release PR';
@@ -920,15 +953,20 @@ jobs:
             // The workflow is addressed by its compiled lock file, which is
             // the file GitHub actually knows about. `copilot-review-fix.md` is
             // source; asking the API for it returns 404.
-            const FIX_WORKFLOW = 'copilot-review-fix.lock.yml';
+            function fixWorkflow(pr) {
+              return labelsOf(pr).includes('upstream-triage')
+                ? { file: 'copilot-triage-review-fix.lock.yml', name: 'Copilot Triage Review Fix' }
+                : { file: 'copilot-review-fix.lock.yml', name: 'Copilot Review Fix' };
+            }
 
-            async function dispatchFixWorkflow(number, head) {
+            async function dispatchFixWorkflow(number, head, workflow) {
+              const FIX_WORKFLOW = workflow.file;
               const before = new Date(Date.now() - 30_000).toISOString();
               // Must match `run-name:` in copilot-review-fix.md exactly. It is
               // the only positive correlation available: the dispatch API names
               // no run, and "newest dispatch run of this workflow" would let a
               // run created for a different pull request stand in for this one.
-              const runName = `Copilot Review Fix - PR #${number} @ ${head}`;
+              const runName = `${workflow.name} - PR #${number} @ ${head}`;
               await userRequest(
                 'POST',
                 `/repos/${owner}/${repo}/actions/workflows/${FIX_WORKFLOW}/dispatches`,
@@ -988,8 +1026,9 @@ jobs:
             // `contents: write`, and the loop reported "waiting on the coding
             // agent" for the next hour. A dead run is knowable immediately, so
             // it should be said immediately.
-            async function fixRunOutcome(number, head) {
-              const runName = `Copilot Review Fix - PR #${number} @ ${head}`;
+            async function fixRunOutcome(number, head, workflow) {
+              const FIX_WORKFLOW = workflow.file;
+              const runName = `${workflow.name} - PR #${number} @ ${head}`;
               // Deliberately one bounded page, not `paginate`. The Actions
               // list endpoint returns descending `created_at`, so the run being
               // looked for is always on the first page; paginating the whole
@@ -1029,12 +1068,16 @@ jobs:
               const reason = disqualify(pr);
               if (reason) {
                 core.info(`PR #${number} not in scope: ${reason}.`);
+                if (pr.state === 'open' && labelsOf(pr).includes(DONE_LABEL)) {
+                  await revoke(pr);
+                }
                 return;
               }
 
               const head = pr.head.sha;
               const short = head.slice(0, 7);
               const handle = await readState(number);
+              const workflow = fixWorkflow(pr);
 
               // gh-aw's banner requires manual review before *any* follow-up
               // automation, and everything below this point is exactly that:
@@ -1056,6 +1099,23 @@ jobs:
                   note: holdNote('threat', null, short),
                 });
                 core.notice(`PR #${number}: threat-flagged, parked before any automation.`);
+                return;
+              }
+
+              let triageViolation;
+              try {
+                triageViolation = await triageScopeViolation(pr);
+              } catch (error) {
+                await revoke(pr);
+                throw error;
+              }
+              if (triageViolation) {
+                await revoke(pr);
+                await writeState(number, handle, {
+                  phase: 'human-hold',
+                  reviewedSha: null,
+                  note: holdNote('triage-scope', null, short),
+                });
                 return;
               }
 
@@ -1284,6 +1344,10 @@ jobs:
                 const { data: fresh } = await github.rest.pulls.get({
                   owner, repo, pull_number: number,
                 });
+                if (fresh.state !== 'open') {
+                  core.info(`PR #${number}: closed during this run.`);
+                  return;
+                }
                 const hold = await holdReason(fresh);
                 if (hold) {
                   // The tag can be added to the body after a sign-off, so this
@@ -1313,7 +1377,9 @@ jobs:
                   return;
                 }
                 // A sign-off is only meaningful for the exact commit reviewed.
-                if (fresh.head.sha !== head) {
+                if (fresh.head.sha !== head ||
+                    fixWorkflow(fresh).file !== workflow.file) {
+                  await revoke(fresh);
                   core.info(`PR #${number}: head moved during the run; re-examining next time.`);
                   return;
                 }
@@ -1355,6 +1421,10 @@ jobs:
               const { data: current } = await github.rest.pulls.get({
                 owner, repo, pull_number: number,
               });
+              if (current.state !== 'open') {
+                core.info(`PR #${number}: closed during this run.`);
+                return;
+              }
               const hold = await holdReason(current);
               if (hold) {
                 await revoke(current);
@@ -1367,11 +1437,18 @@ jobs:
                 return;
               }
 
+              if (current.head.sha !== head ||
+                  fixWorkflow(current).file !== workflow.file) {
+                await revoke(current);
+                core.info(`PR #${number}: head or workflow kind changed; re-examining next time.`);
+                return;
+              }
+
               if (handle.value.dispatchedSha === head) {
                 // The head has not moved since the dispatch. That is either
                 // "still running" or "the run is over and nothing landed", and
                 // those deserve very different notes.
-                const run = await fixRunOutcome(number, head);
+                const run = await fixRunOutcome(number, head, workflow);
                 // Already known dead. `fixRunOutcome` returns null when the
                 // runs cannot be listed, so without this a transient list
                 // failure would fall through and overwrite the terminal note
@@ -1517,14 +1594,14 @@ jobs:
               // no marker, and the next sweep dispatches a second time. A
               // duplicate round is bounded by MAX_ROUNDS and visible; a
               // permanent stall is neither. Duplicate is the better failure.
-              await dispatchFixWorkflow(number, head);
+              await dispatchFixWorkflow(number, head, workflow);
 
               await userRequest(
                 'POST', `/repos/${owner}/${repo}/issues/${number}/comments`,
                 {
                   body:
                     `${dispatchMarker}\n` +
-                    `Dispatched **Copilot Review Fix** (Opus 5) for the ` +
+                    `Dispatched **${workflow.name}** (Opus 5) for the ` +
                     `${outstanding.length} Copilot code review comment(s) on commit ` +
                     `\`${short}\`, listed below. It fixes them as one batch and pushes ` +
                     'to this branch; the loop re-reviews the new head.\n\n' +
