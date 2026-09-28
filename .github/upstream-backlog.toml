@@ -37,8 +37,8 @@ schema_version = 1
 # the submodule pin, and the validator fails if this drifts from it.
 [watermark]
 pinned = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
-upstream = "13c5744cf1705d05b9a93b8b652ba2ce29b3dcfc"
-commits_behind = 115
+upstream = "9c9091275e707ab09d09a5a608fcdb84bf0dec85"
+commits_behind = 137
 
 # ---------------------------------------------------------------------------
 # Port items, in upstream ancestry order (oldest first). The port workflow
@@ -314,6 +314,28 @@ retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "Upstream separates `mIsLinkAudioEnabledByUser` from effective audio sharing and recomputes the latter from Link enablement and the user's request. `LinkAudio` preserves that request across disable/enable cycles, removes `DerefMut` to prevent lifecycle bypass, and forwards mutable `BasicLink` methods explicitly. Audio teardown precedes `BasicLink::disable().await` for cancellation safety. Enabled-state reads and normal endpoint withdrawal wait for their mutexes; final destruction uses best-effort withdrawal before core shutdown/join to avoid caller-held-lock deadlock. The managed engine starts paused. Ending peer sync closes receive admission and generation-fences individual nonblocking UDP sends, invalidates sync and buffer epochs, resets queued/encoded audio, and clears peers/receivers. Old application-held buffers are rejected even if committed after resume. Beginning peer sync resumes existing engine tasks; final shutdown stays irreversible. Tests cover cancellation, contention, reentrant destruction, late channel requests, gate-drain timeout, pause/resume, stale buffers and slot recycling."
 impact = "An application that turned audio sharing on before enabling Link, or that disabled Link mid-session after a dropout or a pause, kept announcing its audio endpoint against a session that was no longer discoverable, so peers saw a stale, unreachable endpoint. Audio sharing now follows Link's own enabled state, and stops even if the caller abandons the disable operation partway. Code that reached the mutable side of the plain Link API by dereferencing the audio type must now call those methods on the audio type instead."
 
+[[port]]
+id = "sink-buffer-never-shrinks-and-retains-iteratively"
+title = "Confirm the audio sink never shrinks its buffer and never recurses while looking for a big-enough slot"
+upstream = ["4ce3038601e79e02ac0e46cc1ca8085836483f41", "3771e6b19733bc6edc6de85c0180b29a23dc32dc"]
+rust = ["src/link_audio/sink.rs"]
+risk = "internal"
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
+why = "Upstream commit 4ce3038601e7 changes `Sink::requestMaxNumSamples` (include/ableton/link_audio/Sink.hpp) from a plain store to a compare-exchange loop that only raises `mMaxNumSamples`, because the class already never shrinks the underlying buffer when the requested size drops, so the accessor should say the same thing the implementation already does. Upstream commit 3771e6b19733 rewrites `Sink::retainBuffer()` from a recursive retry (retain a slot, and if it is undersized, release it and recurse into `retainBuffer()` again) into a `while (queueWriter.retainSlot())` loop that returns the first slot at least `mMaxNumSamples` long, or `nullptr` once the queue reports no more retainable slots, avoiding unbounded recursion depth when many stale small slots are queued. Both behaviors are already present in this port: `Sink::request_max_num_samples` in `src/link_audio/sink.rs` uses `AtomicUsize::fetch_max`, which is exactly a monotonically-increasing compare-and-swap loop, and `Sink::retain_buffer` grows an undersized slot in place with `buffer.samples.resize(max_num_samples, 0)` rather than rejecting and re-searching for a bigger one, which sidesteps the recursion problem entirely by construction — there is no loop or recursion to unbound. The existing `max_num_samples_only_grows` test already covers the first behavior; retained without further changes."
+impact = "No user-visible effect: two upstream C++ implementation details -- how the internal audio sink decides never to shrink its buffer and how it searches for a large-enough free slot -- were already implemented equivalently and safely in this crate before these upstream commits landed. Recorded so the commits are accounted for."
+
+[[port]]
+id = "harden-audiobuffer-deserialization-against-malformed-network-input"
+title = "Reject malformed audio buffer messages instead of silently accepting bad values from the network"
+upstream = ["0fd85e8cfaeca22d1aef6cba4405b71f9941bf65", "06590b98ce6f413c0c6589ee1b60c3b11903d500", "caece1ac17547c7d9eaf3efe0fc9b17042e4cbd1", "ab3dfee9c36eee26838820e6e4cc0a2143b88671", "6b94b00ee72007e33493787ce2e7b1d17e660afa", "e4c0371a298360e5942241e9e2af1b42f65730a7"]
+rust = ["src/link_audio/payload.rs", "src/link_audio/sink.rs", "src/link_audio/api.rs"]
+risk = "wire-format"
+status = "outstanding"
+retired_at_pin = ""
+why = "Six upstream commits tighten `AudioBuffer` validation, five of them on `AudioBuffer::fromNetworkByteStream` (include/ableton/link_audio/AudioBuffer.hpp), one on the public commit path: (1) `0fd85e8cfaec` adds `sampleRate > 0` to `LinkAudioSink::BufferHandle::commit` (include/ableton/LinkAudio.ipp) and throws `runtime_error(\"Invalid sample rate.\")` in deserialization if `sampleRate == 0`, because a zero sample rate divides by zero in the Resizer on send and in `endBeats()` on receive; (2) `06590b98ce6f` fixes `sizeInByteStream()` to cast `numChannels`/`numBytes` to the same unsigned types actually written on the wire (`uint8_t`/`uint16_t`) instead of signed ones, avoiding a size miscalculation; (3) `caece1ac1754` changes the accepted-codec check from `codec == Codec::kInvalid` (reject only the zero sentinel) to `codec != Codec::kPCM_i16` (reject everything except the one codec actually implemented), so any codec byte other than 1 is rejected rather than merely 0; (4) `ab3dfee9c36e` rejects `numChannels` outside `{1, 2}`; (5) `6b94b00ee720` adds `numBytes > kMaxAudioBytes` as its own explicit range_error before the existing frame/byte-count consistency check, so an oversized byte count is rejected before the multiplication that would otherwise silently overflow or under-detect it; (6) `e4c0371a2983` rejects any chunk whose `tempo.bpm()` is non-finite (NaN/Inf) or `<= 0.0`. In `src/link_audio/payload.rs`, `AudioBuffer::decode_body` currently accepts `Codec::Invalid` only being rejected (matches the pre-fix upstream behavior in (3), needs updating to reject anything but `Codec::PcmI16`), has no `sample_rate == 0` check, no explicit `num_channels` in `{1, 2}` check, no `num_bytes > MAX_AUDIO_BYTES` check (relies solely on the frame/byte consistency check, which for `num_channels == 0` divides-by-nothing but does not bound `num_bytes` against `MAX_AUDIO_BYTES` before the multiplication), and no chunk-tempo finiteness/positivity check (`Chunk::decode` already builds a `Tempo` from a raw `i64` microseconds-per-beat with no bounds check, so a hostile peer can send a zero, negative or absurd tempo). `SinkBufferHandle::commit` in `src/link_audio/sink.rs` validates `num_channels == 0` and buffer-size overflow but not `sample_rate == 0`, so `LinkAudioSink::commit`/`LinkAudioApi` equivalents in `src/link_audio/api.rs` should also gain the same guard upstream added at its public API entry point. Port all six checks together since they are one cohesive hardening pass on the same deserialization path and public commit path; keep error messages distinguishable so a peer sending malformed data can be diagnosed. `d5a392da8862` (AudioBuffer test refactor) is C++-test-only and filed separately as not-applicable."
+impact = "A malformed or hostile audio buffer message on the network -- zero sample rate, unknown codec, wrong channel count, oversized byte count, or a non-finite tempo -- could previously be accepted, or trigger a division by zero downstream. Upstream now rejects each case at the network boundary with a clear error instead of destabilizing the receiver."
+
 # ---------------------------------------------------------------------------
 # Commits seen and consciously parked. Kept so that coverage stays provable:
 # a commit nobody mentions is not deferred, it is deleted the moment the pin
@@ -470,3 +492,59 @@ reason = "link_audio_hut example changes (examples only)"
 [[not_applicable]]
 upstream = ["f7bae9860a3c"]
 reason = "Refactor: Use structs instead of typedefs in abl_link (`extensions/abl_link/**` C API only, not mapped to Rust)"
+
+[[not_applicable]]
+upstream = ["c93f94322f9a6d23fb2cade2d298e36fa2d97005"]
+reason = "Add workflow_dispatch to the ci action (`.github/workflows/ci.yml` only, upstream C++ CI)"
+
+[[not_applicable]]
+upstream = ["e753ebbce389d994a0c59ca48ac5716e0d6dbbcd"]
+reason = "Fix comment in AudioEngine.hpp (`examples/linkaudio/AudioEngine.ipp` only, C++ example)"
+
+[[not_applicable]]
+upstream = ["df285b898c3448b06a210a5e38078ca5e1fa910b"]
+reason = "Update macOS CI configuration (`.github/workflows/ci.yml` only, upstream C++ CI)"
+
+[[not_applicable]]
+upstream = ["d5a392da8862ee4908f4e34349c80d2b8262e97b"]
+reason = "Refactor AudioBuffer tests with shared helpers (`src/ableton/link_audio/tst_AudioBuffer.cpp` only, Catch2 test harness)"
+
+[[not_applicable]]
+upstream = ["a1fb637ecdb29187949a55b060eab2e16f0ec82d"]
+reason = "Add Android build support (CMake/NDK toolchain and CI matrix only, no Rust build system analogue)"
+
+[[not_applicable]]
+upstream = ["d350678e6dfc8ba262e965376f68275bcb0df90c"]
+reason = "Require CMake 3.16 (`CMakeLists.txt`/policy handling only, C++ build system)"
+
+[[not_applicable]]
+upstream = ["0cae0c01cb7d71f49e8032c18d95dac544bfbf69"]
+reason = "Update the Asio types used for esp32 (`platforms/esp32/Context.hpp` Asio io_service to io_context migration; Rust port uses Tokio, not Asio)"
+
+[[not_applicable]]
+upstream = ["ce9db9ae99998c3afc598fc8e1e671f4ca68cb34"]
+reason = "Update the Asio submodule to version 1.38.2 (vendored `modules/asio-standalone` bump; Rust port does not vendor Asio)"
+
+[[not_applicable]]
+upstream = ["0cc3843dd31d6228a3566622d85f8bbc450226df"]
+reason = "Use Asio's inline version namespace (`platforms/asio/**`, `discovery/AsioTypes.hpp`; Asio-only namespacing mechanism, no Rust analogue)"
+
+[[not_applicable]]
+upstream = ["3757c518d18da24384e49b3fff3dfcf25baaa47b"]
+reason = "Move the Asio configuration from AsioWrapper.hpp to CMake (Asio-only build configuration)"
+
+[[not_applicable]]
+upstream = ["e6e6b078a036a70f0c0172ea3529e37b2203544f"]
+reason = "Derive ASIO_VERSION_NAMESPACE from the bundled Asio version (`cmake_include/ConfigureAsioStandalone.cmake` only, Asio-only)"
+
+[[not_applicable]]
+upstream = ["7f8231b59ec4925ef8273b2103a1a03cbdff2b43"]
+reason = "Add LINK_USE_BUNDLED_ASIO to allow using a custom Asio version (CMake/Asio-only option)"
+
+[[not_applicable]]
+upstream = ["ac76eb4cffc53a8ef45c2a2ff9b5431b731fbacb"]
+reason = "Define _WIN32_WINNT for Link's own Windows targets (Asio/Windows-SDK header-ordering fix for the C++ build, no Rust analogue)"
+
+[[not_applicable]]
+upstream = ["9c9091275e707ab09d09a5a608fcdb84bf0dec85"]
+reason = "Update README (upstream C++ CMake/Asio build documentation only)"
