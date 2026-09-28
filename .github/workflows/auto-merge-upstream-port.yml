@@ -8,6 +8,8 @@ name: Auto-merge upstream port PRs
 # workflow closes that loop by putting qualifying port PRs into GitHub's native
 # auto-merge queue, so they land on their own once every required check on `main`
 # has passed.
+# Backlog-only upstream-triage PRs use the same review/sign-off gate, without
+# acquiring upstream-sync (which would block the porting pipeline).
 #
 # What this does NOT do
 # =====================
@@ -40,7 +42,7 @@ name: Auto-merge upstream port PRs
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review, labeled, synchronize]
+    types: [opened, reopened, ready_for_review, labeled, unlabeled, synchronize]
   # A merge to `main` can leave an already-queued port PR out of date, and
   # `main` requires branches to be up to date (`strict: true`). Re-examine open
   # port PRs whenever `main` moves so that situation is reported rather than
@@ -76,7 +78,7 @@ jobs:
         github.event.pull_request.user.login == 'github-actions[bot]'
       )
     steps:
-      - name: Enable auto-merge for qualifying port PRs
+      - name: Enable auto-merge for qualifying upstream PRs
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
@@ -98,7 +100,9 @@ jobs:
                 ({ data: pr } = await github.rest.pulls.get({
                   owner, repo, pull_number: number,
                 }));
-                if (labelsOf(pr).includes('upstream-sync')) break;
+                if (labelsOf(pr).includes('automation') &&
+                    (labelsOf(pr).includes('upstream-sync') ||
+                     labelsOf(pr).includes('upstream-triage'))) break;
                 if (i < attempts - 1) await sleep(5000);
               }
               return pr;
@@ -126,6 +130,14 @@ jobs:
                 'auto-merging it would put a protocol change on `main` ' +
                 'with no human having read it.\n\nReview it and merge by ' +
                 'hand.',
+            };
+            const TRIAGE_HOLD = {
+              marker: '<!-- auto-merge-upstream-port: triage-scope-hold -->',
+              body: '**Auto-merge withheld.** A triage PR may only modify ' +
+                    '`.github/upstream-backlog.toml`, without adding, deleting, ' +
+                    'or renaming files. Remove the out-of-scope changes and get ' +
+                    'a new review, or handle this PR manually. Do not add ' +
+                    '`upstream-sync` to bypass the triage boundary.',
             };
 
             // Posts once per pull request. The marker is the idempotency key,
@@ -155,10 +167,11 @@ jobs:
               // No branch-name check. The port workflow's branch name is chosen
               // by the model per run, not fixed by link-upstream-port.md: #69,
               // #76 and #83 happened to use `port/`, but #86 used
-              // `chore/advance-submodule-...` and was skipped entirely. The
-              // `upstream-sync` + `automation` label pair below is the actual
-              // contract, and it is applied only by the port workflow.
-              if (!labels.includes('upstream-sync') || !labels.includes('automation')) {
+              // `chore/advance-submodule-...` and was skipped entirely.
+              // Exactly one upstream kind plus automation: triage must never
+              // borrow the port label or its wider file permissions.
+              if (!labels.includes('automation') ||
+                  labels.includes('upstream-sync') === labels.includes('upstream-triage')) {
                 return `labels are [${labels.join(', ')}]`;
               }
               if (labels.includes('autorelease: pending')) return 'it is a release PR';
@@ -267,6 +280,16 @@ jobs:
               return files.some(f => WIRE_FORMAT_PATHS.includes(f.filename));
             }
 
+            async function triageScopeViolation(pr) {
+              if (!labelsOf(pr).includes('upstream-triage')) return false;
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: pr.number, per_page: 100,
+              });
+              return files.length !== 1 ||
+                files[0].filename !== '.github/upstream-backlog.toml' ||
+                files[0].status !== 'modified' || !!files[0].previous_filename;
+            }
+
             async function revoke(pr) {
               await disableAutoMerge(pr);
               try {
@@ -280,6 +303,11 @@ jobs:
 
             async function process(number) {
               const pr = await fetchQualifying(number);
+              if (!labelsOf(pr).some(label =>
+                ['upstream-sync', 'upstream-triage', 'copilot-reviewed'].includes(label))) {
+                core.info(`PR #${number}: outside upstream automation; leaving it unchanged.`);
+                return;
+              }
               // Threat is settled from labels alone, before any further API
               // call. `isWireFormat` queries the file list, and a failure there
               // throws out of `process` before `revoke` ever runs - which on a
@@ -293,10 +321,25 @@ jobs:
               // never read, and computing it would reintroduce the API call
               // this ordering exists to avoid.
               const threat = labelsOf(pr).includes(THREAT_LABEL);
+              let triageViolation = false;
+              try {
+                triageViolation = !threat && await triageScopeViolation(pr);
+              } catch (error) {
+                // An unavailable diff is not permission to leave a triage
+                // auto-merge armed against an unverified scope.
+                await revoke(pr);
+                throw error;
+              }
+              if (triageViolation) {
+                await revoke(pr);
+                await postHold(number, TRIAGE_HOLD);
+                core.warning(`PR #${number}: triage changes exceed the backlog-only scope.`);
+                return;
+              }
               const wire = threat ? false : await isWireFormat(pr);
               const reason = disqualify(pr, wire);
               if (reason) {
-                core.info(`PR #${number} does not qualify: ${reason}. Doing nothing.`);
+                core.info(`PR #${number} does not qualify: ${reason}. Revoking upstream sign-off.`);
                 // The two rejections a human must know about, because the PR
                 // will otherwise sit waiting on nobody. Both revoke rather than
                 // merely decline: the label or tag can arrive *after* a
@@ -314,6 +357,9 @@ jobs:
                 if (hold) {
                   await revoke(pr);
                   await postHold(number, hold);
+                } else if (pr.state === 'open') {
+                  if (labelsOf(pr).includes('copilot-reviewed')) await revoke(pr);
+                  else await disableAutoMerge(pr);
                 }
                 return;
               }
@@ -391,10 +437,22 @@ jobs:
               }
 
               if (state.headRefOid !== reviewed) {
+                await revoke(pr);
                 core.info(
                   `PR #${number} head moved to ${state.headRefOid} during this run, ` +
                   `past the signed-off ${reviewed}. Doing nothing.`
                 );
+                return;
+              }
+
+              // Recheck the label contract at the merge boundary as well as
+              // the SHA: a relabelled triage PR must not become a port here.
+              const latestLabels = (state.labels.nodes || []).map(l => l.name);
+              if (disqualify({ ...pr, labels: state.labels.nodes }, false) ||
+                  latestLabels.includes('upstream-triage') !==
+                    labelsOf(pr).includes('upstream-triage')) {
+                await revoke(pr);
+                core.warning(`PR #${number}: eligibility changed during this run.`);
                 return;
               }
 
@@ -481,8 +539,8 @@ jobs:
               return;
             }
 
-            // push to main, or a manual dispatch: reconcile every open port PR.
-            const { data: open } = await github.rest.pulls.list({
+            // push to main, or a manual dispatch: reconcile ports and triage.
+            const open = await github.paginate(github.rest.pulls.list, {
               owner, repo, state: 'open', per_page: 100,
             });
             // Coarse pre-filter by author only; `disqualify` names every other
@@ -491,7 +549,7 @@ jobs:
               pr => pr.user.login === 'github-actions[bot]'
             );
             if (candidates.length === 0) {
-              core.info('No open port PRs to reconcile.');
+              core.info('No open bot PRs to reconcile.');
               return;
             }
             for (const pr of candidates) {
