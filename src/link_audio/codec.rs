@@ -291,6 +291,113 @@ mod tests {
         assert!(!called);
     }
 
+    /// Ported from upstream's `Encoder` test,
+    /// `PacketSizeWithFrequentTimingChanges` section: with a timing change on
+    /// every callback, every encoded message must still fit the 576 byte
+    /// budget and the complete sample stream must survive the batching.
+    #[test]
+    fn packet_size_with_frequent_timing_changes() {
+        use super::super::messages::audio_buffer_message;
+
+        fn build_samples(num_frames: u32, num_channels: u32) -> Vec<i16> {
+            let mut samples = vec![0i16; (num_frames * num_channels) as usize];
+            for frame in 0..num_frames {
+                for channel in 0..num_channels {
+                    samples[(frame * num_channels + channel) as usize] = frame as i16;
+                }
+            }
+            samples
+        }
+
+        fn build_input(
+            samples: &[i16],
+            sample_rate: u32,
+            num_channels: u32,
+            begin_beats: Beats,
+            tempo: Tempo,
+        ) -> Buffer {
+            let mut buffer = Buffer::new(samples.len());
+            buffer.samples = samples.to_vec();
+            buffer.num_frames = samples.len() as u32 / num_channels;
+            buffer.num_channels = num_channels;
+            buffer.sample_rate = sample_rate;
+            buffer.begin_beats = begin_beats;
+            buffer.tempo = tempo;
+            buffer
+        }
+
+        for num_channels in [1u32, 2] {
+            for num_frames in [4u32, 120] {
+                let sent = Arc::new(Mutex::new(Vec::new()));
+                let num_packets = Arc::new(Mutex::new(0usize));
+
+                let sink = sent.clone();
+                let packets = num_packets.clone();
+                let mut encoder = Encoder::new(
+                    move |buffer: &AudioBuffer| {
+                        *packets.lock().unwrap() += 1;
+                        let message =
+                            audio_buffer_message(NodeId::default(), &buffer.encode_raw()).unwrap();
+                        assert!(
+                            message.len() <= 576,
+                            "encoded message of {} bytes exceeds the 576 byte budget",
+                            message.len()
+                        );
+
+                        let mut reader = ByteStreamReader::new(&buffer.bytes);
+                        let mut sink = sink.lock().unwrap();
+                        while !reader.is_empty() {
+                            sink.push(reader.read_i16().unwrap());
+                        }
+                    },
+                    id(1),
+                );
+
+                let samples = build_samples(num_frames, num_channels);
+                let mut expected = Vec::new();
+
+                for i in 0..32u32 {
+                    encoder.encode(&build_input(
+                        &samples,
+                        48000,
+                        num_channels,
+                        Beats::new(i as f64),
+                        Tempo::new(if i % 2 == 0 { 120.0 } else { 121.0 }),
+                    ));
+                    expected.extend_from_slice(&samples);
+                }
+
+                // Flush the remaining samples by changing the sample rate
+                // without adding audio.
+                encoder.encode(&build_input(
+                    &[],
+                    44100,
+                    num_channels,
+                    Beats::new(0.0),
+                    Tempo::new(0.0),
+                ));
+                encoder.encode(&build_input(
+                    &samples,
+                    44100,
+                    num_channels,
+                    Beats::new(32.0),
+                    Tempo::new(120.0),
+                ));
+                expected.extend_from_slice(&samples);
+                encoder.encode(&build_input(
+                    &[],
+                    48000,
+                    num_channels,
+                    Beats::new(0.0),
+                    Tempo::new(0.0),
+                ));
+
+                assert!(*num_packets.lock().unwrap() > 0);
+                assert_eq!(*sent.lock().unwrap(), expected);
+            }
+        }
+    }
+
     #[test]
     fn max_audio_bytes_fits_the_payload_budget() {
         const { assert!(MAX_AUDIO_BYTES <= AudioBuffer::MAX_AUDIO_BYTES) };
