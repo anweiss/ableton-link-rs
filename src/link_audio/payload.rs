@@ -480,14 +480,32 @@ impl Entry for AudioBuffer {
             return Err(AudioError::Invalid("audio buffer has no chunks"));
         }
 
+        for chunk in &chunks {
+            let bpm = chunk.tempo.bpm();
+            if !bpm.is_finite() || bpm <= 0.0 {
+                return Err(AudioError::Invalid("invalid tempo"));
+            }
+        }
+
         let codec = Codec::from_u8(reader.read_u8()?);
-        if codec == Codec::Invalid {
-            return Err(AudioError::Invalid("invalid codec"));
+        if codec != Codec::PcmI16 {
+            return Err(AudioError::Invalid("unknown codec"));
         }
 
         let sample_rate = reader.read_u32()?;
+        if sample_rate == 0 {
+            return Err(AudioError::Invalid("invalid sample rate"));
+        }
+
         let num_channels = reader.read_u8()?;
+        if num_channels != 1 && num_channels != 2 {
+            return Err(AudioError::Invalid("invalid channel count"));
+        }
+
         let num_bytes = reader.read_u16()? as usize;
+        if num_bytes > Self::MAX_AUDIO_BYTES {
+            return Err(AudioError::Range("byte count exceeds maximum"));
+        }
 
         let buffer = AudioBuffer {
             channel_id,
@@ -499,9 +517,7 @@ impl Entry for AudioBuffer {
             bytes: Vec::new(),
         };
 
-        if codec == Codec::PcmI16
-            && buffer.num_frames() as usize * num_channels as usize * 2 != num_bytes
-        {
+        if buffer.num_frames() as usize * num_channels as usize * 2 != num_bytes {
             return Err(AudioError::Invalid("byte count / frame count mismatch"));
         }
 
@@ -797,6 +813,94 @@ mod tests {
         assert!((decoded.chunks[0].tempo.bpm() - 120.0).abs() < 1e-6);
         assert_eq!(decoded.bytes, buffer.bytes);
         assert_eq!(decoded.num_frames(), 2);
+    }
+
+    fn valid_buffer() -> AudioBuffer {
+        AudioBuffer {
+            channel_id: id(1),
+            session_id: id(2),
+            chunks: vec![Chunk {
+                count: 1,
+                num_frames: 2,
+                begin_beats: Beats::new(0.0),
+                tempo: Tempo::new(120.0),
+            }],
+            codec: Codec::PcmI16,
+            sample_rate: 44100,
+            num_channels: 2,
+            bytes: vec![0; 8],
+        }
+    }
+
+    fn decode_err(encoded: &[u8]) -> AudioError {
+        parse_payload(encoded, |key, reader| {
+            if key == AUDIO_BUFFER_KEY {
+                AudioBuffer::decode_body(reader)?;
+            }
+            Ok(())
+        })
+        .unwrap_err()
+    }
+
+    #[test]
+    fn audio_buffer_rejects_zero_sample_rate() {
+        let mut buffer = valid_buffer();
+        buffer.sample_rate = 0;
+        let err = decode_err(&buffer.to_payload());
+        assert!(matches!(err, AudioError::Invalid("invalid sample rate")));
+    }
+
+    #[test]
+    fn audio_buffer_rejects_unknown_codec() {
+        let mut encoded = valid_buffer().to_payload();
+        // entry header (8) + two ids (16) + chunk vector (4 + chunk)
+        let codec_offset = 8 + 16 + 4 + Chunk::SIZE as usize;
+        encoded[codec_offset] = 42;
+        let err = decode_err(&encoded);
+        assert!(matches!(err, AudioError::Invalid("unknown codec")));
+    }
+
+    #[test]
+    fn audio_buffer_rejects_invalid_channel_count() {
+        let mut buffer = valid_buffer();
+        buffer.num_channels = 0;
+        buffer.chunks[0].num_frames = 0;
+        buffer.bytes.clear();
+        let err = decode_err(&buffer.to_payload());
+        assert!(matches!(err, AudioError::Invalid("invalid channel count")));
+
+        let mut buffer = valid_buffer();
+        buffer.num_channels = 3;
+        buffer.bytes = vec![0; 12];
+        let err = decode_err(&buffer.to_payload());
+        assert!(matches!(err, AudioError::Invalid("invalid channel count")));
+    }
+
+    #[test]
+    fn audio_buffer_rejects_oversized_byte_count() {
+        let mut buffer = valid_buffer();
+        buffer.bytes = vec![0; AudioBuffer::MAX_AUDIO_BYTES + 1];
+        let err = decode_err(&buffer.to_payload());
+        assert!(matches!(
+            err,
+            AudioError::Range("byte count exceeds maximum")
+        ));
+    }
+
+    #[test]
+    fn audio_buffer_rejects_invalid_tempo() {
+        let mut encoded = valid_buffer().to_payload();
+        // entry header (8) + two ids (16) + chunk vector length (4) + count,
+        // frames and begin beats (18); the tempo field follows
+        let tempo_offset = 8 + 16 + 4 + 18;
+        encoded[tempo_offset..tempo_offset + 8].fill(0);
+        let err = decode_err(&encoded);
+        assert!(matches!(err, AudioError::Invalid("invalid tempo")));
+
+        let mut buffer = valid_buffer();
+        buffer.chunks[0].tempo = Tempo::new(f64::NAN);
+        let err = decode_err(&buffer.to_payload());
+        assert!(matches!(err, AudioError::Invalid("invalid tempo")));
     }
 
     #[test]
