@@ -336,6 +336,12 @@ Audio buffer messages are the one exception to the usual payload framing: their 
 into the message rather than being wrapped in the `key`/`size` entry header, saving eight bytes per packet
 on the hot path. This matches upstream and is required for interoperability.
 
+Incoming audio buffers are rejected if they have a zero sample rate, a codec other than PCM i16,
+a channel count other than one or two, an audio byte count above `AudioBuffer::MAX_AUDIO_BYTES` or
+inconsistent with the frame count, or a non-positive or non-finite chunk tempo. Sink buffer commits
+return `false` when the sample rate is zero. These validation checks leave the wire format and
+well-formed traffic unchanged.
+
 Receiving from Ableton Live has been verified against a real Live instance: Live publishes one channel per
 track (plus `Main`), so pick the channel you actually want — most tracks stream silence unless they are
 audible in the mix. The `link_audio` example plays the subscribed channel through the default output device
