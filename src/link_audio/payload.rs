@@ -897,9 +897,9 @@ mod tests {
         let err = decode_err(&encoded);
         assert!(matches!(err, AudioError::Invalid("invalid tempo")));
 
-        let mut buffer = valid_buffer();
-        buffer.chunks[0].tempo = Tempo::new(f64::NAN);
-        let err = decode_err(&buffer.to_payload());
+        let mut encoded = valid_buffer().to_payload();
+        encoded[tempo_offset..tempo_offset + 8].copy_from_slice(&(-1_i64).to_be_bytes());
+        let err = decode_err(&encoded);
         assert!(matches!(err, AudioError::Invalid("invalid tempo")));
     }
 
