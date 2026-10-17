@@ -157,9 +157,13 @@ impl IoContext {
                 // The executing callback must return before its thread can be
                 // joined. A retained join service owns that completion, not a
                 // detached task or an abort-only fallback.
-                self.reaper
-                    .send(thread)
-                    .expect("retained Link join service must remain connected");
+                // If that service is gone, detach rather than panic: this
+                // runs from Drop, where a panic aborts the process. The
+                // thread is the current one and ends when its callback returns.
+                if let Err(unsent) = self.reaper.send(thread) {
+                    tracing::warn!("Link join service disconnected; detaching the IO thread");
+                    drop(unsent.0);
+                }
             } else if thread.join().is_err() {
                 tracing::error!("Link IO thread panicked during shutdown");
             }
