@@ -1353,7 +1353,14 @@ fn advertise_endpoint_for(state: &mut PeerState, interface: Option<Ipv4Addr>, so
 }
 
 pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf: &[u8]) {
-    let payload = parse_payload(buf).unwrap();
+    // Received from the network: a malformed payload is dropped.
+    let payload = match parse_payload(buf) {
+        Ok(payload) => payload,
+        Err(e) => {
+            debug!("dropping peer state with a malformed payload: {}", e);
+            return;
+        }
+    };
     let measurement_endpoint = payload.entries.iter().find_map(|e| {
         if let PayloadEntry::MeasurementEndpointV4(me) = e {
             me.endpoint

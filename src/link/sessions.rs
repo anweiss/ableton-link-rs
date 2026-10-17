@@ -356,8 +356,11 @@ impl Sessions {
 /// Microseconds in `d`, saturating instead of failing on an out-of-range
 /// duration (a peer's measurement can produce absurd values).
 fn micros(d: Duration) -> i64 {
-    d.num_microseconds()
-        .unwrap_or(if d < Duration::zero() { i64::MIN } else { i64::MAX })
+    d.num_microseconds().unwrap_or(if d < Duration::zero() {
+        i64::MIN
+    } else {
+        i64::MAX
+    })
 }
 
 pub async fn launch_session_measurement(
@@ -469,10 +472,7 @@ async fn handle_successful_measurement_inner(
             const SESSION_EPS: Duration = Duration::microseconds(500000);
 
             let host_time = clock.micros();
-            let cur_ghost = current_session
-                .measurement
-                .x_form
-                .host_to_ghost(host_time);
+            let cur_ghost = current_session.measurement.x_form.host_to_ghost(host_time);
             let new_ghost = measurement.x_form.host_to_ghost(host_time);
 
             s.measurement = measurement;

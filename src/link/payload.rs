@@ -107,21 +107,36 @@ impl From<PeerState> for Payload {
     }
 }
 
+/// The bytes of a fixed-size payload entry, after its header. Received data
+/// can announce an entry and then stop short; that's an error, not a panic.
+fn entry_bytes(data: &[u8], size: u32) -> Result<(&[u8], usize)> {
+    let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + size as usize;
+    data.get(PAYLOAD_ENTRY_HEADER_SIZE..decode_len)
+        .map(|bytes| (bytes, decode_len))
+        .ok_or(crate::link::error::Error::Protocol(
+            "truncated payload entry",
+        ))
+}
+
+/// Microseconds for encoding a time, or an error if it's outside the range
+/// the wire format (and chrono) can represent.
+fn wire_micros(time: Duration) -> Result<i64> {
+    time.num_microseconds()
+        .ok_or(crate::link::error::Error::Protocol("time out of range"))
+}
+
 pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
     if PAYLOAD_ENTRY_HEADER_SIZE > data.len() {
         return Ok(());
     }
 
     let (payload_entry_header, _) =
-        encoding::decode_from_slice::<PayloadEntryHeader>(&data[..PAYLOAD_ENTRY_HEADER_SIZE])
-            .unwrap();
+        encoding::decode_from_slice::<PayloadEntryHeader>(&data[..PAYLOAD_ENTRY_HEADER_SIZE])?;
 
     match payload_entry_header.key {
         HOST_TIME_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + HOST_TIME_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<HostTime>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
+            let (bytes, decode_len) = entry_bytes(data, HOST_TIME_SIZE)?;
+            let (entry, _) = encoding::decode_from_slice::<HostTime>(bytes)?;
 
             debug!("decoded payload entry {:?}", entry);
 
@@ -129,11 +144,8 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             decode(payload, &data[decode_len..])?;
         }
         TIMELINE_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + TIMELINE_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<Timeline>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )
-            .unwrap();
+            let (bytes, decode_len) = entry_bytes(data, TIMELINE_SIZE)?;
+            let (entry, _) = encoding::decode_from_slice::<Timeline>(bytes)?;
 
             debug!("decoded payload entry {:?}", entry);
 
@@ -141,10 +153,8 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             decode(payload, &data[decode_len..])?;
         }
         SESSION_MEMBERSHIP_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + SESSION_MEMBERSHIP_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<SessionMembership>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
+            let (bytes, decode_len) = entry_bytes(data, SESSION_MEMBERSHIP_SIZE)?;
+            let (entry, _) = encoding::decode_from_slice::<SessionMembership>(bytes)?;
 
             debug!("decoded payload entry {:?}", entry);
 
@@ -152,10 +162,8 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             decode(payload, &data[decode_len..])?;
         }
         START_STOP_STATE_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + START_STOP_STATE_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<StartStopState>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
+            let (bytes, decode_len) = entry_bytes(data, START_STOP_STATE_SIZE)?;
+            let (entry, _) = encoding::decode_from_slice::<StartStopState>(bytes)?;
 
             debug!("decoded payload entry {:?}", entry);
 
@@ -163,10 +171,8 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             decode(payload, &data[decode_len..])?;
         }
         MEASUREMENT_ENDPOINT_V4_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + MEASUREMENT_ENDPOINT_V4_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<MeasurementEndpointV4>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
+            let (bytes, decode_len) = entry_bytes(data, MEASUREMENT_ENDPOINT_V4_SIZE)?;
+            let (entry, _) = encoding::decode_from_slice::<MeasurementEndpointV4>(bytes)?;
 
             debug!("decoded payload entry {:?}", entry);
 
@@ -176,10 +182,8 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             decode(payload, &data[decode_len..])?;
         }
         AUDIO_ENDPOINT_V4_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + AUDIO_ENDPOINT_V4_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<AudioEndpointV4>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
+            let (bytes, decode_len) = entry_bytes(data, AUDIO_ENDPOINT_V4_SIZE)?;
+            let (entry, _) = encoding::decode_from_slice::<AudioEndpointV4>(bytes)?;
 
             debug!("decoded payload entry {:?}", entry);
 
@@ -209,10 +213,8 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             }
         }
         GHOST_TIME_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + GHOST_TIME_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<GhostTime>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
+            let (bytes, decode_len) = entry_bytes(data, GHOST_TIME_SIZE)?;
+            let (entry, _) = encoding::decode_from_slice::<GhostTime>(bytes)?;
 
             debug!("decoded payload entry {:?}", entry);
 
@@ -220,10 +222,8 @@ pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
             decode(payload, &data[decode_len..])?;
         }
         PREV_GHOST_TIME_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + PREV_GHOST_TIME_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<PrevGhostTime>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
+            let (bytes, decode_len) = entry_bytes(data, PREV_GHOST_TIME_SIZE)?;
+            let (entry, _) = encoding::decode_from_slice::<PrevGhostTime>(bytes)?;
 
             debug!("decoded payload entry {:?}", entry);
 
@@ -296,9 +296,7 @@ impl HostTime {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = HOST_TIME_HEADER.encode()?;
-        encoded.append(&mut encoding::encode_to_vec(
-            &self.time.num_microseconds().unwrap(),
-        )?);
+        encoded.append(&mut encoding::encode_to_vec(&wire_micros(self.time)?)?);
         Ok(encoded)
     }
 }
@@ -335,9 +333,7 @@ impl GhostTime {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = GHOST_TIME_HEADER.encode()?;
-        encoded.append(&mut encoding::encode_to_vec(
-            &self.time.num_microseconds().unwrap(),
-        )?);
+        encoded.append(&mut encoding::encode_to_vec(&wire_micros(self.time)?)?);
         Ok(encoded)
     }
 }
@@ -366,9 +362,7 @@ impl PrevGhostTime {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = PREV_GHOST_TIME_HEADER.encode()?;
-        encoded.append(&mut encoding::encode_to_vec(
-            &self.time.num_microseconds().unwrap(),
-        )?);
+        encoded.append(&mut encoding::encode_to_vec(&wire_micros(self.time)?)?);
         Ok(encoded)
     }
 }
