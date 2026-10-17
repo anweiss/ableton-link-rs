@@ -6,6 +6,8 @@
 extern crate alloc;
 
 pub mod encoding;
+/// Panic-free lock helpers (see the module docs).
+pub(crate) mod sync;
 
 #[cfg(feature = "std")]
 pub mod discovery;
