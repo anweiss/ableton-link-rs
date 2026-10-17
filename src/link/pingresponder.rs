@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::encoding::{self, Decode, Encode};
+use crate::sync::lock;
 
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
@@ -136,14 +137,10 @@ impl PingResponder {
         }
 
         let id = SessionMembership {
-            session_id: *self.session_id.try_lock().unwrap(),
+            session_id: *lock(&self.session_id),
         };
         let current_gt = GhostTime {
-            time: self
-                .ghost_x_form
-                .try_lock()
-                .unwrap()
-                .host_to_ghost(self.clock.micros()),
+            time: lock(&self.ghost_x_form).host_to_ghost(self.clock.micros()),
         };
 
         payload_entries.push(PayloadEntry::SessionMembership(id));
@@ -175,8 +172,8 @@ impl PingResponder {
     }
 
     pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
-        *self.session_id.try_lock().unwrap() = session_id;
-        *self.ghost_x_form.try_lock().unwrap() = x_form;
+        *lock(&self.session_id) = session_id;
+        *lock(&self.ghost_x_form) = x_form;
     }
 }
 
@@ -210,11 +207,13 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
     let min_message_size = PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE;
 
     if data.len() < min_message_size {
-        panic!("invalid message size");
+        return Err(crate::link::error::Error::Protocol("invalid message size"));
     }
 
     if !data.starts_with(&PROTOCOL_HEADER) {
-        panic!("invalid protocol header");
+        return Err(crate::link::error::Error::Protocol(
+            "invalid protocol header",
+        ));
     }
 
     let (header, consumed) = encoding::decode_from_slice::<MessageHeader>(

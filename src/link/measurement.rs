@@ -18,7 +18,6 @@ use tracing::{debug, info};
 
 use crate::{
     discovery::{messages::parse_payload, messenger::new_udp_reuseport, peers::PeerState},
-    sync::lock,
     encoding::{self, Decode, Encode},
     link::{
         payload::PrevGhostTime,
@@ -28,6 +27,7 @@ use crate::{
         },
         Result,
     },
+    sync::lock,
 };
 
 use super::{
