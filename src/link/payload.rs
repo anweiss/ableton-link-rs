@@ -87,11 +87,15 @@ impl From<NodeState> for Payload {
 impl From<PeerState> for Payload {
     fn from(value: PeerState) -> Self {
         let mut payload = Payload::from(value.node_state);
-        payload
-            .entries
-            .push(PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
-                endpoint: value.measurement_endpoint,
-            }));
+        // Only a known endpoint is announced: a peer can't measure against an
+        // empty one, and it isn't sent until the responder has an address.
+        if value.measurement_endpoint.is_some() {
+            payload
+                .entries
+                .push(PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
+                    endpoint: value.measurement_endpoint,
+                }));
+        }
         if value.audio_endpoint.is_some() {
             payload
                 .entries
@@ -392,6 +396,30 @@ mod tests {
         tempo::Tempo,
         timeline::Timeline,
     };
+
+    #[test]
+    fn peer_state_without_an_endpoint_announces_none() {
+        let without = Payload::from(PeerState::default());
+        assert!(!without
+            .entries
+            .iter()
+            .any(|e| matches!(e, PayloadEntry::MeasurementEndpointV4(_))));
+
+        let endpoint = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, 5), 4321);
+        let with = Payload::from(PeerState {
+            measurement_endpoint: Some(endpoint),
+            ..PeerState::default()
+        });
+        assert!(with.entries.iter().any(|e| matches!(
+            e,
+            PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 { endpoint: Some(ep) }) if *ep == endpoint
+        )));
+
+        // Encoding an empty endpoint writes 0.0.0.0:0 rather than panicking.
+        let bytes =
+            crate::encoding::encode_to_vec(&MeasurementEndpointV4 { endpoint: None }).unwrap();
+        assert_eq!(bytes, vec![0; 6]);
+    }
 
     #[test]
     fn host_time_header() {
