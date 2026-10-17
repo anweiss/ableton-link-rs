@@ -1251,13 +1251,18 @@ async fn send_peer_state_via(
     group_id: SessionGroupId,
     registration: Option<(&InterfaceSocket, &InterfaceSockets)>,
 ) {
-    let (ident, peer_state_clone) = match peer_state.try_lock() {
+    let (ident, mut peer_state_clone) = match peer_state.try_lock() {
         Ok(guard) => (guard.ident(), guard.clone()),
         Err(_) => {
             // If we can't get the lock, skip this broadcast
             return;
         }
     };
+    advertise_endpoint_for(
+        &mut peer_state_clone,
+        registration.map(|(entry, _)| entry.identity.addr),
+        &socket,
+    );
 
     match send_message_reporting(
         socket,
@@ -1286,6 +1291,30 @@ async fn send_peer_state_via(
     if let Ok(mut last_time) = last_broadcast_time.try_lock() {
         *last_time = Instant::now();
     }
+}
+
+/// Make the advertised measurement endpoint one a receiver of this message can
+/// reach. The ping responder is bound to the wildcard address, so its own
+/// address names no interface; what a peer needs is this host's address on the
+/// network the message goes out on, with the responder's port. Upstream gets the
+/// same effect by running one gateway, and so one measurement endpoint, per
+/// interface.
+///
+/// `interface` is the address of the interface socket the message is sent
+/// through. Without one, the sending socket's own address is used when it names
+/// an interface. An endpoint already bound to a concrete address is left alone.
+fn advertise_endpoint_for(state: &mut PeerState, interface: Option<Ipv4Addr>, socket: &UdpSocket) {
+    let Some(endpoint) = state.measurement_endpoint else {
+        return;
+    };
+    if !endpoint.ip().is_unspecified() {
+        return;
+    }
+    let local = interface.or_else(|| match socket.local_addr() {
+        Ok(SocketAddr::V4(addr)) if !addr.ip().is_unspecified() => Some(*addr.ip()),
+        _ => None,
+    });
+    state.measurement_endpoint = local.map(|ip| SocketAddrV4::new(ip, endpoint.port()));
 }
 
 pub async fn receive_peer_state(tx: Sender<OnEvent>, header: MessageHeader, buf: &[u8]) {
@@ -1417,6 +1446,110 @@ mod tests {
         assert!(listen.as_mut().poll(&mut context).is_pending());
         notifier.notify_waiters();
         assert!(listen.as_mut().poll(&mut context).is_ready());
+    }
+
+    fn with_endpoint(endpoint: Option<SocketAddrV4>) -> PeerState {
+        PeerState {
+            measurement_endpoint: endpoint,
+            ..PeerState::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn advertised_endpoint_follows_the_sending_interface() {
+        let wildcard = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let wired = Ipv4Addr::new(169, 254, 0, 2);
+
+        // The wildcard responder is advertised at the interface's address.
+        let mut state = with_endpoint(Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 4321)));
+        advertise_endpoint_for(&mut state, Some(wired), &wildcard);
+        assert_eq!(
+            state.measurement_endpoint,
+            Some(SocketAddrV4::new(wired, 4321))
+        );
+
+        // An endpoint bound to a concrete address is left as it is.
+        let concrete = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 4321);
+        let mut state = with_endpoint(Some(concrete));
+        advertise_endpoint_for(&mut state, Some(wired), &wildcard);
+        assert_eq!(state.measurement_endpoint, Some(concrete));
+
+        // No interface: fall back to the sending socket's own address...
+        let loopback = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut state = with_endpoint(Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 4321)));
+        advertise_endpoint_for(&mut state, None, &loopback);
+        assert_eq!(
+            state.measurement_endpoint,
+            Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4321))
+        );
+
+        // ...and advertise nothing rather than an unreachable 0.0.0.0.
+        let mut state = with_endpoint(Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 4321)));
+        advertise_endpoint_for(&mut state, None, &wildcard);
+        assert_eq!(state.measurement_endpoint, None);
+
+        // No endpoint stays no endpoint.
+        let mut state = with_endpoint(None);
+        advertise_endpoint_for(&mut state, Some(wired), &wildcard);
+        assert_eq!(state.measurement_endpoint, None);
+    }
+
+    /// End to end over the loopback adapter: a peer state sent through an
+    /// interface socket carries that interface's address as its measurement
+    /// endpoint, not the wildcard the responder is bound to.
+    #[tokio::test]
+    async fn peer_state_sent_through_an_interface_advertises_its_address() {
+        let sockets: InterfaceSockets = Arc::new(Mutex::new(HashMap::from([(
+            Ipv4Addr::LOCALHOST,
+            interface_socket(),
+        )])));
+        // Sends are only made through a registered socket.
+        let entry = interface_socket_entries(&sockets)
+            .into_iter()
+            .next()
+            .unwrap();
+        let peer_state = Arc::new(Mutex::new(with_endpoint(Some(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            4321,
+        )))));
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let SocketAddr::V4(to) = receiver.local_addr().unwrap() else {
+            unreachable!()
+        };
+
+        send_peer_state_via(
+            entry.socket.clone(),
+            peer_state.clone(),
+            1,
+            ALIVE,
+            to,
+            Arc::new(Mutex::new(Instant::now())),
+            0,
+            Some((&entry, &sockets)),
+        )
+        .await;
+
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let (size, _) = tokio::time::timeout(Duration::from_secs(5), receiver.recv_from(&mut buf))
+            .await
+            .expect("the peer state arrives")
+            .unwrap();
+        let (header, header_len) = parse_message_header(&buf[..size]).unwrap();
+        assert_eq!(header.message_type, ALIVE);
+        let payload = parse_payload(&buf[header_len..size]).unwrap();
+        let advertised = payload.entries.iter().find_map(|e| match e {
+            PayloadEntry::MeasurementEndpointV4(me) => me.endpoint,
+            _ => None,
+        });
+        assert_eq!(
+            advertised,
+            Some(SocketAddrV4::new(entry.identity.addr, 4321))
+        );
+        // The shared state itself keeps the wildcard: each send picks its own.
+        assert_eq!(
+            peer_state.lock().unwrap().measurement_endpoint,
+            Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 4321))
+        );
     }
 
     fn receive_context(tx_event: Sender<OnEvent>) -> ReceiveContext {
