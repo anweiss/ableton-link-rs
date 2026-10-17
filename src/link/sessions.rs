@@ -20,6 +20,7 @@ use super::{
     encoding::PayloadEntryHeader,
     ghostxform::GhostXForm,
     measurement::MeasurePeerEvent,
+    micros,
     node::NodeId,
     timeline::Timeline,
     Result,
@@ -351,16 +352,6 @@ impl Sessions {
 
         session
     }
-}
-
-/// Microseconds in `d`, saturating instead of failing on an out-of-range
-/// duration (a peer's measurement can produce absurd values).
-fn micros(d: Duration) -> i64 {
-    d.num_microseconds().unwrap_or(if d < Duration::zero() {
-        i64::MIN
-    } else {
-        i64::MAX
-    })
 }
 
 pub async fn launch_session_measurement(

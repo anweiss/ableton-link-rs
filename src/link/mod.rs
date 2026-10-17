@@ -55,6 +55,19 @@ use self::{
 
 pub type Result<T> = result::Result<T, error::Error>;
 
+/// Microseconds in `d`, saturating at the `i64` limits instead of failing.
+/// Durations derived from a peer's times (ghost times, timeline origins,
+/// start/stop timestamps) can fall outside what `num_microseconds` can
+/// return, and unwrapping that would let a peer panic this host.
+pub(crate) fn micros(d: chrono::Duration) -> i64 {
+    d.num_microseconds()
+        .unwrap_or(if d < chrono::Duration::zero() {
+            i64::MIN
+        } else {
+            i64::MAX
+        })
+}
+
 #[cfg(feature = "std")]
 pub type PeerCountCallback = Arc<Mutex<Box<dyn Fn(usize) + Send>>>;
 #[cfg(feature = "std")]

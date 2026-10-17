@@ -496,9 +496,9 @@ impl Controller {
         let closed = callbacks_closed.clone();
         let managed: AudioEndpointCallback =
             Arc::new(Mutex::new(Box::new(move |peer, endpoint| {
-                let callback = callback.lock().unwrap().clone();
+                let callback = crate::sync::lock(&callback).clone();
                 if let Some(callback) = callback {
-                    let callback = callback.lock().unwrap();
+                    let callback = crate::sync::lock(&callback);
                     if !closed.load(Ordering::Acquire) {
                         callback(peer, endpoint);
                     }
@@ -795,7 +795,7 @@ impl Controller {
                                     "controller received start stop state. isPlaying: {}, beats: {}, time: {} for session: {}",
                                     peer_start_stop_state.is_playing,
                                     peer_start_stop_state.beats.floating(),
-                                    peer_start_stop_state.timestamp.num_microseconds().unwrap(),
+                                    super::micros(peer_start_stop_state.timestamp),
                                     peer_session,
                                 );
 
@@ -948,7 +948,7 @@ impl Controller {
         self.discovery.measurement_service.stop().await;
         self.discovery.stop().await;
         self.dispatch.gate.stop().await;
-        self.session_peer_counter.lock().unwrap().session_peer_count = 0;
+        crate::sync::lock(&self.session_peer_counter).session_peer_count = 0;
 
         // Reset while dispatch and discovery are still disabled. Opening first
         // lets a resumed result handler race this new lifecycle's state reset.

@@ -25,7 +25,7 @@ impl Display for Tempo {
 impl From<Duration> for Tempo {
     fn from(value: Duration) -> Self {
         Tempo {
-            value: 60.0 * 1e6 / value.num_microseconds().unwrap() as f64,
+            value: 60.0 * 1e6 / super::micros(value) as f64,
         }
     }
 }
@@ -44,16 +44,12 @@ impl Tempo {
     }
 
     pub fn micros_to_beats(&self, micros: Duration) -> Beats {
-        Beats::new(
-            micros.num_microseconds().unwrap() as f64
-                / self.micros_per_beat().num_microseconds().unwrap() as f64,
-        )
+        Beats::new(super::micros(micros) as f64 / super::micros(self.micros_per_beat()) as f64)
     }
 
     pub fn beats_to_micros(&self, beats: Beats) -> Duration {
         Duration::microseconds(
-            (beats.floating() * self.micros_per_beat().num_microseconds().unwrap() as f64).round()
-                as i64,
+            (beats.floating() * super::micros(self.micros_per_beat()) as f64).round() as i64,
         )
     }
 }
@@ -63,10 +59,7 @@ impl crate::encoding::Encode for Tempo {
         &self,
         out: &mut alloc::vec::Vec<u8>,
     ) -> core::result::Result<(), crate::encoding::EncodeError> {
-        self.micros_per_beat()
-            .num_microseconds()
-            .unwrap()
-            .encode_to(out)?;
+        super::micros(self.micros_per_beat()).encode_to(out)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {

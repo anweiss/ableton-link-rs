@@ -525,23 +525,18 @@ fn prune_expired_peers(
     // find the first element in pt whose timeout value is not less than Instant::now()
     // NOTE: peer_timeouts will be empty if byebye message is received prior to pruning
 
-    let i = peer_timeouts.try_lock().ok().and_then(|timeouts| {
-        timeouts
-            .iter()
-            .position(|(timeout, _)| timeout >= &Instant::now())
-    });
-
-    if let Some(i) = i {
-        peer_timeouts
-            .try_lock()
-            .map(|mut timeouts| timeouts.drain(0..i).collect::<Vec<_>>())
-            .unwrap_or_default()
-    } else {
-        peer_timeouts
-            .try_lock()
-            .map(|mut timeouts| timeouts.drain(..).collect::<Vec<_>>())
-            .unwrap_or_default()
-    }
+    //
+    // Search and drain under one lock: a position found under one lock and
+    // drained under another can be past the end once a BYEBYE has removed a
+    // peer in between (a panic), and a failed first `try_lock` used to look
+    // like "nothing unexpired" and dropped every peer.
+    let mut timeouts = lock(&peer_timeouts);
+    let now = Instant::now();
+    let expired = timeouts
+        .iter()
+        .position(|(timeout, _)| timeout >= &now)
+        .unwrap_or(timeouts.len());
+    timeouts.drain(..expired).collect()
 }
 
 impl Drop for PeerGateway {

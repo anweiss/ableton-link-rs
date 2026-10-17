@@ -60,10 +60,7 @@ impl Encode for Timeline {
     ) -> core::result::Result<(), crate::encoding::EncodeError> {
         self.tempo.encode_to(out)?;
         self.beat_origin.encode_to(out)?;
-        self.time_origin
-            .num_microseconds()
-            .unwrap()
-            .encode_to(out)?;
+        super::micros(self.time_origin).encode_to(out)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {
