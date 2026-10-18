@@ -537,6 +537,7 @@ Without `std`, only core types and math are available (requires `alloc`).
 | Requirement | Version |
 |-------------|---------|
 | Rust | 1.87+ to use the library (enforced by `rust-version`); 1.88+ to run the test suite, which pulls `console-subscriber` |
+| Tokio | 1.53.3+ with `std`, for `AsyncFd::register` (the replacement for the deprecated `AsyncFd::new`) |
 | macOS | 10.15+ |
 | Linux | glibc 2.28+, `libasound2-dev` (for `rodio`) |
 | Windows | Windows 10+ |
