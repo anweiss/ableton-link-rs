@@ -892,7 +892,12 @@ fn receive_loop(
             } else {
                 debug!(
                     "received message type {} from peer {} at {}",
-                    MESSAGE_TYPES[header.message_type as usize], header.ident, src
+                    MESSAGE_TYPES
+                        .get(usize::from(header.message_type))
+                        .copied()
+                        .unwrap_or("UNKNOWN"),
+                    header.ident,
+                    src
                 );
             }
 
@@ -1653,6 +1658,47 @@ mod tests {
             assert!(rx.try_recv().is_err());
         }
         gate.stop().await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A datagram with an out-of-range message type reaches the receive loop
+    /// with debug logging on (where the type is looked up by name) and must
+    /// not take the loop down: the BYEBYE sent after it still arrives.
+    #[tokio::test]
+    async fn receive_loop_survives_unknown_message_types() {
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_test_writer()
+                .finish(),
+        );
+        let socket =
+            Arc::new(PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap());
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let context = receive_context(tx);
+        let cancel = Cancel::default();
+        let worker = tokio::spawn(receive_loop(socket.clone(), Some(cancel.clone()), context));
+        let node = NodeId::from_array([9; 8]);
+        let mut bad = encode_message(node, 0, BYEBYE, &Payload::default(), 0).unwrap();
+        bad[crate::discovery::messages::PROTOCOL_HEADER_SIZE] = 255;
+        sender
+            .send_to(&bad, socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let good = encode_message(node, 0, BYEBYE, &Payload::default(), 0).unwrap();
+        sender
+            .send_to(&good, socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the loop is still running after the bad datagram");
+        assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == node));
         cancel.cancel();
         tokio::time::timeout(Duration::from_secs(5), worker)
             .await
