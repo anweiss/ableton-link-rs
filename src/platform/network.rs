@@ -140,12 +140,18 @@ fn is_usable_interface(addr: &IpAddr) -> bool {
 
 /// Check if an IPv4 address is usable for Link discovery
 fn is_usable_ipv4(addr: &Ipv4Addr) -> bool {
-    // Exclude loopback, broadcast, and other special addresses
+    // Exclude loopback, broadcast, and other special addresses.
+    //
+    // Link-local (169.254.0.0/16) addresses are deliberately *kept*: upstream's
+    // `platforms/posix/ScanIpIfAddrs.hpp` takes every running IPv4 address
+    // without filtering link-local ones, and they are often the only address a
+    // machine has on a wired network without a DHCP server (a laptop cabled
+    // straight to a switch, as is common on stage). Excluding them left Link
+    // unable to discover peers on such networks.
     !addr.is_loopback()
         && !addr.is_broadcast()
         && !addr.is_multicast()
         && !addr.is_unspecified()
-        && !addr.is_link_local()
         && *addr != Ipv4Addr::new(0, 0, 0, 0)
 }
 
@@ -187,6 +193,9 @@ mod tests {
         assert!(!is_usable_ipv4(&Ipv4Addr::UNSPECIFIED)); // 0.0.0.0
         assert!(!is_usable_ipv4(&Ipv4Addr::BROADCAST)); // 255.255.255.255
         assert!(is_usable_ipv4(&Ipv4Addr::new(192, 168, 1, 100))); // Private network
+                                                                   // Self-assigned link-local: the only address on a wired network
+                                                                   // without DHCP. Upstream Link uses these too.
+        assert!(is_usable_ipv4(&Ipv4Addr::new(169, 254, 0, 2)));
 
         // IPv6 tests
         assert!(!is_usable_ipv6(&Ipv6Addr::LOCALHOST)); // ::1

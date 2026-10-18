@@ -1,11 +1,10 @@
 use std::{
-    net::{IpAddr, SocketAddrV4},
+    net::SocketAddrV4,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex, Weak},
 };
 
 use chrono::Duration;
-use local_ip_address::list_afinet_netifas;
 use tokio::sync::{mpsc::Receiver, Notify};
 use tracing::{debug, info};
 
@@ -535,24 +534,16 @@ impl Controller {
             audio_endpoint: None,
         }));
 
-        let ip = list_afinet_netifas()
-            .map_err(|e| {
-                std::io::Error::other(format!("failed to enumerate network interfaces: {}", e))
-            })?
-            .iter()
-            .find_map(|(_, ip)| match ip {
-                IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::AddrNotAvailable,
-                    "no non-loopback IPv4 interface found",
-                )
-            })?;
-
-        let ping_responder_unicast_socket =
-            Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into())?);
+        // One ping responder for every interface: bound to the wildcard address
+        // so peers on any network can reach it. Each discovery message then
+        // advertises it as `<the sending interface's address>:<this port>`
+        // (see `send_peer_state_via`), the way upstream gives every interface
+        // gateway its own measurement endpoint. Binding it to a single address
+        // (the first non-loopback one) told peers on the machine's other
+        // networks to measure against an address they cannot reach.
+        let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(
+            SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        )?);
 
         let discovery = Arc::new(
             PeerGateway::new(
@@ -2240,17 +2231,16 @@ mod dispatch_gate_tests {
         let mut controller = Controller::new(tempo::Tempo::new(120.0), clock)
             .await
             .unwrap();
-        let local_ip = controller
-            .discovery
-            .measurement_service
-            .shared_socket
-            .local_addr()
-            .unwrap()
-            .ip();
         let peer_id = NodeId::from_array([1; 8]);
         let peer_session = SessionId(peer_id);
-        // Keep source and destination on the same local interface on every platform.
-        let socket = Arc::new(tokio::net::UdpSocket::bind((local_ip, 0)).await.unwrap());
+        // The controller's measurement sockets are bound to the wildcard address,
+        // so the OS routes each ping; a fake peer on loopback is reachable from
+        // them on every platform.
+        let socket = Arc::new(
+            tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        );
         let std::net::SocketAddr::V4(endpoint) = socket.local_addr().unwrap() else {
             panic!("expected an IPv4 measurement endpoint");
         };

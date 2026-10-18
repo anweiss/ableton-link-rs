@@ -78,6 +78,21 @@ mod platform {
         reader: Mutex<()>,
     }
 
+    /// Hand the route socket to tokio's reactor.
+    ///
+    /// `AsyncFd::new` is deprecated as unsound (tokio-rs/tokio#8587: it can't
+    /// know the descriptor stays valid), and its replacement,
+    /// `AsyncFd::register`, is `unsafe`. No safe wrapper fits: tokio's socket
+    /// types don't cover routing (`PF_ROUTE`) or netlink sockets, and
+    /// `async-io`'s `Async` would bring a second reactor.
+    #[allow(unsafe_code)]
+    fn register(fd: OwnedFd) -> io::Result<AsyncFd<OwnedFd>> {
+        // SAFETY: `fd` is an `OwnedFd`, so it is open; the `AsyncFd` takes
+        // ownership of it, so it stays open and `as_raw_fd` keeps returning the
+        // same descriptor until the `AsyncFd` is dropped.
+        Ok(unsafe { AsyncFd::register(fd) }?)
+    }
+
     impl Source {
         pub fn new(_events: Arc<Events>) -> io::Result<Self> {
             #[cfg(target_os = "linux")]
@@ -100,7 +115,7 @@ mod platform {
             };
             fcntl(&fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
             Ok(Self {
-                fd: AsyncFd::new(fd)?,
+                fd: register(fd)?,
                 reader: Mutex::new(()),
             })
         }

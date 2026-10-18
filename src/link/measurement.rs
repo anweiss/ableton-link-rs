@@ -1,12 +1,11 @@
 use std::{
     collections::HashMap,
     io, mem,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
 
 use chrono::Duration;
-use local_ip_address::list_afinet_netifas;
 use tokio::{
     net::UdpSocket,
     select,
@@ -61,7 +60,10 @@ impl Encode for MeasurementEndpointV4 {
         &self,
         out: &mut Vec<u8>,
     ) -> core::result::Result<(), crate::encoding::EncodeError> {
-        let ep = self.endpoint.unwrap();
+        // Like `AudioEndpointV4`: never panic on a missing endpoint.
+        let ep = self
+            .endpoint
+            .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
         u32::from(*ep.ip()).encode_to(out)?;
         ep.port().encode_to(out)?;
         Ok(())
@@ -439,17 +441,16 @@ async fn measure_peer_in_epoch(
 pub const NUMBER_DATA_POINTS: usize = 20;
 pub const NUMBER_MEASUREMENTS: usize = 5;
 
+/// The socket a measurement pings a peer from. Bound to the wildcard address so
+/// the OS picks the source address that routes to that peer: binding it to one
+/// interface (the first non-loopback one) sent pings to peers on the machine's
+/// other networks from an address they could not reach or answer, and
+/// panicked on a machine with no non-loopback IPv4 address at all.
 fn new_unicast_socket() -> Arc<UdpSocket> {
-    let ip = list_afinet_netifas()
-        .unwrap()
-        .iter()
-        .find_map(|(_, ip)| match ip {
-            IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
-            _ => None,
-        })
-        .unwrap();
-
-    Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap())
+    Arc::new(
+        new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
+            .expect("binding an ephemeral wildcard UDP socket"),
+    )
 }
 
 /// Determine the message type of a datagram received on a measurement socket,
