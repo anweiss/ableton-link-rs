@@ -147,6 +147,10 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
     let (header, consumed) = encoding::decode_from_slice::<MessageHeader>(
         &data[PROTOCOL_HEADER_SIZE..min_message_size],
     )?;
+    // Only types this crate knows (MESSAGE_TYPES is indexed by them).
+    if usize::from(header.message_type) >= MESSAGE_TYPES.len() {
+        return Err(crate::link::error::Error::Protocol("unknown message type"));
+    }
     Ok((header, PROTOCOL_HEADER_SIZE + consumed))
 }
 
@@ -334,6 +338,17 @@ mod tests {
         for cut in 0..=msg.len() {
             parse(&msg[..cut]);
         }
+    }
+
+    #[test]
+    fn parse_message_header_rejects_unknown_types() {
+        let node_id = NodeId::from_array([9; 8]);
+        let mut msg = byebye_message(node_id).unwrap();
+        msg[PROTOCOL_HEADER_SIZE] = 255; // the message type byte
+        let err = parse_message_header(&msg).unwrap_err();
+        assert!(err.to_string().contains("unknown message type"), "{}", err);
+        msg[PROTOCOL_HEADER_SIZE] = BYEBYE;
+        assert_eq!(parse_message_header(&msg).unwrap().0.message_type, BYEBYE);
     }
 
     #[test]
