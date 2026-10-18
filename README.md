@@ -389,6 +389,29 @@ this for payloads supplied by a caller. With the `audio` feature,
 > `Ok(())` (and propagate nested encodes with `?`); downstream callers of `encode_to` must handle
 > the `Result`. `EncodeError` is now `#[non_exhaustive]`, so future variants will not be breaking.
 
+### Received data and panics
+
+Everything a peer sends is untrusted, and a host may be built with
+`panic = "abort"`, where any panic on a Link task ends the process. So nothing
+reachable from the network or from lock contention panics:
+
+- Malformed datagrams are errors, never panics. `discovery::messages::parse_message_header`
+  and `link::pingresponder::parse_message_header` return
+  `Err(Error::Protocol("invalid message size" | "invalid protocol header"))`, and
+  `discovery::messages::parse_payload` returns `Error::Protocol("truncated payload entry")` for
+  an entry that announces more bytes than follow. The receive loops drop what doesn't parse.
+- Durations derived from a peer's times are converted with a saturating microsecond count, and
+  a time that can't be represented on the wire is an encode error (`Error::Protocol("time out of
+  range")`) rather than a panic.
+- Shared state is locked through a blocking, poison-tolerant helper (`sync::lock`) instead of
+  `try_lock().unwrap()`.
+- A peer that can't be measured (no measurement endpoint, or no socket to measure from) is
+  reported as a failed measurement, like one that never answers.
+
+> **API changes:** `link::error::Error` has a new variant, `Protocol(&'static str)`; code that
+> matches `Error` exhaustively needs an arm for it. `link::measurement::Measurement::new` returns
+> `io::Result<Measurement>` instead of panicking when it can't bind its socket.
+
 ## Time and Clocks
 
 The Link implementation uses platform-specific high-resolution clocks:
@@ -478,6 +501,7 @@ Successful scheduling requests are not evidence of measured clock accuracy.
 ```
 ableton-link-rs
 ├── encoding.rs              # Wire encoding traits and primitives (no_std)
+├── sync.rs                  # Poison-tolerant lock helpers (std)
 ├── link/                    # Core Link types and API
 │   ├── mod.rs               # BasicLink, SessionState, ApiState
 │   ├── beats.rs             # Beat position type (no_std)
@@ -537,6 +561,7 @@ Without `std`, only core types and math are available (requires `alloc`).
 | Requirement | Version |
 |-------------|---------|
 | Rust | 1.87+ to use the library (enforced by `rust-version`); 1.88+ to run the test suite, which pulls `console-subscriber` |
+| Tokio | 1.53.3+ with `std`, for `AsyncFd::register` (the replacement for the deprecated `AsyncFd::new`) |
 | macOS | 10.15+ |
 | Linux | glibc 2.28+, `libasound2-dev` (for `rodio`) |
 | Windows | Windows 10+ |

@@ -41,7 +41,7 @@ impl Encode for StartStopState {
     ) -> core::result::Result<(), crate::encoding::EncodeError> {
         self.is_playing.encode_to(out)?;
         self.beats.encode_to(out)?;
-        self.timestamp.num_microseconds().unwrap().encode_to(out)?;
+        super::micros(self.timestamp).encode_to(out)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {

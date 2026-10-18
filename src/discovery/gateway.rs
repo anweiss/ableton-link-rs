@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::Duration;
 use tokio::{
     net::UdpSocket,
     select,
@@ -23,6 +22,7 @@ use crate::link::{
     node::{NodeId, NodeState},
     state::SessionState,
 };
+use crate::sync::lock;
 
 use super::{
     messenger::{send_byebye, Messenger},
@@ -58,7 +58,7 @@ impl PeerGateway {
 
     pub(crate) async fn stop(&self) {
         self.gate.stop().await;
-        self.peer_timeouts.lock().unwrap().clear();
+        lock(&self.peer_timeouts).clear();
     }
 
     #[cfg(test)]
@@ -193,14 +193,12 @@ impl PeerGateway {
             .unwrap_or_default();
 
         info!(
-            "initializing peer gateway {:?} on interface {}",
+            "initializing peer gateway {:?} on interface {:?}",
             node_id,
             self.messenger
                 .interface
                 .as_ref()
-                .unwrap()
-                .local_addr()
-                .unwrap()
+                .and_then(|socket| socket.local_addr().ok())
         );
 
         let peer_state = self.peer_state.clone();
@@ -270,7 +268,7 @@ impl PeerGateway {
                 result = &mut signal, if signal_available => {
                     match result {
                         Ok(()) => {
-                            send_byebye(peer_state.lock().unwrap().ident());
+                            send_byebye(lock(&peer_state).ident());
                             notifier.notify_waiters();
                             break;
                         }
@@ -323,16 +321,10 @@ async fn on_peer_state_in_epoch(
     debug!("received peer state from messenger");
 
     let peer_id = msg.node_state.ident();
-    peer_timeouts
-        .try_lock()
-        .unwrap()
-        .retain(|(_, id)| id != &peer_id);
+    lock(&peer_timeouts).retain(|(_, id)| id != &peer_id);
 
     let new_to = (
-        Instant::now()
-            + Duration::seconds(std::cmp::min(msg.ttl as i64, 3))
-                .to_std()
-                .unwrap(), // Cap timeout at 3 seconds max
+        Instant::now() + std::time::Duration::from_secs(u64::from(msg.ttl.min(3))), // Cap timeout at 3 seconds max
         peer_id,
     );
 
@@ -470,7 +462,7 @@ async fn schedule_next_pruning_in_epoch(
     let (timeout_instant, peer_id) = {
         if let Ok(timeouts) = pt.try_lock() {
             if let Some((timeout, peer_id)) = timeouts.first().copied() {
-                let timeout_instant = timeout + Duration::milliseconds(100).to_std().unwrap();
+                let timeout_instant = timeout + std::time::Duration::from_millis(100);
                 (timeout_instant, peer_id)
             } else {
                 return; // No timeouts available
@@ -533,23 +525,18 @@ fn prune_expired_peers(
     // find the first element in pt whose timeout value is not less than Instant::now()
     // NOTE: peer_timeouts will be empty if byebye message is received prior to pruning
 
-    let i = peer_timeouts.try_lock().ok().and_then(|timeouts| {
-        timeouts
-            .iter()
-            .position(|(timeout, _)| timeout >= &Instant::now())
-    });
-
-    if let Some(i) = i {
-        peer_timeouts
-            .try_lock()
-            .map(|mut timeouts| timeouts.drain(0..i).collect::<Vec<_>>())
-            .unwrap_or_default()
-    } else {
-        peer_timeouts
-            .try_lock()
-            .map(|mut timeouts| timeouts.drain(..).collect::<Vec<_>>())
-            .unwrap_or_default()
-    }
+    //
+    // Search and drain under one lock: a position found under one lock and
+    // drained under another can be past the end once a BYEBYE has removed a
+    // peer in between (a panic), and a failed first `try_lock` used to look
+    // like "nothing unexpired" and dropped every peer.
+    let mut timeouts = lock(&peer_timeouts);
+    let now = Instant::now();
+    let expired = timeouts
+        .iter()
+        .position(|(timeout, _)| timeout >= &now)
+        .unwrap_or(timeouts.len());
+    timeouts.drain(..expired).collect()
 }
 
 impl Drop for PeerGateway {

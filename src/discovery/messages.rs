@@ -135,22 +135,28 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
     let min_message_size = PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE;
 
     if data.len() < min_message_size {
-        panic!("invalid message size");
+        return Err(crate::link::error::Error::Protocol("invalid message size"));
     }
 
     if !data.starts_with(&PROTOCOL_HEADER) {
-        panic!("invalid protocol header");
+        return Err(crate::link::error::Error::Protocol(
+            "invalid protocol header",
+        ));
     }
 
     let (header, consumed) = encoding::decode_from_slice::<MessageHeader>(
         &data[PROTOCOL_HEADER_SIZE..min_message_size],
     )?;
+    // Only types this crate knows (MESSAGE_TYPES is indexed by them).
+    if usize::from(header.message_type) >= MESSAGE_TYPES.len() {
+        return Err(crate::link::error::Error::Protocol("unknown message type"));
+    }
     Ok((header, PROTOCOL_HEADER_SIZE + consumed))
 }
 
 pub fn parse_payload(data: &[u8]) -> Result<Payload> {
     let mut payload = Payload::default();
-    payload::decode(&mut payload, data).unwrap();
+    payload::decode(&mut payload, data)?;
 
     Ok(payload)
 }
@@ -264,20 +270,92 @@ mod tests {
         assert_eq!(header.ident, node_id);
     }
 
+    // Received datagrams are untrusted: bad ones are errors, never panics.
     #[test]
-    #[should_panic(expected = "invalid message size")]
     fn parse_message_header_too_short() {
         let data = [0u8; 4]; // Way too short
-        let _ = parse_message_header(&data);
+        let err = parse_message_header(&data).unwrap_err();
+        assert!(err.to_string().contains("invalid message size"), "{}", err);
     }
 
     #[test]
-    #[should_panic(expected = "invalid protocol header")]
     fn parse_message_header_bad_protocol() {
         // Create data of correct length but wrong protocol header
         let mut data = vec![0u8; PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE];
         data[0] = 0xFF; // Wrong protocol
-        let _ = parse_message_header(&data);
+        let err = parse_message_header(&data).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid protocol header"),
+            "{}",
+            err
+        );
+    }
+
+    /// Whatever arrives on the Link port, parsing must return, never panic:
+    /// random bytes, random bytes behind a valid protocol header, and a real
+    /// message cut off at every length.
+    #[test]
+    fn parsers_never_panic_on_received_data() {
+        use crate::link::{
+            beats::Beats, node::NodeState, sessions::SessionId, state::StartStopState,
+            tempo::Tempo, timeline::Timeline,
+        };
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let parse = |data: &[u8]| {
+            if let Ok((_, offset)) = parse_message_header(data) {
+                let _ = parse_payload(&data[offset..]);
+            }
+            let _ = parse_payload(data);
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 600) as usize;
+            let mut data: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            parse(&data);
+            if data.len() >= PROTOCOL_HEADER_SIZE {
+                data[..PROTOCOL_HEADER_SIZE].copy_from_slice(&PROTOCOL_HEADER);
+                parse(&data);
+            }
+        }
+
+        let node_id = NodeId::from_array([7; 8]);
+        let node_state = NodeState {
+            node_id,
+            session_id: SessionId(node_id),
+            timeline: Timeline {
+                tempo: Tempo::new(120.0),
+                beat_origin: Beats::new(0.0),
+                time_origin: Duration::zero(),
+            },
+            start_stop_state: StartStopState::default(),
+        };
+        let msg = alive_message(node_id, 5, &Payload::from(node_state), 0).unwrap();
+        for cut in 0..=msg.len() {
+            parse(&msg[..cut]);
+        }
+    }
+
+    #[test]
+    fn parse_message_header_rejects_unknown_types() {
+        let node_id = NodeId::from_array([9; 8]);
+        let mut msg = byebye_message(node_id).unwrap();
+        msg[PROTOCOL_HEADER_SIZE] = 255; // the message type byte
+        let err = parse_message_header(&msg).unwrap_err();
+        assert!(err.to_string().contains("unknown message type"), "{}", err);
+        msg[PROTOCOL_HEADER_SIZE] = BYEBYE;
+        assert_eq!(parse_message_header(&msg).unwrap().0.message_type, BYEBYE);
+    }
+
+    #[test]
+    fn parse_payload_rejects_garbage() {
+        // An entry header announcing more bytes than follow.
+        let data = [0x5f, 0x5f, 0x68, 0x74, 0x00, 0x00, 0x00, 0x08, 0x01];
+        assert!(parse_payload(&data).is_err());
     }
 
     #[test]

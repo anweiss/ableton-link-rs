@@ -1,12 +1,11 @@
 use std::{
     collections::HashMap,
     io, mem,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
 
 use chrono::Duration;
-use local_ip_address::list_afinet_netifas;
 use tokio::{
     net::UdpSocket,
     select,
@@ -28,6 +27,7 @@ use crate::{
         },
         Result,
     },
+    sync::lock,
 };
 
 use super::{
@@ -61,7 +61,10 @@ impl Encode for MeasurementEndpointV4 {
         &self,
         out: &mut Vec<u8>,
     ) -> core::result::Result<(), crate::encoding::EncodeError> {
-        let ep = self.endpoint.unwrap();
+        // Like `AudioEndpointV4`: never panic on a missing endpoint.
+        let ep = self
+            .endpoint
+            .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
         u32::from(*ep.ip()).encode_to(out)?;
         ep.port().encode_to(out)?;
         Ok(())
@@ -186,8 +189,8 @@ impl MeasurementService {
             clock,
             ping_responder: PingResponder::new(
                 ping_responder_unicast_socket.clone(),
-                peer_state.try_lock().unwrap().session_id(),
-                session_state.try_lock().unwrap().ghost_x_form,
+                lock(&peer_state).session_id(),
+                lock(&session_state).ghost_x_form,
                 clock,
             ),
             tx_measure_peer: tx_measure_peer_result,
@@ -218,8 +221,8 @@ impl MeasurementService {
         let pong_dispatch = self.pong_dispatch.clone();
 
         info!(
-            "listening for ping and pong messages on {}",
-            socket.local_addr().unwrap()
+            "listening for ping and pong messages on {:?}",
+            socket.local_addr()
         );
 
         let task = tokio::spawn(async move {
@@ -264,7 +267,14 @@ pub async fn measure_peer(
     state: PeerState,
     notifier: Arc<Notify>,
 ) {
-    let socket = new_unicast_socket();
+    let socket = match new_unicast_socket() {
+        Ok(socket) => socket,
+        Err(error) => {
+            debug!("can't open a measurement socket: {}", error);
+            report_failed_measurement(&tx_measure_peer_result, session_id).await;
+            return;
+        }
+    };
     let pong_dispatch: PongDispatch = Arc::new(Mutex::new(HashMap::new()));
     spawn_pong_dispatch(socket.clone(), pong_dispatch.clone());
 
@@ -354,23 +364,28 @@ async fn measure_peer_in_epoch(
     pong_dispatch: PongDispatch,
     lifecycle: Option<(Arc<DispatchGate>, u64)>,
 ) {
+    // A peer that announced no measurement endpoint can't be measured: report
+    // it like any other failed measurement.
+    let Some(peer_endpoint) = state.measurement_endpoint else {
+        info!(
+            "peer {} has no measurement endpoint; can't measure session {}",
+            state.node_state.node_id, session_id
+        );
+        report_failed_measurement(&tx_measure_peer_result, session_id).await;
+        return;
+    };
     info!(
         "measuring peer {} at {} for session {}",
-        state.node_state.node_id,
-        state.measurement_endpoint.unwrap(),
-        session_id
+        state.node_state.node_id, peer_endpoint, session_id
     );
 
     let node_id = state.node_state.node_id;
-    let endpoint = SocketAddr::V4(state.measurement_endpoint.unwrap());
+    let endpoint = SocketAddr::V4(peer_endpoint);
 
     let (tx_measurement, mut rx_measurement) = mpsc::channel(1);
     let (tx_pong, rx_pong) = mpsc::channel(NUMBER_DATA_POINTS);
 
-    pong_dispatch
-        .lock()
-        .unwrap()
-        .insert(endpoint, tx_pong.clone());
+    lock(&pong_dispatch).insert(endpoint, tx_pong.clone());
     let registration = MeasurementRegistration {
         node_id,
         endpoint,
@@ -439,17 +454,27 @@ async fn measure_peer_in_epoch(
 pub const NUMBER_DATA_POINTS: usize = 20;
 pub const NUMBER_MEASUREMENTS: usize = 5;
 
-fn new_unicast_socket() -> Arc<UdpSocket> {
-    let ip = list_afinet_netifas()
-        .unwrap()
-        .iter()
-        .find_map(|(_, ip)| match ip {
-            IpAddr::V4(ipv4) if !ip.is_loopback() => Some(*ipv4),
-            _ => None,
-        })
-        .unwrap();
+/// The socket a measurement pings a peer from. Bound to the wildcard address so
+/// the OS picks the source address that routes to that peer: binding it to one
+/// interface (the first non-loopback one) sent pings to peers on the machine's
+/// other networks from an address they could not reach or answer, and
+/// panicked on a machine with no non-loopback IPv4 address at all.
+fn new_unicast_socket() -> io::Result<Arc<UdpSocket>> {
+    new_udp_reuseport(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into()).map(Arc::new)
+}
 
-    Arc::new(new_udp_reuseport(SocketAddrV4::new(ip, 0).into()).unwrap())
+/// Tell the session logic a measurement of `session_id` failed (an identity
+/// transform), as a measurement that got no answers does.
+async fn report_failed_measurement(
+    tx_measure_peer_result: &tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    session_id: SessionId,
+) {
+    if let Err(error) = tx_measure_peer_result
+        .send(MeasurePeerEvent::XForm(session_id, GhostXForm::default()))
+        .await
+    {
+        debug!("measurement result consumer closed: {}", error);
+    }
 }
 
 /// Determine the message type of a datagram received on a measurement socket,
@@ -475,7 +500,7 @@ fn message_type(data: &[u8], src: SocketAddr) -> Option<MessageType> {
 /// it. `try_send` is used so that a slow or already finished measurement cannot
 /// stall the dispatch of datagrams destined for other peers.
 fn dispatch_pong(pong_dispatch: &PongDispatch, data: &[u8], src: SocketAddr) {
-    let mut dispatch = pong_dispatch.lock().unwrap();
+    let mut dispatch = lock(pong_dispatch);
 
     let closed = match dispatch.get(&src) {
         Some(tx_pong) => match tx_pong.try_send((data.to_vec(), src)) {
@@ -560,21 +585,18 @@ impl Measurement {
         clock: Clock,
         tx_measurement: Sender<Vec<(f64, f64)>>,
         notifier: Arc<Notify>,
-    ) -> Self {
-        let socket = new_unicast_socket();
+    ) -> io::Result<Self> {
+        let socket = new_unicast_socket()?;
         let pong_dispatch: PongDispatch = Arc::new(Mutex::new(HashMap::new()));
         let (tx_pong, rx_pong) = mpsc::channel(NUMBER_DATA_POINTS);
 
         if let Some(endpoint) = state.measurement_endpoint {
-            pong_dispatch
-                .lock()
-                .unwrap()
-                .insert(SocketAddr::V4(endpoint), tx_pong);
+            lock(&pong_dispatch).insert(SocketAddr::V4(endpoint), tx_pong);
         }
 
         spawn_pong_dispatch(socket.clone(), pong_dispatch);
 
-        Self::with_socket(state, clock, tx_measurement, notifier, socket, rx_pong).await
+        Ok(Self::with_socket(state, clock, tx_measurement, notifier, socket, rx_pong).await)
     }
 
     pub async fn with_socket(
@@ -592,8 +614,8 @@ impl Measurement {
         let (tx_timer, mut rx_timer) = mpsc::channel(1);
 
         info!(
-            "initiating measurement using socket {} for measurement_endpoint {:?}",
-            unicast_socket.local_addr().unwrap(),
+            "initiating measurement using socket {:?} for measurement_endpoint {:?}",
+            unicast_socket.local_addr(),
             state.measurement_endpoint
         );
 
@@ -615,6 +637,13 @@ impl Measurement {
             job: Arc::new(()),
         };
 
+        // Nothing to measure without an endpoint (callers check first); hand
+        // back a measurement that never started instead of panicking.
+        let Some(endpoint) = state.measurement_endpoint else {
+            measurement.cancelled = true;
+            return measurement;
+        };
+
         let ht = HostTime::new(clock.micros());
 
         let s = success.clone();
@@ -628,13 +657,7 @@ impl Measurement {
         measurement.tasks.0.push(tokio::spawn(async move {
             while rx_timer.recv().await.is_some() {
                 fn_loop.notify_one();
-                finish(
-                    s.clone(),
-                    state.measurement_endpoint.unwrap(),
-                    d.clone(),
-                    t.clone(),
-                )
-                .await;
+                finish(s.clone(), endpoint, d.clone(), t.clone()).await;
             }
         }));
 
@@ -644,7 +667,7 @@ impl Measurement {
 
         let init_bytes_sent = match send_ping(
             unicast_socket.clone(),
-            *state.measurement_endpoint.as_ref().unwrap(),
+            endpoint,
             &Payload {
                 entries: vec![PayloadEntry::HostTime(ht)],
             },
@@ -653,11 +676,7 @@ impl Measurement {
         {
             Ok(bytes_sent) => bytes_sent,
             Err(e) => {
-                debug!(
-                    "failed to send initial ping to {}: {}",
-                    state.measurement_endpoint.as_ref().unwrap(),
-                    e
-                );
+                debug!("failed to send initial ping to {}: {}", endpoint, e);
                 0
             }
         };
@@ -668,7 +687,7 @@ impl Measurement {
             measurement.measurements_started.clone(),
             clock,
             Some(unicast_socket.clone()),
-            state.measurement_endpoint.unwrap(),
+            endpoint,
             data.clone(),
             tx_measurement.clone(),
             finished_notifier.clone(),
@@ -686,8 +705,12 @@ impl Measurement {
     }
 
     pub async fn listen(&mut self, mut rx_pong: Receiver<PongMessage>) {
-        let socket = self.unicast_socket.as_ref().unwrap().clone();
-        let endpoint = *self.measurement_endpoint.as_ref().unwrap();
+        let (Some(socket), Some(endpoint)) =
+            (self.unicast_socket.clone(), self.measurement_endpoint)
+        else {
+            debug!("measurement has no socket or endpoint to listen with");
+            return;
+        };
 
         let clock = self.clock;
         let s_id = self.session_id;
@@ -716,7 +739,14 @@ impl Measurement {
                         pong_received = true;
                     }
 
-                    let payload = parse_payload(&buf[header_len..]).unwrap();
+                    // Inbound data: a malformed pong is dropped, never trusted.
+                    let payload = match parse_payload(&buf[header_len..]) {
+                        Ok(payload) => payload,
+                        Err(e) => {
+                            debug!("malformed pong payload from {}: {}", src, e);
+                            continue;
+                        }
+                    };
 
                     let mut session_id = SessionId::default();
                     let mut ghost_time = Duration::zero();
@@ -749,30 +779,31 @@ impl Measurement {
                             debug!("failed to send ping to {}: {}", endpoint, e);
                         }
 
+                        // Times come from the peer; a value outside chrono's
+                        // microsecond range is a bad sample, so it's skipped.
+                        let us = |d: Duration| d.num_microseconds().map(|v| v as f64);
                         if ghost_time != Duration::microseconds(0)
                             && prev_host_time != Duration::microseconds(0)
                         {
-                            let avg_host = (host_time + prev_host_time).num_microseconds().unwrap()
-                                as f64
-                                * 0.5;
-                            let offset = ghost_time.num_microseconds().unwrap() as f64 - avg_host;
-                            data.try_lock().unwrap().push((avg_host, offset));
+                            if let (Some(sum_host), Some(ghost)) =
+                                (us(host_time + prev_host_time), us(ghost_time))
+                            {
+                                let avg_host = sum_host * 0.5;
+                                lock(&data).push((avg_host, ghost - avg_host));
+                            }
 
                             if prev_ghost_time != Duration::microseconds(0) {
-                                let avg_ghost =
-                                    (ghost_time + prev_ghost_time).num_microseconds().unwrap()
-                                        as f64
-                                        * 0.5;
-                                let offset2 =
-                                    avg_ghost - prev_host_time.num_microseconds().unwrap() as f64;
-                                data.try_lock().unwrap().push((
-                                    prev_host_time.num_microseconds().unwrap() as f64,
-                                    offset2,
-                                ));
+                                if let (Some(sum_ghost), Some(prev_host)) =
+                                    (us(ghost_time + prev_ghost_time), us(prev_host_time))
+                                {
+                                    let avg_ghost = sum_ghost * 0.5;
+                                    lock(&data).push((prev_host, avg_ghost - prev_host));
+                                }
                             }
                         }
 
-                        if data.try_lock().unwrap().len() > NUMBER_DATA_POINTS {
+                        let enough = lock(&data).len() > NUMBER_DATA_POINTS;
+                        if enough {
                             if let Err(error) = tx_timer.send(()).await {
                                 debug!("measurement timer closed during cancellation: {}", error);
                             }
@@ -796,18 +827,20 @@ async fn reset_timer(
 ) {
     loop {
         select! {
-            _  = tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()) => {
-                info!(
-                    "measurements_start {}",
-                    measurements_started.try_lock().unwrap()
-                );
-                if *measurements_started.try_lock().unwrap() < NUMBER_MEASUREMENTS {
+            _  = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                let started = *lock(&measurements_started);
+                info!("measurements_start {}", started);
+                if started < NUMBER_MEASUREMENTS {
                     let ht = HostTime {
                         time: clock.micros(),
                     };
 
+                    let Some(socket) = unicast_socket.as_ref() else {
+                        debug!("no socket to ping {} with", measurement_endpoint);
+                        break;
+                    };
                     if let Err(e) = send_ping(
-                        unicast_socket.as_ref().unwrap().clone(),
+                        socket.clone(),
                         measurement_endpoint,
                         &Payload {
                             entries: vec![PayloadEntry::HostTime(ht)],
@@ -818,14 +851,14 @@ async fn reset_timer(
                         break;
                     }
 
-                    tokio::time::sleep(Duration::seconds(1).to_std().unwrap()).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-                    *measurements_started.try_lock().unwrap() += 1;
+                    *lock(&measurements_started) += 1;
                 } else {
-                    data.try_lock().unwrap().clear();
+                    lock(&data).clear();
                     info!("measuring {} failed", measurement_endpoint);
 
-                    let data = data.try_lock().unwrap().clone();
+                    let data = lock(&data).clone();
                     if let Err(error) = tx_measurement.send(data).await {
                         debug!("measurement result receiver closed during cancellation: {}", error);
                     }
@@ -845,17 +878,17 @@ async fn finish(
     data: Arc<Mutex<Vec<(f64, f64)>>>,
     tx_measurement: Sender<Vec<(f64, f64)>>,
 ) {
-    *success.try_lock().unwrap() = true;
+    *lock(&success) = true;
     debug!("measuring {} done", measurement_endpoint);
 
-    let d = data.try_lock().unwrap().clone();
+    let d = lock(&data).clone();
     if let Err(error) = tx_measurement.send(d).await {
         debug!(
             "measurement result receiver closed during cancellation: {}",
             error
         );
     }
-    data.try_lock().unwrap().clear();
+    lock(&data).clear();
 }
 
 pub async fn send_ping(
@@ -879,11 +912,15 @@ pub async fn send_ping(
     socket.send_to(&message, measurement_endpoint).await
 }
 
+/// The median, or 0.0 for no numbers. NaNs sort last (`total_cmp`) rather
+/// than panicking the comparison.
 pub fn median(mut numbers: Vec<f64>) -> f64 {
-    numbers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    numbers.sort_by(|a, b| a.total_cmp(b));
     let length = numbers.len();
 
-    assert!(length > 2);
+    if length == 0 {
+        return 0.0;
+    }
     if length.is_multiple_of(2) {
         let mid = length / 2;
         (numbers[mid - 1] + numbers[mid]) / 2.0

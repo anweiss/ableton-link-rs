@@ -27,7 +27,7 @@ impl<const NUM_POINTS: usize> HostTimeFilter<NUM_POINTS> {
     /// This method accumulates sample time points and uses linear regression
     /// to determine the best mapping to host time, compensating for clock drift.
     pub fn sample_time_to_host_time(&mut self, sample_time: f64) -> Duration {
-        let host_micros = self.clock.micros().num_microseconds().unwrap() as f64;
+        let host_micros = super::micros(self.clock.micros()) as f64;
         let point = (sample_time, host_micros);
 
         // Add the new point
