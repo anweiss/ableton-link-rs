@@ -1,6 +1,6 @@
 [package]
 name = "ableton-link-rs"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 # Enforced, not just advertised. Four floors were checked and this is the
 # highest that binds library consumers:
