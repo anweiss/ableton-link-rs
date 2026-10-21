@@ -140,6 +140,9 @@ crossterm = { version = "0.29", default-features = false, features = ["windows"]
 [[example]]
 name = "rusthut"
 path = "examples/rusthut.rs"
+# Runs the unit tests in examples/common/audio_sink.rs, which both audio
+# examples include.
+test = true
 
 [[example]]
 name = "platform_demo"

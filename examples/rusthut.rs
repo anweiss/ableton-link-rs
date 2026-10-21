@@ -1,12 +1,15 @@
 use ableton_link_rs::link::{BasicLink, SessionState};
 use cpal::traits::{DeviceTrait, HostTrait};
-use rodio::{cpal, DeviceSinkBuilder, Player, SampleRate};
+use rodio::{cpal, Player, SampleRate};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+
+#[path = "common/audio_sink.rs"]
+mod audio_sink;
 
 /// Channel-based audio metronome that's Send-safe
 #[derive(Debug)]
@@ -41,7 +44,7 @@ impl MetronomeHandle {
 
     fn audio_thread(mut rx: mpsc::UnboundedReceiver<MetronomeMessage>) {
         // Create audio stream in the background thread
-        let stream = match DeviceSinkBuilder::open_default_sink() {
+        let stream = match audio_sink::open_default_sink() {
             Ok(stream) => stream,
             Err(e) => {
                 eprintln!("Failed to create audio stream: {}", e);

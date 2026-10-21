@@ -18,7 +18,10 @@ use std::{
 };
 
 use ableton_link_rs::link_audio::LinkAudio;
-use rodio::{ChannelCount, DeviceSinkBuilder, Player, Sample, SampleRate, Source};
+use rodio::{ChannelCount, Player, Sample, SampleRate, Source};
+
+#[path = "common/audio_sink.rs"]
+mod audio_sink;
 
 const SAMPLE_RATE: u32 = 44100;
 const NUM_CHANNELS: usize = 2;
@@ -128,7 +131,7 @@ fn start_playback(
     sample_rate: SampleRate,
 ) {
     std::thread::spawn(move || {
-        let stream = match DeviceSinkBuilder::open_default_sink() {
+        let stream = match audio_sink::open_default_sink() {
             Ok(stream) => stream,
             Err(e) => {
                 eprintln!("could not open an audio output device: {e}");
