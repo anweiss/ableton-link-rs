@@ -148,6 +148,10 @@ concurrency:
 jobs:
   review-loop:
     runs-on: ubuntu-latest
+    # Bounds a hung run, which would otherwise hold the single global
+    # concurrency group below. The longest legitimate wait is the 60 s
+    # fix-dispatch poll.
+    timeout-minutes: 10
     steps:
       # Runs BEFORE the review loop and independently of it, because the loop
       # only ever looks at pull requests `disqualify` accepts: opened by
@@ -174,6 +178,9 @@ jobs:
         env:
           PIPELINE_PAT: ${{ secrets.PIPELINE_PAT }}
         with:
+          # Turns on the bundled Octokit retry plugin (off by default) for
+          # 5xx and network errors; 4xx stays exempt.
+          retries: 3
           script: |
             const { owner, repo } = context.repo;
             const pat = process.env.PIPELINE_PAT || '';
@@ -190,6 +197,40 @@ jobs:
             // Runs also surface it as a *conclusion* once they finish being
             // held, and the list endpoint does not match those, so the
             // conclusion is checked client-side too.
+            // Shared verbatim by both held-run approval paths in this file;
+            // the automation tests fail if the two copies drift apart.
+            //
+            // A held `pull_request` run executes the workflow definitions from
+            // the pull request's own branch, so approving it runs whatever the
+            // branch says with this repository's secrets and write tokens. Bot
+            // pull requests are only expected to change code, never
+            // automation, so any change to - or rename away from - workflows,
+            // composite actions or the scripts they load is left for a human.
+            // `listFiles` stops at 3000 files, and a listing that may be cut
+            // short cannot prove the absence of such a change.
+            async function heldRunRefusal(number) {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: number, per_page: 100,
+              });
+              const PROTECTED = /^\.github\/(?:workflows|actions|scripts)\//;
+              const touched = files.filter(f =>
+                PROTECTED.test(f.filename || '') || PROTECTED.test(f.previous_filename || ''));
+              let reason = null;
+              if (files.length >= 3000) {
+                reason = 'its diff is too large to confirm it leaves .github/workflows, ' +
+                         '.github/actions and .github/scripts untouched';
+              } else if (touched.length > 0) {
+                reason = `it changes ${touched.length} file(s) under .github/workflows, ` +
+                         '.github/actions or .github/scripts';
+              }
+              if (!reason) return null;
+              // Paths go to the log only: git allows backticks and newlines in
+              // filenames, and the reason is also written into PR comments.
+              core.warning(
+                `PR #${number}: not approving held runs because ${reason}: ` +
+                touched.slice(0, 10).map(f => f.filename).join(', '));
+              return reason;
+            }
             const runs = await github.paginate(
               github.rest.actions.listWorkflowRunsForRepo,
               { owner, repo, status: 'action_required', per_page: 100 },
@@ -226,7 +267,31 @@ jobs:
             // above, but a skipped run must not abort the rest of the batch.
             const UNAPPROVABLE = /not from a fork pull request or queued by the Actions bot/i;
             let failures = [];
+            // One verdict per pull request, and every open pull request at a
+            // head is checked, so a protected change on any of them holds the
+            // run. A listing failure also withholds approval, but only warns:
+            // retries have already absorbed transient errors, and the review
+            // loop below reports held runs on the pull requests it owns.
+            const refusals = new Map();
+            async function refused(number) {
+              if (!refusals.has(number)) {
+                try {
+                  refusals.set(number, await heldRunRefusal(number));
+                } catch (err) {
+                  core.warning(
+                    `PR #${number}: could not list changed files (${err.message}); ` +
+                    'not approving its held runs.');
+                  refusals.set(number, 'unreadable');
+                }
+              }
+              return refusals.get(number);
+            }
             for (const run of held) {
+              let blocked = false;
+              for (const pr of open.filter(p => p.head.sha === run.head_sha)) {
+                if (await refused(pr.number)) blocked = true;
+              }
+              if (blocked) continue;
               const res = await fetch(
                 `https://api.github.com/repos/${owner}/${repo}/actions/runs/${run.id}/approve`,
                 {
@@ -263,6 +328,9 @@ jobs:
         env:
           PIPELINE_PAT: ${{ secrets.PIPELINE_PAT }}
         with:
+          # Turns on the bundled Octokit retry plugin (off by default) for
+          # 5xx and network errors; 4xx stays exempt.
+          retries: 3
           script: |
             const { owner, repo } = context.repo;
 
@@ -304,8 +372,40 @@ jobs:
             // that reject installation tokens. Deliberately not a second
             // Octokit: github-script's bundled modules are not a documented
             // `require` surface, whereas `fetch` is in the runtime.
-            async function userRequest(method, path, body) {
-              const res = await fetch(`https://api.github.com${path}`, {
+            //
+            // `retries:` on the step only covers the bundled Octokit, so the
+            // raw `fetch` calls retry here. Only 5xx and network failures are
+            // transient: a 4xx is a verdict about the request and would fail
+            // the same way again. Every log line names the method and URL,
+            // never the headers, which carry the PAT.
+            async function fetchWithRetry(url, init, attempts = 4) {
+              const method = init.method || 'GET';
+              for (let attempt = 1; ; attempt++) {
+                let res = null;
+                let failure = null;
+                try {
+                  res = await fetch(url, init);
+                } catch (err) {
+                  failure = err;
+                }
+                if (res && res.status < 500) {
+                  if (!res.ok) core.info(`${method} ${url} -> ${res.status}`);
+                  return res;
+                }
+                const outcome = res ? `${res.status}` : `network error (${failure.message})`;
+                if (attempt >= attempts) {
+                  core.warning(`${method} ${url} -> ${outcome}, giving up after ${attempt} attempt(s).`);
+                  if (res) return res;
+                  throw new Error(`${method} ${url} -> ${outcome}`);
+                }
+                core.info(`${method} ${url} -> ${outcome}, retrying (attempt ${attempt} of ${attempts}).`);
+                await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** (attempt - 1)));
+              }
+            }
+
+            async function userRequest(method, path, body, attempts) {
+              const url = `https://api.github.com${path}`;
+              const res = await fetchWithRetry(url, {
                 method,
                 headers: {
                   authorization: `Bearer ${pat}`,
@@ -315,10 +415,12 @@ jobs:
                   'user-agent': 'copilot-review-loop',
                 },
                 body: body === undefined ? undefined : JSON.stringify(body),
-              });
+              }, attempts);
               if (!res.ok) {
                 const text = await res.text();
-                throw new Error(`${method} ${path} -> ${res.status} ${text.slice(0, 300)}`);
+                const error = new Error(`${method} ${url} -> ${res.status} ${text.slice(0, 300)}`);
+                error.status = res.status;
+                throw error;
               }
               if (res.status === 204) return null;
               return res.json().catch(() => null);
@@ -332,7 +434,8 @@ jobs:
             // `Bot:copilot-pull-request-reviewer` with a user token. GraphQL
             // also reports errors in a 200 body, so those are surfaced here.
             async function userGraphql(query, variables) {
-              const res = await fetch('https://api.github.com/graphql', {
+              const url = 'https://api.github.com/graphql';
+              const res = await fetchWithRetry(url, {
                 method: 'POST',
                 headers: {
                   authorization: `Bearer ${pat}`,
@@ -344,7 +447,9 @@ jobs:
               });
               const text = await res.text();
               if (!res.ok) {
-                throw new Error(`GraphQL -> ${res.status} ${text.slice(0, 300)}`);
+                const error = new Error(`POST ${url} -> ${res.status} ${text.slice(0, 300)}`);
+                error.status = res.status;
+                throw error;
               }
               const payload = JSON.parse(text);
               if (payload.errors && payload.errors.length > 0) {
@@ -353,6 +458,18 @@ jobs:
                 );
               }
               return payload.data;
+            }
+
+            // Octokit's `HttpError` for a text/plain 5xx has an empty
+            // message, which used to leave `PR #185: ` as the whole error
+            // line. Status, method and URL come from the error itself; the
+            // request headers, which hold the token, are never read.
+            function describeError(err) {
+              const status = err && err.status ? `${err.status} ` : '';
+              const request = (err && err.request) || {};
+              const where = request.method && request.url ? `${request.method} ${request.url} ` : '';
+              const message = (err && err.message) || '(no message)';
+              return `${status}${where}${message}`;
             }
 
             const labelsOf = pr => pr.labels.map(l => l.name);
@@ -504,7 +621,7 @@ jobs:
               if (typeof value.rounds !== 'number' || !Number.isFinite(value.rounds)) {
                 value.rounds = 0;
               }
-              return { id: found.id, value };
+              return { id: found.id, value, body: found.body };
             }
 
             function renderState(value) {
@@ -532,6 +649,15 @@ jobs:
               }
               if (!next.phaseSince) next.phaseSince = new Date().toISOString();
               const body = renderState(next);
+              // Most sweeps change nothing, and an unconditional PATCH every
+              // five minutes was both pure churn and the call that 5xx'd in
+              // the failed runs. `phaseSince` only moves with the phase, so an
+              // unchanged state renders to the identical body.
+              if (handle.id && handle.body === body) {
+                core.info(`PR #${number}: state unchanged, write skipped`);
+                handle.value = next;
+                return next;
+              }
               if (handle.id) {
                 await github.rest.issues.updateComment({
                   owner, repo, comment_id: handle.id, body,
@@ -542,6 +668,7 @@ jobs:
                 });
                 handle.id = data.id;
               }
+              handle.body = body;
               handle.value = next;
               return next;
             }
@@ -635,6 +762,40 @@ jobs:
             // about the run, not about the token.
             const UNAPPROVABLE = /not from a fork pull request or queued by the Actions bot/i;
 
+            // Shared verbatim by both held-run approval paths in this file;
+            // the automation tests fail if the two copies drift apart.
+            //
+            // A held `pull_request` run executes the workflow definitions from
+            // the pull request's own branch, so approving it runs whatever the
+            // branch says with this repository's secrets and write tokens. Bot
+            // pull requests are only expected to change code, never
+            // automation, so any change to - or rename away from - workflows,
+            // composite actions or the scripts they load is left for a human.
+            // `listFiles` stops at 3000 files, and a listing that may be cut
+            // short cannot prove the absence of such a change.
+            async function heldRunRefusal(number) {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: number, per_page: 100,
+              });
+              const PROTECTED = /^\.github\/(?:workflows|actions|scripts)\//;
+              const touched = files.filter(f =>
+                PROTECTED.test(f.filename || '') || PROTECTED.test(f.previous_filename || ''));
+              let reason = null;
+              if (files.length >= 3000) {
+                reason = 'its diff is too large to confirm it leaves .github/workflows, ' +
+                         '.github/actions and .github/scripts untouched';
+              } else if (touched.length > 0) {
+                reason = `it changes ${touched.length} file(s) under .github/workflows, ` +
+                         '.github/actions or .github/scripts';
+              }
+              if (!reason) return null;
+              // Paths go to the log only: git allows backticks and newlines in
+              // filenames, and the reason is also written into PR comments.
+              core.warning(
+                `PR #${number}: not approving held runs because ${reason}: ` +
+                touched.slice(0, 10).map(f => f.filename).join(', '));
+              return reason;
+            }
             async function unblockRuns(pr) {
               const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
                 owner, repo, head_sha: pr.head.sha, per_page: 100,
@@ -658,6 +819,11 @@ jobs:
               if (!hasPat) {
                 return 'the `PIPELINE_PAT` secret is not set, so they cannot be ' +
                        'approved here';
+              }
+              const refusal = await heldRunRefusal(pr.number);
+              if (refusal) {
+                return `were not approved because ${refusal}; a human must read ` +
+                       'those changes before any workflow from this branch runs';
               }
               for (const run of held) {
                 try {
@@ -981,6 +1147,9 @@ jobs:
                     aw_context: JSON.stringify({
                       item_type: 'pull_request', item_number: number }),
                   } },
+                // A 5xx can follow a dispatch that did start a run, and each
+                // run is a paid agent session, so this POST retries only once.
+                2,
               );
 
               // A dispatched run does not appear instantly, so this polls rather
@@ -1626,35 +1795,64 @@ jobs:
             // the pending scheduled sweep over and over - and the sweep is the
             // only guaranteed recovery path. Reconciling everything on every run
             // makes that coalescing harmless.
-            const open = await github.paginate(github.rest.pulls.list, {
-              owner, repo, state: 'open', per_page: 100,
-            });
-            // Deliberately a coarse pre-filter: author only. Anything finer
-            // here silently drops a pull request before `disqualify` can name
-            // a reason, which is how PR #86 vanished from the sweep with no
-            // log line at all. Let `disqualify` be the single place that
-            // decides, so every exclusion is stated out loud.
-            const numbers = open
-              .filter(pr => pr.user.login === 'github-actions[bot]')
-              .map(pr => pr.number);
-            // There is no triggering pull request to fold in any more: the
-            // `pull_request` and `pull_request_review` triggers were removed
-            // because their runs were held and unapprovable (see the header).
-            // Every remaining trigger is repository-scoped, so the sweep above
-            // is the complete candidate set.
+            //
+            // Release pull requests are the one exclusion made from list data.
+            // `reconcile` starts with `pulls.get`, and for a release PR that
+            // call can 422 with "too many files changed" (PR #73) and fail
+            // the sweep over a pull request the loop never owns. The skip is
+            // logged in the same words `disqualify` would use. One that still
+            // carries `copilot-reviewed` goes through, so `reconcile` can
+            // revoke the stale sign-off.
+            function sweepSkipReason(pr) {
+              const names = pr.labels.map(l => l.name);
+              if (names.includes('autorelease: pending') && !names.includes('copilot-reviewed')) {
+                return 'it is a release PR';
+              }
+              return null;
+            }
 
-            let failed = [];
-            for (const number of numbers) {
-              try {
-                await reconcile(number);
-              } catch (err) {
-                failed.push(number);
-                core.error(`PR #${number}: ${err.message}`);
+            async function sweep() {
+              const open = await github.paginate(github.rest.pulls.list, {
+                owner, repo, state: 'open', per_page: 100,
+              });
+              // Deliberately a coarse pre-filter: author, plus the logged
+              // release skip above. Anything finer here silently drops a pull
+              // request before `disqualify` can name a reason, which is how PR
+              // #86 vanished from the sweep with no log line at all. Let
+              // `disqualify` be the single place that decides, so every
+              // exclusion is stated out loud.
+              const numbers = [];
+              for (const pr of open) {
+                if (pr.user.login !== 'github-actions[bot]') continue;
+                const skip = sweepSkipReason(pr);
+                if (skip) {
+                  core.info(`PR #${pr.number} not in scope: ${skip}.`);
+                  continue;
+                }
+                numbers.push(pr.number);
+              }
+              // There is no triggering pull request to fold in any more: the
+              // `pull_request` and `pull_request_review` triggers were removed
+              // because their runs were held and unapprovable (see the header).
+              // Every remaining trigger is repository-scoped, so the sweep
+              // above is the complete candidate set.
+
+              let failed = [];
+              for (const number of numbers) {
+                try {
+                  await reconcile(number);
+                } catch (err) {
+                  failed.push(number);
+                  core.error(`PR #${number}: ${describeError(err)}`);
+                }
+              }
+              // Any failure fails the run. A partial failure that leaves the
+              // run green is the silent stall this workflow exists to avoid:
+              // the PR it could not process is exactly the one nobody will
+              // notice.
+              if (failed.length > 0) {
+                core.setFailed(`Failed to process PR(s): ${failed.map(n => `#${n}`).join(', ')}.`);
               }
             }
-            // Any failure fails the run. A partial failure that leaves the run
-            // green is the silent stall this workflow exists to avoid: the PR
-            // it could not process is exactly the one nobody will notice.
-            if (failed.length > 0) {
-              core.setFailed(`Failed to process PR(s): ${failed.map(n => `#${n}`).join(', ')}.`);
-            }
+
+            await sweep();

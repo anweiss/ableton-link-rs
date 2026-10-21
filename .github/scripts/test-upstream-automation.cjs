@@ -470,3 +470,318 @@ test('triage fix: compiled preflight and safe-output policy match the tested sou
   assert.ok(lock.indexOf('name: Preserve reviewed backlog through instruction restore') <
     lock.indexOf('name: Restore agent config folders from base branch'));
 });
+
+// ---- Review loop hardening -------------------------------------------------
+
+// The two github-script steps, dedented, in file order: the held-run approval
+// step first, then the review-loop sweep.
+function loopScripts() {
+  return loopSource.split('          script: |\n').slice(1)
+    .map(block => block.split('\n      - name: ')[0].replace(/^ {12}/gm, ''));
+}
+
+const response = (status, body = '') => ({
+  ok: status >= 200 && status < 300, status,
+  text: async () => typeof body === 'string' ? body : JSON.stringify(body),
+  json: async () => body,
+});
+
+function retryHarness(responses) {
+  const calls = [];
+  const logs = [];
+  const delays = [];
+  const log = message => logs.push(message);
+  const context = loadFunctions(loopSource, ['fetchWithRetry', 'userRequest', 'userGraphql'], {
+    pat: 'ghp_supersecret',
+    setTimeout: (callback, ms) => { delays.push(ms); callback(); },
+    core: { ...quiet, info: log, notice: log, warning: log, error: log },
+    fetch: async (url, init) => {
+      calls.push({ url, method: init.method });
+      const next = responses.shift();
+      if (next instanceof Error) throw next;
+      return response(next.status, next.body);
+    },
+  });
+  return { context, calls, logs, delays };
+}
+
+test('review: both github-script steps retry and the job is time-bounded', () => {
+  const steps = loopSource.split('uses: actions/github-script@').slice(1)
+    .map(step => step.split('script: |')[0]);
+  assert.equal(steps.length, 2);
+  for (const step of steps) assert.match(step, /\n {10}retries: 3\n/);
+  assert.match(loopSource, /\n  review-loop:\n    runs-on: ubuntu-latest\n(?: {4}#.*\n)* {4}timeout-minutes: 10\n/);
+});
+
+test('review: REST wrapper retries 5xx and network errors, then succeeds', async () => {
+  for (const failure of [{ status: 502 }, { status: 500 }, new TypeError('fetch failed')]) {
+    const { context, calls } = retryHarness([failure, { status: 200, body: { ok: 1 } }]);
+    assert.deepEqual(await context.userRequest('GET', '/repos/anweiss/ableton-link-rs/pulls/185'), { ok: 1 });
+    assert.equal(calls.length, 2);
+  }
+  const graph = retryHarness([{ status: 503 }, { status: 200, body: { data: { viewer: 1 } } }]);
+  // JSON.parse runs inside the VM realm, so compare by value, not prototype.
+  assert.equal(JSON.stringify(await graph.context.userGraphql('query { viewer { login } }', {})),
+    JSON.stringify({ viewer: 1 }));
+  assert.equal(graph.calls.length, 2);
+});
+
+test('review: REST and GraphQL wrappers never retry 4xx and name the failed request', async () => {
+  for (const status of [404, 422, 403]) {
+    const { context, calls, logs } = retryHarness([{ status, body: 'nope' }]);
+    const error = await context.userRequest(
+      'POST', '/repos/anweiss/ableton-link-rs/issues/185/labels', { labels: ['x'] },
+    ).then(() => null, err => err);
+    assert.ok(error, 'a 4xx must propagate');
+    assert.equal(calls.length, 1);
+    assert.equal(error.status, status);
+    const text = [error.message, ...logs].join('\n');
+    assert.match(text, new RegExp(`${status}`));
+    assert.match(text, /POST https:\/\/api\.github\.com\/repos\/anweiss\/ableton-link-rs\/issues\/185\/labels/);
+    assert.doesNotMatch(text, /supersecret|authorization|Bearer/i);
+  }
+  const graph = retryHarness([{ status: 401, body: 'bad credentials' }]);
+  await assert.rejects(graph.context.userGraphql('query { viewer { login } }', {}), /401/);
+  assert.equal(graph.calls.length, 1);
+});
+
+test('review: retries are bounded with backoff and log the final failure without secrets', async () => {
+  const { context, calls, logs, delays } = retryHarness(Array.from({ length: 10 }, () => ({ status: 500 })));
+  const error = await context.userRequest('GET', '/repos/anweiss/ableton-link-rs/issues/185/comments')
+    .then(() => null, err => err);
+  assert.ok(error);
+  assert.equal(calls.length, 4);
+  assert.equal(delays.length, 3);
+  assert.ok(delays.every((ms, i) => ms > 0 && ms <= 10_000 && (i === 0 || ms >= delays[i - 1])));
+  const final = logs.at(-1);
+  assert.match(final, /500/);
+  assert.match(final, /GET https:\/\/api\.github\.com\/repos\/anweiss\/ableton-link-rs\/issues\/185\/comments/);
+  assert.doesNotMatch([error.message, ...logs].join('\n'), /supersecret|authorization|Bearer/i);
+
+  const network = retryHarness(Array.from({ length: 10 }, () => new TypeError('fetch failed')));
+  await assert.rejects(network.context.userGraphql('query { viewer { login } }', {}), /POST https:\/\/api\.github\.com\/graphql/);
+  assert.equal(network.calls.length, 4);
+
+  // The dispatch is not idempotent, so its caller can cap the retries lower.
+  const dispatch = retryHarness(Array.from({ length: 10 }, () => ({ status: 502 })));
+  await assert.rejects(dispatch.context.userRequest('POST', '/x/dispatches', {}, 2));
+  assert.equal(dispatch.calls.length, 2);
+});
+
+test('review: per-PR error lines carry status, method and URL but not headers', () => {
+  const { describeError } = loadFunctions(loopSource, ['describeError']);
+  const line = describeError({
+    status: 500, message: '',
+    request: {
+      method: 'PATCH', url: 'https://api.github.com/repos/anweiss/ableton-link-rs/issues/comments/1',
+      headers: { authorization: 'token ghs_supersecret' },
+    },
+  });
+  assert.match(line, /500/);
+  assert.match(line, /PATCH https:\/\/api\.github\.com\/repos\/anweiss\/ableton-link-rs\/issues\/comments\/1/);
+  assert.doesNotMatch(line, /supersecret/);
+  assert.match(describeError(new Error('boom')), /boom/);
+});
+
+function stateHarness(comments) {
+  const calls = [];
+  const infos = [];
+  const context = loadFunctions(loopSource, ['readState', 'renderState', 'writeState'], {
+    STATE_MARKER: '<!-- copilot-review-loop:state -->',
+    BLANK: { phase: 'new', phaseSince: null, reviewedSha: null,
+      dispatchedSha: null, rounds: 0, note: '' },
+    core: { ...quiet, info: message => infos.push(message) },
+    github: {
+      paginate: async () => comments,
+      rest: { issues: {
+        listComments: 'comments',
+        updateComment: async args => { calls.push(['update', args]); },
+        createComment: async args => { calls.push(['create', args]); return { data: { id: 99 } }; },
+      } },
+    },
+  });
+  return { context, calls, infos };
+}
+
+test('review: writeState skips identical bodies, updates changed ones once, creates missing', async () => {
+  const created = stateHarness([]);
+  const handle = await created.context.readState(185);
+  await created.context.writeState(185, handle, { phase: 'done', note: 'Signed off.' });
+  assert.deepEqual(created.calls.map(([kind]) => kind), ['create']);
+  await created.context.writeState(185, handle, { phase: 'done', note: 'Signed off.' });
+  assert.deepEqual(created.calls.map(([kind]) => kind), ['create']);
+  assert.ok(created.infos.includes('PR #185: state unchanged, write skipped'));
+
+  const value = { phase: 'done', phaseSince: '2026-10-19T18:27:00.000Z', reviewedSha: head,
+    dispatchedSha: null, rounds: 1, note: 'Signed off.' };
+  const body = created.context.renderState(value);
+  const existing = stateHarness([{ id: 7, body, user: { login: 'github-actions[bot]' } }]);
+  const stored = await existing.context.readState(185);
+  await existing.context.writeState(185, stored, { phase: 'done', reviewedSha: head, note: 'Signed off.' });
+  assert.deepEqual(existing.calls, []);
+  assert.ok(existing.infos.includes('PR #185: state unchanged, write skipped'));
+  await existing.context.writeState(185, stored, { note: 'Something changed.' });
+  assert.equal(existing.calls.length, 1);
+  assert.equal(existing.calls[0][0], 'update');
+  assert.equal(existing.calls[0][1].comment_id, 7);
+  await existing.context.writeState(185, stored, { note: 'Something changed.' });
+  assert.equal(existing.calls.length, 1);
+});
+
+test('review: sweep drops release PRs from list data before any pulls.get', async () => {
+  const gets = [];
+  const infos = [];
+  const errors = [];
+  let failedWith = null;
+  const bot = { login: 'github-actions[bot]' };
+  const open = [
+    { number: 73, user: bot, labels: labels(['autorelease: pending']) },
+    { number: 185, user: bot, labels: labels(['automation', 'upstream-sync']) },
+    { number: 183, user: { login: 'medcelerate' }, labels: [] },
+    { number: 186, user: bot, labels: labels(['automation', 'upstream-triage']) },
+  ];
+  const github = {
+    paginate: async () => open,
+    rest: { pulls: { list: 'pulls', get: async args => { gets.push(args.pull_number); return { data: {} }; } } },
+  };
+  const context = loadFunctions(loopSource, ['describeError', 'sweepSkipReason', 'sweep'], {
+    github,
+    core: { ...quiet, info: m => infos.push(m), error: m => errors.push(m),
+      setFailed: m => { failedWith = m; } },
+    reconcile: async number => {
+      await github.rest.pulls.get({ pull_number: number });
+      if (number === 185) throw Object.assign(new Error(''), { status: 502 });
+    },
+  });
+  await context.sweep();
+  assert.deepEqual(gets, [185, 186]);
+  assert.ok(infos.some(line => /PR #73 not in scope/.test(line)));
+  assert.ok(errors.some(line => /PR #185: 502/.test(line)));
+  assert.match(failedWith, /#185/);
+  // A stale sign-off on a release PR still reaches `reconcile` to be revoked.
+  assert.equal(context.sweepSkipReason(
+    { number: 73, user: bot, labels: labels(['autorelease: pending', 'copilot-reviewed']) }), null);
+});
+
+test('review: both held-run approval paths share one byte-identical guard', () => {
+  const definition = new RegExp(
+    '^            async function heldRunRefusal\\([^\\n]*\\) \\{\\n[\\s\\S]*?^            \\}', 'gm');
+  const copies = [...loopSource.matchAll(definition)].map(match => match[0]);
+  assert.equal(copies.length, 2);
+  assert.equal(copies[0], copies[1]);
+  const [approve, drive] = loopScripts();
+  assert.match(approve, /await heldRunRefusal\(/);
+  assert.match(drive, /await heldRunRefusal\(/);
+});
+
+test('review: held-run guard refuses workflow, action and script paths, including renames', async () => {
+  let files;
+  const warnings = [];
+  const { heldRunRefusal } = loadFunctions(loopSource, ['heldRunRefusal'], {
+    core: { ...quiet, warning: message => warnings.push(message) },
+    github: {
+      rest: { pulls: { listFiles: 'files' } },
+      paginate: async (method, args) => {
+        assert.equal(method, 'files');
+        assert.equal(args.pull_number, 185);
+        return files;
+      },
+    },
+  });
+  for (files of [
+    [{ filename: '.github/workflows/ci.yml', status: 'modified' }],
+    [{ filename: '.github/actions/setup/action.yml', status: 'added' }],
+    [{ filename: '.github/scripts/test-upstream-automation.cjs', status: 'removed' }],
+    [{ filename: 'src/lib.rs', status: 'renamed', previous_filename: '.github/scripts/a.cjs' }],
+    [{ filename: 'src/a.rs', status: 'modified' }, { filename: '.github/workflows/x/y.yml', status: 'added' }],
+    Array.from({ length: 3000 }, (_, i) => ({ filename: `src/f${i}.rs`, status: 'added' })),
+  ]) {
+    warnings.length = 0;
+    assert.ok(await heldRunRefusal(185), JSON.stringify(files.slice(0, 2)));
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /PR #185/);
+  }
+  for (files of [
+    [{ filename: 'src/lib.rs', status: 'modified' }],
+    [{ filename: '.github/upstream-backlog.toml', status: 'modified' }],
+    [{ filename: '.github/workflows-notes.md', status: 'added' }],
+    [{ filename: 'docs/.github/workflows/x.yml', status: 'added' }],
+    [{ filename: 'src/b.rs', status: 'renamed', previous_filename: 'src/a.rs' }],
+  ]) {
+    warnings.length = 0;
+    assert.equal(await heldRunRefusal(185), null, JSON.stringify(files));
+    assert.equal(warnings.length, 0);
+  }
+});
+
+async function runApproveStep(filesByPr) {
+  const approved = [];
+  const warnings = [];
+  let failedWith = null;
+  const open = [185, 186, 187].map((number, i) => ({ number, head: { sha: String(i + 1).repeat(40) } }));
+  const runs = open.map((value, i) => ({
+    id: 900 + i, name: 'CI', head_branch: `b${i}`, head_sha: value.head.sha,
+    status: 'action_required', actor: { login: 'github-actions[bot]' },
+    head_repository: { full_name: 'anweiss/ableton-link-rs' },
+  }));
+  const github = {
+    rest: { actions: { listWorkflowRunsForRepo: 'runs' }, pulls: { list: 'pulls', listFiles: 'files' } },
+    paginate: async (method, args) => {
+      if (method === 'runs') return runs;
+      if (method === 'pulls') return open;
+      const files = filesByPr[args.pull_number];
+      if (files instanceof Error) throw files;
+      return files;
+    },
+  };
+  const fetch = async url => { approved.push(url); return response(201); };
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const execute = new AsyncFunction('github', 'context', 'core', 'process', 'fetch', loopScripts()[0]);
+  await execute(github, { repo: { owner: 'anweiss', repo: 'ableton-link-rs' } },
+    { ...quiet, warning: m => warnings.push(m), setFailed: m => { failedWith = m; } },
+    { env: { PIPELINE_PAT: 'ghp_supersecret' } }, fetch);
+  return { approved, warnings, failedWith };
+}
+
+test('review: approve-held-runs step refuses protected PRs and still approves the rest', async () => {
+  const result = await runApproveStep({
+    185: [{ filename: '.github/workflows/auto-merge-upstream-port.yml', status: 'modified' }],
+    186: [{ filename: 'src/lib.rs', status: 'modified' }],
+    187: new Error('diff unavailable'),
+  });
+  assert.deepEqual(result.approved.map(url => url.split('/actions/runs/')[1]), ['901/approve']);
+  assert.ok(result.warnings.some(line => /PR #185/.test(line)));
+  assert.ok(result.warnings.some(line => /PR #187/.test(line)));
+  assert.equal(result.failedWith, null);
+});
+
+test('review: sweep-side run approval refuses protected PRs and still approves the rest', async () => {
+  const requests = [];
+  const warnings = [];
+  const filesByPr = {
+    185: [{ filename: 'src/lib.rs', status: 'renamed', previous_filename: '.github/actions/a.yml' }],
+    186: [{ filename: 'src/lib.rs', status: 'modified' }],
+  };
+  const context = loadFunctions(loopSource, ['heldRunRefusal', 'unblockRuns'], {
+    hasPat: true,
+    UNAPPROVABLE: /not from a fork pull request or queued by the Actions bot/i,
+    context: { workflow: 'Copilot review loop for port PRs' },
+    core: { ...quiet, warning: m => warnings.push(m) },
+    userRequest: async (method, path) => { requests.push(`${method} ${path}`); return null; },
+    github: {
+      rest: {
+        pulls: { listFiles: 'files' },
+        actions: { listWorkflowRunsForRepo: async () => ({ data: { workflow_runs: [
+          { id: 5, name: 'CI', status: 'action_required' },
+        ] } }) },
+      },
+      paginate: async (_method, args) => filesByPr[args.pull_number],
+    },
+  });
+  const refused = await context.unblockRuns({ number: 185, head: { sha: head } });
+  assert.match(refused, /not approved/);
+  assert.deepEqual(requests, []);
+  assert.ok(warnings.some(line => /PR #185/.test(line)));
+  assert.equal(await context.unblockRuns({ number: 186, head: { sha: head } }), null);
+  assert.deepEqual(requests, ['POST /repos/anweiss/ableton-link-rs/actions/runs/5/approve']);
+});
