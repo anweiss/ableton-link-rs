@@ -542,6 +542,10 @@ Without `std`, only core types and math are available (requires `alloc`).
 | Windows | Windows 10+ |
 | ESP32 | ESP-IDF v5.3+, espup toolchain |
 
+The `std` feature requires tokio 1.53.3 or newer. Discovery registers its
+interface-change socket with `AsyncFd::register`, which older tokio releases do
+not provide; it replaces the now-deprecated `AsyncFd::new`.
+
 Linux and macOS networking enable both the `net` and `time` features of `rustix`,
 including the time types used by its socket timeout helpers. This dependency
 remains optional under `std`; `no_std` builds do not enable it.
@@ -550,22 +554,29 @@ remains optional under `std`; `no_std` builds do not enable it.
 
 Contributions are welcome! This project uses [conventional commits](https://www.conventionalcommits.org/) for automated releases.
 
+`Cargo.lock` is committed, and every CI cargo invocation passes `--locked`, so CI
+builds exactly the dependency versions in the lock file. A new upstream release
+cannot change what CI compiles or turn an unrelated pull request red. A build that
+would need to modify the lock file fails instead. If your change needs newer
+dependencies, run `cargo update` (or `cargo update -p <crate>`) deliberately and
+commit the resulting `Cargo.lock` in the same pull request so the bump is reviewed.
+
 ```bash
 # Format
 cargo fmt --all -- --check
 
 # Lint
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
 
 # Test (must be serial — tests share multicast port 20808)
 # --all-features is required to exercise the optional `audio` (LinkAudio) module
-cargo test --all --all-features -- --nocapture --test-threads=1
+cargo test --all --all-features --locked -- --nocapture --test-threads=1
 
 # Verify no_std
-cargo check --lib --no-default-features
+cargo check --lib --no-default-features --locked
 
 # Verify the default build (audio off) still compiles
-cargo check --all-targets
+cargo check --all-targets --locked
 
 # Validate the upstream porting backlog (stdlib only; watermark checks need the submodule)
 python3 .github/scripts/validate-upstream-backlog.py
