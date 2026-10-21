@@ -103,8 +103,15 @@ async function runMerge(options = {}) {
     body: '<!-- copilot-review-loop:state -->\n```json\n' +
       JSON.stringify({ reviewedSha: options.reviewedSha || head }) + '\n```',
   }];
+  const gets = [];
   const pulls = {
-    get: async () => ({ data: current }),
+    get: async ({ pull_number }) => {
+      gets.push(pull_number);
+      if ((options.getErrors || []).includes(pull_number)) {
+        throw new Error(`pulls.get ${pull_number} failed`);
+      }
+      return { data: { ...current, number: pull_number } };
+    },
     listFiles: 'files',
     list: 'pulls',
     merge: async args => { events.push(['merge', args]); },
@@ -122,6 +129,7 @@ async function runMerge(options = {}) {
         return files;
       }
       if (method === 'comments') return comments;
+      if (method === 'pulls') return options.open || [];
       throw new Error(`Unexpected paginate ${method}`);
     },
     graphql: async query => {
@@ -151,15 +159,60 @@ async function runMerge(options = {}) {
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const execute = new AsyncFunction('github', 'context', 'core', 'setTimeout', mergeScript());
+  const failed = [];
+  const core = { ...quiet, setFailed: message => failed.push(message) };
+  const eventName = options.eventName || 'pull_request';
+  const payload = eventName === 'pull_request'
+    ? { action: options.action, pull_request: { number: current.number } }
+    : {};
   let error;
   try {
     await execute(github, {
-      repo: { owner: 'anweiss', repo: 'ableton-link-rs' },
-      eventName: 'pull_request', payload: { pull_request: { number: current.number } },
-    }, quiet, callback => callback());
+      repo: { owner: 'anweiss', repo: 'ableton-link-rs' }, eventName, payload,
+    }, core, callback => callback());
   } catch (failure) { error = failure; }
-  return { events, error };
+  if (!error && failed.length) error = new Error(failed.join('\n'));
+  return { events, error, gets, failed };
 }
+
+test('merge: push mode isolates one PR failure and reports it after the rest', async () => {
+  const bot = number => ({ number, user: { login: 'github-actions[bot]' } });
+  const result = await runMerge({
+    eventName: 'push', open: [bot(201), bot(202), { number: 203, user: { login: 'anweiss' } }],
+    getErrors: [201],
+  });
+  assert.ok(result.gets.includes(202), 'the PR after the failing one is still processed');
+  assert.ok(!result.gets.includes(203), 'non-bot PRs stay filtered');
+  assert.ok(result.events.some(([event]) => event === 'enable'));
+  assert.equal(result.failed.length, 1);
+  assert.match(result.failed[0], /#201/);
+  assert.match(result.failed[0], /pulls\.get 201 failed/);
+  assert.doesNotMatch(result.failed[0], /#202/);
+  const clean = await runMerge({ eventName: 'push', open: [bot(201), bot(202)] });
+  assert.deepEqual(clean.failed, []);
+});
+
+test('merge: label race is polled only on opened events', async () => {
+  const outside = { pr: { labels: labels(['automation']) } };
+  const opened = await runMerge({ ...outside, action: 'opened' });
+  assert.equal(opened.gets.length, 6);
+  for (const action of ['reopened', 'labeled', 'unlabeled', 'synchronize', 'ready_for_review', undefined]) {
+    const result = await runMerge({ ...outside, action });
+    assert.equal(result.gets.length, 1, String(action));
+  }
+  const sweep = await runMerge({
+    ...outside, eventName: 'push',
+    open: [{ number: 73, user: { login: 'github-actions[bot]' } }],
+  });
+  assert.deepEqual(sweep.gets, [73]);
+});
+
+test('merge: no function shadows the process global and no stale strict claims', () => {
+  assert.doesNotMatch(mergeSource, /function process\(/);
+  assert.doesNotMatch(mergeSource, /\bprocess\(/);
+  assert.doesNotMatch(mergeSource, /strict: true/);
+  assert.match(mergeSource, /^ {8}with:\n(?: {10}#.*\n)* {10}retries: 3\n {10}script: \|$/m);
+});
 
 test('merge: reviewed triage and ports can queue or SHA-bound squash merge', async () => {
   for (const kind of ['upstream-triage', 'upstream-sync']) {
