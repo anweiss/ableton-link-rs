@@ -78,6 +78,22 @@ mod platform {
         reader: Mutex<()>,
     }
 
+    // tokio deprecated `AsyncFd`'s safe constructors as unsound
+    // (tokio-rs/tokio#8587) and offers no safe replacement; `register` is
+    // `unsafe`.
+    // No safe wrapper fits: tokio's socket types don't cover routing
+    // (`PF_ROUTE`) or netlink sockets, and `async-io`'s `Async` would bring a
+    // second reactor.
+    #[allow(unsafe_code)]
+    fn register(fd: OwnedFd) -> io::Result<AsyncFd<OwnedFd>> {
+        // SAFETY: `fd` is an `OwnedFd`, so it is open, and it is moved into the
+        // `AsyncFd`, which owns it for its whole lifetime. `Source` only uses
+        // `get_ref()` and `readable()` and never `get_mut()`, so the descriptor
+        // is never swapped and `as_raw_fd` keeps returning the same fd until the
+        // `AsyncFd` is dropped.
+        unsafe { AsyncFd::register(fd) }.map_err(io::Error::from)
+    }
+
     impl Source {
         pub fn new(_events: Arc<Events>) -> io::Result<Self> {
             #[cfg(target_os = "linux")]
@@ -100,7 +116,7 @@ mod platform {
             };
             fcntl(&fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
             Ok(Self {
-                fd: AsyncFd::new(fd)?,
+                fd: register(fd)?,
                 reader: Mutex::new(()),
             })
         }
@@ -202,6 +218,27 @@ mod tests {
             std::mem::offset_of!(MIB_UNICASTIPADDRESS_ROW, CreationTimeStamp),
             72
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn topology_monitor_constructs_with_registered_fd() {
+        let topology = Topology::new().expect("monitor registers its socket with the reactor");
+        let epoch = topology
+            .check()
+            .expect("draining the registered socket succeeds");
+        // Readiness must be polled through the reactor without error; real
+        // interface events may or may not arrive in this window.
+        if let Ok(result) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            topology.source.ready(),
+        )
+        .await
+        {
+            result.expect("readiness wait on the registered socket succeeds");
+        }
+        topology.invalidate();
+        assert!(topology.check().unwrap() > epoch);
     }
 
     #[tokio::test]
