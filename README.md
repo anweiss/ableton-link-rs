@@ -826,15 +826,52 @@ polls for them rather than trusting the `opened` payload.
 **Setup.** These need a `COPILOT_GITHUB_TOKEN` repository secret — a fine-grained PAT
 with the *Copilot Requests* permission. Organization-owned repositories can drop the
 secret and use `permissions: copilot-requests: write` instead; that path does not
-apply here. Recompile after any frontmatter change:
+apply here.
+
+**Lock files are compiler output.** Each gh-aw workflow is a `.md` source plus a
+generated `.lock.yml`, and both are committed. The lock files in this repository are
+compiled with gh-aw **v0.87.10**, and that exact version must be used to regenerate
+them. Never hand-edit a `.lock.yml`: change the `.md` source and recompile.
 
 ```bash
-gh extension install github/gh-aw
-gh aw compile
+gh extension install github/gh-aw --pin v0.87.10   # once; check with `gh aw version`
+gh aw compile --no-check-update
+git diff --stat
 ```
 
-Both the `.md` source and the generated `.lock.yml` are committed.
+`--no-check-update` stops the compiler from checking for a newer gh-aw release. Do not
+upgrade the extension as part of a workflow change. A different compiler version
+rewrites every lock file, and an upgrade needs a token that can resolve
+`github/gh-aw-actions` commit SHAs. Without that access, the compiler writes tag refs
+in place of SHAs and deletes the pin cache.
 
+**Never delete `.github/aw/actions-lock.json`.** It is the compiler's cache of
+action-to-SHA resolutions, and it is what lets a recompile keep every
+`github/gh-aw-actions/...` reference pinned to a full commit SHA without resolving
+it again. After compiling, check that the file is unchanged and that
+`rg 'gh-aw-actions/[^@]+@v' .github/workflows/*.lock.yml` finds nothing.
+
+**The `gh-aw lock drift` CI job** (in [`ci.yml`](.github/workflows/ci.yml)) downloads
+the gh-aw v0.87.10 release binary, verifies its checksum, and runs
+[`.github/scripts/check-aw-lock-drift.sh`](.github/scripts/check-aw-lock-drift.sh). The
+script recompiles every workflow and fails if any `.lock.yml` or `actions-lock.json`
+differs from the committed copy, or if the compiler produced a new file that was not
+committed. It is not a required check, but a failure means the committed lock files do
+not match their sources. To fix it, edit the `.md` source rather than the lock file,
+run `gh aw compile --no-check-update` with v0.87.10, and commit the regenerated
+`.lock.yml` files and `actions-lock.json` together with the source change. You can run
+the same check locally with `bash .github/scripts/check-aw-lock-drift.sh`.
+
+**Dependabot and lock files.** [`dependabot.yml`](.github/dependabot.yml) excludes
+`.github/workflows/*.lock.yml` from `github-actions` updates (`exclude-paths`), because
+an edit to a `uses:` pin inside a lock file is reverted by the next compile and leaves
+the `gh-aw-manifest` header stale. Dependabot still updates the hand-written workflows.
+To bump an action that a gh-aw workflow uses, change the pin in the `.md` source and
+recompile. Dependabot also ignores `github/gh-aw-actions/*` everywhere: the compiler
+owns those pins and writes them together with the step bodies that call them, so they
+only move when gh-aw itself is upgraded and the workflows are recompiled. If a
+Dependabot PR ever does touch a lock file, the drift job fails it. Apply the same
+change to the `.md` source and recompile instead of merging the lock-only edit.
 `copilot-review-loop.yml` additionally wants a `PIPELINE_PAT` repository secret, a
 classic or fine-grained PAT owned by a maintainer with `repo` / *Actions: write*,
 *Pull requests: write* and *Contents: write* on this repository. Four steps across the
@@ -851,6 +888,20 @@ loop and the fixer cannot use `GITHUB_TOKEN` at all:
   leaving the PR unmergeable for want of the very checks the loop is waiting on.
 - **Requesting the Copilot reviewer.** Under `GITHUB_TOKEN` the GraphQL
   `requestReviews` mutation reports success and attaches nobody.
+
+**`PIPELINE_PAT` must be a personal access token**: fine-grained (`github_pat_`) or
+classic (`ghp_`). Do not use an OAuth token (`gho_`), such as the output of
+`gh auth token`, or a user-to-server token (`ghu_`). Those tokens work for reads, so
+the pipeline looks healthy until gh-aw's push handler refuses the token inside
+`Copilot Review Fix` and the whole fix round is wasted. Every workflow that consumes
+the secret therefore checks the token prefix before first use and fails with a
+`PIPELINE_PAT has the wrong token type` error when it sees `gho_` or `ghu_`. The
+check never prints the token. It runs in `copilot-review-loop.yml`, in
+`release-please.yml` (only when `PIPELINE_PAT` is the selected token), and in a
+pre-agent job of both gh-aw review-fix workflows, so the agent job never receives the
+secret. An empty secret passes the check, and each workflow keeps its existing
+handling for a missing token. To fix a failure, create a fine-grained or classic PAT
+with the permissions above and replace the secret with `gh secret set PIPELINE_PAT`.
 
 Port PRs are still created by gh-aw with `GITHUB_TOKEN`, so they stay authored by
 `github-actions[bot]` and keep matching the auto-merge author gate. Without the secret
