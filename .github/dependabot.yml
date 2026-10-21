@@ -14,6 +14,16 @@ updates:
     commit-message:
       prefix: "ci"
       include: "scope"
+    exclude-paths:
+      # Compiled gh-aw workflows are generated from their .md sources by
+      # `gh aw compile`; a Dependabot edit to a `uses:` pin inside one is
+      # reverted by the next compile and leaves the gh-aw-manifest header
+      # stale. Bump such actions in the .md source (and in hand-written
+      # workflows, which Dependabot still updates) and recompile. The
+      # `gh-aw lock drift` CI job fails any PR whose lock files differ from
+      # the compiler output, in case this exclusion is ever bypassed.
+      # https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#exclude-paths
+      - ".github/workflows/*.lock.yml"
     ignore:
       # The `github/gh-aw-actions/*` pins are compiler-owned, not dependencies.
       # `gh aw compile` writes them into the generated `*.lock.yml` files and

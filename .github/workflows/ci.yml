@@ -23,6 +23,28 @@ jobs:
       - uses: actions/checkout@v7
       - run: node --test .github/scripts/test-upstream-automation.cjs
 
+  aw-lock-drift:
+    name: gh-aw lock drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The release binary is downloaded by exact version and checksum instead of
+      # `gh extension install`: the lock files must be compiled by v0.87.10, and
+      # a newer compiler would rewrite every lock file (and without github-org
+      # access it emits tag refs and deletes .github/aw/actions-lock.json).
+      - name: Install gh-aw v0.87.10
+        env:
+          GH_AW_VERSION: v0.87.10
+          GH_AW_SHA256: 1624fb3a6e93b48046377c7b26c9b326e2b25056b3f36cc3fd3bf0ebee7d59fd
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gh-aw" "https://github.com/github/gh-aw/releases/download/${GH_AW_VERSION}/linux-amd64"
+          echo "${GH_AW_SHA256}  $RUNNER_TEMP/gh-aw" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/gh-aw"
+      - name: Check lock files match their sources
+        env:
+          GH_AW: ${{ runner.temp }}/gh-aw
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/check-aw-lock-drift.sh
   fmt:
     name: Format check
     runs-on: ubuntu-latest
