@@ -146,7 +146,7 @@ steps:
   - name: Compute upstream drift
     run: ./.github/scripts/link-upstream-drift.sh
   - name: Install Rust toolchain
-    uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+    uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
     with:
       toolchain: stable
       components: rustfmt, clippy
