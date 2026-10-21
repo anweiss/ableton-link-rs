@@ -26,6 +26,10 @@ engine: copilot
 concurrency:
   group: link-upstream-port
   cancel-in-progress: false
+  # Without it every run shares one generated conclusion concurrency slot, and
+  # GitHub keeps only one pending job per group, so overlapping runs can cancel
+  # each other's conclusion and lose its report.
+  job-discriminator: ${{ github.run_id }}
 
 network:
   allowed:
@@ -61,6 +65,10 @@ tools:
     - "rg:*"
     - "mkdir:*"
     - "test:*"
+    # The backlog validator needs tomllib (Python >= 3.11). The runner's system
+    # interpreter has it; bare `python3` can resolve to an older hosted-toolcache
+    # PyPy. #180 opened unvalidated because python was not allowed at all.
+    - "/usr/bin/python3:*"
 
 safe-outputs:
   create-pull-request:
@@ -142,7 +150,87 @@ safe-outputs:
 imports:
   - shared/link-upstream-context.md
 
+# The README-maintenance waiver, applied by a deterministic job rather than left
+# to the agent. The prompt's PR template asks for `<!-- docs-not-needed -->`, and
+# the agent wrote the justification but dropped the marker on both #147 and #180,
+# each time failing `README maintenance` on an otherwise complete port. This job
+# runs after gh-aw has opened the pull request, lists its files, and appends the
+# marker when the diff does not touch README.md (and the body lacks it).
+#
+# The marker is honoured only because these pull requests carry the
+# `automation` label (see readme-maintenance.yml), which safe-outputs pins.
+# A PR that does change README.md is left alone: the check already passes.
+#
+# Why a post-job and not a safe-outputs option: in gh-aw v0.87.10,
+# create-pull-request has no body template (its `footer` is a boolean, and
+# `messages.footer` would stamp every issue and comment this workflow writes,
+# unconditionally), and the patch it applies is a git bundle whose format is
+# internal to gh-aw. `created_pr_number` is a documented output of the
+# safe_outputs job, so the GitHub API is the stable seam.
+#
+# It edits with the same token gh-aw used to open the pull request. Events from
+# GITHUB_TOKEN start no workflows, so whichever token opened the PR also decides
+# whether this edit re-runs `README maintenance` (via its `edited` trigger) -
+# the edit is seen exactly when the opening was.
+jobs:
+  docs-marker:
+    name: Add docs-not-needed marker
+    # `agent` is listed explicitly: gh-aw v0.87.10 treats a custom job that does
+    # not name it as a pre-agent job and makes the agent wait on it, which with
+    # `safe_outputs` here is a dependency cycle.
+    needs: [agent, safe_outputs]
+    if: needs.safe_outputs.outputs.created_pr_number != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Add docs-not-needed marker when README.md is untouched
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ needs.safe_outputs.outputs.created_pr_number }}
+        with:
+          github-token: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          retries: 3
+          script: |
+            // Renames count on both sides, matching readme-maintenance.yml.
+            function touchesReadme(files) {
+              return files.some(f => f.filename === 'README.md' || f.previous_filename === 'README.md');
+            }
+
+            // The same pattern readme-maintenance.yml accepts, so a marker the
+            // agent did write (with any spacing) is not duplicated.
+            function withDocsMarker(body) {
+              if (/<!--\s*docs-not-needed\s*-->/.test(body || '')) return null;
+              const text = (body || '').trimEnd();
+              return `${text ? `${text}\n\n` : ''}<!-- docs-not-needed -->\n`;
+            }
+
+            async function ensureDocsMarker(number) {
+              const { owner, repo } = context.repo;
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: number, per_page: 100,
+              });
+              if (touchesReadme(files)) {
+                core.info(`PR #${number}: README.md is part of the diff; no marker needed.`);
+                return;
+              }
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+              const body = withDocsMarker(pr.body);
+              if (body === null) {
+                core.info(`PR #${number}: docs-not-needed marker already present.`);
+                return;
+              }
+              await github.rest.pulls.update({ owner, repo, pull_number: number, body });
+              core.info(`PR #${number}: appended the docs-not-needed marker.`);
+            }
+
+            await ensureDocsMarker(Number(process.env.PR_NUMBER));
+
 steps:
+  - name: Verify backlog validator runtime
+    run: /usr/bin/python3 -c "import sys, tomllib; assert sys.version_info >= (3, 11)"
   - name: Compute upstream drift
     run: ./.github/scripts/link-upstream-drift.sh
   - name: Install Rust toolchain
@@ -623,8 +711,15 @@ did, rewrite them in plain language, because the validator will reject any ident
 you put there. Then run:
 
 ```bash
-python3 .github/scripts/validate-upstream-backlog.py
+/usr/bin/python3 .github/scripts/validate-upstream-backlog.py
 ```
+
+Use **`/usr/bin/python3`** for this and any other Python command. The runner's system
+interpreter has `tomllib`, which the validator needs; bare `python3` can resolve to an
+older PyPy from the hosted tool cache, and is not on your allowlist. Do not install
+packages or replace the validator with a hand-written check. If the approved
+interpreter cannot run it, report that with `missing_tool` and do not open the pull
+request.
 
 `status = "retired"` means **you ported the work**, not that the pin is past every
 SHA in the item. Upstream routinely splits one idea across commits that sit far apart
@@ -741,6 +836,13 @@ dependency, or build-requirement change; this is an internal shutdown-ordering
 reliability fix") and omitted the marker, and the check failed on an otherwise
 complete port that needed a maintainer to unblock by hand. If you write the sentence,
 write the marker.
+
+The workflow now backs this up mechanically: after the pull request opens, a
+separate `docs-marker` job appends `<!-- docs-not-needed -->` to the body of any port
+pull request whose diff does not touch `README.md`. Write the sentence and the marker
+anyway — the sentence is the justification a reviewer reads, and the backstop exists
+for the run that forgets, not as permission to skip the judgement. If the port does
+change the public API, update `README.md`; the backstop is not a way around that.
 
 `Closes #<issue>` is the tracking issue you found in step 7 — the one carrying
 `<!-- upstream-backlog-id: <id> -->`, not a shared backlog issue. Each backlog item

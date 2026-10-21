@@ -50,6 +50,11 @@ model: claude-opus-5
 concurrency:
   group: copilot-review-fix-${{ github.event.inputs.pull_request_number }}
   cancel-in-progress: false
+  # The per-PR group above covers the agent job only. Without a discriminator
+  # the generated conclusion job shares one slot across every dispatch, and
+  # GitHub keeps only one pending job per group, so overlapping fixes for
+  # different PRs can cancel each other's result comment.
+  job-discriminator: ${{ github.run_id }}
 
 network:
   allowed:

@@ -838,3 +838,91 @@ test('review: sweep-side run approval refuses protected PRs and still approves t
   assert.equal(await context.unblockRuns({ number: 186, head: { sha: head } }), null);
   assert.deepEqual(requests, ['POST /repos/anweiss/ableton-link-rs/actions/runs/5/approve']);
 });
+
+// ---- Port workflow ----------------------------------------------------------
+
+const portSource = workflow('link-upstream-port.md');
+
+function docsMarkerScript() {
+  return portSource.split('  docs-marker:\n')[1]
+    .split('          script: |\n')[1].split(/\n(?=\S)/)[0];
+}
+
+function docsMarkerHarness(files, body) {
+  const updates = [];
+  const infos = [];
+  const context = loadFunctions(docsMarkerScript(), ['touchesReadme', 'withDocsMarker', 'ensureDocsMarker'], {
+    context: { repo: { owner: 'anweiss', repo: 'ableton-link-rs' } },
+    core: { ...quiet, info: m => infos.push(m) },
+    github: {
+      rest: { pulls: {
+        listFiles: 'files',
+        get: async () => ({ data: { number: 190, state: 'open', body } }),
+        update: async args => { updates.push(args); },
+      } },
+      paginate: async (method, args) => {
+        assert.equal(method, 'files');
+        assert.equal(args.per_page, 100);
+        return files;
+      },
+    },
+  });
+  return { context, updates, infos };
+}
+
+test('port: docs marker is appended only when README.md is untouched', async () => {
+  const src = [{ filename: 'src/lib.rs', status: 'modified' }];
+  let { context, updates } = docsMarkerHarness(src, 'Fixes a thing.\n');
+  await context.ensureDocsMarker(190);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].pull_number, 190);
+  assert.match(updates[0].body, /^Fixes a thing\.\n\n<!-- docs-not-needed -->\n$/);
+
+  ({ context, updates } = docsMarkerHarness(src, null));
+  await context.ensureDocsMarker(190);
+  assert.equal(updates[0].body, '<!-- docs-not-needed -->\n');
+
+  for (const files of [
+    [...src, { filename: 'README.md', status: 'modified' }],
+    [{ filename: 'docs/README.md', status: 'renamed', previous_filename: 'README.md' }],
+  ]) {
+    ({ context, updates } = docsMarkerHarness(files, 'Body'));
+    await context.ensureDocsMarker(190);
+    assert.deepEqual(updates, [], 'a README change needs no waiver');
+  }
+});
+
+test('port: docs marker is not duplicated when the agent already wrote it', async () => {
+  for (const body of ['x\n<!-- docs-not-needed -->', 'x\n<!--  docs-not-needed  -->\n']) {
+    const { context, updates, infos } = docsMarkerHarness([{ filename: 'src/a.rs' }], body);
+    await context.ensureDocsMarker(190);
+    assert.deepEqual(updates, []);
+    assert.ok(infos.some(line => /already/.test(line)));
+  }
+  const { context } = docsMarkerHarness([], '');
+  assert.equal(context.withDocsMarker('a <!-- docs-not-needed --> b'), null);
+  assert.equal(context.touchesReadme([{ filename: 'src/README.md' }]), false);
+});
+
+test('port: compiled lock carries the validator runtime, python allowlist and docs-marker job', () => {
+  const lock = workflow('link-upstream-port.lock.yml');
+  assert.ok(/^    - "\/usr\/bin\/python3:\*"$/m.test(portSource), 'python allowlist entry');
+  assert.ok(/^\/usr\/bin\/python3 \.github\/scripts\/validate-upstream-backlog\.py$/m.test(portSource));
+  assert.ok(!/^python3 /m.test(portSource), 'bare python3 invocation');
+  assert.ok(lock.includes("--allow-tool '\\''shell(/usr/bin/python3:*)'\\''"), 'compiled allowlist');
+  assert.match(lock, /name: Verify backlog validator runtime\n\s+run: \/usr\/bin\/python3 -c "import sys, tomllib; assert sys\.version_info >= \(3, 11\)"/);
+  const job = lock.split('\n  docs-marker:\n')[1].split(/\n  [a-z_]+:\n/)[0];
+  assert.match(job, /^    needs:\n      - agent\n      - safe_outputs$/m);
+  assert.match(job, /^    if: needs\.safe_outputs\.outputs\.created_pr_number != ''$/m);
+  assert.match(job, /^      pull-requests: write$/m);
+  assert.equal(job.split('          script: |\n')[1].trimEnd(), docsMarkerScript().trimEnd());
+  assert.ok(lock.indexOf('Verify backlog validator runtime') < lock.indexOf('Compute upstream drift'));
+});
+
+test('gh-aw: dispatched workflows give each run its own conclusion slot', () => {
+  for (const name of ['link-upstream-port', 'copilot-review-fix']) {
+    assert.ok(/^  job-discriminator: \$\{\{ github\.run_id \}\}$/m.test(workflow(`${name}.md`)), name);
+    assert.ok(workflow(`${name}.lock.yml`)
+      .includes(`group: "gh-aw-conclusion-${name}-\${{ github.run_id }}"`), name);
+  }
+});
