@@ -153,6 +153,27 @@ jobs:
     # fix-dispatch poll.
     timeout-minutes: 10
     steps:
+      # Fails the run before either step below hands PIPELINE_PAT to the API.
+      # An OAuth token (`gho_`, e.g. the output of `gh auth token`) or a
+      # user-to-server token (`ghu_`) authenticates fine for reads, so
+      # everything looks healthy until gh-aw's push handler refuses it inside
+      # Copilot Review Fix and the round is spent for nothing. That is what
+      # happened before the secret was rotated on 28 Sep. The prefix is checked
+      # without printing the value. An empty secret passes: the steps below
+      # already warn about it and degrade instead of failing.
+      #
+      # The same `case` text is in release-please.yml and the two gh-aw review
+      # fix workflows; the automation tests require the copies to match.
+      - name: Refuse OAuth and user tokens in PIPELINE_PAT
+        env:
+          PIPELINE_PAT: ${{ secrets.PIPELINE_PAT }}
+        run: |
+          case "$PIPELINE_PAT" in
+            gho_*|ghu_*)
+              echo "::error title=PIPELINE_PAT has the wrong token type::PIPELINE_PAT must be a fine-grained PAT (github_pat_) or classic PAT (ghp_), not an OAuth (gho_) or user-to-server (ghu_) token such as the output of gh auth token. Replace the secret with gh secret set PIPELINE_PAT."
+              exit 1
+              ;;
+          esac
       # Runs BEFORE the review loop and independently of it, because the loop
       # only ever looks at pull requests `disqualify` accepts: opened by
       # `github-actions[bot]`, labelled `automation` plus exactly one of

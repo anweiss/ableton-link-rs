@@ -926,3 +926,101 @@ test('gh-aw: dispatched workflows give each run its own conclusion slot', () => 
       .includes(`group: "gh-aw-conclusion-${name}-\${{ github.run_id }}"`), name);
   }
 });
+
+// ---- PIPELINE_PAT fail-fast -------------------------------------------------
+
+// Every consumer runs the same `case`, extracted here from the hand-written
+// YAML, the gh-aw sources and their compiled locks, and executed for real.
+const PAT_CONSUMERS = [
+  'copilot-review-loop.yml', 'release-please.yml',
+  'copilot-review-fix.md', 'copilot-review-fix.lock.yml',
+  'copilot-triage-review-fix.md', 'copilot-triage-review-fix.lock.yml',
+];
+
+function patCheck(source, name) {
+  const match = source.match(/^( *)case "\$PIPELINE_PAT" in\n[\s\S]*?^\1esac$/m);
+  assert.ok(match, `${name}: missing PIPELINE_PAT check`);
+  return match[0].replace(new RegExp(`^${match[1]}`, 'gm'), '');
+}
+
+function runPatCheck(snippet, value) {
+  try {
+    const out = execFileSync('sh', ['-c', snippet], {
+      env: { PATH: process.env.PATH, PIPELINE_PAT: value }, encoding: 'utf8', stdio: 'pipe',
+    });
+    return { status: 0, out };
+  } catch (err) {
+    return { status: err.status, out: `${err.stdout}${err.stderr}` };
+  }
+}
+
+test('pat: every consumer carries one identical check', () => {
+  const snippets = PAT_CONSUMERS.map(name => patCheck(workflow(name), name));
+  for (const snippet of snippets) assert.equal(snippet, snippets[0]);
+});
+
+test('pat: OAuth and user-to-server tokens fail, PATs pass, empty is left alone, nothing leaks', () => {
+  for (const name of PAT_CONSUMERS) {
+    const snippet = patCheck(workflow(name), name);
+    for (const value of ['gho_x', 'ghu_x', 'gho_SeCrEt123', 'ghu_SeCrEt123']) {
+      const { status, out } = runPatCheck(snippet, value);
+      assert.equal(status, 1, `${name}: ${value.slice(0, 4)} must fail`);
+      assert.match(out, /^::error[^:]*::PIPELINE_PAT must be a fine-grained PAT \(github_pat_\) or classic PAT \(ghp_\)/m);
+      assert.ok(!out.includes(value), `${name}: token value leaked`);
+      assert.ok(!out.includes('SeCrEt'), `${name}: token suffix leaked`);
+    }
+    for (const value of ['github_pat_x', 'ghp_x', 'github_pat_SeCrEt123']) {
+      const { status, out } = runPatCheck(snippet, value);
+      assert.equal(status, 0, `${name}: ${value.slice(0, 4)} must pass`);
+      assert.equal(out, '', `${name}: a valid token prints nothing`);
+    }
+    // Each workflow keeps its own empty-secret handling downstream.
+    assert.deepEqual(runPatCheck(snippet, ''), { status: 0, out: '' });
+  }
+});
+
+test('pat: hand-written workflows check before the first use', () => {
+  const firstUse = (source, from) => {
+    const lines = source.split('\n');
+    return lines.findIndex((line, i) => i >= from &&
+      /secrets\.PIPELINE_PAT|process\.env\.PIPELINE_PAT/.test(line) && !/^\s*#/.test(line));
+  };
+  const loop = loopSource.split('\n');
+  const loopStep = loop.findIndex(line => line === '      - name: Refuse OAuth and user tokens in PIPELINE_PAT');
+  assert.ok(loopStep > 0);
+  assert.ok(loopStep < loop.findIndex(line => line === '      - name: Approve held runs on our own bot branches'));
+  const loopCheck = loop.findIndex(line => /case "\$PIPELINE_PAT" in/.test(line));
+  assert.ok(firstUse(loopSource, 0) > loopStep && firstUse(loopSource, 0) < loopCheck);
+  assert.ok(firstUse(loopSource, loopCheck) > loopCheck);
+
+  // release-please: only the token that is actually selected is checked, so a
+  // stale PIPELINE_PAT behind an App token or RELEASE_PLEASE_PAT is harmless.
+  const release = workflow('release-please.yml');
+  const step = release.split('      - name: Refuse OAuth and user tokens in PIPELINE_PAT\n')[1];
+  assert.ok(step, 'release-please check step');
+  const body = step.split('\n      - ')[0];
+  assert.match(body, /^        if: steps\.app-token\.outputs\.token == ''$/m);
+  assert.match(body, /^          PIPELINE_PAT: \$\{\{ secrets\.RELEASE_PLEASE_PAT == '' && secrets\.PIPELINE_PAT \|\| '' \}\}$/m);
+  assert.ok(release.indexOf('Refuse OAuth and user tokens') < release.indexOf('googleapis/release-please-action@'));
+  assert.ok(release.indexOf('id: app-token') < release.indexOf('Refuse OAuth and user tokens'));
+});
+
+test('pat: gh-aw check is a pre-agent job, so the agent never sees the secret', () => {
+  for (const name of ['copilot-review-fix', 'copilot-triage-review-fix']) {
+    const source = workflow(`${name}.md`);
+    const job = source.split('\njobs:\n  pipeline-pat:\n')[1];
+    assert.ok(job, `${name}: pipeline-pat job`);
+    assert.ok(!/^    needs:/m.test(job.split(/\n(?=\S)/)[0]), `${name}: must stay a pre-agent job`);
+
+    const lock = workflow(`${name}.lock.yml`);
+    const jobs = lock.split('\njobs:\n')[1];
+    const jobBody = id => jobs.split(`\n  ${id}:\n`)[1].split(/\n  [a-z_-]+:\n/)[0];
+    const agent = jobBody('agent');
+    assert.match(agent, /^    needs:\n(?:      - .*\n)*      - pipeline-pat$/m, `${name}: agent waits on the check`);
+    assert.ok(!/^\s+PIPELINE_PAT:/m.test(agent), `${name}: PAT exposed to the agent job`);
+    assert.match(jobBody('safe_outputs'), /^      - agent$/m);
+    const check = jobBody('pipeline-pat');
+    assert.match(check, /^          PIPELINE_PAT: \$\{\{ secrets\.PIPELINE_PAT \}\}$/m);
+    assert.match(check, /^    permissions: \{\}$/m);
+  }
+});

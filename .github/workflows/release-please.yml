@@ -54,6 +54,25 @@ jobs:
           app-id: ${{ vars.RELEASE_PLEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
 
+      # Only checks PIPELINE_PAT when it is the token the step below will use:
+      # with an App token or RELEASE_PLEASE_PAT configured it is an unused
+      # fallback, and a stale value there must not stop a release. An OAuth or
+      # user-to-server token would otherwise open the release PR as that user
+      # and fail later in less obvious ways. Empty passes, so the warning step
+      # at the end still reports the GITHUB_TOKEN fallback. The `case` text is
+      # shared with copilot-review-loop.yml (see the comment there).
+      - name: Refuse OAuth and user tokens in PIPELINE_PAT
+        if: steps.app-token.outputs.token == ''
+        env:
+          PIPELINE_PAT: ${{ secrets.RELEASE_PLEASE_PAT == '' && secrets.PIPELINE_PAT || '' }}
+        run: |
+          case "$PIPELINE_PAT" in
+            gho_*|ghu_*)
+              echo "::error title=PIPELINE_PAT has the wrong token type::PIPELINE_PAT must be a fine-grained PAT (github_pat_) or classic PAT (ghp_), not an OAuth (gho_) or user-to-server (ghu_) token such as the output of gh auth token. Replace the secret with gh secret set PIPELINE_PAT."
+              exit 1
+              ;;
+          esac
+
       # No release type input on purpose: setting one switches the action to
       # single-package mode, which ignores release-please-config.json and
       # .release-please-manifest.json (and with them bump-minor-pre-major, so a
