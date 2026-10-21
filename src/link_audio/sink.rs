@@ -158,7 +158,7 @@ impl SinkBufferHandle<'_> {
         sample_rate: u32,
     ) -> bool {
         let max_num_samples = self.sink.max_num_samples();
-        if num_channels == 0 || num_frames * num_channels > max_num_samples {
+        if num_channels == 0 || sample_rate == 0 || num_frames * num_channels > max_num_samples {
             return false;
         }
 
