@@ -1,6 +1,6 @@
 use ableton_link_rs::link::{BasicLink, SessionState};
 use cpal::traits::{DeviceTrait, HostTrait};
-use rodio::{cpal, OutputStreamBuilder, Sink};
+use rodio::{cpal, DeviceSinkBuilder, Player, SampleRate};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -41,14 +41,14 @@ impl MetronomeHandle {
 
     fn audio_thread(mut rx: mpsc::UnboundedReceiver<MetronomeMessage>) {
         // Create audio stream in the background thread
-        let stream = match OutputStreamBuilder::open_default_stream() {
+        let stream = match DeviceSinkBuilder::open_default_sink() {
             Ok(stream) => stream,
             Err(e) => {
                 eprintln!("Failed to create audio stream: {}", e);
                 return;
             }
         };
-        let sink = Sink::connect_new(stream.mixer());
+        let sink = Player::connect_new(stream.mixer());
 
         // Use blocking receive since we're in a regular thread
         while let Some(msg) = rx.blocking_recv() {
@@ -63,7 +63,7 @@ impl MetronomeHandle {
         }
     }
 
-    fn play_click_sync(sink: &Sink, is_downbeat: bool) -> Result<(), Box<dyn std::error::Error>> {
+    fn play_click_sync(sink: &Player, is_downbeat: bool) -> Result<(), Box<dyn std::error::Error>> {
         // Generate click audio exactly like C++ LinkHut
         let frequency = if is_downbeat { 1567.98 } else { 1108.73 }; // Same frequencies as C++
         let duration_ms = 100; // 100ms click duration like C++ version
@@ -83,7 +83,11 @@ impl MetronomeHandle {
             .collect();
 
         // Create audio source from samples
-        let source = rodio::buffer::SamplesBuffer::new(1, sample_rate, samples);
+        let source = rodio::buffer::SamplesBuffer::new(
+            rodio::nz!(1),
+            SampleRate::new(sample_rate).ok_or("sample rate must be non-zero")?,
+            samples,
+        );
 
         // Play the click sound
         sink.append(source);
@@ -448,7 +452,7 @@ fn get_audio_device_info() -> Result<AudioDeviceInfo, Box<dyn std::error::Error>
     let device = host
         .default_output_device()
         .ok_or("No default output device found")?;
-    let device_name = device.name()?;
+    let device_name = device.description()?.name().to_string();
     let default_config = device.default_output_config()?;
 
     let buffer_size_range = match default_config.buffer_size() {
@@ -458,7 +462,7 @@ fn get_audio_device_info() -> Result<AudioDeviceInfo, Box<dyn std::error::Error>
 
     Ok(AudioDeviceInfo {
         device_name,
-        sample_rate: default_config.sample_rate().0,
+        sample_rate: default_config.sample_rate(),
         buffer_size_range,
     })
 }
