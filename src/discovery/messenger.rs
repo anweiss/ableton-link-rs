@@ -588,8 +588,32 @@ fn remove_interface(
 }
 
 /// Keep the per-interface sockets in sync with the interfaces of the host.
+/// Interfaces whose setup failed, with the error. The scan retries a failed
+/// interface every [`INTERFACE_SCAN_PERIOD`]; this keeps a persistent failure
+/// to one warning (then debug) until the error changes or the interface is
+/// set up or goes away.
+#[derive(Default)]
+struct SetupFailures(HashMap<Ipv4Interface, String>);
+
+impl SetupFailures {
+    fn failed(&mut self, interface: &Ipv4Interface, error: &std::io::Error) {
+        let message = error.to_string();
+        if self.0.get(interface) == Some(&message) {
+            debug!("still cannot set up interface {:?}: {}", interface, error);
+        } else {
+            warn!("failed to set up interface {:?}: {}", interface, error);
+            self.0.insert(interface.clone(), message);
+        }
+    }
+
+    fn forget_except(&mut self, current: &[Ipv4Interface]) {
+        self.0.retain(|interface, _| current.contains(interface));
+    }
+}
+
 async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContext) {
     let mut children = tokio::task::JoinSet::new();
+    let mut failures = SetupFailures::default();
     let mut interval = tokio::time::interval(INTERFACE_SCAN_PERIOD);
     let mut observed = interface_socket_entries(&context.interface_sockets)
         .first()
@@ -661,6 +685,7 @@ async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContex
             &mut children,
             &current,
             generation,
+            &mut failures,
         );
         observed = generation;
     }
@@ -683,7 +708,14 @@ fn reconcile_interfaces(
         },
         None => 0,
     };
-    reconcile_interfaces_at(multicast_socket, context, children, current, generation);
+    reconcile_interfaces_at(
+        multicast_socket,
+        context,
+        children,
+        current,
+        generation,
+        &mut SetupFailures::default(),
+    );
 }
 
 fn reconcile_interfaces_at(
@@ -692,7 +724,9 @@ fn reconcile_interfaces_at(
     children: &mut tokio::task::JoinSet<()>,
     current: &[Ipv4Interface],
     generation: u64,
+    failures: &mut SetupFailures,
 ) {
+    failures.forget_except(current);
     let entries = interface_socket_entries(&context.interface_sockets);
     let known: Vec<_> = entries.iter().map(|entry| entry.identity.clone()).collect();
 
@@ -723,6 +757,7 @@ fn reconcile_interfaces_at(
         ) {
             Ok(entry) => {
                 changed = true;
+                failures.0.remove(addr);
                 info!(
                     "joined Ableton Link multicast group on interface {}",
                     addr.addr
@@ -733,7 +768,7 @@ fn reconcile_interfaces_at(
                     context.clone(),
                 ));
             }
-            Err(e) => warn!("failed to set up interface {:?}: {}", addr, e),
+            Err(e) => failures.failed(addr, &e),
         }
     }
     // Mirrors upstream's once-per-pass notification, including removal-only
@@ -1395,6 +1430,33 @@ mod tests {
     use std::net::Ipv6Addr;
 
     use super::*;
+
+    #[test]
+    fn setup_failures_warn_once_per_error_and_forget_gone_interfaces() {
+        let bt = Ipv4Interface {
+            addr: Ipv4Addr::new(169, 254, 67, 110),
+            index: 8,
+            name: "Bluetooth Network Connection".into(),
+        };
+        let mut failures = SetupFailures::default();
+        let not_valid = std::io::Error::from(std::io::ErrorKind::AddrNotAvailable);
+        failures.failed(&bt, &not_valid);
+        failures.failed(&bt, &not_valid);
+        assert_eq!(failures.0.len(), 1, "a repeated failure is remembered once");
+        failures.failed(
+            &bt,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(
+            failures.0[&bt].contains("ermission"),
+            "a new error replaces the old one"
+        );
+        failures.forget_except(&[]);
+        assert!(
+            failures.0.is_empty(),
+            "an interface that's gone is forgotten"
+        );
+    }
     use crate::discovery::socket_test_support::{
         assert_ephemeral_socket_is_unshared, shared_loopback_socket,
     };

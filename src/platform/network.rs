@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tracing::{debug, error};
 
 /// A discovery registration retains OS identity, not just a routable address.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Ipv4Interface {
     pub addr: Ipv4Addr,
     pub index: u32,
@@ -16,8 +16,12 @@ pub(crate) struct Ipv4Interface {
 
 pub(crate) fn scan_discovery_interfaces() -> std::io::Result<Vec<Ipv4Interface>> {
     let interfaces = network_interface::NetworkInterface::show().map_err(std::io::Error::other)?;
+    let down = down_interface_indices();
     let mut result = Vec::new();
     for interface in interfaces {
+        if down.contains(&interface.index) {
+            continue;
+        }
         for address in interface.addr {
             if let IpAddr::V4(addr) = address.ip() {
                 if is_usable_ipv4(&addr) && interface.index != 0 {
@@ -33,6 +37,40 @@ pub(crate) fn scan_discovery_interfaces() -> std::io::Result<Vec<Ipv4Interface>>
     result.sort_by_key(|interface| (interface.addr, interface.index));
     result.dedup();
     Ok(result)
+}
+
+/// Indices of adapters the OS reports as not operationally up. Upstream's
+/// scanners take only running adapters (Windows: `IfOperStatusUp`; POSIX:
+/// `IFF_RUNNING`), but `network-interface` doesn't report the status. On
+/// Windows that matters: a disconnected adapter (Bluetooth PAN, the Wi-Fi
+/// Direct virtual adapters) still lists an APIPA 169.254 address, binding it
+/// fails with WSAEADDRNOTAVAIL (10049), and every scan retried it.
+///
+/// Only adapters positively reported as down are excluded: if `if-addrs`
+/// fails, or doesn't know an index, nothing is filtered.
+fn down_interface_indices() -> std::collections::HashSet<u32> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return std::collections::HashSet::new();
+    };
+    down_indices(
+        interfaces
+            .iter()
+            .filter_map(|i| Some((i.index?, i.is_oper_up()))),
+    )
+}
+
+/// The indices with no "up" entry among `(index, up)` pairs (an adapter can
+/// list several addresses).
+fn down_indices(entries: impl IntoIterator<Item = (u32, bool)>) -> std::collections::HashSet<u32> {
+    let mut up = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    for (index, is_up) in entries {
+        seen.insert(index);
+        if is_up {
+            up.insert(index);
+        }
+    }
+    seen.difference(&up).copied().collect()
 }
 
 /// Safe Rust implementation using the network-interface crate
@@ -164,6 +202,16 @@ fn is_usable_ipv6(addr: &Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn down_indices_needs_every_entry_down() {
+        // 8: down (a Bluetooth PAN with an APIPA address). 2: one address up
+        // and one down — up, as the adapter is running. 5: up.
+        let down = down_indices([(8, false), (2, true), (2, false), (5, true)]);
+        assert_eq!(down, std::collections::HashSet::from([8]));
+        // Nothing reported → nothing filtered.
+        assert!(down_indices([]).is_empty());
+    }
 
     #[tokio::test]
     async fn test_safe_interface_scanning() {
