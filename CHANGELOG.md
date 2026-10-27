@@ -1,5 +1,101 @@
 # Changelog
 
+## [0.4.0](https://github.com/anweiss/ableton-link-rs/compare/v0.3.0...v0.4.0) (2026-10-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* **audio:** stop audio sharing when Link is disabled
+* `Encode::encode_to` now returns `Result<(), EncodeError>` instead of `()`, and `EncodeError` gains its first constructible variant, `StringTooLong`. Downstream `Encode` implementations must return `Ok(())` and propagate nested encodes with `?`; callers must handle the `Result`. `EncodeError` is now `#[non_exhaustive]` so future variants are additive.
+
+### Features
+
+* add PartialEq for SessionState and ApiState ([#89](https://github.com/anweiss/ableton-link-rs/issues/89)) ([c9595fb](https://github.com/anweiss/ableton-link-rs/commit/c9595fbf6cebae7f364795bed632739c127c94ca))
+* add String and i16 support to wire encoding layer ([#92](https://github.com/anweiss/ableton-link-rs/issues/92)) ([7d444a3](https://github.com/anweiss/ableton-link-rs/commit/7d444a37d512698f9782070a7cace85fd7132063))
+* **agentics:** let the watch workflow maintain the backlog issue body ([#79](https://github.com/anweiss/ableton-link-rs/issues/79)) ([c358937](https://github.com/anweiss/ableton-link-rs/commit/c35893797e7bf53d26f18fc4125abd2e15ef98cb))
+* **ci:** fix Copilot review batches with Opus 5 instead of the cloud agent ([#94](https://github.com/anweiss/ableton-link-rs/issues/94)) ([39a46f2](https://github.com/anweiss/ableton-link-rs/commit/39a46f2d83977a918edfc29e73e94bdcb155a150))
+* **ci:** gate port PR auto-merge behind a Copilot review loop ([#84](https://github.com/anweiss/ableton-link-rs/issues/84)) ([6f45585](https://github.com/anweiss/ableton-link-rs/commit/6f4558577359df1110342fc382feea9203c327f7))
+* **ci:** handle Copilot review states now that auto-approval is on ([#142](https://github.com/anweiss/ableton-link-rs/issues/142)) ([b5d04c1](https://github.com/anweiss/ableton-link-rs/commit/b5d04c1037b2ac967386cbcae60d3b51e619f8db))
+* **ci:** version the upstream porting backlog as a file with per-item issues ([#101](https://github.com/anweiss/ableton-link-rs/issues/101)) ([f1a5006](https://github.com/anweiss/ableton-link-rs/commit/f1a50063d264f0e5ec7b87c8d094da960af68110))
+* count interface-set changes in Messenger (gatewaysChanged) ([#121](https://github.com/anweiss/ableton-link-rs/issues/121)) ([6c13778](https://github.com/anweiss/ableton-link-rs/commit/6c137781cedd8f0518f04e7bcc673e1c197fcc24))
+* notify on peer audio-endpoint changes ([#129](https://github.com/anweiss/ableton-link-rs/issues/129)) ([3ff21d0](https://github.com/anweiss/ableton-link-rs/commit/3ff21d0285384ca9e2b92334346f75b2415d6ff5))
+* own Link IO execution and complete core shutdown ([7bd0d08](https://github.com/anweiss/ableton-link-rs/commit/7bd0d08d282abcfd85b8a4324af25605fe0263b4)), closes [#106](https://github.com/anweiss/ableton-link-rs/issues/106) [#120](https://github.com/anweiss/ableton-link-rs/issues/120)
+* **platform:** add ThreadPriority API (partial port; IO-thread wiring still outstanding) ([#137](https://github.com/anweiss/ableton-link-rs/issues/137)) ([15443b3](https://github.com/anweiss/ableton-link-rs/commit/15443b3a81717a3a9332a879e734d007effa5dbb))
+
+
+### Bug Fixes
+
+* add SessionId to ClientState for correct grace-period propagation ([#83](https://github.com/anweiss/ableton-link-rs/issues/83)) ([fd6fdd4](https://github.com/anweiss/ableton-link-rs/commit/fd6fdd41f316e1dd06e9ccc5aab07565cfbbbd86))
+* **audio:** decode Ableton Live audio buffers and stabilize playback ([#72](https://github.com/anweiss/ableton-link-rs/issues/72)) ([10f0725](https://github.com/anweiss/ableton-link-rs/commit/10f0725da4d9530b372142ab2304cdd644b7b15a))
+* **audio:** stop audio sharing when Link is disabled ([89122a2](https://github.com/anweiss/ableton-link-rs/commit/89122a20636512b51ed0d7c8a9e235910cf78b29))
+* catch message-encode errors in sendUdpMessage ([#124](https://github.com/anweiss/ableton-link-rs/issues/124)) ([ad928c1](https://github.com/anweiss/ableton-link-rs/commit/ad928c19f65d9955992f26149f18930e9bc16fa3))
+* **ci:** address the Copilot review findings from [#101](https://github.com/anweiss/ableton-link-rs/issues/101) ([#114](https://github.com/anweiss/ableton-link-rs/issues/114)) ([4dc1b1a](https://github.com/anweiss/ableton-link-rs/commit/4dc1b1ae4a1d78049bbb78f2be52ace1d79586dc))
+* **ci:** announce a review-loop handoff instead of editing a sticky comment ([#155](https://github.com/anweiss/ableton-link-rs/issues/155)) ([7aff7c4](https://github.com/anweiss/ableton-link-rs/commit/7aff7c40e3cb0368d6bf0534a04b4680dbdfb7bf))
+* **ci:** bound upstream watch triage and use system Python ([#166](https://github.com/anweiss/ableton-link-rs/issues/166)) ([9bedc37](https://github.com/anweiss/ableton-link-rs/commit/9bedc37e5c1a8aae1e6a8e409351b5b1d8ecffad))
+* **ci:** close the three gaps that made the review loop need a human ([#123](https://github.com/anweiss/ableton-link-rs/issues/123)) ([e7166a1](https://github.com/anweiss/ableton-link-rs/commit/e7166a159d68228891d1df067409afac4d0f1429))
+* **ci:** close three narrative-drift gaps the first unblocked port run exposed ([#148](https://github.com/anweiss/ableton-link-rs/issues/148)) ([d8764d1](https://github.com/anweiss/ableton-link-rs/commit/d8764d1f39e6d67c54b2de2cc37d51760ee73e5c))
+* **ci:** drop unsupported $schema key from release-please manifest ([#194](https://github.com/anweiss/ableton-link-rs/issues/194)) ([937bbe6](https://github.com/anweiss/ableton-link-rs/commit/937bbe6fa57a78252554ea2ee0f72adf8be80bfd))
+* **ci:** key the blocker exemption on a marker and stop using gh pr list ([#151](https://github.com/anweiss/ableton-link-rs/issues/151)) ([9fdd985](https://github.com/anweiss/ableton-link-rs/commit/9fdd9850630781bab102328a9605d7b89cefe025))
+* **ci:** let the merge close the port item's tracking issue ([#133](https://github.com/anweiss/ableton-link-rs/issues/133)) ([42afc66](https://github.com/anweiss/ableton-link-rs/commit/42afc665077af480161a79050492f005382c0cd8))
+* **ci:** let the upstream workflows actually write the backlog file ([#118](https://github.com/anweiss/ableton-link-rs/issues/118)) ([9b88ccd](https://github.com/anweiss/ableton-link-rs/commit/9b88ccdd1e68b7e55bd160102322343f77e0d29d))
+* **ci:** migrate to AsyncFd::register, commit Cargo.lock, and repair agentic workflows ([6fa2263](https://github.com/anweiss/ableton-link-rs/commit/6fa2263149f19132bd87d8880839f0cfa894a009))
+* **ci:** put the blocker marker in the comment template, not a distant rule ([#153](https://github.com/anweiss/ableton-link-rs/issues/153)) ([ebb4f07](https://github.com/anweiss/ableton-link-rs/commit/ebb4f07b0207b7220f80c98ea381485d04eed4b1))
+* **ci:** recompile agentic workflow locks and stop Dependabot bumping them ([#100](https://github.com/anweiss/ableton-link-rs/issues/100)) ([cf10b36](https://github.com/anweiss/ableton-link-rs/commit/cf10b3660aba255ef7247f4f8f6b8ab29b88a2e5))
+* **ci:** request Copilot review over GraphQL, not REST ([#88](https://github.com/anweiss/ableton-link-rs/issues/88)) ([156bedf](https://github.com/anweiss/ableton-link-rs/commit/156bedfa2eae0bda4e12e01ea707fc41b9a3a87a))
+* **ci:** request Copilot review with the PAT, not GITHUB_TOKEN ([#90](https://github.com/anweiss/ableton-link-rs/issues/90)) ([ae890ab](https://github.com/anweiss/ableton-link-rs/commit/ae890ab57f01f73a797dd8d56f3ffcfabdc522b8))
+* **ci:** require a green Copilot verdict to sign off, not merely zero inline comments ([#146](https://github.com/anweiss/ableton-link-rs/issues/146)) ([3f991e1](https://github.com/anweiss/ableton-link-rs/commit/3f991e1749f2e1ec5d1e7925040a5866722e31ff))
+* **ci:** stop asking the maintainer to approve held workflow runs ([#97](https://github.com/anweiss/ableton-link-rs/issues/97)) ([591a2bc](https://github.com/anweiss/ableton-link-rs/commit/591a2bcc5ac151eec1204837e29823c0e643c5b2))
+* **ci:** stop gating port PRs on a `port/` branch prefix ([#87](https://github.com/anweiss/ableton-link-rs/issues/87)) ([56a752b](https://github.com/anweiss/ableton-link-rs/commit/56a752beb5e956f37d2a02458d74af3160dff692))
+* **ci:** stop one undecidable item head-of-line blocking the port backlog ([#145](https://github.com/anweiss/ableton-link-rs/issues/145)) ([9acb159](https://github.com/anweiss/ableton-link-rs/commit/9acb1593b715877aaa39a583d22e3a6a5c394d42))
+* **ci:** stop release PRs from needing a manual workflow approval every time ([#80](https://github.com/anweiss/ableton-link-rs/issues/80)) ([55a7fbf](https://github.com/anweiss/ableton-link-rs/commit/55a7fbffd36ed65de8d821fa9653cd97cfbc5f5d))
+* **ci:** stop the release PR needing a manual workflow approval ([#126](https://github.com/anweiss/ableton-link-rs/issues/126)) ([8e5db03](https://github.com/anweiss/ableton-link-rs/commit/8e5db03a4b9023e84083e0343f8be13361cedc30))
+* **ci:** stop the review loop merging past a threat-detection flag ([#131](https://github.com/anweiss/ableton-link-rs/issues/131)) ([e2388e8](https://github.com/anweiss/ableton-link-rs/commit/e2388e89f29071d4cc18b6028abc55387443088d))
+* **ci:** treat `unstable status` as already-mergeable when queueing auto-merge ([#91](https://github.com/anweiss/ableton-link-rs/issues/91)) ([f77350d](https://github.com/anweiss/ableton-link-rs/commit/f77350daed2d9dd827774f985158218047e2c734))
+* **ci:** unblock port PR runs promptly instead of waiting on a 30-minute sweep ([#93](https://github.com/anweiss/ableton-link-rs/issues/93)) ([61ac540](https://github.com/anweiss/ableton-link-rs/commit/61ac5400355b031564e37b401213781f3db72bc4))
+* **ci:** unstall the review loop — writable target files, and a real Octokit method ([#128](https://github.com/anweiss/ableton-link-rs/issues/128)) ([0e06f65](https://github.com/anweiss/ableton-link-rs/commit/0e06f6534c698065f25b06916d406ac584d34f77))
+* **ci:** verify reconciled backlog issues by number, not by a lagged list ([#112](https://github.com/anweiss/ableton-link-rs/issues/112)) ([822662b](https://github.com/anweiss/ableton-link-rs/commit/822662b1b7e0dceac938ffebd1c8f7f15b8fc8d8))
+* close dispatch admission and cancel owned tasks on controller drop ([#156](https://github.com/anweiss/ableton-link-rs/issues/156)) ([4ee4f6d](https://github.com/anweiss/ableton-link-rs/commit/4ee4f6dce475cdf1673ce000887b954376febe45))
+* correct audio chunk resizer packet sizing and timing-change detection ([#176](https://github.com/anweiss/ableton-link-rs/issues/176)) ([7fddef0](https://github.com/anweiss/ableton-link-rs/commit/7fddef0304a424eea57cf146313f701b3b00f29a)), closes [#175](https://github.com/anweiss/ableton-link-rs/issues/175)
+* deliver only joined multicast groups to the discovery sockets on Linux ([#152](https://github.com/anweiss/ableton-link-rs/issues/152)) ([ed0e4ec](https://github.com/anweiss/ableton-link-rs/commit/ed0e4ecfba414624e476f8c4ce6f7dd4aced89c3))
+* **discovery:** avoid port sharing for ephemeral UDP sockets ([#167](https://github.com/anweiss/ableton-link-rs/issues/167)) ([9c57237](https://github.com/anweiss/ableton-link-rs/commit/9c572378437e7da63dfb15885ec1b849d142a004))
+* enforce safe-by-default with deny(unsafe_code) instead of asking ([#141](https://github.com/anweiss/ableton-link-rs/issues/141)) ([6ff330b](https://github.com/anweiss/ableton-link-rs/commit/6ff330b9fc996c5d4173509fb19a69e19d5538df))
+* explicitly skip aep6 payload entries for IPv6 audio endpoints ([#86](https://github.com/anweiss/ableton-link-rs/issues/86)) ([4f52e8f](https://github.com/anweiss/ableton-link-rs/commit/4f52e8fc1a67795cccb687cfa89a124f0e98c3f8))
+* gate Controller dispatch loops on disable to stop callbacks after shutdown ([#147](https://github.com/anweiss/ableton-link-rs/issues/147)) ([78dc501](https://github.com/anweiss/ableton-link-rs/commit/78dc5017ae6d14cb7873d78458da6efecda414dd))
+* invalidate ingress leases on raw topology changes ([#162](https://github.com/anweiss/ableton-link-rs/issues/162)) ([aa677b7](https://github.com/anweiss/ableton-link-rs/commit/aa677b72cd5fbf27613725bb0c739c1f38582ddb))
+* reject malformed LinkAudio buffer messages and zero sample rate commits ([#180](https://github.com/anweiss/ableton-link-rs/issues/180)) ([22d8784](https://github.com/anweiss/ableton-link-rs/commit/22d8784a34986bcfd24d844cd412dd26fcb8b60b)), closes [#179](https://github.com/anweiss/ableton-link-rs/issues/179)
+* restore measurement and discovery across enable cycles ([#158](https://github.com/anweiss/ableton-link-rs/issues/158)) ([5da0685](https://github.com/anweiss/ableton-link-rs/commit/5da0685c50e2d83701024a5d25625dc113b19216))
+* retain ingress interface identity for discovery responses ([#161](https://github.com/anweiss/ableton-link-rs/issues/161)) ([8044864](https://github.com/anweiss/ableton-link-rs/commit/8044864ec373263104f58e30ec9655d38284843e))
+* return an error instead of panicking on oversized ping/pong messages ([#144](https://github.com/anweiss/ableton-link-rs/issues/144)) ([88ad7ce](https://github.com/anweiss/ableton-link-rs/commit/88ad7ce3c424468de6ef6c5937f8425a617c441c))
+* scope the stranded-port detector to this workflow's own output ([#75](https://github.com/anweiss/ableton-link-rs/issues/75)) ([53f97b9](https://github.com/anweiss/ableton-link-rs/commit/53f97b911a26fb74334780c43e308cd564925ea1))
+* tear down LinkAudio before Link on drop (SessionController shutdown ordering) ([#119](https://github.com/anweiss/ableton-link-rs/issues/119)) ([8446299](https://github.com/anweiss/ableton-link-rs/commit/8446299760bd165bd00bfb5737a3df54d841e589))
+
+
+### Code Refactoring
+
+* share the unicast socket across measurements in MeasurementService ([#76](https://github.com/anweiss/ableton-link-rs/issues/76)) ([e9f978c](https://github.com/anweiss/ableton-link-rs/commit/e9f978c5c6606e6de9fed48beaa3d01d106ce4c5))
+
+
+### Documentation
+
+* **ci:** make a retire-only port PR close its tracking issue too ([#134](https://github.com/anweiss/ableton-link-rs/issues/134)) ([f5924c4](https://github.com/anweiss/ableton-link-rs/commit/f5924c41beed7b0098e04a0ae6cadd9c584d02f2))
+* **ci:** split backlog prose by audience so generated issues read as English ([#150](https://github.com/anweiss/ableton-link-rs/issues/150)) ([7447367](https://github.com/anweiss/ableton-link-rs/commit/7447367f8553c0a469d173bbccce708845f64877))
+* qualify --locked claim in README ([#196](https://github.com/anweiss/ableton-link-rs/issues/196)) ([ca4ace4](https://github.com/anweiss/ableton-link-rs/commit/ca4ace4e75e848153e788870a8f893264cebf5ee))
+* **readme:** describe the file-based porting backlog ([#116](https://github.com/anweiss/ableton-link-rs/issues/116)) ([06e8314](https://github.com/anweiss/ableton-link-rs/commit/06e8314af629510372922dc24353c950c1c1d3dd))
+
+
+### CI/CD
+
+* auto-merge upstream port PRs once required checks pass ([#77](https://github.com/anweiss/ableton-link-rs/issues/77)) ([0e2042a](https://github.com/anweiss/ableton-link-rs/commit/0e2042a72a2523049440d66060c21db7bb66388c))
+* automate upstream triage reviews and merges ([#178](https://github.com/anweiss/ableton-link-rs/issues/178)) ([a08f797](https://github.com/anweiss/ableton-link-rs/commit/a08f797c361fe3e0b4b7331a5354864dff18cf1e))
+* **deps:** bump github/gh-aw-actions/setup from 0.86.2 to 0.87.0 ([#82](https://github.com/anweiss/ableton-link-rs/issues/82)) ([0eb1fe4](https://github.com/anweiss/ableton-link-rs/commit/0eb1fe4c6faa9e107894e8c6cb5868a31f559823))
+* **deps:** bump github/gh-aw-actions/setup from 0.87.0 to 0.87.4 ([#95](https://github.com/anweiss/ableton-link-rs/issues/95)) ([fe048fd](https://github.com/anweiss/ableton-link-rs/commit/fe048fd579aa8ae23a5c42f3ab682b41775b110b))
+* **deps:** bump github/gh-aw-actions/setup-cli from 0.84.2 to 0.86.1 ([#74](https://github.com/anweiss/ableton-link-rs/issues/74)) ([b3eb2ca](https://github.com/anweiss/ableton-link-rs/commit/b3eb2ca766baebede2a8e19a5f8d190ee0607d45))
+* **deps:** bump github/gh-aw-actions/setup-cli from 0.86.2 to 0.87.0 ([#81](https://github.com/anweiss/ableton-link-rs/issues/81)) ([627f92a](https://github.com/anweiss/ableton-link-rs/commit/627f92a20816a257856912a7d089f7ee817eb042))
+* **deps:** bump github/gh-aw-actions/setup-cli from 0.87.0 to 0.87.4 ([#96](https://github.com/anweiss/ableton-link-rs/issues/96)) ([2ad027f](https://github.com/anweiss/ableton-link-rs/commit/2ad027fca5bce8ee9f6dc248abe7dc2d098f70a4))
+* **deps:** update dtolnay/rust-toolchain requirement to 02cb101ec7c40f2c49e1d9714d64511d8e1b74de ([#174](https://github.com/anweiss/ableton-link-rs/issues/174)) ([9e79c0d](https://github.com/anweiss/ableton-link-rs/commit/9e79c0d94115b1f1ee24e591f22dc2449bce9526))
+* enforce the README-maintenance rule instead of restating it ([#135](https://github.com/anweiss/ableton-link-rs/issues/135)) ([5c0cdc5](https://github.com/anweiss/ableton-link-rs/commit/5c0cdc5002dae5360893646e4a75af4f7ac9735b))
+* recompile agentic workflow locks with gh-aw v0.86.2 ([#78](https://github.com/anweiss/ableton-link-rs/issues/78)) ([6cccd28](https://github.com/anweiss/ableton-link-rs/commit/6cccd2899dcd8dff4baa74f3bd69ade1f05f024e))
+
 ## [0.3.0](https://github.com/anweiss/ableton-link-rs/compare/v0.2.0...v0.3.0) (2026-08-10)
 
 
