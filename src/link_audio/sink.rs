@@ -259,6 +259,14 @@ mod tests {
     }
 
     #[test]
+    fn commit_rejects_zero_sample_rate() {
+        let (sink, _reader) = Sink::new("drums", 8, Id::default());
+        sink.set_is_connected(true);
+        let handle = sink.retain_buffer().unwrap();
+        assert!(!handle.commit(&timeline(), NodeId::default(), 0.0, 4.0, 4, 2, 0));
+    }
+
+    #[test]
     fn commit_rejects_oversized_buffers() {
         let (sink, _reader) = Sink::new("drums", 8, Id::default());
         sink.set_is_connected(true);
