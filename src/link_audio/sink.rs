@@ -158,7 +158,7 @@ impl SinkBufferHandle<'_> {
         sample_rate: u32,
     ) -> bool {
         let max_num_samples = self.sink.max_num_samples();
-        if num_channels == 0 || num_frames * num_channels > max_num_samples {
+        if num_channels == 0 || sample_rate == 0 || num_frames * num_channels > max_num_samples {
             return false;
         }
 
@@ -256,6 +256,14 @@ mod tests {
 
         assert!(reader.retain_slot());
         assert_eq!(reader.slot_mut().unwrap().tempo, Tempo::new(0.0));
+    }
+
+    #[test]
+    fn commit_rejects_zero_sample_rate() {
+        let (sink, _reader) = Sink::new("drums", 8, Id::default());
+        sink.set_is_connected(true);
+        let handle = sink.retain_buffer().unwrap();
+        assert!(!handle.commit(&timeline(), NodeId::default(), 0.0, 4.0, 4, 2, 0));
     }
 
     #[test]
