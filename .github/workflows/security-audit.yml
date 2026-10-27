@@ -20,7 +20,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - run: cargo generate-lockfile
+      # Audit the committed Cargo.lock as-is; regenerating it here would audit
+      # whatever resolves today instead of what the repository actually ships.
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

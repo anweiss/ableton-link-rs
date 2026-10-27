@@ -43,10 +43,12 @@ name: Auto-merge upstream port PRs
 on:
   pull_request:
     types: [opened, reopened, ready_for_review, labeled, unlabeled, synchronize]
-  # A merge to `main` can leave an already-queued port PR out of date, and
-  # `main` requires branches to be up to date (`strict: true`). Re-examine open
-  # port PRs whenever `main` moves so that situation is reported rather than
-  # silently stalling the pipeline.
+  # A merge to `main` can change what an already-open port PR needs: a conflict,
+  # a sign-off that went stale, or a PR that is now mergeable and only waiting
+  # to be queued. `main` does not currently require branches to be up to date
+  # (branch protection has `strict: false`), but if that is ever switched on a
+  # stale branch is reported here too. Re-examine open bot PRs whenever `main`
+  # moves so none of these silently stall the pipeline.
   push:
     branches: [main]
   workflow_dispatch:
@@ -81,6 +83,11 @@ jobs:
       - name: Enable auto-merge for qualifying upstream PRs
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
+          # Transient API failures (5xx, secondary rate limits) are retried by
+          # github-script itself. Every step below is idempotent - holds post
+          # once per marker, auto-merge is checked before it is enabled, and the
+          # direct merge is SHA-bound - so a retried call cannot double-act.
+          retries: 3
           script: |
             const { owner, repo } = context.repo;
             const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -92,9 +99,12 @@ jobs:
             const THREAT_LABEL = 'agentic-threat-detected';
 
             // Labels are applied a second or two after the PR is created, so a
-            // single read of an `opened` event races them. Poll briefly.
-            async function fetchQualifying(number) {
-              const attempts = 6;
+            // single read of an `opened` event races them. Poll briefly - but
+            // only then. Every other trigger fires after the labels exist, and
+            // polling there just spends 25 seconds on PRs that will never
+            // qualify (release-please's #73 on every push to `main`).
+            async function fetchQualifying(number, poll) {
+              const attempts = poll ? 6 : 1;
               let pr;
               for (let i = 0; i < attempts; i++) {
                 ({ data: pr } = await github.rest.pulls.get({
@@ -301,8 +311,10 @@ jobs:
               }
             }
 
-            async function process(number) {
-              const pr = await fetchQualifying(number);
+            // Not named `process`: that would shadow Node's global inside the
+            // script.
+            async function reconcilePr(number, { poll = false } = {}) {
+              const pr = await fetchQualifying(number, poll);
               if (!labelsOf(pr).some(label =>
                 ['upstream-sync', 'upstream-triage', 'copilot-reviewed'].includes(label))) {
                 core.info(`PR #${number}: outside upstream automation; leaving it unchanged.`);
@@ -310,7 +322,7 @@ jobs:
               }
               // Threat is settled from labels alone, before any further API
               // call. `isWireFormat` queries the file list, and a failure there
-              // throws out of `process` before `revoke` ever runs - which on a
+              // throws out of `reconcilePr` before `revoke` ever runs - which on a
               // flagged pull request would leave an already-armed auto-merge
               // request armed. This workflow is not a required check, so its
               // own failure holds nothing back. Deciding the flagged case from
@@ -389,7 +401,8 @@ jobs:
               }
 
               if (pr.draft) {
-                core.info(`PR #${number} is a draft; marking it ready for review.`);                await github.graphql(
+                core.info(`PR #${number} is a draft; marking it ready for review.`);
+                await github.graphql(
                   `mutation($id: ID!) {
                      markPullRequestReadyForReview(input: { pullRequestId: $id }) {
                        pullRequest { number }
@@ -517,25 +530,55 @@ jobs:
                 }
               }
 
-              // `main` requires branches to be up to date. Auto-merge does not
-              // reliably update a stale branch, and updating it here would push a
-              // commit with GITHUB_TOKEN, whose events do not start workflows -
-              // the PR would end up with no checks on its new head and could
-              // never satisfy protection. Report it and let a human update.
+              // GitHub reports `behind` only when branch protection requires
+              // branches to be up to date. `main` does not today (`strict:
+              // false`), so this is a guard for that setting being turned on.
+              // Auto-merge does not reliably update a stale branch, and updating
+              // it here would push a commit with GITHUB_TOKEN, whose events do
+              // not start workflows - the PR would end up with no checks on its
+              // new head and could never satisfy protection. Report it and let a
+              // human update.
               const { data: fresh } = await github.rest.pulls.get({
                 owner, repo, pull_number: number,
               });
               if (fresh.mergeable_state === 'behind') {
                 core.warning(
-                  `PR #${number} is behind main and main requires branches to be ` +
-                  'up to date. Auto-merge is queued but cannot complete until the ' +
-                  'branch is updated. Click "Update branch" on the PR.'
+                  `PR #${number} is behind main, and branch protection requires ` +
+                  'branches to be up to date. Auto-merge is queued but cannot ' +
+                  'complete until the branch is updated. Click "Update branch" ' +
+                  'on the PR.'
+                );
+              }
+            }
+
+            // One PR's failure must not stop the sweep: a transient error on
+            // the first PR would otherwise leave every later PR - including
+            // one that needs disarming - untouched until `main` moves again.
+            // The run still fails, after every PR has had its turn, so the
+            // error is not lost.
+            async function reconcileAll(numbers) {
+              const failures = [];
+              for (const number of numbers) {
+                try {
+                  await reconcilePr(number);
+                } catch (error) {
+                  const message = String((error && error.message) || error);
+                  core.error(`PR #${number}: ${message}`);
+                  failures.push(`#${number}: ${message}`);
+                }
+              }
+              if (failures.length) {
+                core.setFailed(
+                  `Reconciling ${failures.length} of ${numbers.length} PRs failed: ` +
+                  failures.join('; ')
                 );
               }
             }
 
             if (context.eventName === 'pull_request') {
-              await process(context.payload.pull_request.number);
+              await reconcilePr(context.payload.pull_request.number, {
+                poll: context.payload.action === 'opened',
+              });
               return;
             }
 
@@ -552,6 +595,4 @@ jobs:
               core.info('No open bot PRs to reconcile.');
               return;
             }
-            for (const pr of candidates) {
-              await process(pr.number);
-            }
+            await reconcileAll(candidates.map(pr => pr.number));

@@ -37,8 +37,8 @@ schema_version = 1
 # the submodule pin, and the validator fails if this drifts from it.
 [watermark]
 pinned = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
-upstream = "9c9091275e707ab09d09a5a608fcdb84bf0dec85"
-commits_behind = 137
+upstream = "5ba907ae027a8c2ec8824463e37296dcefc5e9be"
+commits_behind = 139
 
 # ---------------------------------------------------------------------------
 # Port items, in upstream ancestry order (oldest first). The port workflow
@@ -548,3 +548,11 @@ reason = "Define _WIN32_WINNT for Link's own Windows targets (Asio/Windows-SDK h
 [[not_applicable]]
 upstream = ["9c9091275e707ab09d09a5a608fcdb84bf0dec85"]
 reason = "Update README (upstream C++ CMake/Asio build documentation only)"
+
+[[not_applicable]]
+upstream = ["8923342a895e57501396a5f13f8a4080049820e0"]
+reason = "Sink::retainBuffer/releaseSlot refactor so an undersized slot discarded for a larger size is released with zeroed beats/tempo and not resent. The Rust sink (src/link_audio/sink.rs) grows an undersized slot in place with resize and SinkBufferHandle::drop already clears timing on uncommitted release, so the resend bug cannot occur"
+
+[[not_applicable]]
+upstream = ["5ba907ae027a8c2ec8824463e37296dcefc5e9be"]
+reason = "Add SinkProcessor and SourceProcessor Catch2 tests (CMake and test harness only)"
