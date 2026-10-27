@@ -37,8 +37,8 @@ schema_version = 1
 # the submodule pin, and the validator fails if this drifts from it.
 [watermark]
 pinned = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
-upstream = "9c9091275e707ab09d09a5a608fcdb84bf0dec85"
-commits_behind = 137
+upstream = "5ba907ae027a8c2ec8824463e37296dcefc5e9be"
+commits_behind = 139
 
 # ---------------------------------------------------------------------------
 # Port items, in upstream ancestry order (oldest first). The port workflow
@@ -326,6 +326,17 @@ why = "Upstream commit 4ce3038601e7 changes `Sink::requestMaxNumSamples` (includ
 impact = "No user-visible effect: two upstream C++ implementation details -- how the internal audio sink decides never to shrink its buffer and how it searches for a large-enough free slot -- were already implemented equivalently and safely in this crate before these upstream commits landed. Recorded so the commits are accounted for."
 
 [[port]]
+id = "sink-does-not-resend-stale-buffers-when-growing"
+title = "Confirm the audio sink never resends stale audio when its buffer size is increased"
+upstream = ["8923342a895e57501396a5f13f8a4080049820e0"]
+rust = ["src/link_audio/sink.rs"]
+risk = "internal"
+status = "retired"
+retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
+why = "Upstream 8923342 factors `Sink::releaseSlot(Writer&)` (include/ableton/link_audio/Sink.hpp) that zeroes `mBeginBeats` and `mTempo` before `releaseSlot()`, and uses it in `retainBuffer()` when an undersized slot is discarded, so a discarded too-small slot is no longer treated as a valid buffer and resent. This port never discards undersized slots: `Sink::retain_buffer` in `src/link_audio/sink.rs` resizes the slot in place, and `SinkBufferHandle::drop` already calls `clear_timing()` before `release_slot()` for uncommitted handles. No change needed."
+impact = "No user-visible effect: an upstream fix for audio buffers being sent twice after the sink buffer size grows has no analogue here, because this crate grows buffers in place. Recorded so the commit is accounted for."
+
+[[port]]
 id = "harden-audiobuffer-deserialization-against-malformed-network-input"
 title = "Reject malformed audio buffer messages instead of silently accepting bad values from the network"
 upstream = ["0fd85e8cfaeca22d1aef6cba4405b71f9941bf65", "06590b98ce6f413c0c6589ee1b60c3b11903d500", "caece1ac17547c7d9eaf3efe0fc9b17042e4cbd1", "ab3dfee9c36eee26838820e6e4cc0a2143b88671", "6b94b00ee72007e33493787ce2e7b1d17e660afa", "e4c0371a298360e5942241e9e2af1b42f65730a7"]
@@ -548,3 +559,7 @@ reason = "Define _WIN32_WINNT for Link's own Windows targets (Asio/Windows-SDK h
 [[not_applicable]]
 upstream = ["9c9091275e707ab09d09a5a608fcdb84bf0dec85"]
 reason = "Update README (upstream C++ CMake/Asio build documentation only)"
+
+[[not_applicable]]
+upstream = ["5ba907ae027a8c2ec8824463e37296dcefc5e9be"]
+reason = "Adds C++ Catch2 tests for SinkProcessor and SourceProcessor (test harness only, no behavior change)"
