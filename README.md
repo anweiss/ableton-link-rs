@@ -554,8 +554,8 @@ remains optional under `std`; `no_std` builds do not enable it.
 
 Contributions are welcome! This project uses [conventional commits](https://www.conventionalcommits.org/) for automated releases.
 
-`Cargo.lock` is committed, and every CI cargo invocation passes `--locked`, so CI
-builds exactly the dependency versions in the lock file. A new upstream release
+`Cargo.lock` is committed, and every dependency-resolving CI cargo invocation passes
+`--locked`, so CI builds exactly the dependency versions in the lock file. A new upstream release
 cannot change what CI compiles or turn an unrelated pull request red. A build that
 would need to modify the lock file fails instead. If your change needs newer
 dependencies, run `cargo update` (or `cargo update -p <crate>`) deliberately and
