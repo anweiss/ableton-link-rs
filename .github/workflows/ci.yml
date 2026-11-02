@@ -12,6 +12,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Every cargo invocation passes --locked so CI builds exactly the committed
+# Cargo.lock and fails if Cargo.toml changed without the lock being updated.
+
 jobs:
   upstream-automation:
     name: Upstream automation tests
@@ -20,6 +23,28 @@ jobs:
       - uses: actions/checkout@v7
       - run: node --test .github/scripts/test-upstream-automation.cjs
 
+  aw-lock-drift:
+    name: gh-aw lock drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The release binary is downloaded by exact version and checksum instead of
+      # `gh extension install`: the lock files must be compiled by v0.87.10, and
+      # a newer compiler would rewrite every lock file (and without github-org
+      # access it emits tag refs and deletes .github/aw/actions-lock.json).
+      - name: Install gh-aw v0.87.10
+        env:
+          GH_AW_VERSION: v0.87.10
+          GH_AW_SHA256: 1624fb3a6e93b48046377c7b26c9b326e2b25056b3f36cc3fd3bf0ebee7d59fd
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gh-aw" "https://github.com/github/gh-aw/releases/download/${GH_AW_VERSION}/linux-amd64"
+          echo "${GH_AW_SHA256}  $RUNNER_TEMP/gh-aw" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/gh-aw"
+      - name: Check lock files match their sources
+        env:
+          GH_AW: ${{ runner.temp }}/gh-aw
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/check-aw-lock-drift.sh
   fmt:
     name: Format check
     runs-on: ubuntu-latest
@@ -27,7 +52,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
           toolchain: stable
           components: rustfmt
@@ -44,14 +69,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
           toolchain: stable
           components: clippy
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   build:
     name: Build (${{ matrix.os }})
@@ -64,13 +89,13 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
           toolchain: stable
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo build --all-targets --all-features
+      - run: cargo build --all-targets --all-features --locked
 
   test:
     name: Test (${{ matrix.os }})
@@ -83,7 +108,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
           toolchain: stable
       - name: Install ALSA dev (Linux)
@@ -93,12 +118,12 @@ jobs:
       # and will collide when run in parallel.
       # --all-features is required to compile and run the optional `audio`
       # (LinkAudio) module; without it none of src/link_audio/ is exercised.
-      - run: cargo test --all --all-features -- --nocapture --test-threads=1
+      - run: cargo test --all --all-features --locked -- --nocapture --test-threads=1
       - name: Real multihomed discovery and interface churn
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          cargo test --lib --all-features --no-run --message-format=json > /tmp/link-test-artifacts.json
+          cargo test --lib --all-features --locked --no-run --message-format=json > /tmp/link-test-artifacts.json
           test_binary="$(jq -r 'select(.profile.test == true and .executable != null) | .executable' /tmp/link-test-artifacts.json)"
           sudo env LINK_IO_REQUIRE_PRIORITY=1 "$test_binary" --exact platform::io_context::tests::real_priority_request_and_restore_stay_on_owned_thread --nocapture
           sudo unshare --mount --net bash .github/scripts/test-discovery-ingress.sh "$test_binary"
@@ -108,14 +133,14 @@ jobs:
         run: |
           python3 -m venv "$RUNNER_TEMP/link154-python"
           "$RUNNER_TEMP/link154-python/bin/pip" install -r .github/scripts/discovery-fixture-requirements.txt
-          cargo test --lib --all-features --no-run --message-format=json > /tmp/link-test-artifacts.json
+          cargo test --lib --all-features --locked --no-run --message-format=json > /tmp/link-test-artifacts.json
           test_binary="$(jq -r 'select(.profile.test == true and .executable != null) | .executable' /tmp/link-test-artifacts.json)"
           sudo env GITHUB_ACTIONS=true LINK_154_PYTHON="$RUNNER_TEMP/link154-python/bin/python" bash .github/scripts/test-discovery-ingress-macos.sh "$test_binary"
       - name: Real multihomed discovery on Windows adapters
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $artifacts = cargo test --lib --all-features --no-run --message-format=json
+          $artifacts = cargo test --lib --all-features --locked --no-run --message-format=json
           if ($LASTEXITCODE -ne 0) { throw 'Test compilation failed' }
           $binary = $artifacts | ConvertFrom-Json | Where-Object { $_.profile.test -and $_.executable } | Select-Object -ExpandProperty executable
           & .github/scripts/test-discovery-ingress-windows.ps1 -TestBinary $binary
@@ -127,14 +152,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
           toolchain: stable
       - name: Install ALSA dev
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       # `audio` is off by default. Verify the configuration most users get still
       # compiles, so an audio-only change cannot break the default build.
-      - run: cargo check --all-targets
+      - run: cargo check --all-targets --locked
 
   no-std:
     name: no_std check
@@ -143,10 +168,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
           toolchain: stable
-      - run: cargo check --lib --no-default-features
+      - run: cargo check --lib --no-default-features --locked
 
   upstream-backlog:
     name: Upstream backlog check
