@@ -1,3 +1,4 @@
+use crate::discovery::messenger::{MeasurementRoute, MeasurementRoutes};
 use std::{
     collections::HashMap,
     io, mem,
@@ -80,7 +81,8 @@ impl Decode for MeasurementEndpointV4 {
         let (port, n2) = u16::decode_from(&bytes[n1..])?;
         Ok((
             Self {
-                endpoint: Some(SocketAddrV4::new(Ipv4Addr::from(ip_raw), port)),
+                endpoint: (ip_raw != 0 || port != 0)
+                    .then(|| SocketAddrV4::new(Ipv4Addr::from(ip_raw), port)),
             },
             n1 + n2,
         ))
@@ -146,7 +148,31 @@ impl MeasurementService {
         clock: Clock,
         tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
         notifier: Arc<Notify>,
-        mut rx_measure_peer_state: tokio::sync::mpsc::Receiver<MeasurePeerEvent>,
+        rx_measure_peer_state: tokio::sync::mpsc::Receiver<MeasurePeerEvent>,
+    ) -> MeasurementService {
+        Self::new_with_routes(
+            ping_responder_unicast_socket,
+            peer_state,
+            session_state,
+            clock,
+            tx_measure_peer_result,
+            notifier,
+            rx_measure_peer_state,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn new_with_routes(
+        ping_responder_unicast_socket: Arc<UdpSocket>,
+        peer_state: Arc<Mutex<PeerState>>,
+        session_state: Arc<Mutex<SessionState>>,
+        clock: Clock,
+        tx_measure_peer_result: Sender<MeasurePeerEvent>,
+        notifier: Arc<Notify>,
+        mut rx_measure_peer_state: Receiver<MeasurePeerEvent>,
+        routes: Option<MeasurementRoutes>,
     ) -> MeasurementService {
         let measurement_map = Arc::new(Mutex::new(HashMap::new()));
         let pong_dispatch: PongDispatch = Arc::new(Mutex::new(HashMap::new()));
@@ -164,6 +190,28 @@ impl MeasurementService {
                 gated_recv(&task_gate, &mut open, &mut rx_measure_peer_state).await
             {
                 if let MeasurePeerEvent::PeerState(session_id, peer) = event {
+                    let route = match &routes {
+                        Some(routes) => match routes.resolve(&peer) {
+                            Some(route) => Some(route),
+                            None => {
+                                tokio::select! {
+                                    biased;
+                                    _ = open.closed() => {}
+                                    _ = t_peer.send(MeasurePeerEvent::XForm(session_id, GhostXForm::default())) => {}
+                                }
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+                    let socket = route
+                        .as_ref()
+                        .map(MeasurementRoute::socket)
+                        .unwrap_or_else(|| socket_loop.clone());
+                    let dispatch = route
+                        .as_ref()
+                        .map(MeasurementRoute::dispatch)
+                        .unwrap_or_else(|| dispatch_loop.clone());
                     let measurement = measure_peer_in_epoch(
                         clock,
                         m_map.clone(),
@@ -171,9 +219,10 @@ impl MeasurementService {
                         session_id,
                         peer,
                         notifier.clone(),
-                        socket_loop.clone(),
-                        dispatch_loop.clone(),
+                        socket,
+                        dispatch,
                         Some((task_gate.clone(), epoch)),
+                        route,
                     );
                     tokio::select! {
                         biased;
@@ -211,10 +260,9 @@ impl MeasurementService {
         self.tasks.gate.stop().await;
     }
 
-    /// Start the single receive loop for the shared unicast socket. Every
-    /// datagram is dispatched from here: PING messages go to the ping
-    /// responder, PONG messages go to the measurement registered for the
-    /// sending peer.
+    /// Receive standalone traffic on the shared socket. Managed discovery
+    /// measurements instead use their learned interface registration's socket
+    /// and dispatcher, preserving arrival identity even for overlapping peers.
     pub async fn listen(&self, _notifier: Arc<Notify>) {
         let socket = self.shared_socket.clone();
         let ping_responder = self.ping_responder.clone();
@@ -337,6 +385,7 @@ pub async fn measure_peer_with_socket(
         socket,
         pong_dispatch,
         None,
+        None,
     )
     .await;
 }
@@ -388,6 +437,7 @@ async fn measure_peer_in_epoch(
     socket: Arc<UdpSocket>,
     pong_dispatch: PongDispatch,
     lifecycle: Option<(Arc<DispatchGate>, u64)>,
+    route: Option<MeasurementRoute>,
 ) {
     // A peer that announced no measurement endpoint can't be measured: report
     // it like any other failed measurement.
@@ -420,8 +470,16 @@ async fn measure_peer_in_epoch(
         dispatch: pong_dispatch,
     };
 
-    let mut measurement =
-        Measurement::with_socket(state, clock, tx_measurement, notifier, socket, rx_pong).await;
+    let mut measurement = Measurement::with_route(
+        state,
+        clock,
+        tx_measurement,
+        notifier,
+        socket,
+        rx_pong,
+        route,
+    )
+    .await;
     if measurement.cancelled {
         return;
     }
@@ -524,7 +582,7 @@ fn message_type(data: &[u8], src: SocketAddr) -> Option<MessageType> {
 /// Hand a PONG datagram to the measurement registered for the peer that sent
 /// it. `try_send` is used so that a slow or already finished measurement cannot
 /// stall the dispatch of datagrams destined for other peers.
-fn dispatch_pong(pong_dispatch: &PongDispatch, data: &[u8], src: SocketAddr) {
+pub(crate) fn dispatch_pong(pong_dispatch: &PongDispatch, data: &[u8], src: SocketAddr) {
     let mut dispatch = lock(pong_dispatch);
 
     let closed = match dispatch.get(&src) {
@@ -590,6 +648,7 @@ impl Drop for MeasurementTasks {
 
 #[derive(Debug)]
 pub struct Measurement {
+    route: Option<MeasurementRoute>,
     pub unicast_socket: Option<Arc<UdpSocket>>,
     pub session_id: SessionId,
     pub measurement_endpoint: Option<SocketAddrV4>,
@@ -625,6 +684,7 @@ impl Measurement {
         if state.measurement_endpoint.is_none() {
             let (tx_timer, _rx_timer) = mpsc::channel(1);
             let measurement = Self {
+                route: None,
                 unicast_socket: None,
                 session_id: state.node_state.session_id,
                 measurement_endpoint: None,
@@ -663,6 +723,27 @@ impl Measurement {
         unicast_socket: Arc<UdpSocket>,
         rx_pong: Receiver<PongMessage>,
     ) -> Self {
+        Self::with_route(
+            state,
+            clock,
+            tx_measurement,
+            notifier,
+            unicast_socket,
+            rx_pong,
+            None,
+        )
+        .await
+    }
+
+    async fn with_route(
+        state: PeerState,
+        clock: Clock,
+        tx_measurement: Sender<Vec<(f64, f64)>>,
+        notifier: Arc<Notify>,
+        unicast_socket: Arc<UdpSocket>,
+        rx_pong: Receiver<PongMessage>,
+        route: Option<MeasurementRoute>,
+    ) -> Self {
         // Register before any await or spawned worker can observe disable.
         let cancelled = notifier.notified();
         tokio::pin!(cancelled);
@@ -679,6 +760,7 @@ impl Measurement {
         let data = Arc::new(Mutex::new(vec![]));
 
         let mut measurement = Measurement {
+            route: route.clone(),
             unicast_socket: Some(unicast_socket.clone()),
             session_id: state.node_state.session_id,
             measurement_endpoint: state.measurement_endpoint,
@@ -724,8 +806,9 @@ impl Measurement {
 
         info!("sending initial host time ping {:?}", ht);
 
-        let init_bytes_sent = match send_ping(
+        let init_bytes_sent = match send_ping_via(
             unicast_socket.clone(),
+            route.clone(),
             endpoint,
             &Payload {
                 entries: vec![PayloadEntry::HostTime(ht)],
@@ -750,6 +833,7 @@ impl Measurement {
             data.clone(),
             tx_measurement.clone(),
             finished_notifier.clone(),
+            route,
         );
         tokio::select! {
             biased;
@@ -772,6 +856,7 @@ impl Measurement {
         };
 
         let clock = self.clock;
+        let route = self.route.clone();
         let s_id = self.session_id;
         let data = self.data.clone();
         let tx_timer = self.tx_timer.clone();
@@ -834,7 +919,9 @@ impl Measurement {
                             ],
                         };
 
-                        if let Err(e) = send_ping(socket.clone(), endpoint, &payload).await {
+                        if let Err(e) =
+                            send_ping_via(socket.clone(), route.clone(), endpoint, &payload).await
+                        {
                             debug!("failed to send ping to {}: {}", endpoint, e);
                         }
 
@@ -875,6 +962,7 @@ impl Measurement {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reset_timer(
     measurements_started: Arc<Mutex<usize>>,
     clock: Clock,
@@ -883,6 +971,7 @@ async fn reset_timer(
     data: Arc<Mutex<Vec<(f64, f64)>>>,
     tx_measurement: Sender<Vec<(f64, f64)>>,
     finished_notifier: Arc<Notify>,
+    route: Option<MeasurementRoute>,
 ) {
     loop {
         select! {
@@ -898,8 +987,8 @@ async fn reset_timer(
                         debug!("no socket to ping {} with", measurement_endpoint);
                         break;
                     };
-                    if let Err(e) = send_ping(
-                        socket.clone(),
+                    if let Err(e) = send_ping_via(
+                        socket.clone(), route.clone(),
                         measurement_endpoint,
                         &Payload {
                             entries: vec![PayloadEntry::HostTime(ht)],
@@ -907,6 +996,9 @@ async fn reset_timer(
                     )
                     .await {
                         debug!("Failed to send ping to {}: {}", measurement_endpoint, e);
+                        if let Err(error) = tx_measurement.send(Vec::new()).await {
+                            debug!("measurement result receiver closed: {}", error);
+                        }
                         break;
                     }
 
@@ -955,6 +1047,15 @@ pub async fn send_ping(
     measurement_endpoint: SocketAddrV4,
     payload: &Payload,
 ) -> io::Result<usize> {
+    send_ping_via(socket, None, measurement_endpoint, payload).await
+}
+
+async fn send_ping_via(
+    socket: Arc<UdpSocket>,
+    route: Option<MeasurementRoute>,
+    measurement_endpoint: SocketAddrV4,
+    payload: &Payload,
+) -> std::io::Result<usize> {
     let message = match encode_message(PING, payload) {
         Ok(message) => message,
         Err(e) => {
@@ -968,7 +1069,11 @@ pub async fn send_ping(
         measurement_endpoint
     );
 
-    socket.send_to(&message, measurement_endpoint).await
+    if let Some(route) = route {
+        route.send(&message, measurement_endpoint).await
+    } else {
+        socket.send_to(&message, measurement_endpoint).await
+    }
 }
 
 /// The median, or 0.0 for no numbers. NaNs sort last (`total_cmp`) rather
@@ -1010,6 +1115,7 @@ mod tests {
     fn inert_measurement(job: Arc<()>, endpoint: SocketAddrV4) -> Measurement {
         let (tx_timer, _rx_timer) = mpsc::channel(1);
         Measurement {
+            route: None,
             unicast_socket: None,
             session_id: SessionId::default(),
             measurement_endpoint: Some(endpoint),
@@ -1267,6 +1373,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_missing_route_remains_cancelable_with_result_backpressure() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let (tx_result, _rx_result) = mpsc::channel(1);
+            tx_result
+                .send(MeasurePeerEvent::XForm(
+                    SessionId::default(),
+                    GhostXForm::default(),
+                ))
+                .await
+                .unwrap();
+            let (tx_peer, rx_peer) = mpsc::channel(1);
+            let service = MeasurementService::new_with_routes(
+                socket,
+                Arc::new(Mutex::new(PeerState::default())),
+                Arc::new(Mutex::new(SessionState::default())),
+                Clock::new(),
+                tx_result,
+                Arc::new(Notify::new()),
+                rx_peer,
+                Some(MeasurementRoutes::default()),
+            )
+            .await;
+            tx_peer
+                .send(MeasurePeerEvent::PeerState(
+                    SessionId::default(),
+                    PeerState::default(),
+                ))
+                .await
+                .unwrap();
+            drop(tx_peer.reserve().await.unwrap());
+            service.stop().await;
+            assert!(service.measurement_map.lock().unwrap().is_empty());
+        })
+        .await
+        .expect("missing-route failure reporting must not block lifecycle stop");
+    }
+
+    #[tokio::test]
     async fn registration_cleans_old_node_without_deleting_replacements() {
         for replace_same_node in [false, true] {
             let endpoint = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808);
@@ -1334,6 +1479,7 @@ mod tests {
             data,
             tx,
             Arc::new(Notify::new()),
+            None,
         )
         .await;
     }

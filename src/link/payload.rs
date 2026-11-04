@@ -391,6 +391,26 @@ mod tests {
         let bytes =
             crate::encoding::encode_to_vec(&MeasurementEndpointV4 { endpoint: None }).unwrap();
         assert_eq!(bytes, vec![0; 6]);
+        let (decoded, consumed) =
+            crate::encoding::decode_from_slice::<MeasurementEndpointV4>(&bytes).unwrap();
+        assert_eq!(decoded.endpoint, None);
+        assert_eq!(consumed, bytes.len());
+        for endpoint in [
+            Some(endpoint),
+            Some(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::UNSPECIFIED,
+                4321,
+            )),
+        ] {
+            let original = MeasurementEndpointV4 { endpoint };
+            let bytes = crate::encoding::encode_to_vec(&original).unwrap();
+            assert_eq!(
+                crate::encoding::decode_from_slice::<MeasurementEndpointV4>(&bytes)
+                    .unwrap()
+                    .0,
+                original
+            );
+        }
     }
 
     fn entry(key: u32, size: u32, body: &[u8]) -> Vec<u8> {

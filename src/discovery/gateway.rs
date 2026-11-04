@@ -114,7 +114,7 @@ impl PeerGateway {
             enabled.clone(),
         )?;
         messenger.gate = gate.clone();
-        let measurement_service = MeasurementService::new(
+        let measurement_service = MeasurementService::new_with_routes(
             ping_responder_unicast_socket,
             peer_state.clone(),
             session_state,
@@ -122,6 +122,7 @@ impl PeerGateway {
             tx_measure_peer_result,
             notifier,
             rx_measure_peer_state,
+            Some(messenger.measurement_routes.clone()),
         )
         .await;
         messenger.set_measurement_responder(measurement_service.ping_responder.clone());
