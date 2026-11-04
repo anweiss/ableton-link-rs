@@ -74,6 +74,9 @@ wildcard sender selects a different address than the advertised bound socket.
 It then decodes the real announcement, sends a PING to its measurement endpoint,
 and verifies the PONG comes from that exact address and port. It changes no host
 routes or interface configuration and does not establish atomic topology identity.
+A separate loopback test enables the responder through `Messenger`, checks the
+initial registration, removes and re-adds it through reconciliation, and verifies
+both announcements and PONG sources for the new registration as well.
 
 ## Registration, queues and lifecycle
 
