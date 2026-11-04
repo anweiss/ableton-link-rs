@@ -116,9 +116,9 @@ When modifying this module:
 
 1. **No `unsafe`.** On top of the crate-wide `deny` above, `src/link_audio/mod.rs` carries `#![forbid(unsafe_code)]`, which cannot be opted out of with `#[allow]`. Upstream's raw-pointer ring buffer is replaced by a channel-based buffer pool (`queue.rs`) and RAII buffer handles lending `&mut [i16]` (`sink.rs`). Never remove the attribute to make a change fit.
 2. **Test with `--all-features`.** A bare `cargo test --all` compiles none of `src/link_audio/` and passes without running a single audio test.
-4. **Wire format.** `src/link_audio/{messages,payload,encoding,codec}.rs` put bytes on the network. LinkAudio length-prefixes strings with a **u32**. The `aep4` peer-state entry (`src/link/audio_endpoint.rs`) is Link Classic wire format and is how audio peers discover each other.
-5. The runnable demo is `examples/link_audio.rs` (`cargo run --example link_audio --features audio`).
-6. `LinkAudio` constructs its engine and peer-sync task on the core's owned IO
+3. **Wire format.** `src/link_audio/{messages,payload,encoding,codec}.rs` put bytes on the network. LinkAudio length-prefixes strings with a **u32**. The `aep4` peer-state entry (`src/link/audio_endpoint.rs`) is Link Classic wire format and is how audio peers discover each other.
+4. The runnable demo is `examples/link_audio.rs` (`cargo run --example link_audio --features audio`).
+5. `LinkAudio` constructs its engine and peer-sync task on the core's owned IO
    runtime. Keep both there: abort plus a bounded send-gate wait is not task
    completion. Final core join covers their cleanup; reentrant drop uses the
    same owned join service. Standalone `AudioEngine` remains caller-managed.
