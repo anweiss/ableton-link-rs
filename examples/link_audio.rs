@@ -18,7 +18,10 @@ use std::{
 };
 
 use ableton_link_rs::link_audio::LinkAudio;
-use rodio::{ChannelCount, OutputStreamBuilder, Sample, SampleRate, Sink, Source};
+use rodio::{ChannelCount, Player, Sample, SampleRate, Source};
+
+#[path = "common/audio_sink.rs"]
+mod audio_sink;
 
 const SAMPLE_RATE: u32 = 44100;
 const NUM_CHANNELS: usize = 2;
@@ -70,7 +73,7 @@ impl LivePlayback {
             queue,
             channels,
             sample_rate,
-            frame: VecDeque::with_capacity(channels as usize),
+            frame: VecDeque::with_capacity(channels.get() as usize),
         }
     }
 }
@@ -83,7 +86,7 @@ impl Iterator for LivePlayback {
             return Some(sample);
         }
 
-        let channels = self.channels as usize;
+        let channels = self.channels.get() as usize;
         let mut queue = self.queue.lock().unwrap();
 
         if queue.samples.len() >= channels {
@@ -128,7 +131,7 @@ fn start_playback(
     sample_rate: SampleRate,
 ) {
     std::thread::spawn(move || {
-        let stream = match OutputStreamBuilder::open_default_stream() {
+        let stream = match audio_sink::open_default_sink() {
             Ok(stream) => stream,
             Err(e) => {
                 eprintln!("could not open an audio output device: {e}");
@@ -136,7 +139,7 @@ fn start_playback(
             }
         };
 
-        let sink = Sink::connect_new(stream.mixer());
+        let sink = Player::connect_new(stream.mixer());
         sink.append(LivePlayback::new(queue, channels, sample_rate));
         sink.sleep_until_end();
     });
@@ -246,10 +249,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     if let Some(queue) = &playback {
                         let mut queue = queue.lock().unwrap();
-                        queue.format.get_or_insert((
-                            handle.info.num_channels.max(1) as ChannelCount,
-                            handle.info.sample_rate,
-                        ));
+                        if queue.format.is_none() {
+                            // The stream header is network data, so a zero
+                            // sample rate or an out-of-range channel count is
+                            // skipped rather than trusted.
+                            let channels = u16::try_from(handle.info.num_channels.max(1))
+                                .ok()
+                                .and_then(ChannelCount::new);
+                            let rate = SampleRate::new(handle.info.sample_rate);
+                            if let (Some(channels), Some(rate)) = (channels, rate) {
+                                queue.format = Some((channels, rate));
+                            }
+                        }
                         let max_frames = handle.info.sample_rate as usize * latency_ms / 1000;
                         let channels = handle.info.num_channels.max(1);
                         let capacity = (max_frames * channels).max(handle.samples.len());

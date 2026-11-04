@@ -50,6 +50,11 @@ model: claude-opus-5
 concurrency:
   group: copilot-review-fix-${{ github.event.inputs.pull_request_number }}
   cancel-in-progress: false
+  # The per-PR group above covers the agent job only. Without a discriminator
+  # the generated conclusion job shares one slot across every dispatch, and
+  # GitHub keeps only one pending job per group, so overlapping fixes for
+  # different PRs can cancel each other's result comment.
+  job-discriminator: ${{ github.run_id }}
 
 network:
   allowed:
@@ -143,9 +148,39 @@ safe-outputs:
     max: 1
   missing-tool:
 
+# Fails the run before the agent starts when PIPELINE_PAT is an OAuth (`gho_`)
+# or user-to-server (`ghu_`) token. gh-aw's push handler refuses those, but
+# only after the agent has spent its session, and it reports the refusal as a
+# warning. This is a separate job on purpose: the agent job's environment
+# never receives the secret, and gh-aw v0.87.10 makes the agent wait on a
+# custom job that does not name `agent` in `needs`, so `safe_outputs` (the only
+# job that uses the PAT) cannot start without it either. Steps under
+# `safe-outputs.steps` would run too late, after the checkout that already
+# authenticates with the PAT. The prefix is checked without printing the
+# value; an empty secret passes, as before (the review loop does not dispatch
+# this workflow without one). The `case` text is shared with
+# copilot-review-loop.yml, and the automation tests require the copies to match.
+jobs:
+  pipeline-pat:
+    name: Check PIPELINE_PAT token type
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Refuse OAuth and user tokens in PIPELINE_PAT
+        env:
+          PIPELINE_PAT: ${{ secrets.PIPELINE_PAT }}
+        run: |
+          case "$PIPELINE_PAT" in
+            gho_*|ghu_*)
+              echo "::error title=PIPELINE_PAT has the wrong token type::PIPELINE_PAT must be a fine-grained PAT (github_pat_) or classic PAT (ghp_), not an OAuth (gho_) or user-to-server (ghu_) token such as the output of gh auth token. Replace the secret with gh secret set PIPELINE_PAT."
+              exit 1
+              ;;
+          esac
+
 steps:
   - name: Install Rust toolchain
-    uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+    uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
     with:
       toolchain: stable
       components: rustfmt, clippy
