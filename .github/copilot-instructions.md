@@ -95,8 +95,13 @@ If nothing safe will do:
    no stated alternative is a review blocker.
 
 Current exceptions are the Linux/Windows `IP_UNICAST_IF` setters and Darwin
-RFC 3678 group memberships in `src/discovery/ingress.rs`, and Windows notification registration/cancellation in
-`src/discovery/topology.rs`. Each names
+RFC 3678 group memberships in `src/discovery/ingress.rs`, and Unix topology
+`AsyncFd::register` plus Windows notification registration/cancellation in
+`src/discovery/topology.rs`. Unix registration moves an `OwnedFd` into `AsyncFd`
+and never replaces its descriptor; retain that ownership/lifetime safety proof.
+Tokio has no safe replacement constructor for these routing/netlink sockets;
+its socket wrappers do not cover them, and `async-io` would add another reactor.
+Each exception names
 the safe alternatives evaluated and why they were rejected. Packet reception
 uses `socket-pktinfo`; do not replace it with a hand-written ancillary-data parser.
 Unix indexed multicast egress now uses `rustix`; the Windows console example
