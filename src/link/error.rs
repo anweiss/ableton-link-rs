@@ -10,8 +10,9 @@ pub enum Error {
     Encoding(#[cfg_attr(feature = "std", from)] encoding::EncodeError),
     #[cfg_attr(feature = "std", error("decoding error: {0}"))]
     Decoding(#[cfg_attr(feature = "std", from)] encoding::DecodeError),
-    /// Not a Link message: received data that doesn't follow the protocol.
-    /// Datagrams come from the network, so this is an error, never a panic.
+    /// A value violates the Link wire protocol during decoding or encoding.
+    /// This includes malformed received data and locally supplied state that
+    /// cannot be encoded, such as a time outside signed 64-bit microseconds.
     #[cfg_attr(feature = "std", error("protocol error: {0}"))]
     Protocol(&'static str),
 }

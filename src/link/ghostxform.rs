@@ -35,6 +35,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transforms_saturate_out_of_range_microsecond_inputs_in_both_directions() {
+        let identity = GhostXForm {
+            slope: 1.0,
+            intercept: Duration::zero(),
+        };
+        for (limit, delta) in [(i64::MIN, -1), (i64::MIN, 0), (i64::MAX, 0), (i64::MAX, 1)] {
+            let input = Duration::microseconds(limit) + Duration::microseconds(delta);
+            assert_eq!(identity.host_to_ghost(input), Duration::microseconds(limit));
+            assert_eq!(identity.ghost_to_host(input), Duration::microseconds(limit));
+        }
+        for (input, expected) in [(Duration::MIN, i64::MIN), (Duration::MAX, i64::MAX)] {
+            assert_eq!(
+                identity.host_to_ghost(input),
+                Duration::microseconds(expected)
+            );
+            assert_eq!(
+                identity.ghost_to_host(input),
+                Duration::microseconds(expected)
+            );
+        }
+        for (limit, intercept) in [(i64::MIN, 1), (i64::MAX, -1)] {
+            let offset = GhostXForm {
+                slope: 1.0,
+                intercept: Duration::microseconds(intercept),
+            };
+            assert_eq!(
+                offset.ghost_to_host(Duration::microseconds(limit)),
+                Duration::microseconds(limit)
+            );
+        }
+    }
+
+    #[test]
     fn default_has_zero_slope_and_intercept() {
         let xf = GhostXForm::default();
         assert_eq!(xf.slope, 0.0);

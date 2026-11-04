@@ -123,6 +123,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn start_stop_encoding_saturates_both_wire_time_boundaries() {
+        for limit in [i64::MIN, i64::MAX] {
+            for delta in [-1, 0, 1] {
+                let expected = limit.saturating_add(delta);
+                let state = StartStopState {
+                    timestamp: Duration::microseconds(limit) + Duration::microseconds(delta),
+                    ..StartStopState::default()
+                };
+                let bytes = crate::encoding::encode_to_vec(&state).unwrap();
+                assert_eq!(&bytes[bytes.len() - 8..], &expected.to_be_bytes());
+                let (decoded, consumed) = StartStopState::decode_from(&bytes).unwrap();
+                assert_eq!(decoded.timestamp, Duration::microseconds(expected));
+                assert_eq!(consumed, bytes.len());
+                assert_eq!(decoded.is_playing, state.is_playing);
+                assert_eq!(decoded.beats, state.beats);
+            }
+        }
+    }
+
+    #[test]
     fn test_key() {
         assert_eq!(START_STOP_STATE_HEADER_KEY, 0x73747374);
         println!("size: {}", START_STOP_STATE_SIZE);

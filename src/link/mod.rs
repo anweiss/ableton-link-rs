@@ -567,6 +567,24 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn micros_saturates_both_boundaries_and_preserves_in_range_values() {
+        for (value, delta, expected) in [
+            (i64::MIN, -1, i64::MIN),
+            (i64::MIN, 0, i64::MIN),
+            (i64::MIN, 1, i64::MIN + 1),
+            (i64::MAX, -1, i64::MAX - 1),
+            (i64::MAX, 0, i64::MAX),
+            (i64::MAX, 1, i64::MAX),
+        ] {
+            let duration =
+                chrono::Duration::microseconds(value) + chrono::Duration::microseconds(delta);
+            assert_eq!(micros(duration), expected);
+        }
+        assert_eq!(micros(chrono::Duration::MIN), i64::MIN);
+        assert_eq!(micros(chrono::Duration::MAX), i64::MAX);
+    }
+
     #[tokio::test]
     async fn cancelled_disable_keeps_atomic_and_controller_enabled_flags_consistent() {
         use std::future::Future;

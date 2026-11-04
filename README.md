@@ -415,6 +415,9 @@ panic recovery; this is not a blanket guarantee for every API or invalid state:
 - Timeline and start/stop timestamp encoders use saturating microsecond conversions.
   The `HostTime`, `GhostTime`, and `PrevGhostTime` payload entry encoders instead return
   `Error::Protocol("time out of range")` for times outside the wire format's range.
+  This can be a local encoding failure from caller-supplied state, not just an
+  error in received network data. Saturation tests cover the helper, timeline,
+  start/stop, and ghost-time conversion paths independently of those encoders.
 - The hardened session, measurement, gateway, and controller paths use a blocking,
   poison-tolerant helper (`sync::lock`) instead of `try_lock().unwrap()`.
 - A peer that can't be measured (no measurement endpoint, or no socket to measure from) is

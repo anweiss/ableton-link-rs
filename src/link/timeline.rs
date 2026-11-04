@@ -164,6 +164,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn timeline_encoding_saturates_both_wire_time_boundaries() {
+        for limit in [i64::MIN, i64::MAX] {
+            for delta in [-1, 0, 1] {
+                let expected = limit.saturating_add(delta);
+                let timeline = Timeline {
+                    tempo: Tempo::new(120.0),
+                    time_origin: Duration::microseconds(limit) + Duration::microseconds(delta),
+                    ..Timeline::default()
+                };
+                let bytes = crate::encoding::encode_to_vec(&timeline).unwrap();
+                assert_eq!(&bytes[bytes.len() - 8..], &expected.to_be_bytes());
+                let (decoded, consumed) = Timeline::decode_from(&bytes).unwrap();
+                assert_eq!(decoded.time_origin, Duration::microseconds(expected));
+                assert_eq!(consumed, bytes.len());
+                assert_eq!(decoded.tempo, timeline.tempo);
+                assert_eq!(decoded.beat_origin, timeline.beat_origin);
+            }
+        }
+    }
+
+    #[test]
     fn session_to_client_updates_tempo() {
         let b0 = Beats::new(-1.0);
         let t0 = Duration::microseconds(-1);
