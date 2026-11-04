@@ -267,7 +267,28 @@ pub async fn measure_peer(
     state: PeerState,
     notifier: Arc<Notify>,
 ) {
-    let socket = match new_unicast_socket() {
+    measure_peer_with_socket_factory(
+        clock,
+        measurement_map,
+        tx_measure_peer_result,
+        session_id,
+        state,
+        notifier,
+        new_unicast_socket,
+    )
+    .await;
+}
+
+async fn measure_peer_with_socket_factory(
+    clock: Clock,
+    measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
+    tx_measure_peer_result: Sender<MeasurePeerEvent>,
+    session_id: SessionId,
+    state: PeerState,
+    notifier: Arc<Notify>,
+    socket_factory: impl FnOnce() -> io::Result<Arc<UdpSocket>>,
+) {
+    let socket = match socket_factory() {
         Ok(socket) => socket,
         Err(error) => {
             debug!("can't open a measurement socket: {}", error);
@@ -592,9 +613,8 @@ impl Measurement {
 
         if let Some(endpoint) = state.measurement_endpoint {
             lock(&pong_dispatch).insert(SocketAddr::V4(endpoint), tx_pong);
+            spawn_pong_dispatch(socket.clone(), pong_dispatch);
         }
-
-        spawn_pong_dispatch(socket.clone(), pong_dispatch);
 
         Ok(Self::with_socket(state, clock, tx_measurement, notifier, socket, rx_pong).await)
     }
@@ -637,9 +657,12 @@ impl Measurement {
             job: Arc::new(()),
         };
 
-        // Nothing to measure without an endpoint (callers check first); hand
-        // back a measurement that never started instead of panicking.
+        // Public constructors must complete the result protocol even when no
+        // worker starts; another sender may keep the consumer's channel open.
         let Some(endpoint) = state.measurement_endpoint else {
+            if let Err(error) = tx_measurement.send(Vec::new()).await {
+                debug!("measurement result consumer closed: {}", error);
+            }
             measurement.cancelled = true;
             return measurement;
         };
@@ -964,6 +987,181 @@ mod tests {
             cancelled: false,
             job,
         }
+    }
+
+    #[tokio::test]
+    async fn public_constructors_report_missing_endpoint_samples() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for use_supplied_socket in [false, true] {
+                let (tx, mut rx) = mpsc::channel(1);
+                let measurement = if use_supplied_socket {
+                    let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+                    let (_tx_pong, rx_pong) = mpsc::channel(1);
+                    Measurement::with_socket(
+                        PeerState::default(),
+                        Clock::new(),
+                        tx.clone(),
+                        Arc::new(Notify::new()),
+                        socket,
+                        rx_pong,
+                    )
+                    .await
+                } else {
+                    Measurement::new(
+                        PeerState::default(),
+                        Clock::new(),
+                        tx.clone(),
+                        Arc::new(Notify::new()),
+                    )
+                    .await
+                    .unwrap()
+                };
+                assert!(rx.recv().await.unwrap().is_empty());
+                assert!(measurement.cancelled);
+                assert!(measurement.tasks.0.is_empty());
+                assert!(
+                    !tx.is_closed(),
+                    "the retained sender must not mask a missing result"
+                );
+                assert!(
+                    rx.try_recv().is_err(),
+                    "only one failure result is reported"
+                );
+            }
+        })
+        .await
+        .expect("constructors must report failure without waiting for sender closure");
+    }
+
+    #[tokio::test]
+    async fn missing_endpoint_reports_failed_session_measurement() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let session_id = SessionId(NodeId::from_array([7; 8]));
+            let measurements = Arc::new(Mutex::new(HashMap::new()));
+            let dispatch = Arc::new(Mutex::new(HashMap::new()));
+            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let (tx, mut rx) = mpsc::channel(1);
+            measure_peer_with_socket(
+                Clock::new(),
+                measurements.clone(),
+                tx.clone(),
+                session_id,
+                PeerState::default(),
+                Arc::new(Notify::new()),
+                socket,
+                dispatch.clone(),
+            )
+            .await;
+            assert!(
+                matches!(rx.recv().await, Some(MeasurePeerEvent::XForm(id, xform))
+                if id == session_id && xform == GhostXForm::default())
+            );
+            assert!(lock(&measurements).is_empty());
+            assert!(lock(&dispatch).is_empty());
+            assert!(!tx.is_closed());
+        })
+        .await
+        .expect("missing endpoint must report a bounded failure event");
+    }
+
+    #[tokio::test]
+    async fn socket_bind_error_reports_failed_session_measurement() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let session_id = SessionId(NodeId::from_array([8; 8]));
+            let measurements = Arc::new(Mutex::new(HashMap::new()));
+            let state = PeerState {
+                measurement_endpoint: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808)),
+                ..PeerState::default()
+            };
+            let (tx, mut rx) = mpsc::channel(1);
+            measure_peer_with_socket_factory(
+                Clock::new(),
+                measurements.clone(),
+                tx.clone(),
+                session_id,
+                state,
+                Arc::new(Notify::new()),
+                || {
+                    Err(io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "injected bind failure",
+                    ))
+                },
+            )
+            .await;
+            assert!(
+                matches!(rx.recv().await, Some(MeasurePeerEvent::XForm(id, xform))
+                if id == session_id && xform == GhostXForm::default())
+            );
+            assert!(lock(&measurements).is_empty());
+            assert!(!tx.is_closed());
+        })
+        .await
+        .expect("socket setup failure must report a bounded failure event");
+    }
+
+    #[tokio::test]
+    async fn pong_worker_drops_malformed_and_out_of_range_samples_then_continues() {
+        use crate::link::payload::GhostTime;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let SocketAddr::V4(endpoint) = socket.local_addr().unwrap() else {
+                panic!("expected IPv4")
+            };
+            let mut measurement = inert_measurement(Arc::new(()), endpoint);
+            measurement.unicast_socket = Some(socket);
+            assert!(measurement.clock.micros() > Duration::zero());
+            let (tx_pong, rx_pong) = mpsc::channel(8);
+            measurement.listen(rx_pong).await;
+            let packet = |host, ghost, previous| {
+                encode_message(
+                    PONG,
+                    &Payload {
+                        entries: vec![
+                            PayloadEntry::HostTime(HostTime::new(Duration::microseconds(host))),
+                            PayloadEntry::GhostTime(GhostTime::new(Duration::microseconds(ghost))),
+                            PayloadEntry::PrevGhostTime(PrevGhostTime::new(
+                                Duration::microseconds(previous),
+                            )),
+                        ],
+                    },
+                )
+                .unwrap()
+            };
+            let mut malformed = packet(100, 200, 300);
+            malformed.pop();
+            for bytes in [
+                vec![0],
+                malformed,
+                packet(i64::MAX, 1, 0),
+                packet(i64::MAX, i64::MAX, i64::MAX),
+                packet(i64::MAX, i64::MIN, i64::MIN),
+                packet(100, 200, 300),
+            ] {
+                tx_pong
+                    .send((bytes, SocketAddr::V4(endpoint)))
+                    .await
+                    .unwrap();
+            }
+            drop(tx_pong);
+            measurement
+                .tasks
+                .0
+                .pop()
+                .unwrap()
+                .await
+                .expect("invalid pongs must not panic the worker");
+            let data = lock(&measurement.data);
+            assert_eq!(
+                data.len(),
+                2,
+                "only the final valid pong contributes samples"
+            );
+            assert_eq!(data[0].0 + data[0].1, 200.0);
+            assert_eq!(data[1], (100.0, 150.0));
+        })
+        .await
+        .expect("pong worker must process subsequent valid samples and terminate");
     }
 
     #[tokio::test]

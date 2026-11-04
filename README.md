@@ -412,7 +412,10 @@ panic recovery; this is not a blanket guarantee for every API or invalid state:
 - The hardened session, measurement, gateway, and controller paths use a blocking,
   poison-tolerant helper (`sync::lock`) instead of `try_lock().unwrap()`.
 - A peer that can't be measured (no measurement endpoint, or no socket to measure from) is
-  reported as a failed measurement, like one that never answers.
+  reported as a failed measurement, like one that never answers. The public
+  `Measurement::new` and `Measurement::with_socket` constructors also send an empty
+  sample vector before returning when the peer has no endpoint, so a retained
+  result sender does not leave consumers waiting indefinitely.
 
 > **API changes:** `link::error::Error` has a new variant, `Protocol(&'static str)`; code that
 > matches `Error` exhaustively needs an arm for it. `link::measurement::Measurement::new` returns

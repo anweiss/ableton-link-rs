@@ -441,6 +441,34 @@ mod tests {
     }
 
     #[test]
+    fn time_entry_encoders_check_both_microsecond_boundaries() {
+        for (limit, step) in [(i64::MIN, -1), (i64::MAX, 1)] {
+            let boundary = Duration::microseconds(limit);
+            for encoded in [
+                HostTime::new(boundary).encode(),
+                GhostTime::new(boundary).encode(),
+                PrevGhostTime::new(boundary).encode(),
+            ] {
+                assert_eq!(
+                    &encoded.unwrap()[PAYLOAD_ENTRY_HEADER_SIZE..],
+                    &limit.to_be_bytes()
+                );
+            }
+            let outside = boundary + Duration::microseconds(step);
+            for encoded in [
+                HostTime::new(outside).encode(),
+                GhostTime::new(outside).encode(),
+                PrevGhostTime::new(outside).encode(),
+            ] {
+                assert!(matches!(
+                    encoded,
+                    Err(crate::link::error::Error::Protocol("time out of range"))
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn host_time_header() {
         assert_eq!(HOST_TIME_HEADER_KEY, 0x5f5f6874, "unexpected byte order");
         assert_eq!(HOST_TIME_SIZE, 8, "unexpected size");
