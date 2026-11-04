@@ -962,8 +962,22 @@ impl Measurement {
     }
 }
 
+fn publish_samples(tx: &Sender<Vec<(f64, f64)>>, samples: Vec<(f64, f64)>) {
+    // The receiver may not be polled until the timer returns. A queued result
+    // wins over a concurrent completion; waiting for capacity would deadlock.
+    match tx.try_send(samples) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            debug!("measurement already has a queued result");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            debug!("measurement result receiver closed");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn reset_timer(
+pub(crate) async fn reset_timer(
     measurements_started: Arc<Mutex<usize>>,
     clock: Clock,
     unicast_socket: Option<Arc<UdpSocket>>,
@@ -996,9 +1010,7 @@ async fn reset_timer(
                     )
                     .await {
                         debug!("Failed to send ping to {}: {}", measurement_endpoint, e);
-                        if let Err(error) = tx_measurement.send(Vec::new()).await {
-                            debug!("measurement result receiver closed: {}", error);
-                        }
+                        publish_samples(&tx_measurement, Vec::new());
                         break;
                     }
 
@@ -1010,9 +1022,7 @@ async fn reset_timer(
                     info!("measuring {} failed", measurement_endpoint);
 
                     let data = lock(&data).clone();
-                    if let Err(error) = tx_measurement.send(data).await {
-                        debug!("measurement result receiver closed during cancellation: {}", error);
-                    }
+                    publish_samples(&tx_measurement, data);
                     break;
                 }
             }
@@ -1033,12 +1043,7 @@ async fn finish(
     debug!("measuring {} done", measurement_endpoint);
 
     let d = lock(&data).clone();
-    if let Err(error) = tx_measurement.send(d).await {
-        debug!(
-            "measurement result receiver closed during cancellation: {}",
-            error
-        );
-    }
+    publish_samples(&tx_measurement, d);
     lock(&data).clear();
 }
 
@@ -1370,6 +1375,42 @@ mod tests {
         })
         .await
         .expect("pong worker must process subsequent valid samples and terminate");
+    }
+
+    #[tokio::test]
+    async fn queued_samples_do_not_block_success_or_timeout_completion() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (tx, mut rx) = mpsc::channel(1);
+            let queued = vec![(1.0, 2.0)];
+            tx.send(queued.clone()).await.unwrap();
+            let data = Arc::new(Mutex::new(vec![(3.0, 4.0)]));
+            let endpoint = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808);
+            finish(
+                Arc::new(Mutex::new(false)),
+                endpoint,
+                data.clone(),
+                tx.clone(),
+            )
+            .await;
+            reset_timer(
+                Arc::new(Mutex::new(NUMBER_MEASUREMENTS)),
+                Clock::new(),
+                None,
+                endpoint,
+                data,
+                tx.clone(),
+                Arc::new(Notify::new()),
+                None,
+            )
+            .await;
+            assert_eq!(rx.try_recv().unwrap(), queued);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        })
+        .await
+        .expect("completion must not wait for the caller to drain queued samples");
     }
 
     #[tokio::test]

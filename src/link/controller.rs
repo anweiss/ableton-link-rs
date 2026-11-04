@@ -2229,22 +2229,53 @@ mod dispatch_gate_tests {
             .unwrap();
         let peer_id = NodeId::from_array([1; 8]);
         let peer_session = SessionId(peer_id);
-        let local = controller
+        let destination = std::net::SocketAddrV4::new(
+            crate::discovery::MULTICAST_ADDR,
+            crate::discovery::LINK_PORT,
+        );
+        let candidates = controller
             .discovery
             .socket_probes()
             .into_iter()
             .filter_map(|socket| socket.upgrade())
-            .find_map(|socket| match socket.local_addr().unwrap() {
+            .filter_map(|socket| match socket.local_addr().unwrap() {
                 std::net::SocketAddr::V4(addr) if !addr.ip().is_unspecified() => Some(*addr.ip()),
                 _ => None,
             })
-            .expect("identified local discovery interface");
-        let socket = Arc::new(tokio::net::UdpSocket::bind((local, 0)).await.unwrap());
-        let announcement_socket = socket.clone();
-        socket2::SockRef::from(announcement_socket.as_ref())
-            .set_multicast_if_v4(&local)
-            .unwrap();
-        announcement_socket.set_multicast_loop_v4(true).unwrap();
+            .collect::<std::collections::BTreeSet<_>>();
+        let route_probe = crate::discovery::messages::encode_message(
+            controller.peer_state.lock().unwrap().ident(),
+            0,
+            crate::discovery::messages::BYEBYE,
+            &crate::link::payload::Payload::default(),
+            0,
+        )
+        .unwrap();
+        let mut announcement_socket = None;
+        let mut route_errors = Vec::new();
+        // A registered virtual adapter may have no multicast route on hosted
+        // runners. Exercise an actual routable registration, not HashMap order.
+        for local in candidates {
+            let attempt = async {
+                let socket = tokio::net::UdpSocket::bind((local, 0)).await?;
+                socket2::SockRef::from(&socket).set_multicast_if_v4(&local)?;
+                socket.set_multicast_loop_v4(true)?;
+                socket.send_to(&route_probe, destination).await?;
+                Ok::<_, std::io::Error>(Arc::new(socket))
+            }
+            .await;
+            match attempt {
+                Ok(socket) => {
+                    announcement_socket = Some(socket);
+                    break;
+                }
+                Err(error) => route_errors.push((local, error)),
+            }
+        }
+        let announcement_socket = announcement_socket.unwrap_or_else(|| {
+            panic!("no registered interface has a usable multicast route: {route_errors:?}")
+        });
+        let socket = announcement_socket.clone();
         let std::net::SocketAddr::V4(endpoint) = socket.local_addr().unwrap() else {
             panic!("expected an IPv4 measurement endpoint");
         };
@@ -2300,10 +2331,6 @@ mod dispatch_gate_tests {
             )
             .unwrap()
         };
-        let destination = std::net::SocketAddrV4::new(
-            crate::discovery::MULTICAST_ADDR,
-            crate::discovery::LINK_PORT,
-        );
         announcement_socket
             .send_to(&announce(Timeline::default()), destination)
             .await

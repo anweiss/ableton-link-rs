@@ -2113,6 +2113,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalidated_measurement_route_does_not_block_completed_sample_channel() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let entry = interface_socket();
+            let route = MeasurementRoute {
+                entry: entry.lease(),
+                sockets: Arc::new(Mutex::new(HashMap::from([(
+                    entry.identity.addr,
+                    entry.lease(),
+                )]))),
+            };
+            entry.cancel.cancel();
+            let endpoint = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808);
+            assert!(route.send(b"invalidated", endpoint).await.is_err());
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let completed = vec![(1.0, 2.0)];
+            tx.send(completed.clone()).await.unwrap();
+            crate::link::measurement::reset_timer(
+                Arc::new(Mutex::new(0)),
+                crate::link::clock::Clock::new(),
+                Some(route.socket()),
+                endpoint,
+                Arc::new(Mutex::new(Vec::new())),
+                tx.clone(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(route),
+            )
+            .await;
+            assert_eq!(rx.try_recv().unwrap(), completed);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        })
+        .await
+        .expect("failed routed ping must finish before the result receiver is drained");
+    }
+
+    #[tokio::test]
     async fn absent_measurement_endpoint_roundtrips_through_peer_state_wire_messages() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let original = PeerState::default();
