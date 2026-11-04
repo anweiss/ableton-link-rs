@@ -70,8 +70,12 @@ registration when the original has disappeared.
 Before initial enumeration, discovery subscribes to raw topology notifications:
 Linux route-netlink link/IPv4-address groups, macOS routing-socket interface and
 address messages, and Windows IP Helper interface/address callbacks. Unix uses
-safe nix sockets and Tokio `AsyncFd`; only the Windows callback ownership needs
-local unsafe code. `netwatcher` was evaluated but rejected: its drain followed by
+safe nix sockets, with a narrowly scoped unsafe Tokio `AsyncFd::register` call.
+The registration moves an open `OwnedFd` into `AsyncFd` and never replaces or
+mutates that descriptor, so its identity remains stable until drop. Tokio
+deprecated the safe constructors without a safe replacement; its socket wrappers
+do not cover routing/netlink sockets, and `async-io` would add a second reactor.
+Windows callback registration/cancellation is a separate local unsafe exception. `netwatcher` was evaluated but rejected: its drain followed by
 snapshot-diff delivery collapses remove/add events whose final snapshot is
 identical. This monitor conservatively advances a global generation for relevant
 raw events, without comparing snapshots. Unrelated interface changes therefore
@@ -157,7 +161,9 @@ Both fixtures fail if their required overlap/churn assertions fail.
 The fixture also tries the independent NetTCPIP `New-NetIPAddress` provider
 when the native IP Helper call returns 5010. This is confined to the adapters
 it created, never the runner's transport adapter. Provider success must pass
-the existing duplicate-network assertions; a matching 5010 is still missing
+the existing duplicate-address unicast-response assertions. Managed outgoing
+multicast capture in this adapter fixture is macOS-only, so Windows provider
+success alone would still not prove duplicate-address multicast egress; a matching 5010 is still missing
 evidence, and any other failure fails setup. This tests a second provisioning
 API, not a different Windows network stack or an independent physical topology.
 These same-host tests are distinct from Linux's independent peer namespaces;
@@ -209,7 +215,10 @@ Complete repository-owned unsafe removal is also unfinished. `rustix` replaced
 Unix multicast egress and `crossterm` replaced the Windows example console calls.
 The remaining unicast/membership options still lack suitable safe APIs in the
 evaluated socket2/nix/rustix interfaces. Windows notification replacement must
-preserve raw changes even when the final address set is identical.
+preserve raw changes even when the final address set is identical. Unix topology
+registration also retains the `AsyncFd::register` exception and ownership proof
+described above; a safe replacement must preserve its reactor and descriptor
+lifetime guarantees.
 `if-watch` 3.2.2 was independently evaluated: its Windows callback sets a resync
 flag, then its public stream emits an address-set difference, so it loses that
 case just as the rejected snapshot watcher does. No local FFI was moved into a
