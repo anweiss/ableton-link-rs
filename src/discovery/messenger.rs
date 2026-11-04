@@ -372,35 +372,30 @@ impl Messenger {
         }
     }
 
-    pub(crate) fn listen_owned(&self) -> impl std::future::Future<Output = ()> + '_ {
-        let multicast_socket = self.multicast_receiver.clone();
-        let interface_sockets = self.interface_sockets.clone();
-        let peer_state = self.peer_state.clone();
-        let ttl = self.ttl;
-        let tx_event = self.tx_event.clone();
-        let last_broadcast_time = self.last_broadcast_time.clone();
-        let enabled = self.enabled.clone();
-        let group_id = self.group_id;
-
-        let _n = self.notifier.clone();
-
-        let context = ReceiveContext {
+    fn receive_context(&self) -> ReceiveContext {
+        ReceiveContext {
             measurement_responder: self.measurement_responder.clone(),
             topology: Some(self.topology.clone()),
-            interface_sockets: interface_sockets.clone(),
-            peer_state: peer_state.clone(),
-            ttl,
-            tx_event: tx_event.clone(),
-            last_broadcast_time: last_broadcast_time.clone(),
-            enabled: enabled.clone(),
-            group_id,
+            interface_sockets: self.interface_sockets.clone(),
+            peer_state: self.peer_state.clone(),
+            ttl: self.ttl,
+            tx_event: self.tx_event.clone(),
+            last_broadcast_time: self.last_broadcast_time.clone(),
+            enabled: self.enabled.clone(),
+            group_id: self.group_id,
             gateways_changed: self.gateways_changed.clone(),
             gate: self.gate.clone(),
             #[cfg(test)]
             fail_receive_once: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             drain_count: Arc::new(AtomicUsize::new(0)),
-        };
+        }
+    }
+
+    pub(crate) fn listen_owned(&self) -> impl std::future::Future<Output = ()> + '_ {
+        let multicast_socket = self.multicast_receiver.clone();
+        let interface_sockets = self.interface_sockets.clone();
+        let context = self.receive_context();
 
         // The shared multicast socket receives the multicast traffic of every
         // interface it joined.
@@ -1780,6 +1775,64 @@ mod tests {
             group_id: 0,
             gateways_changed: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[tokio::test]
+    async fn messenger_enables_measurement_on_initial_and_reconciled_registrations() {
+        use crate::link::{
+            clock::Clock, ghostxform::GhostXForm, pingresponder, sessions::SessionId,
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let identity = interface_socket().identity;
+            let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let SocketAddr::V4(destination) = peer.local_addr().unwrap() else { panic!("expected IPv4") };
+            let wildcard = Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap());
+            let SocketAddr::V4(wildcard_endpoint) = wildcard.local_addr().unwrap() else { panic!("expected IPv4") };
+            let state = Arc::new(Mutex::new(PeerState { measurement_endpoint: Some(wildcard_endpoint), ..PeerState::default() }));
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let mut messenger = Messenger::new_with_interfaces(
+                state, tx, Instant::now(), Arc::new(Notify::new()), Arc::new(Mutex::new(true)),
+                Some(Ok(vec![identity.clone()])),
+            ).unwrap();
+            assert_eq!(interface_socket_entries(&messenger.interface_sockets).len(), 1);
+            messenger.set_measurement_responder(pingresponder::PingResponder::new(
+                wildcard, SessionId::default(), GhostXForm::default(), Clock::new(),
+            ));
+            let context = messenger.receive_context();
+            let initial = interface_socket_entries(&messenger.interface_sockets).pop().unwrap();
+            let mut children = tokio::task::JoinSet::new();
+            children.spawn(receive_loop(initial.receiver.clone(), Some(initial.cancel.clone()), context.clone()));
+            for newly_reconciled in [false, true] {
+                if newly_reconciled {
+                    reconcile_interfaces(&messenger.multicast_receiver.socket, &context, &mut children, &[]);
+                    assert!(interface_socket_entries(&messenger.interface_sockets).is_empty());
+                    reconcile_interfaces(&messenger.multicast_receiver.socket, &context, &mut children, std::slice::from_ref(&identity));
+                }
+                let entries = interface_socket_entries(&messenger.interface_sockets);
+                assert_eq!(entries.len(), 1);
+                let entry = &entries[0];
+                if newly_reconciled { assert!(!Arc::ptr_eq(&initial.socket, &entry.socket)); }
+                let endpoint = entry.socket.local_addr().unwrap();
+                send_peer_state_via(
+                    entry.socket.clone(), messenger.peer_state.clone(), 1, ALIVE, destination,
+                    messenger.last_broadcast_time.clone(), 0, Some((entry, &messenger.interface_sockets)),
+                ).await;
+                let mut buffer = [0; MAX_MESSAGE_SIZE];
+                let (size, source) = peer.recv_from(&mut buffer).await.unwrap();
+                assert_eq!(source, endpoint);
+                let (_, header_len) = parse_message_header(&buffer[..size]).unwrap();
+                let payload = parse_payload(&buffer[header_len..size]).unwrap();
+                assert!(payload.entries.iter().any(|entry| matches!(entry,
+                    PayloadEntry::MeasurementEndpointV4(measurement) if measurement.endpoint.map(SocketAddr::V4) == Some(endpoint))));
+                let ping = pingresponder::encode_message(pingresponder::PING, &Payload::default()).unwrap();
+                peer.send_to(&ping, endpoint).await.unwrap();
+                let (size, source) = peer.recv_from(&mut buffer).await.unwrap();
+                assert_eq!(source, endpoint);
+                assert_eq!(pingresponder::parse_message_header(&buffer[..size]).unwrap().0.message_type, pingresponder::PONG);
+            }
+            reconcile_interfaces(&messenger.multicast_receiver.socket, &context, &mut children, &[]);
+            children.shutdown().await;
+        }).await.expect("Messenger setup and reconciliation must retain measurement endpoints");
     }
 
     #[tokio::test]
