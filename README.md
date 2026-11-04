@@ -13,7 +13,7 @@ A native Rust implementation of [Ableton Link](https://ableton.github.io/link), 
 * **Platform-Specific Timing**: High-resolution clocks using `mach_absolute_time` (macOS), `clock_gettime` (Linux), and `QueryPerformanceCounter` (Windows)
 * **Session Management**: Automatic peer discovery, session state synchronization, and callbacks for tempo and peer audio-endpoint changes
 * **Start/Stop Sync**: Synchronization of play/stop states across devices
-* **Memory Safe**: Uses Rust's ownership system for safe concurrent networking. The package sets `unsafe_code = "deny"` in `[lints.rust]`, covering examples and tests as well as the library. Unix indexed multicast egress uses safe `rustix` APIs; Windows example console mode uses the dev-only `crossterm` wrapper. Remaining narrowly scoped exceptions cover unicast egress options, Darwin indexed memberships and Windows topology notifications; this is not yet an entirely safe-Rust codebase
+* **Memory Safe**: Uses Rust's ownership system for safe concurrent networking. The package sets `unsafe_code = "deny"` in `[lints.rust]`, covering examples and tests as well as the library. Unix indexed multicast egress uses safe `rustix` APIs; Windows example console mode uses the dev-only `crossterm` wrapper. Remaining narrowly scoped exceptions cover unicast egress options, Darwin indexed memberships, Unix topology descriptor registration and Windows topology notifications; this is not yet an entirely safe-Rust codebase
 * **Ingress-Aware Discovery**: On Linux, macOS and Windows, managed discovery receives the OS interface index with each datagram and selects that interface's registered response socket, not a source-address prefix match. Raw topology notifications invalidate older leases even when the final interface snapshot is unchanged. Address-keyed groups retain duplicate-address adapters; memberships and egress select the interface by index. Optional `std` dependencies include `socket-pktinfo`, Unix `nix`, and Windows SDK bindings. See [discovery interface behavior and evidence](docs/discovery-ingress.md) for platform fixtures and remaining limits
 * **LinkAudio (optional)**: Stream PCM audio between Link peers, aligned to the shared beat grid, behind the optional `audio` feature — a fully safe-Rust port of the upstream LinkAudio subsystem
 
@@ -87,6 +87,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+Interface scanning retains IPv4 link-local addresses for networks without DHCP,
+while excluding adapters the OS reports as operationally down. This applies to
+managed discovery and both public scanners, including their `if-addrs` fallback;
+an unavailable status lookup or an unknown adapter index does not exclude an address.
 
 Discovery, measurement, and reply sockets bound to port `0` leave address/port
 reuse disabled so ephemeral unicast sockets do not opt into port sharing.
