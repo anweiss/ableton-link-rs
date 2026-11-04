@@ -36,9 +36,9 @@ schema_version = 1
 # Watermark this triage was computed against. Advisory: the real watermark is
 # the submodule pin, and the validator fails if this drifts from it.
 [watermark]
-pinned = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
+pinned = "62c7f1f5af183ac3317b418a2bda226d57428097"
 upstream = "5ba907ae027a8c2ec8824463e37296dcefc5e9be"
-commits_behind = 139
+commits_behind = 124
 
 # ---------------------------------------------------------------------------
 # Port items, in upstream ancestry order (oldest first). The port workflow
@@ -336,6 +336,17 @@ retired_at_pin = "334972b404d7e8801e921cdc9d4b7e38b702f80a"
 why = "Six upstream commits tighten `AudioBuffer` validation, five of them on `AudioBuffer::fromNetworkByteStream` (include/ableton/link_audio/AudioBuffer.hpp), one on the public commit path: (1) `0fd85e8cfaec` adds `sampleRate > 0` to `LinkAudioSink::BufferHandle::commit` (include/ableton/LinkAudio.ipp) and throws `runtime_error(\"Invalid sample rate.\")` in deserialization if `sampleRate == 0`, because a zero sample rate divides by zero in the Resizer on send and in `endBeats()` on receive; (2) `06590b98ce6f` fixes `sizeInByteStream()` to cast `numChannels`/`numBytes` to the same unsigned types actually written on the wire (`uint8_t`/`uint16_t`) instead of signed ones, avoiding a size miscalculation; (3) `caece1ac1754` changes the accepted-codec check from `codec == Codec::kInvalid` (reject only the zero sentinel) to `codec != Codec::kPCM_i16` (reject everything except the one codec actually implemented), so any codec byte other than 1 is rejected rather than merely 0; (4) `ab3dfee9c36e` rejects `numChannels` outside `{1, 2}`; (5) `6b94b00ee720` adds `numBytes > kMaxAudioBytes` as its own explicit range_error before the existing frame/byte-count consistency check, so an oversized byte count is rejected before the multiplication that would otherwise silently overflow or under-detect it; (6) `e4c0371a2983` rejects any chunk whose `tempo.bpm()` is non-finite (NaN/Inf) or `<= 0.0`. In `src/link_audio/payload.rs`, `AudioBuffer::decode_body` currently accepts `Codec::Invalid` only being rejected (matches the pre-fix upstream behavior in (3), needs updating to reject anything but `Codec::PcmI16`), has no `sample_rate == 0` check, no explicit `num_channels` in `{1, 2}` check, no `num_bytes > MAX_AUDIO_BYTES` check (relies solely on the frame/byte consistency check, which for `num_channels == 0` divides-by-nothing but does not bound `num_bytes` against `MAX_AUDIO_BYTES` before the multiplication), and no chunk-tempo finiteness/positivity check (`Chunk::decode` already builds a `Tempo` from a raw `i64` microseconds-per-beat with no bounds check, so a hostile peer can send a zero, negative or absurd tempo). `SinkBufferHandle::commit` in `src/link_audio/sink.rs` validates `num_channels == 0` and buffer-size overflow but not `sample_rate == 0`, so `LinkAudioSink::commit`/`LinkAudioApi` equivalents in `src/link_audio/api.rs` should also gain the same guard upstream added at its public API entry point. Port all six checks together since they are one cohesive hardening pass on the same deserialization path and public commit path; keep error messages distinguishable so a peer sending malformed data can be diagnosed. `d5a392da8862` (AudioBuffer test refactor) is C++-test-only and filed separately as not-applicable."
 impact = "A malformed or hostile audio buffer message on the network -- zero sample rate, unknown codec, wrong channel count, oversized byte count, or a non-finite tempo -- could previously be accepted, or trigger a division by zero downstream. Upstream now rejects each case at the network boundary with a clear error instead of destabilizing the receiver."
 
+[[port]]
+id = "linkaudio-channels-registry"
+title = "Keep a list of the audio channels announced by other peers"
+upstream = ["62c7f1f5af18"]
+rust = ["src/link_audio/channels.rs"]
+risk = "behavior"
+status = "retired"
+retired_at_pin = "62c7f1f5af183ac3317b418a2bda226d57428097"
+why = "Upstream `62c7f1f5af18` adds `link_audio::Channels`, a per-gateway registry of `ChannelInfo` entries filled from `PeerAnnouncement` (a new entry fires the callback; an update fires it only when the first entry for that id changes; closing a gateway drops its entries and fires it), and owns one in the audio `Controller` with a no-op callback. `src/link_audio/channels.rs` already provides this registry (`saw_announcement`, `gateway_closed`, plus later upstream additions such as byes, ttl pruning and send handlers) and the engine owns it, so no Rust change was needed. Rust reports changes through return values rather than a stored callback. Bookkeeping-only retirement."
+impact = "No user-visible effect: this crate already tracks the audio channels announced by other peers. This entry only records that the upstream commit is accounted for."
+
 # ---------------------------------------------------------------------------
 # Commits seen and consciously parked. Kept so that coverage stays provable:
 # a commit nobody mentions is not deferred, it is deleted the moment the pin
@@ -344,7 +355,6 @@ impact = "A malformed or hostile audio buffer message on the network -- zero sam
 
 [[undecided]]
 upstream = [
-  "62c7f1f5af18",
   "44d30cb2718c",
   "adcee8b31d1c",
   "6b29431cb91a",
