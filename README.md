@@ -423,7 +423,9 @@ panic recovery; this is not a blanket guarantee for every API or invalid state:
   dispatcher. The public
   `Measurement::new` and `Measurement::with_socket` constructors also send an empty
   sample vector before returning when the peer has no endpoint, so a retained
-  result sender does not leave consumers waiting indefinitely.
+  result sender does not leave consumers waiting indefinitely. `Measurement::new`
+  handles that case before binding, returning an inert measurement with no socket
+  or workers even if a bind attempt would fail.
 
 > **API changes:** `link::error::Error` has a new variant, `Protocol(&'static str)`; code that
 > matches `Error` exhaustively needs an arm for it. `link::measurement::Measurement::new` returns

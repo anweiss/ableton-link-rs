@@ -611,7 +611,39 @@ impl Measurement {
         tx_measurement: Sender<Vec<(f64, f64)>>,
         notifier: Arc<Notify>,
     ) -> io::Result<Self> {
-        let socket = new_unicast_socket()?;
+        Self::new_with_socket_factory(state, clock, tx_measurement, notifier, new_unicast_socket)
+            .await
+    }
+
+    async fn new_with_socket_factory(
+        state: PeerState,
+        clock: Clock,
+        tx_measurement: Sender<Vec<(f64, f64)>>,
+        notifier: Arc<Notify>,
+        socket_factory: impl FnOnce() -> io::Result<Arc<UdpSocket>>,
+    ) -> io::Result<Self> {
+        if state.measurement_endpoint.is_none() {
+            let (tx_timer, _rx_timer) = mpsc::channel(1);
+            let measurement = Self {
+                unicast_socket: None,
+                session_id: state.node_state.session_id,
+                measurement_endpoint: None,
+                data: Arc::new(Mutex::new(Vec::new())),
+                clock,
+                measurements_started: Arc::new(Mutex::new(0)),
+                success: Arc::new(Mutex::new(false)),
+                init_bytes_sent: 0,
+                tx_timer,
+                tasks: MeasurementTasks(Vec::new()),
+                cancelled: true,
+                job: Arc::new(()),
+            };
+            if let Err(error) = tx_measurement.send(Vec::new()).await {
+                debug!("measurement result consumer closed: {}", error);
+            }
+            return Ok(measurement);
+        }
+        let socket = socket_factory()?;
         let pong_dispatch: PongDispatch = Arc::new(Mutex::new(HashMap::new()));
         let (tx_pong, rx_pong) = mpsc::channel(NUMBER_DATA_POINTS);
 
@@ -1021,6 +1053,9 @@ mod tests {
                     .unwrap()
                 };
                 assert!(rx.recv().await.unwrap().is_empty());
+                if !use_supplied_socket {
+                    assert!(measurement.unicast_socket.is_none());
+                }
                 assert!(measurement.cancelled);
                 assert!(measurement.tasks.0.is_empty());
                 assert!(
@@ -1035,6 +1070,41 @@ mod tests {
         })
         .await
         .expect("constructors must report failure without waiting for sender closure");
+    }
+
+    #[tokio::test]
+    async fn public_constructor_missing_endpoint_skips_socket_factory() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for panic_if_called in [true, false] {
+                let (tx, mut rx) = mpsc::channel(1);
+                let measurement = Measurement::new_with_socket_factory(
+                    PeerState::default(),
+                    Clock::new(),
+                    tx.clone(),
+                    Arc::new(Notify::new()),
+                    || {
+                        if panic_if_called {
+                            panic!("missing endpoint must not bind a socket");
+                        }
+                        Err(io::Error::new(
+                            io::ErrorKind::AddrNotAvailable,
+                            "injected bind error",
+                        ))
+                    },
+                )
+                .await
+                .expect("an absent endpoint is reported through samples, not a bind error");
+                assert!(rx.recv().await.unwrap().is_empty());
+                assert!(measurement.unicast_socket.is_none());
+                assert!(measurement.measurement_endpoint.is_none());
+                assert!(measurement.cancelled);
+                assert!(measurement.tasks.0.is_empty());
+                assert!(!tx.is_closed());
+                assert!(rx.try_recv().is_err(), "report exactly one empty result");
+            }
+        })
+        .await
+        .expect("constructor failure must not wait for socket creation or sender closure");
     }
 
     #[tokio::test]
