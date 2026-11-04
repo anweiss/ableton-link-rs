@@ -1680,6 +1680,11 @@ mod tests {
             clock::Clock, ghostxform::GhostXForm, pingresponder, sessions::SessionId,
         };
         tokio::time::timeout(Duration::from_secs(5), async {
+            // Winsock rejects loopback-to-non-loopback probes. Its loopback
+            // subnet supports a second address without configuring an alias.
+            #[cfg(target_os = "windows")]
+            let addr = Ipv4Addr::new(127, 0, 0, 2);
+            #[cfg(not(target_os = "windows"))]
             let addr = crate::platform::network::scan_network_interfaces_blocking()
                 .into_iter().find_map(|ip| match ip { IpAddr::V4(ip) => Some(ip), _ => None })
                 .expect("a non-loopback local IPv4 address");
