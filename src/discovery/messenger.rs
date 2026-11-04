@@ -376,6 +376,32 @@ impl Messenger {
     }
 
     #[cfg(test)]
+    pub(crate) async fn receive_peer_state_fixture(&self, local: Ipv4Addr, bytes: &[u8]) {
+        // Lifecycle tests inject at the accepted-datagram boundary; real socket
+        // metadata and wire ingress are exercised separately in this module.
+        let entry = interface_socket_entries(&self.interface_sockets)
+            .into_iter()
+            .find(|entry| entry.identity.addr == local)
+            .expect("registered fixture ingress");
+        assert!(entry.is_current().unwrap());
+        let (header, length) = parse_message_header(bytes).unwrap();
+        assert_eq!(header.message_type, RESPONSE);
+        receive_peer_state_with_route(
+            self.tx_event.clone(),
+            header,
+            &bytes[length..],
+            Some((
+                &self.measurement_routes,
+                MeasurementRoute {
+                    entry,
+                    sockets: self.interface_sockets.clone(),
+                },
+            )),
+        )
+        .await;
+    }
+
+    #[cfg(test)]
     pub(crate) fn socket_probes(&self) -> Vec<std::sync::Weak<UdpSocket>> {
         let mut sockets = vec![Arc::downgrade(self.interface.as_ref().unwrap())];
         sockets.extend(

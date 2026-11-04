@@ -67,6 +67,13 @@ impl PeerGateway {
     }
 
     #[cfg(test)]
+    pub(crate) async fn receive_peer_state_fixture(&self, local: std::net::Ipv4Addr, bytes: &[u8]) {
+        self.messenger
+            .receive_peer_state_fixture(local, bytes)
+            .await;
+    }
+
+    #[cfg(test)]
     pub(crate) fn socket_probes(&self) -> Vec<std::sync::Weak<UdpSocket>> {
         let mut probes = self.messenger.socket_probes();
         probes.push(Arc::downgrade(&self.measurement_service.shared_socket));
