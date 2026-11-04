@@ -288,6 +288,10 @@ async fn measure_peer_with_socket_factory(
     notifier: Arc<Notify>,
     socket_factory: impl FnOnce() -> io::Result<Arc<UdpSocket>>,
 ) {
+    if state.measurement_endpoint.is_none() {
+        report_failed_measurement(&tx_measure_peer_result, session_id).await;
+        return;
+    }
     let socket = match socket_factory() {
         Ok(socket) => socket,
         Err(error) => {
@@ -1062,6 +1066,34 @@ mod tests {
         })
         .await
         .expect("missing endpoint must report a bounded failure event");
+    }
+
+    #[tokio::test]
+    async fn missing_endpoint_never_allocates_a_socket_or_dispatcher() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let session_id = SessionId(NodeId::from_array([9; 8]));
+            let measurements = Arc::new(Mutex::new(HashMap::new()));
+            let (tx, mut rx) = mpsc::channel(1);
+            measure_peer_with_socket_factory(
+                Clock::new(),
+                measurements.clone(),
+                tx.clone(),
+                session_id,
+                PeerState::default(),
+                Arc::new(Notify::new()),
+                || panic!("missing endpoint must fail before socket allocation"),
+            )
+            .await;
+            assert!(
+                matches!(rx.recv().await, Some(MeasurePeerEvent::XForm(id, xform))
+                if id == session_id && xform == GhostXForm::default())
+            );
+            assert!(lock(&measurements).is_empty());
+            assert!(!tx.is_closed());
+            assert!(rx.try_recv().is_err());
+        })
+        .await
+        .expect("missing endpoint must report failure without allocating resources");
     }
 
     #[tokio::test]
