@@ -331,7 +331,6 @@ async fn on_peer_state_in_epoch(
     debug!("received peer state from messenger");
 
     let peer_id = msg.node_state.ident();
-    lock(&peer_timeouts).retain(|(_, id)| id != &peer_id);
 
     let new_to = (
         Instant::now() + std::time::Duration::from_secs(u64::from(msg.ttl.min(3))), // Cap timeout at 3 seconds max
@@ -343,20 +342,14 @@ async fn on_peer_state_in_epoch(
         peer_id, msg.ttl
     );
 
-    if let Ok(mut timeouts) = peer_timeouts.try_lock() {
+    {
+        let mut timeouts = lock(&peer_timeouts);
+        timeouts.retain(|(_, id)| id != &peer_id);
         let i = timeouts
             .iter()
-            .position(|(timeout, _)| timeout >= &new_to.0);
-        if let Some(i) = i {
-            timeouts.insert(i, new_to);
-        } else {
-            timeouts.push(new_to);
-        }
-    } else {
-        debug!(
-            "Could not acquire peer_timeouts lock to update timeout for peer {}",
-            peer_id
-        );
+            .position(|(timeout, _)| timeout >= &new_to.0)
+            .unwrap_or(timeouts.len());
+        timeouts.insert(i, new_to);
     }
 
     debug!("sending peer state to observer");
@@ -391,32 +384,16 @@ pub async fn on_byebye(
 ) {
     info!("Processing BYEBYE from peer {}", peer_id);
 
-    if find_peer(&peer_id, peer_timeouts.clone()).await {
-        info!(
-            "Found peer {} in timeout list, sending PeerLeft event",
-            peer_id
-        );
-        let peer_event = tx_peer_event.clone();
-        if let Err(e) = peer_event.send(PeerEvent::PeerLeft(peer_id)).await {
-            debug!("Failed to send PeerLeft event: {:?}", e);
-        } else {
-            info!("Successfully sent PeerLeft event for peer {}", peer_id);
+    let removed = {
+        let mut timeouts = lock(&peer_timeouts);
+        let before = timeouts.len();
+        timeouts.retain(|(_, id)| id != &peer_id);
+        timeouts.len() != before
+    };
+    if removed {
+        if let Err(error) = tx_peer_event.send(PeerEvent::PeerLeft(peer_id)).await {
+            debug!("Failed to send PeerLeft event: {}", error);
         }
-
-        if let Ok(mut timeouts) = peer_timeouts.try_lock() {
-            timeouts.retain(|(_, id)| id != &peer_id);
-            info!("Removed peer {} from timeout list", peer_id);
-        } else {
-            debug!(
-                "Could not acquire peer_timeouts lock to remove peer {}",
-                peer_id
-            );
-        }
-    } else {
-        info!(
-            "Peer {} not found in timeout list (may have already been removed)",
-            peer_id
-        );
     }
 
     notifier.notify_waiters();
@@ -426,20 +403,7 @@ pub async fn find_peer(
     peer_id: &NodeId,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
 ) -> bool {
-    match peer_timeouts.try_lock() {
-        Ok(timeouts) => {
-            let found = timeouts.iter().any(|(_, id)| id == peer_id);
-            debug!("find_peer: Looking for peer {}, found: {}", peer_id, found);
-            found
-        }
-        Err(_) => {
-            debug!(
-                "Could not acquire peer_timeouts lock in find_peer for {}",
-                peer_id
-            );
-            false
-        }
-    }
+    lock(&peer_timeouts).iter().any(|(_, id)| id == peer_id)
 }
 
 pub async fn schedule_next_pruning(
@@ -458,29 +422,10 @@ async fn schedule_next_pruning_in_epoch(
     cancel: Arc<Notify>,
     lifecycle: Option<(Arc<DispatchGate>, u64)>,
 ) {
-    let pt = peer_timeouts.clone();
-
-    let has_timeouts = peer_timeouts
-        .try_lock()
-        .map(|timeouts| !timeouts.is_empty())
-        .unwrap_or(false);
-
-    if !has_timeouts {
+    let Some((timeout, peer_id)) = lock(&peer_timeouts).first().copied() else {
         return;
-    }
-
-    let (timeout_instant, peer_id) = {
-        if let Ok(timeouts) = pt.try_lock() {
-            if let Some((timeout, peer_id)) = timeouts.first().copied() {
-                let timeout_instant = timeout + std::time::Duration::from_millis(100);
-                (timeout_instant, peer_id)
-            } else {
-                return; // No timeouts available
-            }
-        } else {
-            return; // Cannot acquire lock
-        }
     };
+    let timeout_instant = timeout + std::time::Duration::from_millis(100);
 
     debug!(
         "scheduling next pruning for {}ms since gateway initialization epoch because of peer {}",
@@ -492,13 +437,6 @@ async fn schedule_next_pruning_in_epoch(
         let prune = async {
             select! {
                 _ = tokio::time::sleep_until(timeout_instant) => {
-                    let has_timeouts = peer_timeouts.try_lock()
-                        .map(|timeouts| !timeouts.is_empty())
-                        .unwrap_or(false);
-
-                    if !has_timeouts {
-                        return;
-                    }
                     let expired_peers = prune_expired_peers(peer_timeouts.clone(), epoch);
                     for peer in expired_peers.iter() {
                         info!("pruning peer {}", peer.1);
@@ -570,6 +508,77 @@ mod tests {
 
     fn init_tracing() {
         let _ = tracing_subscriber::fmt::try_init();
+    }
+
+    #[tokio::test]
+    async fn poisoned_timeout_replacement_is_atomic_and_releases_before_event_send() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let id = NodeId::from_array([71; 8]);
+            let other = NodeId::from_array([72; 8]);
+            let epoch = Instant::now();
+            let timeouts = Arc::new(Mutex::new(vec![
+                (epoch - std::time::Duration::from_secs(1), id),
+                (epoch, id),
+                (epoch + std::time::Duration::from_secs(20), other),
+            ]));
+            let poisoned = timeouts.clone();
+            assert!(std::thread::spawn(move || {
+                let _guard = poisoned.lock().unwrap();
+                panic!("poison timeout fixture");
+            })
+            .join()
+            .is_err());
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(PeerEvent::PeerLeft(other)).await.unwrap();
+            let cancel = Arc::new(Notify::new());
+            let work = tokio::spawn(on_peer_state(
+                PeerStateMessageType {
+                    node_state: crate::link::node::NodeState {
+                        node_id: id,
+                        ..Default::default()
+                    },
+                    ttl: 30,
+                    measurement_endpoint: None,
+                    audio_endpoint: None,
+                },
+                timeouts.clone(),
+                tx.clone(),
+                epoch,
+                cancel.clone(),
+                other,
+            ));
+            loop {
+                if lock(&timeouts)
+                    .iter()
+                    .any(|(deadline, node)| *node == id && *deadline > epoch)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            {
+                let current = lock(&timeouts);
+                assert_eq!(current.len(), 2);
+                assert_eq!(current[0].1, id);
+                assert!(current[0].0 <= Instant::now() + std::time::Duration::from_secs(3));
+                assert_eq!(current[1].1, other);
+            }
+            assert!(
+                !work.is_finished(),
+                "full event channel must still apply backpressure"
+            );
+            assert!(find_peer(&id, timeouts.clone()).await);
+            rx.recv().await.unwrap();
+            work.await.unwrap();
+            assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
+            on_byebye(id, timeouts.clone(), tx, cancel).await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(peer)) if peer == id));
+            assert!(!find_peer(&id, timeouts).await);
+        })
+        .await
+        .expect(
+            "timeout replacement must recover poison and release its guard before awaiting events",
+        );
     }
 
     #[tokio::test]

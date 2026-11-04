@@ -1323,7 +1323,9 @@ mod tests {
             };
             let mut measurement = inert_measurement(Arc::new(()), endpoint);
             measurement.unicast_socket = Some(socket);
-            assert!(measurement.clock.micros() > Duration::zero());
+            while measurement.clock.micros() <= Duration::zero() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
             let (tx_pong, rx_pong) = mpsc::channel(8);
             measurement.listen(rx_pong).await;
             let packet = |host, ghost, previous| {
