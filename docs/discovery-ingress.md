@@ -57,6 +57,24 @@ Linux/macOS and Winsock's indexed `0.x.x.x` form through socket2 on Windows.
 Address-only outgoing multicast setters are ambiguous when two adapters share
 an address. The Unix setter no longer needs repository-owned unsafe code.
 
+## Measurement reply source
+
+Managed announcements advertise the concrete address **and port** of that
+interface's registered discovery socket as the measurement endpoint. Its receive
+worker also recognizes measurement PINGs and builds replies from the shared
+session/clock state. Each PONG uses that same captured registration and the
+existing checked send path; wildcard multicast reception does not serve PINGs.
+This avoids wildcard source-address selection on overlapping subnets without
+weakening exact source-endpoint matching in the measurement dispatcher. The
+wildcard measurement client socket remains available for outbound measurements
+and standalone responder usage.
+
+A bounded UDP regression demonstrates the problematic route choice first: a
+wildcard sender selects a different address than the advertised bound socket.
+It then decodes the real announcement, sends a PING to its measurement endpoint,
+and verifies the PONG comes from that exact address and port. It changes no host
+routes or interface configuration and does not establish atomic topology identity.
+
 ## Registration, queues and lifecycle
 
 Each registration retains index, name, local address and its own socket/Cancel

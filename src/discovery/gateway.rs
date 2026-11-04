@@ -114,6 +114,17 @@ impl PeerGateway {
             enabled.clone(),
         )?;
         messenger.gate = gate.clone();
+        let measurement_service = MeasurementService::new(
+            ping_responder_unicast_socket,
+            peer_state.clone(),
+            session_state,
+            clock,
+            tx_measure_peer_result,
+            notifier,
+            rx_measure_peer_state,
+        )
+        .await;
+        messenger.set_measurement_responder(measurement_service.ping_responder.clone());
 
         Ok(PeerGateway {
             gate: gate.clone(),
@@ -128,16 +139,7 @@ impl PeerGateway {
             )
             .await,
             messenger,
-            measurement_service: MeasurementService::new(
-                ping_responder_unicast_socket,
-                peer_state.clone(),
-                session_state,
-                clock,
-                tx_measure_peer_result,
-                notifier,
-                rx_measure_peer_state,
-            )
-            .await,
+            measurement_service,
             peer_state,
             tx_peer_event,
             peer_timeouts: Arc::new(Mutex::new(vec![])),

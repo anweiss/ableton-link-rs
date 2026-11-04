@@ -88,6 +88,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Managed discovery advertises each interface's bound reply socket as its measurement
+endpoint. PINGs received there produce PONGs from that same registered endpoint,
+so overlapping subnet routes cannot substitute a different source address.
+Outbound measurements still use a wildcard client socket; exact peer endpoint
+matching is unchanged.
+
 Interface scanning retains IPv4 link-local addresses for networks without DHCP,
 while excluding adapters the OS reports as operationally down. This applies to
 managed discovery and both public scanners, including their `if-addrs` fallback;

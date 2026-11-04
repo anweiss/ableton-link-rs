@@ -534,13 +534,11 @@ impl Controller {
             audio_endpoint: None,
         }));
 
-        // One ping responder for every interface: bound to the wildcard address
-        // so peers on any network can reach it. Each discovery message then
-        // advertises it as `<the sending interface's address>:<this port>`
-        // (see `send_peer_state_via`), the way upstream gives every interface
-        // gateway its own measurement endpoint. Binding it to a single address
-        // (the first non-loopback one) told peers on the machine's other
-        // networks to measure against an address they cannot reach.
+        // Outbound measurements share a wildcard socket so the OS can route to
+        // any peer. Managed PING replies instead use each interface's bound
+        // discovery socket, advertised as that interface's measurement endpoint.
+        // A wildcard PONG could otherwise choose a different source address on
+        // overlapping networks and fail the peer's exact endpoint check.
         let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(
             SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
         )?);
