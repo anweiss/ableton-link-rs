@@ -145,6 +145,7 @@ pub struct InterfaceSocket {
     cancel: Cancel,
     topology: Option<Arc<Topology>>,
     generation: u64,
+    measurement_responder: bool,
     // Preserve the public address-keyed map while retaining every adapter with
     // that address. Only map roots contain siblings; captured leases do not.
     siblings: Vec<InterfaceSocket>,
@@ -163,6 +164,7 @@ impl InterfaceSocket {
             cancel: self.cancel.clone(),
             topology: self.topology.clone(),
             generation: self.generation,
+            measurement_responder: self.measurement_responder,
             siblings: Vec::new(),
         }
     }
@@ -219,9 +221,27 @@ pub struct Messenger {
     /// (`SessionController::gatewaysChangedCallback`), never by an embedder, so
     /// exposing this would add public API with no upstream counterpart.
     pub(crate) gateways_changed: Arc<AtomicUsize>,
+    measurement_responder: Option<crate::link::pingresponder::PingResponder>,
 }
 
 impl Messenger {
+    pub(crate) fn set_measurement_responder(
+        &mut self,
+        responder: crate::link::pingresponder::PingResponder,
+    ) {
+        self.measurement_responder = Some(responder);
+        let mut sockets = self
+            .interface_sockets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for group in sockets.values_mut() {
+            group.measurement_responder = true;
+            for sibling in &mut group.siblings {
+                sibling.measurement_responder = true;
+            }
+        }
+    }
+
     pub(crate) fn discard_queued_datagrams(&self) {
         if let Some(socket) = &self.interface {
             drain_socket(socket);
@@ -304,6 +324,7 @@ impl Messenger {
                 interface.clone(),
                 Some(topology.clone()),
                 generation,
+                false,
             ) {
                 Ok(_) => info!(
                     "joined Ableton Link multicast group on interface {}",
@@ -327,6 +348,7 @@ impl Messenger {
         Ok(Messenger {
             multicast_receiver,
             topology,
+            measurement_responder: None,
             interface: Some(socket),
             interface_sockets,
             peer_state,
@@ -363,6 +385,7 @@ impl Messenger {
         let _n = self.notifier.clone();
 
         let context = ReceiveContext {
+            measurement_responder: self.measurement_responder.clone(),
             topology: Some(self.topology.clone()),
             interface_sockets: interface_sockets.clone(),
             peer_state: peer_state.clone(),
@@ -431,6 +454,7 @@ impl Messenger {
 
 #[derive(Clone)]
 struct ReceiveContext {
+    measurement_responder: Option<crate::link::pingresponder::PingResponder>,
     topology: Option<Arc<Topology>>,
     #[cfg(test)]
     drain_count: Arc<AtomicUsize>,
@@ -476,6 +500,7 @@ fn add_interface(
     identity: Ipv4Interface,
     topology: Option<Arc<Topology>>,
     generation: u64,
+    measurement_responder: bool,
 ) -> Result<InterfaceSocket, std::io::Error> {
     let addr = identity.addr;
     let receiver = Arc::new(PacketSocket::new(
@@ -489,6 +514,7 @@ fn add_interface(
         cancel: Cancel::default(),
         topology,
         generation,
+        measurement_responder,
         siblings: Vec::new(),
     };
 
@@ -754,6 +780,7 @@ fn reconcile_interfaces_at(
             addr.clone(),
             context.topology.clone(),
             generation,
+            context.measurement_responder.is_some(),
         ) {
             Ok(entry) => {
                 changed = true;
@@ -904,6 +931,30 @@ fn receive_loop(
                     "discarding discovery datagram without a registered ingress from {}",
                     src
                 );
+                continue;
+            }
+
+            if buf[..amt].starts_with(&crate::link::pingresponder::PROTOCOL_HEADER) {
+                if let (Some(responder), Some(entry), SocketAddr::V4(src)) =
+                    (&context.measurement_responder, &ingress, src)
+                {
+                    // Only the advertised, bound unicast endpoint serves PINGs.
+                    // Never answer through the wildcard multicast listener or
+                    // substitute another interface's socket after receipt.
+                    if entry.measurement_responder && Arc::ptr_eq(&entry.receiver, &receive_socket)
+                    {
+                        if let Some(message) = responder.pong_message(&buf[..amt], src.into()) {
+                            select! {
+                                biased;
+                                _ = open.closed() => {}
+                                _ = &mut cancelled => break,
+                                result = send_registered(entry, &context.interface_sockets, &message, src) => {
+                                    if let Err(error) = result { debug!("failed to send registered PONG: {}", error); }
+                                }
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -1298,11 +1349,20 @@ async fn send_peer_state_via(
             return;
         }
     };
-    advertise_endpoint_for(
-        &mut peer_state_clone,
-        registration.map(|(entry, _)| entry.identity.addr),
-        &socket,
-    );
+    if registration.is_some_and(|(entry, _)| entry.measurement_responder)
+        && peer_state_clone.measurement_endpoint.is_some()
+    {
+        peer_state_clone.measurement_endpoint = match socket.local_addr() {
+            Ok(SocketAddr::V4(endpoint)) if !endpoint.ip().is_unspecified() => Some(endpoint),
+            _ => None,
+        };
+    } else {
+        advertise_endpoint_for(
+            &mut peer_state_clone,
+            registration.map(|(entry, _)| entry.identity.addr),
+            &socket,
+        );
+    }
 
     match send_message_reporting(
         socket,
@@ -1333,8 +1393,8 @@ async fn send_peer_state_via(
     }
 }
 
-/// Make the advertised measurement endpoint one a receiver of this message can
-/// reach. The ping responder is bound to the wildcard address, so its own
+/// Compatibility fallback for standalone send helpers without a managed
+/// per-interface measurement responder. If their responder uses a wildcard, its
 /// address names no interface; what a peer needs is this host's address on the
 /// network the message goes out on, with the responder's port. Upstream gets the
 /// same effect by running one gateway, and so one measurement endpoint, per
@@ -1626,8 +1686,76 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn managed_measurement_reply_matches_advertised_endpoint_despite_preferred_route() {
+        use crate::link::{
+            clock::Clock, ghostxform::GhostXForm, pingresponder, sessions::SessionId,
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let addr = crate::platform::network::scan_network_interfaces_blocking()
+                .into_iter().find_map(|ip| match ip { IpAddr::V4(ip) => Some(ip), _ => None })
+                .expect("a non-loopback local IPv4 address");
+            let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let SocketAddr::V4(destination) = peer.local_addr().unwrap() else { panic!("expected IPv4") };
+            let wildcard = Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap());
+            let mut buffer = [0; MAX_MESSAGE_SIZE];
+            wildcard.send_to(b"route probe", destination).await.unwrap();
+            let (_, preferred) = peer.recv_from(&mut buffer).await.unwrap();
+            assert_ne!(preferred.ip(), IpAddr::V4(addr), "fixture must expose different wildcard source selection");
+
+            let receiver = Arc::new(PacketSocket::new(SocketAddrV4::new(addr, 0), None).unwrap());
+            let SocketAddr::V4(endpoint) = receiver.local_addr().unwrap() else { panic!("expected IPv4") };
+            // Observe the actual local delivery interface, without changing any
+            // host routes or requiring a second configured loopback alias.
+            peer.send_to(b"ingress probe", endpoint).await.unwrap();
+            let info = loop {
+                receiver.readable().await.unwrap();
+                match receiver.try_recv(&mut buffer) {
+                    Ok((_, info)) => break info,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => panic!("ingress probe: {}", error),
+                }
+            };
+            let entry = InterfaceSocket {
+                socket: receiver.socket.clone(), receiver: receiver.clone(),
+                identity: Ipv4Interface { addr, index: u32::try_from(info.if_index).unwrap(), name: "measurement-source-fixture".into() },
+                cancel: Cancel::default(), topology: None, generation: 0,
+                measurement_responder: true, siblings: Vec::new(),
+            };
+            let (tx_event, _rx_event) = tokio::sync::mpsc::channel(1);
+            let mut context = receive_context(tx_event);
+            context.interface_sockets = Arc::new(Mutex::new(HashMap::from([(addr, entry.lease())])));
+            context.measurement_responder = Some(pingresponder::PingResponder::new(
+                wildcard.clone(), SessionId::default(), GhostXForm::default(), Clock::new(),
+            ));
+            context.peer_state.lock().unwrap().measurement_endpoint = Some(match wildcard.local_addr().unwrap() {
+                SocketAddr::V4(endpoint) => endpoint, _ => panic!("expected IPv4"),
+            });
+            send_peer_state_via(
+                entry.socket.clone(), context.peer_state.clone(), 1, ALIVE, destination,
+                context.last_broadcast_time.clone(), 0, Some((&entry, &context.interface_sockets)),
+            ).await;
+            let (size, source) = peer.recv_from(&mut buffer).await.unwrap();
+            let (_, header_len) = parse_message_header(&buffer[..size]).unwrap();
+            let payload = parse_payload(&buffer[header_len..size]).unwrap();
+            assert!(payload.entries.iter().any(|entry| matches!(entry,
+                PayloadEntry::MeasurementEndpointV4(measurement) if measurement.endpoint == Some(endpoint))));
+            assert_eq!(source, SocketAddr::V4(endpoint));
+
+            let mut children = tokio::task::JoinSet::new();
+            children.spawn(receive_loop(receiver, Some(entry.cancel.clone()), context));
+            let ping = pingresponder::encode_message(pingresponder::PING, &Payload::default()).unwrap();
+            peer.send_to(&ping, endpoint).await.unwrap();
+            let (size, source) = peer.recv_from(&mut buffer).await.unwrap();
+            assert_eq!(source, SocketAddr::V4(endpoint), "PONG must pass exact advertised endpoint matching");
+            assert_eq!(pingresponder::parse_message_header(&buffer[..size]).unwrap().0.message_type, pingresponder::PONG);
+            children.shutdown().await;
+        }).await.expect("interface-bound measurement round trip must complete");
+    }
+
     fn receive_context(tx_event: Sender<OnEvent>) -> ReceiveContext {
         ReceiveContext {
+            measurement_responder: None,
             topology: None,
             drain_count: Arc::new(AtomicUsize::new(0)),
             fail_receive_once: Arc::new(AtomicBool::new(false)),
@@ -1900,6 +2028,7 @@ mod tests {
             cancel: Cancel::default(),
             topology: None,
             generation: 0,
+            measurement_responder: false,
             siblings: Vec::new(),
         }
     }

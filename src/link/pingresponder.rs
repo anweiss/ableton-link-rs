@@ -91,16 +91,31 @@ impl PingResponder {
     /// reply with a PONG. Datagrams are dispatched by the receive loop owned by
     /// `MeasurementService`, which is the only reader of the shared socket.
     pub async fn handle_ping(&self, data: &[u8], src: SocketAddr) {
-        let unicast_socket = match self.unicast_socket.as_ref() {
-            Some(socket) => socket,
-            None => return,
+        let Some(socket) = self.unicast_socket.as_ref() else {
+            return;
         };
+        let Some(message) = self.pong_message(data, src) else {
+            return;
+        };
+        if let Err(error) = socket.send_to(&message, src).await {
+            debug!("failed to send pong message to {}: {}", src, error);
+        }
+    }
 
+    /// Build a reply independently of its transport. Managed discovery sends
+    /// this through the same bound registration it advertises for measurement.
+    pub(crate) fn pong_message(&self, data: &[u8], src: SocketAddr) -> Option<Vec<u8>> {
+        if data.len() < PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE
+            || !data.starts_with(&PROTOCOL_HEADER)
+            || data[PROTOCOL_HEADER_SIZE] != PING
+        {
+            return None;
+        }
         let (_, header_len) = match parse_message_header(data) {
             Ok(header) => header,
             Err(e) => {
                 debug!("failed to parse ping message header from {}: {}", src, e);
-                return;
+                return None;
             }
         };
 
@@ -109,7 +124,7 @@ impl PingResponder {
 
         if payload_size > max_payload_size {
             debug!("received invalid message from {}", src);
-            return;
+            return None;
         }
 
         let ping_message_received = self.ping_message_received.swap(true, Ordering::Relaxed);
@@ -122,7 +137,7 @@ impl PingResponder {
             Ok(payload) => payload,
             Err(e) => {
                 debug!("failed to parse ping payload from {}: {}", src, e);
-                return;
+                return None;
             }
         };
 
@@ -158,17 +173,10 @@ impl PingResponder {
             Ok(message) => message,
             Err(e) => {
                 debug!("failed to encode pong message for {}: {}", src, e);
-                return;
+                return None;
             }
         };
-        if let Err(e) = unicast_socket.send_to(&pong_message, src).await {
-            debug!("failed to send pong message to {}: {}", src, e);
-            return;
-        }
-
-        if !ping_message_received {
-            debug!("sent pong message to {}", src);
-        }
+        Some(pong_message)
     }
 
     pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
