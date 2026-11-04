@@ -19,7 +19,8 @@
         { "type": "style", "section": "Styles", "hidden": true }
       ],
       "extra-files": [
-        "Cargo.lock"
+        "Cargo.lock",
+        "README.md"
       ]
     }
   }
