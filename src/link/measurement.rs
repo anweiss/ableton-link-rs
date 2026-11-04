@@ -749,6 +749,7 @@ impl Measurement {
         tokio::pin!(cancelled);
         cancelled.as_mut().enable();
         let (tx_timer, mut rx_timer) = mpsc::channel(1);
+        let (tx_terminal, mut rx_terminal) = mpsc::channel(1);
 
         info!(
             "initiating measurement using socket {:?} for measurement_endpoint {:?}",
@@ -789,7 +790,7 @@ impl Measurement {
 
         let s = success.clone();
         let d = data.clone();
-        let t = tx_measurement.clone();
+        let t = tx_terminal.clone();
 
         let finished_notifier = Arc::new(Notify::new());
 
@@ -797,8 +798,8 @@ impl Measurement {
 
         measurement.tasks.0.push(tokio::spawn(async move {
             while rx_timer.recv().await.is_some() {
-                fn_loop.notify_one();
                 finish(s.clone(), endpoint, d.clone(), t.clone()).await;
+                fn_loop.notify_one();
             }
         }));
 
@@ -831,7 +832,7 @@ impl Measurement {
             Some(unicast_socket.clone()),
             endpoint,
             data.clone(),
-            tx_measurement.clone(),
+            tx_terminal,
             finished_notifier.clone(),
             route,
         );
@@ -841,7 +842,15 @@ impl Measurement {
                 measurement.cancelled = true;
                 measurement.tasks.abort();
             }
-            _ = timer => {}
+            _ = async {
+                timer.await;
+                if let Some(samples) = rx_terminal.recv().await {
+                    rx_terminal.close();
+                    if let Err(error) = tx_measurement.send(samples).await {
+                        debug!("measurement result consumer closed: {}", error);
+                    }
+                }
+            } => {}
         }
 
         measurement
@@ -1377,6 +1386,69 @@ mod tests {
         })
         .await
         .expect("pong worker must process subsequent valid samples and terminate");
+    }
+
+    #[tokio::test]
+    async fn public_measurements_preserve_both_results_on_a_shared_full_channel() {
+        async fn complete(tx: Sender<Vec<(f64, f64)>>, ghost: i64) -> Measurement {
+            let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let SocketAddr::V4(endpoint) = peer.local_addr().unwrap() else {
+                panic!("IPv4")
+            };
+            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let (tx_pong, rx_pong) = mpsc::channel(NUMBER_DATA_POINTS);
+            let pong = encode_message(
+                PONG,
+                &Payload {
+                    entries: vec![
+                        PayloadEntry::HostTime(HostTime::new(Duration::microseconds(100))),
+                        PayloadEntry::GhostTime(crate::link::payload::GhostTime::new(
+                            Duration::microseconds(ghost),
+                        )),
+                        PayloadEntry::PrevGhostTime(PrevGhostTime::new(Duration::microseconds(
+                            ghost + 100,
+                        ))),
+                    ],
+                },
+            )
+            .unwrap();
+            for _ in 0..=NUMBER_DATA_POINTS / 2 {
+                tx_pong.send((pong.clone(), endpoint.into())).await.unwrap();
+            }
+            Measurement::with_socket(
+                PeerState {
+                    measurement_endpoint: Some(endpoint),
+                    ..PeerState::default()
+                },
+                Clock::new(),
+                tx,
+                Arc::new(Notify::new()),
+                socket,
+                rx_pong,
+            )
+            .await
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            let (tx, mut rx) = mpsc::channel(1);
+            let first = complete(tx.clone(), 200).await;
+            assert_eq!(rx.len(), 1);
+            let mut second = tokio::spawn(complete(tx.clone(), 400));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), &mut second)
+                    .await
+                    .is_err(),
+                "the second public constructor must honor caller backpressure, not drop its result"
+            );
+            let a = rx.recv().await.unwrap();
+            let second = second.await.unwrap();
+            let b = rx.recv().await.unwrap();
+            assert!(a.len() > NUMBER_DATA_POINTS && b.len() > NUMBER_DATA_POINTS);
+            assert_eq!(a[1], (100.0, 150.0));
+            assert_eq!(b[1], (100.0, 350.0));
+            drop((first, second));
+        })
+        .await
+        .expect("both public measurements must deliver despite sharing a full result channel");
     }
 
     #[tokio::test]
