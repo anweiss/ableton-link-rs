@@ -2337,7 +2337,7 @@ mod dispatch_gate_tests {
             assert_eq!(controller.session_id(), SessionId(node_id));
             let previous_pings = pings.load(Ordering::Relaxed);
             let timeline = Timeline {
-                tempo: tempo::Tempo::new([120.0, 125.0, 150.0][cycle as usize]),
+                tempo: tempo::Tempo::new([100.0, 125.0, 150.0][cycle as usize]),
                 ..Timeline::default()
             };
             // Decode accepted discovery bytes with the current registration;

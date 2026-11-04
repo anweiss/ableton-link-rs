@@ -1045,13 +1045,35 @@ fn drain_socket(socket: &UdpSocket) {
     }
 }
 
+const DISCOVERY_HANDOFF_CAPACITY: usize = 64;
+
 fn receive_loop(
     receive_socket: Arc<PacketSocket>,
     cancel: Option<Cancel>,
     context: ReceiveContext,
 ) -> impl std::future::Future<Output = ()> {
     let mut open = context.gate.subscribe();
+    let mut delivery_open = context.gate.subscribe();
     async move {
+        let (handoff, mut pending) = tokio::sync::mpsc::channel(DISCOVERY_HANDOFF_CAPACITY);
+        let delivery_gate = context.gate.clone();
+        let events = context.tx_event.clone();
+        let mut delivery_task = tokio::task::JoinSet::new();
+        delivery_task.spawn(async move {
+            while let Some((_permit, _, event)) = crate::link::controller::gated_recv(
+                &delivery_gate,
+                &mut delivery_open,
+                &mut pending,
+            )
+            .await
+            {
+                select! {
+                    biased;
+                    _ = delivery_open.closed() => {}
+                    result = events.send(event) => { if result.is_err() { break; } }
+                }
+            }
+        });
         loop {
             let mut buf = [0; MAX_MESSAGE_SIZE];
             let cancelled = async {
@@ -1195,8 +1217,8 @@ fn receive_loop(
                                 return;
                             }
 
-                            receive_peer_state_with_route(
-                                context.tx_event.clone(),
+                            queue_peer_state(
+                                &handoff,
                                 header,
                                 &buf[header_len..amt],
                                 ingress.as_ref().map(|entry| {
@@ -1208,8 +1230,7 @@ fn receive_loop(
                                         },
                                     )
                                 }),
-                            )
-                            .await;
+                            );
                         }
                         RESPONSE => {
                             if !is_enabled {
@@ -1220,8 +1241,8 @@ fn receive_loop(
                                 return;
                             }
 
-                            receive_peer_state_with_route(
-                                context.tx_event.clone(),
+                            queue_peer_state(
+                                &handoff,
                                 header,
                                 &buf[header_len..amt],
                                 ingress.as_ref().map(|entry| {
@@ -1233,13 +1254,12 @@ fn receive_loop(
                                         },
                                     )
                                 }),
-                            )
-                            .await;
+                            );
                         }
                         BYEBYE => {
                             context.measurement_routes.remove_peer(header.ident);
                             info!("Received BYEBYE message from peer {}", header.ident);
-                            receive_bye_bye(context.tx_event.clone(), header.ident).await;
+                            let _ = handoff.try_send(OnEvent::Byebye(header.ident));
                         }
                         _ => {
                             tracing::warn!(
@@ -1623,6 +1643,34 @@ async fn receive_peer_state_with_route(
     buf: &[u8],
     route: Option<(&MeasurementRoutes, MeasurementRoute)>,
 ) {
+    if let Some(event) = peer_state_event(header, buf, route) {
+        let _ = tx.send(event).await;
+    }
+}
+
+fn queue_peer_state(
+    tx: &Sender<OnEvent>,
+    header: MessageHeader,
+    buf: &[u8],
+    route: Option<(&MeasurementRoutes, MeasurementRoute)>,
+) {
+    // Reserve before decoding/recording a route so dropped events cannot grow
+    // the routing table while the consumer is backpressured.
+    match tx.try_reserve() {
+        Ok(permit) => {
+            if let Some(event) = peer_state_event(header, buf, route) {
+                permit.send(event);
+            }
+        }
+        Err(error) => debug!("dropping discovery event from bounded handoff: {}", error),
+    }
+}
+
+fn peer_state_event(
+    header: MessageHeader,
+    buf: &[u8],
+    route: Option<(&MeasurementRoutes, MeasurementRoute)>,
+) -> Option<OnEvent> {
     let payload = parse_payload(buf).unwrap();
     let measurement_endpoint = payload.entries.iter().find_map(|e| {
         if let PayloadEntry::MeasurementEndpointV4(me) = e {
@@ -1645,17 +1693,12 @@ async fn receive_peer_state_with_route(
         routes.record(header.ident, measurement_endpoint, header.ttl, route);
     }
 
-    debug!("sending peer state to gateway {}", node_state.ident());
-    let _ = tx
-        .send(OnEvent::PeerState(PeerStateMessageType {
-            node_state,
-            ttl: header.ttl,
-            measurement_endpoint,
-            audio_endpoint,
-        }))
-        .await;
-
-    // info!("peer state sent")
+    Some(OnEvent::PeerState(PeerStateMessageType {
+        node_state,
+        ttl: header.ttl,
+        measurement_endpoint,
+        audio_endpoint,
+    }))
 }
 
 pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
@@ -2268,6 +2311,119 @@ mod tests {
             reconcile_interfaces(&messenger.multicast_receiver.socket, &context, &mut children, &[]);
             children.shutdown().await;
         }).await.expect("Messenger setup and reconciliation must retain measurement endpoints");
+    }
+
+    #[tokio::test]
+    async fn saturated_discovery_handoff_keeps_measurement_roundtrips_and_restart_live() {
+        use crate::link::{
+            clock::Clock, ghostxform::GhostXForm, pingresponder, sessions::SessionId,
+        };
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let identity = interface_socket().identity;
+            let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let SocketAddr::V4(peer_endpoint) = peer.local_addr().unwrap() else {
+                panic!("IPv4")
+            };
+            let wildcard = Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap());
+            let SocketAddr::V4(wildcard_endpoint) = wildcard.local_addr().unwrap() else {
+                panic!("IPv4")
+            };
+            let (tx, mut events) = tokio::sync::mpsc::channel(1);
+            tx.send(OnEvent::Byebye(NodeId::from_array([88; 8])))
+                .await
+                .unwrap();
+            let mut messenger = Messenger::new_with_interfaces(
+                Arc::new(Mutex::new(PeerState {
+                    measurement_endpoint: Some(wildcard_endpoint),
+                    ..PeerState::default()
+                })),
+                tx,
+                Instant::now(),
+                Arc::new(Notify::new()),
+                Arc::new(Mutex::new(true)),
+                Some(Ok(vec![identity])),
+            )
+            .unwrap();
+            messenger.set_measurement_responder(pingresponder::PingResponder::new(
+                wildcard,
+                SessionId::default(),
+                GhostXForm::default(),
+                Clock::new(),
+            ));
+            let entry = interface_socket_entries(&messenger.interface_sockets)
+                .pop()
+                .unwrap();
+            let endpoint = entry.socket.local_addr().unwrap();
+            let mut children = tokio::task::JoinSet::new();
+            children.spawn(receive_loop(
+                entry.receiver.clone(),
+                Some(entry.cancel.clone()),
+                messenger.receive_context(),
+            ));
+            let remote = PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::from_array([92; 8]),
+                    ..NodeState::default()
+                },
+                measurement_endpoint: Some(peer_endpoint),
+                ..PeerState::default()
+            };
+            let announcement = encode_message(
+                remote.ident(),
+                30,
+                RESPONSE,
+                &Payload::from(remote.clone()),
+                0,
+            )
+            .unwrap();
+            for _ in 0..DISCOVERY_HANDOFF_CAPACITY * 2 {
+                peer.send_to(&announcement, endpoint).await.unwrap();
+            }
+            let ping =
+                pingresponder::encode_message(pingresponder::PING, &Payload::default()).unwrap();
+            peer.send_to(&ping, endpoint).await.unwrap();
+            let mut buf = [0; MAX_MESSAGE_SIZE];
+            let (size, source) = peer.recv_from(&mut buf).await.unwrap();
+            assert_eq!(source, endpoint);
+            assert_eq!(
+                pingresponder::parse_message_header(&buf[..size])
+                    .unwrap()
+                    .0
+                    .message_type,
+                pingresponder::PONG
+            );
+            let route = messenger.measurement_routes.resolve(&remote).unwrap();
+            let (tx_pong, mut rx_pong) = tokio::sync::mpsc::channel(1);
+            route
+                .dispatch()
+                .lock()
+                .unwrap()
+                .insert(peer_endpoint.into(), tx_pong);
+            route.send(&ping, peer_endpoint).await.unwrap();
+            let (_, source) = peer.recv_from(&mut buf).await.unwrap();
+            assert_eq!(source, endpoint);
+            let pong =
+                pingresponder::encode_message(pingresponder::PONG, &Payload::default()).unwrap();
+            peer.send_to(&pong, endpoint).await.unwrap();
+            assert_eq!(rx_pong.recv().await.unwrap(), (pong, peer_endpoint.into()));
+            assert_eq!(
+                events.len(),
+                1,
+                "measurement completed without draining discovery events"
+            );
+            messenger.gate.stop().await;
+            while events.try_recv().is_ok() {}
+            messenger.gate.start().await;
+            assert!(
+                events.try_recv().is_err(),
+                "old handoff events must not cross restart"
+            );
+            peer.send_to(&announcement, endpoint).await.unwrap();
+            assert!(matches!(events.recv().await, Some(OnEvent::PeerState(_))));
+            children.shutdown().await;
+        })
+        .await
+        .expect("full discovery queues must not block measurement traffic or lifecycle stop");
     }
 
     #[tokio::test]
