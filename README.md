@@ -406,9 +406,9 @@ panic recovery; this is not a blanket guarantee for every API or invalid state:
   `Err(Error::Protocol("invalid message size" | "invalid protocol header"))`, and
   `discovery::messages::parse_payload` returns `Error::Protocol("truncated payload entry")` for
   an entry that announces more bytes than follow. The receive loops drop what doesn't parse.
-- Durations derived from a peer's times are converted with a saturating microsecond count, and
-  a time that can't be represented on the wire is an encode error (`Error::Protocol("time out of
-  range")`) rather than a panic.
+- Timeline and start/stop timestamp encoders use saturating microsecond conversions.
+  The `HostTime`, `GhostTime`, and `PrevGhostTime` payload entry encoders instead return
+  `Error::Protocol("time out of range")` for times outside the wire format's range.
 - The hardened session, measurement, gateway, and controller paths use a blocking,
   poison-tolerant helper (`sync::lock`) instead of `try_lock().unwrap()`.
 - A peer that can't be measured (no measurement endpoint, or no socket to measure from) is
