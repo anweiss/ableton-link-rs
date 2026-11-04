@@ -25,19 +25,23 @@ Licensed under the [GNU General Public License v3.0](LICENSE), consistent with t
 
 Add this to your `Cargo.toml`:
 
+<!-- x-release-please-start-version -->
 ```toml
 [dependencies]
 ableton-link-rs = "0.3.0"
 ```
+<!-- x-release-please-end -->
 
 ### `no_std` Usage
 
 For embedded or `no_std` environments, disable the default `std` feature to access only the core types:
 
+<!-- x-release-please-start-version -->
 ```toml
 [dependencies]
 ableton-link-rs = { version = "0.3.0", default-features = false }
 ```
+<!-- x-release-please-end -->
 
 This gives you access to core types like `Beats`, `Tempo`, `Timeline`, `GhostXForm`, `StartStopState`, and `NodeId` without pulling in networking dependencies, along with the wire encoding layer in `src/encoding.rs` (`Encode`/`Decode`, `encode_to_vec`, `decode_from_slice`). Requires `alloc`.
 
@@ -45,10 +49,12 @@ This gives you access to core types like `Beats`, `Tempo`, `Timeline`, `GhostXFo
 
 Audio sharing is opt-in via the `audio` feature, which implies `std`:
 
+<!-- x-release-please-start-version -->
 ```toml
 [dependencies]
 ableton-link-rs = { version = "0.3.0", features = ["audio"] }
 ```
+<!-- x-release-please-end -->
 
 ### Basic Usage
 
@@ -383,7 +389,7 @@ this for payloads supplied by a caller. With the `audio` feature,
 `link_audio::messages::encode_message` enforces its own limit and reports it as
 `AudioError::MessageTooLarge`.
 
-> **Breaking change in 0.3.0:** `Encode::encode_to` previously returned `()`. It now returns
+> **Breaking change in 0.4.0:** `Encode::encode_to` previously returned `()`. It now returns
 > `Result<(), EncodeError>`, and `EncodeError` — previously an uninhabited enum — has its first
 > constructible variant, `StringTooLong`. Downstream `Encode` implementations must return
 > `Ok(())` (and propagate nested encodes with `?`); downstream callers of `encode_to` must handle
