@@ -92,6 +92,22 @@ both announcements and PONG sources for the new registration as well.
 
 ## Registration, queues and lifecycle
 
+Each socket reader owns one delivery task and a 64-event discovery handoff queue.
+It reserves capacity before decoding ALIVE/RESPONSE state or recording a route;
+overflow updates are discarded rather than blocking measurement datagrams or
+accumulating routing hints. The delivery task uses the lifecycle gate's receive
+permit and preparation drain, cancels a blocked event send when the gate closes,
+and is aborted when its owning reader exits. The bounded saturation regression
+keeps the public discovery queue full while real UDP PING/PONG round trips finish,
+then verifies stop/restart discards stale handoff events.
+
+Measurement completion uses a private capacity-one terminal channel per job.
+Success, timeout and send failure compete without blocking that private channel;
+its winning result is forwarded to the public caller using cancellation-aware
+backpressure. This distinguishes competing outcomes of one job from independent
+public measurements sharing a result channel. Both full-private-channel and
+shared-public-channel regressions cover the distinction.
+
 Each registration retains index, name, local address and its own socket/Cancel
 generation. Receiving a datagram and capturing its response registration are
 serialized with interface-map changes. Response work retains that generation

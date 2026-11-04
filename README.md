@@ -97,6 +97,13 @@ Missing, expired, or invalidated routing hints fail the measurement rather than
 falling back to an ambiguous wildcard route. Standalone measurement APIs still
 use caller-supplied sockets or OS routing; exact peer endpoint matching is unchanged.
 
+Discovery forwarding uses a bounded queue and a lifecycle-owned delivery worker,
+so a slow event consumer does not stop that socket from handling PINGs/PONGs.
+Overflow discovery updates are dropped; periodic announcements can refresh them.
+Each measurement keeps competing terminal results on its own private channel,
+then forwards the winning result with caller backpressure. Public measurements
+sharing a full result channel therefore do not discard each other's completions.
+
 Interface scanning retains IPv4 link-local addresses for networks without DHCP,
 while excluding adapters the OS reports as operationally down. This applies to
 managed discovery and both public scanners, including their `if-addrs` fallback;
