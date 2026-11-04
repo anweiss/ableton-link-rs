@@ -66,8 +66,20 @@ session/clock state. Each PONG uses that same captured registration and the
 existing checked send path; wildcard multicast reception does not serve PINGs.
 This avoids wildcard source-address selection on overlapping subnets without
 weakening exact source-endpoint matching in the measurement dispatcher. The
-wildcard measurement client socket remains available for outbound measurements
-and standalone responder usage.
+wildcard socket remains available for standalone measurement/responder usage.
+Managed outbound PINGs use the captured discovery registration too. Hints are
+keyed by peer identity and advertised endpoint, expire with the announcement TTL,
+and are cleared on restart. A missing or stale hint fails closed. Each interface
+registration owns a separate PONG dispatch table, so identical remote endpoints
+on different adapters do not overwrite each other's routes. All PING retries use
+the checked registered send path; this still does not close the atomic OS index
+incarnation gap described below.
+Measurement datagrams addressed to a unique bound port retain that registration's
+ownership. Same-host delivery can name the loopback adapter; this is accepted
+only when the registration's OS snapshot identifies both the loopback index and
+an assigned local source address. Missing snapshot evidence fails closed. This
+exception does not apply to discovery packets or foreign-adapter measurement
+traffic, and does not relax exact remote endpoint matching for PONGs.
 
 A bounded UDP regression demonstrates the problematic route choice first: a
 wildcard sender selects a different address than the advertised bound socket.

@@ -534,11 +534,9 @@ impl Controller {
             audio_endpoint: None,
         }));
 
-        // Outbound measurements share a wildcard socket so the OS can route to
-        // any peer. Managed PING replies instead use each interface's bound
-        // discovery socket, advertised as that interface's measurement endpoint.
-        // A wildcard PONG could otherwise choose a different source address on
-        // overlapping networks and fail the peer's exact endpoint check.
+        // Standalone measurement traffic retains a wildcard socket. Managed
+        // measurements use discovery's learned interface registration for both
+        // PING and PONG, rather than asking the OS to choose an ambiguous route.
         let ping_responder_unicast_socket = Arc::new(new_udp_reuseport(
             SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
         )?);
@@ -2231,14 +2229,22 @@ mod dispatch_gate_tests {
             .unwrap();
         let peer_id = NodeId::from_array([1; 8]);
         let peer_session = SessionId(peer_id);
-        // The controller's measurement sockets are bound to the wildcard address,
-        // so the OS routes each ping; a fake peer on loopback is reachable from
-        // them on every platform.
-        let socket = Arc::new(
-            tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap(),
-        );
+        let local = controller
+            .discovery
+            .socket_probes()
+            .into_iter()
+            .filter_map(|socket| socket.upgrade())
+            .find_map(|socket| match socket.local_addr().unwrap() {
+                std::net::SocketAddr::V4(addr) if !addr.ip().is_unspecified() => Some(*addr.ip()),
+                _ => None,
+            })
+            .expect("identified local discovery interface");
+        let socket = Arc::new(tokio::net::UdpSocket::bind((local, 0)).await.unwrap());
+        let announcement_socket = socket.clone();
+        socket2::SockRef::from(announcement_socket.as_ref())
+            .set_multicast_if_v4(&local)
+            .unwrap();
+        announcement_socket.set_multicast_loop_v4(true).unwrap();
         let std::net::SocketAddr::V4(endpoint) = socket.local_addr().unwrap() else {
             panic!("expected an IPv4 measurement endpoint");
         };
@@ -2274,22 +2280,34 @@ mod dispatch_gate_tests {
         controller.disable().await;
 
         controller.enable().await;
-        controller.peers.lock().unwrap().push(ControllerPeer {
-            peer_state: PeerState {
+        let announce = |timeline| {
+            let state = PeerState {
                 node_state: NodeState {
                     node_id: peer_id,
                     session_id: peer_session,
-                    timeline: Timeline::default(),
+                    timeline,
                     start_stop_state: StartStopState::default(),
                 },
                 measurement_endpoint: Some(endpoint),
                 audio_endpoint: None,
-            },
-        });
-        controller
-            .sessions
-            .saw_session_timeline(peer_session, Timeline::default())
-            .await;
+            };
+            crate::discovery::messages::encode_message(
+                peer_id,
+                30,
+                crate::discovery::messages::RESPONSE,
+                &crate::link::payload::Payload::from(state),
+                0,
+            )
+            .unwrap()
+        };
+        let destination = std::net::SocketAddrV4::new(
+            crate::discovery::MULTICAST_ADDR,
+            crate::discovery::LINK_PORT,
+        );
+        announcement_socket
+            .send_to(&announce(Timeline::default()), destination)
+            .await
+            .unwrap();
         tokio::time::timeout(TEST_TIMEOUT, async {
             while pings.load(Ordering::Relaxed) == 0 {
                 received_ping.notified().await;
@@ -2328,28 +2346,14 @@ mod dispatch_gate_tests {
             assert_eq!(controller.session_id(), SessionId(node_id));
             let previous_pings = pings.load(Ordering::Relaxed);
             let timeline = Timeline {
-                tempo: tempo::Tempo::new(135.0 + f64::from(cycle)),
+                tempo: tempo::Tempo::new([120.0, 125.0, 150.0][cycle as usize]),
                 ..Timeline::default()
             };
-            controller.peers.lock().unwrap().push(ControllerPeer {
-                peer_state: PeerState {
-                    node_state: NodeState {
-                        node_id: peer_id,
-                        session_id: peer_session,
-                        timeline,
-                        start_stop_state: StartStopState::default(),
-                    },
-                    measurement_endpoint: Some(endpoint),
-                    audio_endpoint: None,
-                },
-            });
-
-            // Seed discovery without multicast; everything from requesting a
-            // measurement through UDP ping/pong, regression, and joining is real.
-            controller
-                .sessions
-                .saw_session_timeline(peer_session, timeline)
-                .await;
+            // Use an actual announcement so measurement routing learns ingress.
+            announcement_socket
+                .send_to(&announce(timeline), destination)
+                .await
+                .unwrap();
             tokio::time::timeout(TEST_TIMEOUT, async {
                 while controller.session_id() != peer_session
                     || controller.num_peers() != 1

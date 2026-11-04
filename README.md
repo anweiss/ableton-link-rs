@@ -91,8 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Managed discovery advertises each interface's bound reply socket as its measurement
 endpoint. PINGs received there produce PONGs from that same registered endpoint,
 so overlapping subnet routes cannot substitute a different source address.
-Outbound measurements still use a wildcard client socket; exact peer endpoint
-matching is unchanged.
+Managed outbound measurements use the registration where discovery learned that
+peer endpoint, including its interface-bound socket and its own PONG dispatcher.
+Missing, expired, or invalidated routing hints fail the measurement rather than
+falling back to an ambiguous wildcard route. Standalone measurement APIs still
+use caller-supplied sockets or OS routing; exact peer endpoint matching is unchanged.
 
 Interface scanning retains IPv4 link-local addresses for networks without DHCP,
 while excluding adapters the OS reports as operationally down. This applies to
