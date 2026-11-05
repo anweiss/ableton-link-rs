@@ -57,7 +57,11 @@ impl PeerGateway {
 
     pub(crate) async fn stop(&self) {
         self.gate.stop().await;
-        lock_timeouts(&self.peer_timeouts).clear();
+        crate::platform::io_context::retry_state(|| {
+            try_timeouts(&self.peer_timeouts)?.clear();
+            Some(())
+        })
+        .await;
     }
 
     #[cfg(test)]
@@ -163,17 +167,17 @@ impl PeerGateway {
         _measurement_endpoint: Option<SocketAddrV4>,
         ghost_xform: GhostXForm,
     ) {
-        self.update_node_state_now(node_state, ghost_xform);
-    }
-
-    pub(crate) fn update_node_state_now(&self, node_state: NodeState, ghost_xform: GhostXForm) {
-        self.measurement_service
-            .ping_responder
-            .update_node_state_now(node_state.session_id, ghost_xform);
-        self.peer_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .node_state = node_state;
+        crate::platform::io_context::retry_state(|| {
+            let mut peer = crate::platform::io_context::try_state(&self.peer_state)?;
+            let responder = &self.measurement_service.ping_responder;
+            let mut id = crate::platform::io_context::try_state(&responder.session_id)?;
+            let mut form = crate::platform::io_context::try_state(&responder.ghost_x_form)?;
+            peer.node_state = node_state.clone();
+            *id = node_state.session_id;
+            *form = ghost_xform;
+            Some(())
+        })
+        .await;
     }
 
     pub async fn listen(&self, rx_event: Receiver<OnEvent>, notifier: Arc<Notify>) {
@@ -285,7 +289,7 @@ impl PeerGateway {
                 result = &mut signal, if signal_available => {
                     match result {
                         Ok(()) => {
-                            send_byebye(peer_state.lock().unwrap().ident());
+                            if let Some(state) = crate::platform::io_context::try_state(&peer_state) { send_byebye(state.ident()); }
                             notifier.notify_waiters();
                             break;
                         }
@@ -351,22 +355,24 @@ async fn on_peer_state_in_epoch(
         return;
     }
     let peer_id = msg.node_state.ident();
-    {
-        let mut timeouts = lock_timeouts(&peer_timeouts);
-        let observation = msg.observation.clone();
-        let commit = || {
+    let ttl = msg.ttl;
+    let observation = msg.observation.clone();
+    let mut msg = Some(msg);
+    let mut slot = Some(slot);
+    let commit = crate::platform::io_context::retry_state(|| {
+        let mut timeouts = try_timeouts(&peer_timeouts)?;
+        let mut publish = || {
             let now = Instant::now();
-            if msg.ttl > 0 && deadline <= now {
-                return;
+            if ttl > 0 && deadline <= now {
+                return false;
             }
-            if msg.ttl == 0 {
+            if ttl == 0 {
                 if !timeouts.iter().any(|(_, id)| *id == peer_id) {
-                    return;
+                    return false;
                 }
                 timeouts.retain(|(_, id)| *id != peer_id);
-                // Once the timeout is removed, cleanup is an irrevocable FIFO
-                // obligation. Dropped newer traffic must not cancel peer removal.
-                slot.send(PeerEvent::PeerLeft(peer_id));
+                // Once removed, cleanup remains an irrevocable FIFO obligation.
+                slot.take().unwrap().send(PeerEvent::PeerLeft(peer_id));
             } else {
                 let new_to = (
                     deadline.min(now + std::time::Duration::from_secs(3)),
@@ -378,14 +384,28 @@ async fn on_peer_state_in_epoch(
                     .position(|(time, _)| *time >= new_to.0)
                     .unwrap_or(timeouts.len());
                 timeouts.insert(position, new_to);
-                slot.send(PeerEvent::Observed(msg));
+                slot.take()
+                    .unwrap()
+                    .send(PeerEvent::Observed(msg.take().unwrap()));
             }
+            true
         };
-        if let Some(observation) = observation {
-            observation.while_current(commit);
+        if let Some(observation) = &observation {
+            observation
+                .try_while_current(publish)
+                .map(|result| result.unwrap_or(false))
         } else {
-            commit();
+            Some(publish())
         }
+    });
+    let committed = select! {
+        biased;
+        _ = PeerObservation::invalidated(observation.as_deref()) => false,
+        _ = tokio::time::sleep_until(deadline), if ttl > 0 => false,
+        committed = commit => committed,
+    };
+    if !committed {
+        return;
     }
 
     cancel.notify_waiters();
@@ -399,13 +419,12 @@ async fn on_peer_state_in_epoch(
     .await;
 }
 
-fn lock_timeouts(
+fn try_timeouts(
     timeouts: &Mutex<Vec<(Instant, NodeId)>>,
-) -> std::sync::MutexGuard<'_, Vec<(Instant, NodeId)>> {
-    timeouts.lock().unwrap_or_else(|error| {
-        timeouts.clear_poison();
-        error.into_inner()
-    })
+) -> Option<std::sync::MutexGuard<'_, Vec<(Instant, NodeId)>>> {
+    let guard = crate::platform::io_context::try_state(timeouts)?;
+    timeouts.clear_poison();
+    Some(guard)
 }
 
 pub async fn on_byebye(
@@ -420,23 +439,33 @@ pub async fn on_byebye(
     let Ok(slot) = tx_peer_event.reserve().await else {
         return;
     };
-    let mut timeouts = lock_timeouts(&peer_timeouts);
-    if timeouts.iter().any(|(_, id)| *id == peer_id) {
-        timeouts.retain(|(_, id)| *id != peer_id);
-        slot.send(PeerEvent::PeerLeft(peer_id));
-    }
-    if timeouts.is_empty() {
-        notifier.notify_waiters();
-    }
+    let mut slot = Some(slot);
+    crate::platform::io_context::retry_state(|| {
+        let mut timeouts = try_timeouts(&peer_timeouts)?;
+        if timeouts.iter().any(|(_, id)| *id == peer_id) {
+            timeouts.retain(|(_, id)| *id != peer_id);
+            slot.take().unwrap().send(PeerEvent::PeerLeft(peer_id));
+        }
+        if timeouts.is_empty() {
+            notifier.notify_waiters();
+        }
+        Some(())
+    })
+    .await;
 }
 
 pub async fn find_peer(
     peer_id: &NodeId,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
 ) -> bool {
-    lock_timeouts(&peer_timeouts)
-        .iter()
-        .any(|(_, id)| id == peer_id)
+    crate::platform::io_context::retry_state(|| {
+        Some(
+            try_timeouts(&peer_timeouts)?
+                .iter()
+                .any(|(_, id)| id == peer_id),
+        )
+    })
+    .await
 }
 
 pub async fn schedule_next_pruning(
@@ -455,7 +484,9 @@ async fn schedule_next_pruning_in_epoch(
     cancel: Arc<Notify>,
     lifecycle: Option<(Arc<DispatchGate>, u64)>,
 ) {
-    if lock_timeouts(&peer_timeouts).is_empty() {
+    if crate::platform::io_context::retry_state(|| Some(try_timeouts(&peer_timeouts)?.is_empty()))
+        .await
+    {
         return;
     }
     // Register before spawning so a renewal cannot be missed before the worker polls.
@@ -464,7 +495,10 @@ async fn schedule_next_pruning_in_epoch(
     tokio::spawn(async move {
         let prune = async {
             loop {
-                let deadline = lock_timeouts(&peer_timeouts).first().map(|(time, _)| *time);
+                let deadline = crate::platform::io_context::retry_state(|| {
+                    Some(try_timeouts(&peer_timeouts)?.first().map(|(time, _)| *time))
+                })
+                .await;
                 let Some(deadline) = deadline else {
                     return;
                 };
@@ -474,19 +508,24 @@ async fn schedule_next_pruning_in_epoch(
                 };
                 // A renewal can win while capacity is unavailable. Removal and
                 // publication share one guard with the announcement commit.
-                let mut timeouts = lock_timeouts(&peer_timeouts);
-                if timeouts
-                    .first()
-                    .is_some_and(|(time, _)| *time <= Instant::now())
-                {
-                    let (_, peer) = timeouts.remove(0);
-                    debug!(
-                        "pruning peer {} after {:?}",
-                        peer,
-                        Instant::now().duration_since(epoch)
-                    );
-                    slot.send(PeerEvent::PeerTimedOut(peer));
-                }
+                let mut slot = Some(slot);
+                crate::platform::io_context::retry_state(|| {
+                    let mut timeouts = try_timeouts(&peer_timeouts)?;
+                    if timeouts
+                        .first()
+                        .is_some_and(|(time, _)| *time <= Instant::now())
+                    {
+                        let (_, peer) = timeouts.remove(0);
+                        debug!(
+                            "pruning peer {} after {:?}",
+                            peer,
+                            Instant::now().duration_since(epoch)
+                        );
+                        slot.take().unwrap().send(PeerEvent::PeerTimedOut(peer));
+                    }
+                    Some(())
+                })
+                .await;
             }
         };
         let run = async {

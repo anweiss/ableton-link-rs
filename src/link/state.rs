@@ -41,7 +41,7 @@ impl Encode for StartStopState {
     ) -> core::result::Result<(), crate::encoding::EncodeError> {
         self.is_playing.encode_to(out)?;
         self.beats.encode_to(out)?;
-        self.timestamp.num_microseconds().unwrap().encode_to(out)?;
+        super::micros(self.timestamp).encode_to(out)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {
@@ -121,6 +121,20 @@ pub struct ClientState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_boundary_start_stop_timestamp_saturates_at_wire_encoding() {
+        for (timestamp, expected) in [(Duration::MAX, i64::MAX), (Duration::MIN, i64::MIN)] {
+            let state = StartStopState {
+                timestamp,
+                ..Default::default()
+            };
+            let bytes = crate::encoding::encode_to_vec(&state).unwrap();
+            let (decoded, _) =
+                crate::encoding::decode_from_slice::<StartStopState>(&bytes).unwrap();
+            assert_eq!(decoded.timestamp, Duration::microseconds(expected));
+        }
+    }
 
     #[test]
     fn test_key() {

@@ -488,10 +488,12 @@ async fn measure_peer_in_epoch(
     if measurement.cancelled {
         drop(registration);
         drop(measurement);
-        if forward_route
-            .as_ref()
-            .is_some_and(|route| route.while_current(|| ()).is_none())
-        {
+        let retired = select! {
+            biased;
+            _ = &mut forward_cancelled => return,
+            retired = async { match &forward_route { Some(route) => route.while_current_async(|| ()).await.is_none(), None => false } } => retired,
+        };
+        if retired {
             select! { biased; _ = &mut forward_cancelled => {}, _ = tx_measure_peer_result.send(MeasurePeerEvent::Cancelled(session_id, node_id)) => {} }
         }
         return;
@@ -539,11 +541,13 @@ async fn measure_peer_in_epoch(
             };
             if let Some(route) = &forward_route {
                 let mut slot = Some(slot);
-                route.while_current(|| {
-                    slot.take()
-                        .unwrap()
-                        .send(MeasurePeerEvent::XForm(session_id.clone(), x_form))
-                });
+                select! {
+                    biased;
+                    _ = &mut forward_cancelled => return,
+                    _ = route.while_current_async(|| {
+                        slot.take().unwrap().send(MeasurePeerEvent::XForm(session_id.clone(), x_form))
+                    }) => {},
+                }
                 if let Some(slot) = slot {
                     slot.send(MeasurePeerEvent::Cancelled(session_id, node_id));
                 }
@@ -840,7 +844,7 @@ impl Measurement {
                         if let Some(route) = &route {
                             #[cfg(test)]
                             route.before_sample_publication();
-                            return route.while_current(|| slot.send(samples)).is_some();
+                            return route.while_current_async(|| slot.send(samples)).await.is_some();
                         }
                         slot.send(samples);
                     }
@@ -936,10 +940,19 @@ impl Measurement {
 
                         let Some(samples) = pong_samples(host_time, prev_host_time, ghost_time, prev_ghost_time) else { continue; };
                         {
-                            let mut data = data.lock().unwrap_or_else(|e| e.into_inner());
-                            let append = || data.extend(samples);
-                            if let Some(route) = &route { if route.while_current(append).is_none() { break; } }
-                            else { append(); }
+                            let mut samples = Some(samples);
+                            let append = crate::platform::io_context::retry_state(|| {
+                                let mut data = crate::platform::io_context::try_state(&data)?;
+                                let mut publish = || data.extend(samples.take().unwrap());
+                                if let Some(route) = &route { route.try_while_current(publish).map(|result| result.is_some()) }
+                                else { publish(); Some(true) }
+                            });
+                            let appended = select! {
+                                biased;
+                                _ = async { match &route { Some(route) => route.invalidated().await, None => std::future::pending().await } } => false,
+                                result = append => result,
+                            };
+                            if !appended { break; }
                         }
 
                         if data.lock().unwrap_or_else(|e| e.into_inner()).len() > NUMBER_DATA_POINTS {
@@ -1118,22 +1131,42 @@ fn pong_samples(
     if ghost == Duration::zero() || previous_host == Duration::zero() {
         return Some(Vec::new());
     }
-    let sum_host = host.checked_add(&previous_host)?.num_microseconds()? as f64;
-    let ghost_us = ghost.num_microseconds()? as f64;
-    let previous_host_us = previous_host.num_microseconds()? as f64;
-    let second = if previous_ghost != Duration::zero() {
-        let sum_ghost = ghost.checked_add(&previous_ghost)?.num_microseconds()? as f64;
-        Some((previous_host_us, sum_ghost * 0.5 - previous_host_us))
-    } else {
-        None
-    };
-    let mut samples = vec![(sum_host * 0.5, ghost_us - sum_host * 0.5)];
+    let host = i128::from(host.num_microseconds()?);
+    let previous_host = i128::from(previous_host.num_microseconds()?);
+    let ghost = i128::from(ghost.num_microseconds()?);
+    let previous_ghost = i128::from(previous_ghost.num_microseconds()?);
+    let sum_host = host + previous_host;
+    let second = (previous_ghost != 0).then(|| {
+        (
+            previous_host as f64,
+            (ghost + previous_ghost - 2 * previous_host) as f64 * 0.5,
+        )
+    });
+    let mut samples = vec![(sum_host as f64 * 0.5, (2 * ghost - sum_host) as f64 * 0.5)];
     samples.extend(second);
     Some(samples)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wide_boundary_pong_samples_average_before_narrowing() {
+        for value in [i64::MIN, i64::MAX] {
+            let time = Duration::microseconds(value);
+            assert_eq!(
+                pong_samples(time, time, time, time).unwrap(),
+                vec![(value as f64, 0.0), (value as f64, 0.0)]
+            );
+        }
+        let high = Duration::microseconds(i64::MAX);
+        let low = high - Duration::microseconds(2);
+        assert_eq!(pong_samples(high, low, high, low).unwrap()[0].1, 1.0);
+        assert!(
+            pong_samples(Duration::MAX, high, high, high).is_none(),
+            "individual fields still require wire-representable input"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn origin_finality_completion_survives_contended_sample_state() {
         let expected = vec![(1.0, 2.0), (3.0, 4.0)];
@@ -1513,7 +1546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pong_worker_drops_malformed_and_out_of_range_samples_then_continues() {
+    async fn pong_worker_drops_malformed_and_preserves_wide_samples_then_continues() {
         use crate::link::payload::GhostTime;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
@@ -1568,13 +1601,14 @@ mod tests {
                 .await
                 .expect("invalid pongs must not panic the worker");
             let data = measurement.data.lock().unwrap();
-            assert_eq!(
-                data.len(),
-                2,
-                "only the final valid pong contributes samples"
-            );
-            assert_eq!(data[0].0 + data[0].1, 200.0);
-            assert_eq!(data[1], (100.0, 150.0));
+            assert_eq!(data.len(), 11, "malformed packets contribute nothing; all six well-formed wire packets retain their wide samples");
+            assert!(data.iter().all(|(x,y)| x.is_finite() && y.is_finite()));
+            assert_eq!(data[1], (i64::MAX as f64, 250.0 - i64::MAX as f64));
+            assert_eq!(data[3], (100.0, (i128::from(i64::MAX) + 100) as f64 * 0.5));
+            assert_eq!(data[6], (i64::MAX as f64, 0.0));
+            assert_eq!(data[8], (i64::MAX as f64, (i128::from(i64::MIN) - i128::from(i64::MAX)) as f64));
+            assert_eq!(data[9].0 + data[9].1, 200.0);
+            assert_eq!(data[10], (100.0, 150.0));
         })
         .await
         .expect("pong worker must process subsequent valid samples and terminate");

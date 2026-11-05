@@ -20,23 +20,18 @@ impl Default for GhostXForm {
 impl GhostXForm {
     pub fn host_to_ghost(&self, host_time: Duration) -> Duration {
         let offset =
-            Duration::microseconds((self.slope * super::micros(host_time) as f64).round() as i64);
-        offset
-            .checked_add(&self.intercept)
-            .unwrap_or(if offset < Duration::zero() {
-                Duration::MIN
-            } else {
-                Duration::MAX
-            })
+            (self.slope * (super::duration_nanos(host_time) as f64 / 1_000.0)).round() as i128;
+        super::duration_from_nanos(
+            offset
+                .saturating_mul(1_000)
+                .saturating_add(super::duration_nanos(self.intercept)),
+        )
     }
 
     pub fn ghost_to_host(&self, ghost_time: Duration) -> Duration {
         // Preserve a wide (and potentially cancelling) difference through the
         // division. Only the final host microseconds are saturated by the cast.
-        let nanos = |time: Duration| {
-            i128::from(time.num_seconds()) * 1_000_000_000 + i128::from(time.subsec_nanos())
-        };
-        let difference = nanos(ghost_time) - nanos(self.intercept);
+        let difference = super::duration_nanos(ghost_time) - super::duration_nanos(self.intercept);
         Duration::microseconds((difference as f64 / 1_000.0 / self.slope).round() as i64)
     }
 }
@@ -78,6 +73,37 @@ mod tests {
             form.ghost_to_host(chrono::Duration::MAX),
             chrono::Duration::microseconds(i64::MAX)
         );
+    }
+
+    #[test]
+    fn wide_boundary_forward_scaling_and_intercept_cancellation() {
+        for sign in [-1, 1] {
+            let input = Duration::microseconds(sign * i64::MAX) * 2;
+            let form = GhostXForm {
+                slope: 0.25,
+                intercept: Duration::zero(),
+            };
+            let expected = Duration::microseconds(sign * (i64::MAX / 2));
+            assert!(
+                (form.host_to_ghost(input) - expected)
+                    .num_microseconds()
+                    .unwrap()
+                    .abs()
+                    <= 2
+            );
+            let form = GhostXForm {
+                slope: 2.0,
+                intercept: -Duration::microseconds(sign * i64::MAX),
+            };
+            let output = form.host_to_ghost(Duration::microseconds(sign * i64::MAX));
+            assert!(
+                (output - Duration::microseconds(sign * i64::MAX))
+                    .num_microseconds()
+                    .unwrap()
+                    .abs()
+                    <= 2
+            );
+        }
     }
 
     use super::*;

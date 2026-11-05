@@ -260,9 +260,7 @@ impl HostTime {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = HOST_TIME_HEADER.encode()?;
-        encoded.append(&mut encoding::encode_to_vec(
-            &self.time.num_microseconds().unwrap(),
-        )?);
+        encoded.append(&mut encoding::encode_to_vec(&super::micros(self.time))?);
         Ok(encoded)
     }
 }
@@ -299,9 +297,7 @@ impl GhostTime {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = GHOST_TIME_HEADER.encode()?;
-        encoded.append(&mut encoding::encode_to_vec(
-            &self.time.num_microseconds().unwrap(),
-        )?);
+        encoded.append(&mut encoding::encode_to_vec(&super::micros(self.time))?);
         Ok(encoded)
     }
 }
@@ -330,9 +326,7 @@ impl PrevGhostTime {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = PREV_GHOST_TIME_HEADER.encode()?;
-        encoded.append(&mut encoding::encode_to_vec(
-            &self.time.num_microseconds().unwrap(),
-        )?);
+        encoded.append(&mut encoding::encode_to_vec(&super::micros(self.time))?);
         Ok(encoded)
     }
 }
@@ -360,6 +354,30 @@ mod tests {
         tempo::Tempo,
         timeline::Timeline,
     };
+
+    #[test]
+    fn wide_boundary_all_clock_fields_saturate_only_during_wire_encoding() {
+        for (time, expected) in [(Duration::MAX, i64::MAX), (Duration::MIN, i64::MIN)] {
+            let payload = Payload {
+                entries: vec![
+                    PayloadEntry::HostTime(HostTime::new(time)),
+                    PayloadEntry::GhostTime(GhostTime::new(time)),
+                    PayloadEntry::PrevGhostTime(PrevGhostTime::new(time)),
+                ],
+            };
+            let encoded = payload.encode().unwrap();
+            let decoded = crate::discovery::messages::parse_payload(&encoded).unwrap();
+            for entry in decoded.entries {
+                let actual = match entry {
+                    PayloadEntry::HostTime(v) => v.time,
+                    PayloadEntry::GhostTime(v) => v.time,
+                    PayloadEntry::PrevGhostTime(v) => v.time,
+                    _ => panic!("clock"),
+                };
+                assert_eq!(actual, Duration::microseconds(expected));
+            }
+        }
+    }
 
     #[test]
     fn peer_state_without_an_endpoint_announces_none() {
