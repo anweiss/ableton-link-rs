@@ -114,8 +114,10 @@ pub fn force_beat_at_time_impl(
         closest_phase_match_wide(cur_beat_at_time, beat.value.into(), quantum.value.into());
     *timeline = shift_client_timeline_wide(*timeline, closest_in_phase - cur_beat_at_time);
     // Narrow only after both magnitude adjustments have cancelled.
-    timeline.beat_origin =
-        narrow(i128::from(timeline.beat_origin.value) + i128::from(beat.value) - closest_in_phase);
+    timeline.beat_origin = narrow(
+        (i128::from(timeline.beat_origin.value) + i128::from(beat.value))
+            .saturating_sub(closest_in_phase),
+    );
 }
 
 /// Shift client timeline by the given beat offset
@@ -138,6 +140,25 @@ fn shift_client_timeline_wide(mut timeline: Timeline, shift: i128) -> Timeline {
 mod tests {
     use super::*;
     use crate::link::tempo::Tempo;
+
+    #[test]
+    fn force_beat_saturates_zero_period_magnitude() {
+        for (micros, expected) in [(-1, i64::MAX), (1, i64::MIN)] {
+            let mut timeline = Timeline {
+                tempo: Tempo::new(1e20),
+                beat_origin: Beats::default(),
+                time_origin: Duration::zero(),
+            };
+            force_beat_at_time_impl(
+                &mut timeline,
+                Beats::default(),
+                Duration::microseconds(micros),
+                Beats::default(),
+            );
+            assert_eq!(timeline.beat_origin.value, expected);
+            assert_eq!(timeline.time_origin, Duration::zero());
+        }
+    }
 
     #[test]
     fn numeric_cleanup_phase_preserves_extreme_origin_roundtrips() {
