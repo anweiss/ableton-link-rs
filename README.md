@@ -299,6 +299,8 @@ saturate; timeline composition does not use their narrowed intermediate results.
 Tempo periods stay wide in both beat conversion directions. Forced-beat requests
 re-anchor an unrepresentable origin when a bounded quantum-boundary anchor exists;
 the public rounding correction clamps at Chrono's duration limits.
+Link Classic and LinkAudio tempo encoders saturate signed wire periods without
+changing the sign of a negative out-of-range value.
 PONG ghost timestamps saturate at the final signed-microsecond wire boundary.
 Gateway node publication acquires peer and both responder guards cooperatively
 before any mutation. Checked announcement commits release timeout state while

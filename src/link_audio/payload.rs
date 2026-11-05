@@ -362,12 +362,7 @@ impl Chunk {
         out.write_u64(self.count);
         out.write_u16(self.num_frames);
         out.write_i64(self.begin_beats.micro_beats());
-        out.write_i64(
-            self.tempo
-                .micros_per_beat()
-                .num_microseconds()
-                .unwrap_or(i64::MAX),
-        );
+        out.write_i64(crate::link::micros(self.tempo.micros_per_beat()));
     }
 
     fn decode(reader: &mut ByteStreamReader<'_>) -> Result<Self> {
@@ -644,6 +639,35 @@ impl ChannelStopRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_round_audio_buffer_saturates_wide_periods_with_their_sign() {
+        let period = Duration::microseconds(1_i64 << 62) * 4;
+        for (period, expected) in [(period, i64::MAX), (-period, i64::MIN)] {
+            let buffer = AudioBuffer {
+                chunks: vec![Chunk {
+                    num_frames: 1,
+                    tempo: Tempo::from(period),
+                    ..Chunk::default()
+                }],
+                codec: Codec::PcmI16,
+                sample_rate: 48_000,
+                num_channels: 1,
+                bytes: vec![0, 0],
+                ..AudioBuffer::default()
+            };
+            let bytes = buffer.encode_raw();
+            let mut reader = ByteStreamReader::new(&bytes);
+            read_id(&mut reader).unwrap();
+            read_id(&mut reader).unwrap();
+            assert_eq!(reader.read_u32().unwrap(), 1);
+            reader.read_u64().unwrap();
+            reader.read_u16().unwrap();
+            reader.read_i64().unwrap();
+            assert_eq!(reader.read_i64().unwrap(), expected);
+            assert_eq!(AudioBuffer::decode_raw(&bytes).is_ok(), expected > 0);
+        }
+    }
 
     fn id(n: u8) -> Id {
         NodeId::from_array([n; 8])
