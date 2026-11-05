@@ -402,3 +402,6 @@ and responder publication guards in the same cooperative attempt as session and 
 ownership. A busy guard means retry, not completed/no-change. No state is mutated until
 all required guards are held; callbacks run after release. This includes peerless resets
 and equal-timing joins whose client session identity still needs to change.
+Timeline announcements publish the accepted current identity, timeline and clock mapping
+from one guarded snapshot, never a candidate's wire ID paired with the current timeline.
+A pending promotion leaves local publication to its owned join, including equal-timing joins.

@@ -676,33 +676,11 @@ impl Controller {
                                 timeline.tempo, peer_session
                             );
 
-                            let new_timeline = sessions_loop
-                                .saw_session_timeline(*peer_session, *timeline)
-                                .await;
-
-                            let ghost_x_form = if let Ok(state) = s_state_loop.try_lock() {
-                                state.ghost_x_form
-                            } else {
-                                continue;
-                            };
-
-                            update_session_timing(
-                                s_state_loop.clone(),
-                                c_state_loop.clone(),
-                                new_timeline,
-                                ghost_x_form,
-                                clock,
-                                s_stop_sync_enabled_loop.clone(),
-                                tempo_cb_loop.clone(),
-                                *peer_session,
-                            );
-
-                            update_discovery(
-                                s_state_loop.clone(),
-                                peer_state_loop.clone(),
-                                discovery_loop.clone(),
-                            )
-                            .await;
+                            sessions_loop.saw_session_timeline(*peer_session, *timeline).await;
+                            refresh_current_session_timing(
+                                &sessions_loop, &peer_state_loop, &s_state_loop, &c_state_loop,
+                                &s_stop_sync_enabled_loop, &discovery_loop, clock, &tempo_cb_loop,
+                            ).await;
                         }
                         PeerStateChange::SessionStartStopState(
                             peer_session,
@@ -1288,6 +1266,26 @@ impl SessionCommit<'_> {
         changed
     }
 
+    fn refresh_timing(&mut self, clock: Clock) -> Option<tempo::Tempo> {
+        // A promotion's pending join owns publication of its identity. A timeline
+        // announcement may refresh only the session already published locally.
+        if self.current.session_id != self.peer.session_id() {
+            return None;
+        }
+        let session = self.current.clone();
+        let changed = update_timing_guarded(
+            self.session,
+            self.client,
+            session.timeline,
+            session.measurement.x_form,
+            clock,
+            self.sync_enabled,
+            session.session_id,
+        );
+        self.publish_discovery();
+        changed
+    }
+
     fn join(&mut self, queued: &Session, clock: Clock) -> Option<tempo::Tempo> {
         if !queued.key().matches(self.current) {
             return None;
@@ -1315,6 +1313,35 @@ impl SessionCommit<'_> {
         self.publish_discovery();
         self.counter.session_peer_count = count;
         changed
+    }
+}
+
+async fn refresh_current_session_timing(
+    sessions: &Sessions,
+    peer_state: &Arc<Mutex<PeerState>>,
+    session_state: &Arc<Mutex<SessionState>>,
+    client_state: &Arc<Mutex<ClientState>>,
+    sync_enabled: &Arc<Mutex<bool>>,
+    discovery: &Arc<PeerGateway>,
+    clock: Clock,
+    tempo_callback: &Arc<Mutex<Option<TempoCallback>>>,
+) {
+    let changed = retry_state(|| {
+        try_session_commit(
+            sessions,
+            &sessions.peers,
+            peer_state,
+            session_state,
+            client_state,
+            &discovery.session_peer_counter,
+            sync_enabled,
+            discovery,
+            |state| state.refresh_timing(clock),
+        )
+    })
+    .await;
+    if let Some(tempo) = changed {
+        dispatch_current_tempo(session_state, tempo_callback, tempo);
     }
 }
 
@@ -1659,6 +1686,202 @@ pub struct SessionPeerCounter {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
+    #[tokio::test]
+    async fn owned_io_candidate_timeline_cannot_relabel_current_client() {
+        use crate::discovery::peers::PeerStateMessageType;
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let candidate = SessionId(NodeId::from_array([93; 8]));
+        let (sent, mut received) = tokio::sync::mpsc::channel(1);
+        *controller.audio_endpoint_callback.lock().unwrap() =
+            Some(Arc::new(Mutex::new(Box::new(move |node, _| {
+                if node == candidate.0 {
+                    sent.try_send(()).unwrap();
+                }
+            }))));
+        controller.enable().await;
+        let initial = controller.sessions.current.lock().unwrap().clone();
+        let before = *controller.session_state.lock().unwrap();
+        let client = *controller.client_state.lock().unwrap();
+        controller
+            .discovery
+            .event_sender()
+            .send(OnEvent::PeerState(PeerStateMessageType {
+                expires_at: None,
+                observation: None,
+                ttl: 30,
+                node_state: NodeState {
+                    node_id: candidate.0,
+                    session_id: candidate,
+                    timeline: Timeline {
+                        tempo: tempo::Tempo::new(148.0),
+                        beat_origin: Beats::new(2.0),
+                        ..Default::default()
+                    },
+                    start_stop_state: Default::default(),
+                },
+                measurement_endpoint: Some(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 9)),
+                audio_endpoint: None,
+            }))
+            .await
+            .unwrap();
+        // Audio is last in the real observer/controller batch, after SessionTimeline.
+        tokio::time::timeout(TEST_TIMEOUT, received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            initial
+                .key()
+                .matches(&controller.sessions.current.lock().unwrap()),
+            "candidate was not promoted"
+        );
+        assert!(controller
+            .sessions
+            .other_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.session_id == candidate));
+        assert_eq!(
+            controller.client_state.lock().unwrap().timeline_session_id,
+            initial.session_id,
+            "candidate identity must not relabel the accepted current timeline"
+        );
+        assert_eq!(
+            controller.client_state.lock().unwrap().timeline,
+            client.timeline
+        );
+        assert_eq!(
+            controller.session_state.lock().unwrap().timeline,
+            before.timeline
+        );
+        assert_eq!(
+            controller.peer_state.lock().unwrap().session_id(),
+            initial.session_id
+        );
+        assert_eq!(
+            *controller
+                .discovery
+                .measurement_service
+                .ping_responder
+                .session_id
+                .lock()
+                .unwrap(),
+            initial.session_id
+        );
+        controller.disable().await;
+    }
+
+    #[tokio::test]
+    async fn owned_io_equal_timing_join_publishes_identity_only_at_owned_join() {
+        let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let before = *controller.session_state.lock().unwrap();
+        let previous = controller.peer_state.lock().unwrap().session_id();
+        let remote = Session::new(
+            SessionId(NodeId::from_array([1; 8])),
+            before.timeline,
+            SessionMeasurement::default(),
+        );
+        assert_ne!(remote.session_id, previous);
+        controller
+            .sessions
+            .other_sessions
+            .lock()
+            .unwrap()
+            .push(remote.clone());
+        controller.peers.lock().unwrap().push(ControllerPeer {
+            peer_state: PeerState {
+                node_state: NodeState {
+                    node_id: remote.session_id.0,
+                    session_id: remote.session_id,
+                    timeline: before.timeline,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        });
+        let (joins, mut queued) = tokio::sync::mpsc::channel(1);
+        crate::link::sessions::handle_successful_measurement(
+            remote.key(),
+            before.ghost_x_form,
+            controller.sessions.other_sessions.clone(),
+            controller.sessions.current.clone(),
+            controller.clock,
+            joins,
+            controller.peers.clone(),
+            controller.sessions.tx_measure_peer_state.clone(),
+        )
+        .await;
+        let promoted = tokio::time::timeout(TEST_TIMEOUT, queued.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(remote
+            .key()
+            .matches(&controller.sessions.current.lock().unwrap()));
+        refresh_current_session_timing(
+            &controller.sessions,
+            &controller.peer_state,
+            &controller.session_state,
+            &controller.client_state,
+            &controller.start_stop_sync_enabled,
+            &controller.discovery,
+            controller.clock,
+            &controller.tempo_callback,
+        )
+        .await;
+        assert_eq!(
+            controller.client_state.lock().unwrap().timeline_session_id,
+            previous,
+            "pending promotion cannot publish identity via a timeline refresh"
+        );
+        assert_eq!(controller.peer_state.lock().unwrap().session_id(), previous);
+        join_session(
+            promoted,
+            controller.peer_state.clone(),
+            controller.session_state.clone(),
+            controller.client_state.clone(),
+            controller.clock,
+            controller.start_stop_sync_enabled.clone(),
+            controller.discovery.clone(),
+            controller.peers.clone(),
+            controller.session_peer_counter.clone(),
+            controller.sessions.clone(),
+            controller.tempo_callback.clone(),
+        )
+        .await;
+        assert_eq!(
+            controller.session_state.lock().unwrap().timeline,
+            before.timeline
+        );
+        assert_eq!(
+            controller.session_state.lock().unwrap().ghost_x_form,
+            before.ghost_x_form
+        );
+        assert_eq!(
+            controller.client_state.lock().unwrap().timeline_session_id,
+            remote.session_id
+        );
+        assert_eq!(
+            controller.peer_state.lock().unwrap().session_id(),
+            remote.session_id
+        );
+        assert_eq!(
+            *controller
+                .discovery
+                .measurement_service
+                .ping_responder
+                .session_id
+                .lock()
+                .unwrap(),
+            remote.session_id
+        );
+    }
+
     #[test]
     fn owned_io_timing_update_does_not_partially_mutate_contended_client() {
         let clock = Clock::new();
