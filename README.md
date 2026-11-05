@@ -351,7 +351,22 @@ The lower-level `AtomicSessionState` and
 `complete_pending_update` records the validation result before acknowledgment.
 
 Accepted RT snapshots use pinned, preallocated value slots. A preempted publisher
-does not lock out readers or cause default values to replace an accepted snapshot.
+does not force readers to block or substitute default values for accepted state.
+`BasicLink::capture_audio_session_state` now returns
+`Result<SessionState, AudioCaptureError>`; the low-level
+`AtomicSessionState::capture_audio_session_state` and
+`SafeRtSessionStateHandler::get_rt_client_state` return
+`Result<ClientState, AudioCaptureError>`.
+Each audio capture makes one checked reader-pin attempt. A competing reader-count
+change returns `Busy`, and counter exhaustion returns `ReaderExhausted` before
+incrementing. Handle either by skipping the capture or reusing a caller-owned
+accepted value; never retry inside the audio callback. A failed capture may
+already have flushed a pending accepted publication, so it does not mean that
+accepted state stayed unchanged.
+Capture uses try-only locks and performs no allocation; it is not a lock-free or
+wait-free API and does not promise a wall-clock deadline. App capture retains its
+infallible result through a separate non-RT cache read that serializes with
+publication and may block. Do not use app capture as an audio-callback fallback.
 Publication can remain pending while concurrent readers overlap continuously;
 there is no bounded freshness guarantee under that scheduling pattern.
 The obsolete local grace period is removed: `AtomicSessionState::new` and
@@ -364,6 +379,11 @@ Runtime tempo normalization uses 120 BPM for NaN and bounds other values to
 20..999 BPM, including construction, local edits and accepted remote timelines.
 Canonical storage and publication use the same normalized tempo; raw `Tempo` and
 `Timeline` arithmetic remain separate from this runtime policy.
+`SessionState::set_tempo` retains the wide reference beat through origin
+cancellation rather than narrowing it through public `Timeline::to_beats`.
+A sampled beat outside signed microbeat storage no longer shifts an otherwise
+representable replacement origin. An unrepresentable final time still clamps
+at Chrono's duration limits.
 
 `controller::update_discovery` now accepts `&Controller`, replacing three independent
 state arguments. It reads and publishes through the owner's full guarded boundary;

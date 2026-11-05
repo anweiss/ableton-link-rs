@@ -181,7 +181,7 @@ async fn test_enhanced_basic_link() {
     );
 
     // Test real-time session state access
-    let session_state = link.capture_audio_session_state();
+    let session_state = link.capture_audio_session_state().unwrap();
     assert_eq!(session_state.tempo(), 120.0, "Should capture correct tempo");
     assert!(
         !session_state.is_playing(),
@@ -197,7 +197,7 @@ async fn test_realtime_session_state() {
     let link = BasicLink::new(140.0).await.unwrap();
 
     // Capture initial state
-    let mut session_state = link.capture_audio_session_state();
+    let mut session_state = link.capture_audio_session_state().unwrap();
     assert_eq!(session_state.tempo(), 140.0);
 
     // Modify state
@@ -207,7 +207,7 @@ async fn test_realtime_session_state() {
 
     // Commit changes
     let ticket = link.commit_audio_session_state(session_state).unwrap();
-    assert_eq!(link.capture_audio_session_state().tempo(), 140.0);
+    assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 140.0);
     assert_eq!(
         link.process_audio_session_state_updates().await,
         Some((ticket, Ok(())))
@@ -215,7 +215,7 @@ async fn test_realtime_session_state() {
     assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
 
     // Verify changes
-    let updated_state = link.capture_audio_session_state();
+    let updated_state = link.capture_audio_session_state().unwrap();
     assert_eq!(updated_state.tempo(), 160.0, "Tempo should be updated");
     assert!(updated_state.is_playing(), "Should be playing after commit");
 
@@ -237,7 +237,7 @@ async fn test_realtime_performance() {
 
     // Test audio thread performance
     for i in 0..iterations {
-        let session_state = link.capture_audio_session_state();
+        let session_state = link.capture_audio_session_state().unwrap();
 
         // Simulate some audio processing
         let current_time = link.clock().micros();

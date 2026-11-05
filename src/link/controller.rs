@@ -1998,7 +1998,7 @@ mod dispatch_gate_tests {
         use crate::link::{AudioQueueError, BasicLink, CommitError};
         assert!(!std::mem::needs_drop::<crate::link::SessionState>());
         let link = BasicLink::new(120.0).await.unwrap();
-        let old = link.capture_audio_session_state();
+        let old = link.capture_audio_session_state().unwrap();
         let origin = old.origin.unwrap();
         let ticket = link.commit_audio_session_state(old.clone()).unwrap();
         let mut sessions = link.controller.sessions.clone();
@@ -2058,7 +2058,7 @@ mod dispatch_gate_tests {
         use crate::link::{BasicLink, CommitError};
         for different_id in [false, true] {
             let mut link = BasicLink::new(120.0).await.unwrap();
-            let mut old = link.capture_audio_session_state();
+            let mut old = link.capture_audio_session_state().unwrap();
             old.set_tempo(150.0, link.clock.micros());
             let ticket = link.commit_audio_session_state(old).unwrap();
             let initial = link.controller.sessions.current.lock().unwrap().clone();

@@ -25,6 +25,14 @@ pub enum AudioQueueError {
     UnknownTicket,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AudioCaptureError {
+    #[error("accepted-state reader count changed; skip capture until a later callback")]
+    Busy,
+    #[error("accepted-state reader counter exhausted")]
+    ReaderExhausted,
+}
+
 #[derive(Default)]
 struct PendingUpdate {
     sequence: u64,
@@ -105,27 +113,27 @@ impl AcceptedState {
         self.published.store(next, Ordering::SeqCst);
     }
 
-    fn read(&self) -> ClientState {
+    fn read(&self) -> Result<ClientState, AudioCaptureError> {
+        self.read_with_pin_hook(|| {})
+    }
+
+    fn read_with_pin_hook(
+        &self,
+        mut before_pin: impl FnMut(),
+    ) -> Result<ClientState, AudioCaptureError> {
         if let Ok(mut pending) = self.pending.try_lock() {
             self.flush(&mut pending);
         }
         // Pin before loading the index. An in-flight writer uses the other
         // slot; another writer cannot start while this reader remains pinned.
-        let mut readers = self.readers.load(Ordering::SeqCst);
-        loop {
-            let next = readers
-                .checked_add(1)
-                .expect("too many simultaneous accepted-state readers");
-            match self.readers.compare_exchange_weak(
-                readers,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(current) => readers = current,
-            }
-        }
+        let readers = self.readers.load(Ordering::SeqCst);
+        let next = readers
+            .checked_add(1)
+            .ok_or(AudioCaptureError::ReaderExhausted)?;
+        before_pin();
+        self.readers
+            .compare_exchange(readers, next, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| AudioCaptureError::Busy)?;
         let reader = AcceptedRead(self);
         let slot = self.published.load(Ordering::SeqCst);
         let state = match self.slots[slot].try_read() {
@@ -134,7 +142,14 @@ impl AcceptedState {
             Err(TryLockError::WouldBlock) => unreachable!("published accepted slot is pinned"),
         };
         drop(reader);
-        state
+        Ok(state)
+    }
+
+    fn read_app(&self) -> ClientState {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        self.flush(&mut pending);
+        let slot = self.published.load(Ordering::SeqCst);
+        *self.slots[slot].read().unwrap_or_else(|e| e.into_inner())
     }
 
     fn publish(&self, state: ClientState) {
@@ -162,8 +177,15 @@ impl SafeRtSessionStateHandler {
         }
     }
 
-    pub fn get_rt_client_state(&self) -> ClientState {
+    /// Attempt one reader pin using try-only locks and no allocation.
+    /// On contention, skip this capture or reuse a caller-owned accepted value;
+    /// do not retry on the audio thread. An error may follow a pending flush.
+    pub fn get_rt_client_state(&self) -> Result<ClientState, AudioCaptureError> {
         self.accepted.read()
+    }
+
+    pub(crate) fn get_app_client_state(&self) -> ClientState {
+        self.accepted.read_app()
     }
 
     /// Queue a proposal without changing accepted state. One outstanding request
@@ -320,6 +342,79 @@ mod tests {
     }
 
     #[test]
+    fn ordering_accepted_capture_bounds_pin_attempts_under_competing_readers() {
+        let accepted = AcceptedState::new(create_test_client_state());
+        std::thread::scope(|scope| {
+            let (commands, receive_commands) = std::sync::mpsc::channel();
+            let (finished, receive_finished) = std::sync::mpsc::channel();
+            let peer = &accepted;
+            scope.spawn(move || {
+                let mut pin = None;
+                while let Ok(should_pin) = receive_commands.recv() {
+                    if should_pin {
+                        assert!(pin.is_none());
+                        peer.readers.fetch_add(1, Ordering::SeqCst);
+                        pin = Some(AcceptedRead(peer));
+                    } else {
+                        drop(pin.take());
+                    }
+                    finished.send(()).unwrap();
+                }
+            });
+            let mut attempts = 0;
+            let capture = accepted.read_with_pin_hook(|| {
+                attempts += 1;
+                if attempts <= 64 {
+                    commands.send(attempts % 2 == 1).unwrap();
+                    receive_finished.recv().unwrap();
+                }
+            });
+            commands.send(false).unwrap();
+            receive_finished.recv().unwrap();
+            drop(commands);
+            assert_eq!(accepted.readers.load(Ordering::SeqCst), 0);
+            assert_eq!(attempts, 1, "an audio capture must not retry its pin");
+            assert_eq!(capture, Err(AudioCaptureError::Busy));
+        });
+    }
+
+    #[test]
+    fn ordering_accepted_capture_rejects_reader_exhaustion_without_wrapping() {
+        let initial = create_test_client_state();
+        let accepted = AcceptedState::new(initial);
+        accepted.readers.store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(accepted.read(), Err(AudioCaptureError::ReaderExhausted));
+        assert_eq!(accepted.readers.load(Ordering::SeqCst), usize::MAX);
+        accepted.readers.store(0, Ordering::SeqCst);
+        assert_eq!(accepted.read(), Ok(initial));
+    }
+
+    #[test]
+    fn ordering_accepted_capture_preserves_complete_snapshots_while_pinned() {
+        let initial = create_test_client_state();
+        let accepted = AcceptedState::new(initial);
+        accepted.readers.fetch_add(1, Ordering::SeqCst);
+        let pin = AcceptedRead(&accepted);
+        let mut next = initial;
+        next.timeline.tempo = Tempo::new(150.0);
+        next.timeline.beat_origin = Beats::new(16.0);
+        next.timeline.time_origin = Duration::seconds(4);
+        next.start_stop_state.is_playing = true;
+        next.start_stop_state.timestamp = Duration::seconds(5);
+        accepted.publish(next);
+        assert_eq!(accepted.read(), Ok(initial));
+        next.timeline.beat_origin = Beats::new(32.0);
+        next.start_stop_state.time = Duration::seconds(6);
+        accepted.publish(next);
+        assert_eq!(accepted.read(), Ok(initial));
+        assert_eq!(accepted.read_app(), initial);
+        assert_eq!(*accepted.pending.lock().unwrap(), Some(next));
+        drop(pin);
+        assert_eq!(accepted.read_app(), next);
+        assert_eq!(accepted.read(), Ok(next));
+    }
+
+    #[test]
     fn ordering_foreign_ticket_cannot_complete_or_acknowledge_another_queue() {
         let first = SafeRtSessionStateHandler::new(create_test_client_state());
         let second = SafeRtSessionStateHandler::new(create_test_client_state());
@@ -378,7 +473,7 @@ mod tests {
         let client_state = create_test_client_state();
         let handler = SafeRtSessionStateHandler::new(client_state);
 
-        let retrieved_state = handler.get_rt_client_state();
+        let retrieved_state = handler.get_rt_client_state().unwrap();
 
         assert_eq!(
             retrieved_state.timeline.tempo.bpm(),
@@ -410,7 +505,7 @@ mod tests {
 
         // Update the real-time state
         let ticket = handler.update_rt_client_state(incoming_state).unwrap();
-        assert_eq!(handler.get_rt_client_state(), client_state);
+        assert_eq!(handler.get_rt_client_state(), Ok(client_state));
 
         // Should have pending updates
         assert!(handler.has_pending_updates());
@@ -429,7 +524,7 @@ mod tests {
             Err(AudioQueueError::Busy)
         );
         assert!(handler.complete_pending_update(ticket, Err(CommitError::TimelineOriginExhausted)));
-        assert_eq!(handler.get_rt_client_state(), client_state);
+        assert_eq!(handler.get_rt_client_state(), Ok(client_state));
         assert_eq!(
             handler.update_rt_client_state(incoming_state),
             Err(AudioQueueError::Busy)
@@ -449,7 +544,10 @@ mod tests {
         });
         assert!(handler.complete_pending_update(ticket, Ok(())));
         assert_eq!(handler.take_commit_result(ticket), Ok(Some(Ok(()))));
-        assert_eq!(handler.get_rt_client_state().timeline, new_timeline);
+        assert_eq!(
+            handler.get_rt_client_state().unwrap().timeline,
+            new_timeline
+        );
     }
 
     #[test]
@@ -459,7 +557,7 @@ mod tests {
         let mut accepted = client_state;
         accepted.timeline.tempo = Tempo::new(150.0);
         handler.publish_client_state(accepted);
-        assert_eq!(handler.get_rt_client_state(), accepted);
+        assert_eq!(handler.get_rt_client_state(), Ok(accepted));
         let mut pending = handler.accepted.pending.lock().unwrap();
         let next = 1 - handler.accepted.published.load(Ordering::SeqCst);
         let slot = handler.accepted.slots[next].write().unwrap();
@@ -467,11 +565,11 @@ mod tests {
         newer.timeline.tempo = Tempo::new(180.0);
         *pending = Some(newer);
         for _ in 0..3 {
-            assert_eq!(handler.get_rt_client_state(), accepted);
+            assert_eq!(handler.get_rt_client_state(), Ok(accepted));
         }
         drop(slot);
         drop(pending);
-        assert_eq!(handler.get_rt_client_state(), newer);
+        assert_eq!(handler.get_rt_client_state(), Ok(newer));
     }
 
     #[test]
@@ -544,7 +642,7 @@ mod tests {
         rt_thread.join().unwrap();
 
         // Verify we can still read state
-        let final_state = handler.get_rt_client_state();
+        let final_state = handler.get_rt_client_state().unwrap();
         assert_eq!(final_state.timeline.tempo.bpm(), 169.0);
     }
 }

@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use super::{
     error::CommitError,
-    safe_rt_session_state::{AudioCommitTicket, AudioQueueError, SafeRtSessionStateHandler},
+    safe_rt_session_state::{
+        AudioCaptureError, AudioCommitTicket, AudioQueueError, SafeRtSessionStateHandler,
+    },
     state::ClientState,
 };
 
@@ -33,9 +35,9 @@ impl AtomicSessionState {
         }
     }
 
-    /// Get current session state for audio thread (real-time safe)
-    /// This method is guaranteed to be non-blocking and suitable for audio threads
-    pub fn capture_audio_session_state(&self) -> ClientState {
+    /// Capture with one reader-pin attempt, try-only locks, and no allocation.
+    /// On error, skip this capture or reuse a caller-owned accepted value.
+    pub fn capture_audio_session_state(&self) -> Result<ClientState, AudioCaptureError> {
         self.rt_handler.get_rt_client_state()
     }
 
@@ -67,8 +69,9 @@ impl AtomicSessionState {
     }
 
     /// Read the accepted snapshot without applying queued proposals.
+    /// May block on accepted publication; use audio capture in callbacks.
     pub fn capture_app_session_state(&self) -> ClientState {
-        self.rt_handler.get_rt_client_state()
+        self.rt_handler.get_app_client_state()
     }
 
     /// Queue an application proposal under the same explicit acknowledgment contract.
@@ -194,7 +197,7 @@ mod tests {
         let session_state = AtomicSessionState::new(client_state);
 
         // Test audio thread capture
-        let captured_audio = session_state.capture_audio_session_state();
+        let captured_audio = session_state.capture_audio_session_state().unwrap();
         assert_eq!(captured_audio.timeline.tempo.bpm(), 120.0);
 
         // Test app thread capture

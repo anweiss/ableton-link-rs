@@ -59,7 +59,7 @@ use self::{
 pub type Result<T> = result::Result<T, error::Error>;
 pub use error::CommitError;
 #[cfg(feature = "std")]
-pub use safe_rt_session_state::{AudioCommitTicket, AudioQueueError};
+pub use safe_rt_session_state::{AudioCaptureError, AudioCommitTicket, AudioQueueError};
 
 /// Microseconds in `d`, saturating at the `i64` limits instead of failing.
 /// Durations derived from a peer's times (ghost times, timeline origins,
@@ -309,16 +309,18 @@ impl BasicLink {
         &self.controller
     }
 
-    pub fn capture_audio_session_state(&self) -> SessionState {
-        // Real-time safe capture using atomic session state
-        let client_state = self.atomic_session_state.capture_audio_session_state();
+    /// Attempt accepted capture without retrying reader-pin contention.
+    /// Skip work or reuse a caller-owned accepted value on error; never retry
+    /// inside the callback. Uses try-only locks, not a lock-free protocol.
+    pub fn capture_audio_session_state(&self) -> result::Result<SessionState, AudioCaptureError> {
+        let client_state = self.atomic_session_state.capture_audio_session_state()?;
         let mut captured = to_session_state(&client_state, self.num_peers() > 0);
         if let Some((accepted, origin)) = self.controller.capture_client_state() {
             if accepted == client_state {
                 captured.origin = Some(origin);
             }
         }
-        captured
+        Ok(captured)
     }
 
     /// Queue one request without changing captured state. Drain it on a non-RT
@@ -371,6 +373,8 @@ impl BasicLink {
         self.atomic_session_state.take_commit_result(ticket)
     }
 
+    /// Capture accepted state, possibly blocking on its publication cache.
+    /// Use the fallible audio capture method in callbacks.
     pub fn capture_app_session_state(&self) -> SessionState {
         if let Some((accepted, origin)) = self.controller.capture_client_state() {
             let mut captured = to_session_state(&accepted, self.num_peers() > 0);
@@ -587,13 +591,17 @@ impl SessionState {
     }
 
     pub fn set_tempo(&mut self, bpm: f64, at_time: Duration) {
-        let desired_tl = clamp_tempo(Timeline {
+        let tempo = clamp_tempo(Timeline {
             tempo: Tempo::new(bpm),
-            beat_origin: self.state.timeline.to_beats(at_time),
-            time_origin: at_time,
-        });
-        self.state.timeline.tempo = desired_tl.tempo;
-        self.state.timeline.time_origin = desired_tl.from_beats(self.state.timeline.beat_origin);
+            ..self.state.timeline
+        })
+        .tempo;
+        let difference = i128::from(self.state.timeline.beat_origin.value)
+            .saturating_sub(self.state.timeline.microbeats_at(at_time));
+        self.state.timeline.time_origin = duration_from_nanos(
+            duration_nanos(at_time).saturating_add(tempo.nanos_from_microbeats(difference)),
+        );
+        self.state.timeline.tempo = tempo;
     }
 
     pub fn beat_at_time(&self, time: Duration, quantum: f64) -> f64 {
@@ -686,6 +694,60 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn ordering_public_tempo_change_preserves_wide_reference_beat() {
+        for (origin, sign) in [(i64::MAX - 1, 1_i64), (i64::MIN + 1, -1_i64)] {
+            let mut state = SessionState::new(
+                ApiState {
+                    timeline: Timeline {
+                        tempo: Tempo::new(120.0),
+                        beat_origin: Beats::from_microbeats(origin),
+                        time_origin: Duration::zero(),
+                    },
+                    ..ApiState::default()
+                },
+                false,
+            );
+            let at_time = Duration::nanoseconds(sign * 1_000);
+            let reference = state.timeline().microbeats_at(at_time);
+            state.set_tempo(150.0, at_time);
+            assert_eq!(
+                state.timeline().time_origin,
+                Duration::nanoseconds(sign * 200)
+            );
+            assert_eq!(state.timeline().microbeats_at(at_time), reference);
+            assert_eq!(
+                state.timeline().to_beats(Duration::zero()),
+                Beats::from_microbeats(origin - sign)
+            );
+        }
+    }
+
+    #[test]
+    fn ordering_public_tempo_change_cancels_wide_elapsed_reference() {
+        for sign in [-1_i64, 1_i64] {
+            let mut state = SessionState::new(
+                ApiState {
+                    timeline: Timeline {
+                        tempo: Tempo::new(120.0),
+                        ..Timeline::default()
+                    },
+                    ..ApiState::default()
+                },
+                false,
+            );
+            let at_time = Duration::microseconds(sign * 5_000_000_000_000_000_000);
+            let reference = state.timeline().microbeats_at(at_time);
+            state.set_tempo(150.0, at_time);
+            assert_eq!(
+                state.timeline().time_origin,
+                Duration::microseconds(sign * 1_000_000_000_000_000_000)
+            );
+            assert_eq!(state.timeline().microbeats_at(at_time), reference);
+            assert_eq!(state.timeline().beat_origin, Beats::from_microbeats(0));
+        }
+    }
+
     #[tokio::test]
     async fn ordering_session_state_equality_ignores_capture_provenance() {
         let link = BasicLink::new(120.0).await.unwrap();
@@ -706,10 +768,10 @@ mod tests {
         let first = BasicLink::new(120.0).await.unwrap();
         let second = BasicLink::new(120.0).await.unwrap();
         let a = first
-            .commit_audio_session_state(first.capture_audio_session_state())
+            .commit_audio_session_state(first.capture_audio_session_state().unwrap())
             .unwrap();
         let b = second
-            .commit_audio_session_state(second.capture_audio_session_state())
+            .commit_audio_session_state(second.capture_audio_session_state().unwrap())
             .unwrap();
         assert_ne!(a, b);
         first.process_audio_session_state_updates().await;
@@ -804,7 +866,7 @@ mod tests {
         let link = Arc::new(link);
         let dispatch = link.notification_dispatch.try_lock().unwrap();
         for playing in [true, false] {
-            let mut state = link.capture_audio_session_state();
+            let mut state = link.capture_audio_session_state().unwrap();
             state.set_is_playing(playing, link.clock.micros());
             let ticket = link.commit_audio_session_state(state).unwrap();
             assert_eq!(
@@ -841,7 +903,7 @@ mod tests {
             }
         });
         let link = Arc::new(link);
-        let mut start = link.capture_audio_session_state();
+        let mut start = link.capture_audio_session_state().unwrap();
         start.set_is_playing(true, link.clock.micros());
         let first = link.commit_audio_session_state(start).unwrap();
         let worker = link.clone();
@@ -852,7 +914,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         assert_eq!(link.take_audio_commit_result(first), Ok(Some(Ok(()))));
-        let mut stop = link.capture_audio_session_state();
+        let mut stop = link.capture_audio_session_state().unwrap();
         stop.set_is_playing(false, link.clock.micros());
         let second = link.commit_audio_session_state(stop).unwrap();
         assert_eq!(
@@ -884,13 +946,13 @@ mod tests {
         });
         assert_eq!(callbacks.load(Ordering::SeqCst), 1);
         let link = Arc::new(link);
-        let mut proposed = link.capture_audio_session_state();
+        let mut proposed = link.capture_audio_session_state().unwrap();
         proposed.set_tempo(150.0, link.clock.micros());
         let ticket = link.commit_audio_session_state(proposed).unwrap();
         let consumer = link.non_rt_commit.lock().await;
         let audio = link.clone();
         std::thread::spawn(move || {
-            let capture = audio.capture_audio_session_state();
+            let capture = audio.capture_audio_session_state().unwrap();
             assert_eq!(capture.tempo(), 120.0);
             assert_eq!(
                 audio.commit_audio_session_state(capture),
@@ -911,7 +973,7 @@ mod tests {
         );
         assert_eq!(link.process_audio_session_state_updates().await, None);
         assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
-        assert_eq!(link.capture_audio_session_state().tempo(), 150.0);
+        assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 150.0);
         assert_eq!(callbacks.load(Ordering::SeqCst), 2);
     }
 
@@ -944,7 +1006,7 @@ mod tests {
         holder.join().unwrap();
         timer.await.unwrap();
         assert!(!timed_out.load(Ordering::SeqCst));
-        assert_eq!(link.capture_audio_session_state().tempo(), 120.0);
+        assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 120.0);
     }
 
     #[tokio::test]
@@ -979,7 +1041,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let observed = calls.clone();
         link.set_start_stop_callback(move |playing| observed.lock().unwrap().push(playing));
-        let mut proposed = link.capture_audio_session_state();
+        let mut proposed = link.capture_audio_session_state().unwrap();
         proposed.set_tempo(150.0, link.clock.micros());
         proposed.set_is_playing(true, link.clock.micros());
         let ticket = link.commit_audio_session_state(proposed).unwrap();
@@ -990,13 +1052,13 @@ mod tests {
             .is_pending());
         assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
         assert_eq!(link.process_audio_session_state_updates().await, None);
-        assert_eq!(link.capture_audio_session_state().tempo(), 120.0);
+        assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 120.0);
         drop(drain);
         assert_eq!(*calls.lock().unwrap(), vec![false]);
         release.send(()).unwrap();
         holder.join().unwrap();
         assert_eq!(link.process_audio_session_state_updates().await, None);
-        assert_eq!(link.capture_audio_session_state().tempo(), 150.0);
+        assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 150.0);
         assert_eq!(*calls.lock().unwrap(), vec![false, true]);
         assert_eq!(
             link.take_audio_commit_result(ticket),
@@ -1019,7 +1081,7 @@ mod tests {
             link.set_start_stop_callback(move |_| {
                 playing_calls.fetch_add(1, Ordering::SeqCst);
             });
-            let mut old = link.capture_audio_session_state();
+            let mut old = link.capture_audio_session_state().unwrap();
             old.set_tempo(150.0, link.clock.micros());
             if combined {
                 old.set_is_playing(true, link.clock.micros());
@@ -1056,7 +1118,7 @@ mod tests {
             task::{Context, Waker},
         };
         let link = BasicLink::new(120.0).await.unwrap();
-        let mut proposed = link.capture_audio_session_state();
+        let mut proposed = link.capture_audio_session_state().unwrap();
         proposed.set_tempo(150.0, link.clock.micros());
         let ticket = link.commit_audio_session_state(proposed).unwrap();
         let session = link.controller.session_state.clone();
@@ -1079,7 +1141,7 @@ mod tests {
             .is_pending());
         drop(drain);
         assert_eq!(link.take_audio_commit_result(ticket), Ok(None));
-        assert_eq!(link.capture_audio_session_state().tempo(), 120.0);
+        assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 120.0);
         release.send(()).unwrap();
         holder.join().unwrap();
         assert_eq!(
@@ -1087,7 +1149,7 @@ mod tests {
             Some((ticket, Ok(())))
         );
         assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
-        assert_eq!(link.capture_audio_session_state().tempo(), 150.0);
+        assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 150.0);
     }
 
     #[tokio::test]
@@ -1124,8 +1186,8 @@ mod tests {
         assert!(!link.last_is_playing_for_callback.load(Ordering::Acquire));
         let ticket = link.commit_audio_session_state(proposed).unwrap();
         for _ in 0..3 {
-            assert_eq!(link.capture_audio_session_state().tempo(), 120.0);
-            assert!(!link.capture_audio_session_state().is_playing());
+            assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 120.0);
+            assert!(!link.capture_audio_session_state().unwrap().is_playing());
             assert_eq!(link.take_audio_commit_result(ticket), Ok(None));
         }
         assert_eq!(
