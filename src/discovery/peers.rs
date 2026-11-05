@@ -198,6 +198,21 @@ impl GatewayObserver {
         );
     }
 
+    /// Cooperatively reset session-owned peers without parking the caller runtime.
+    pub async fn reset_peers_async(&self) {
+        retry_state(|| {
+            try_with_observer_state(
+                &self.peers,
+                None,
+                self.sessions.as_ref(),
+                #[cfg(test)]
+                None,
+                |_, peers| peers.clear(),
+            )
+        })
+        .await;
+    }
+
     pub fn reset_peers(&self) {
         with_observer_state(
             &self.peers,

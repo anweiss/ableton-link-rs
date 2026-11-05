@@ -100,8 +100,8 @@ impl MeasurementEndpointV4 {
 pub enum MeasurePeerEvent {
     PeerState(SessionKey, PeerState),
     XForm(SessionKey, GhostXForm),
-    /// A captured ingress retired; retry only this originating incarnation.
-    Cancelled(SessionKey),
+    /// A captured ingress retired; retry this incarnation after the attempted peer.
+    Cancelled(SessionKey, NodeId),
 }
 
 /// A datagram received on the shared unicast socket, along with its sender.
@@ -199,7 +199,7 @@ impl MeasurementService {
                                     tokio::select! {
                                         biased;
                                         _ = open.closed() => {}
-                                        _ = t_peer.send(MeasurePeerEvent::Cancelled(session_id)) => {}
+                                        _ = t_peer.send(MeasurePeerEvent::Cancelled(session_id, peer.ident())) => {}
                                     }
                                     continue;
                                 }
@@ -492,7 +492,7 @@ async fn measure_peer_in_epoch(
             .as_ref()
             .is_some_and(|route| route.while_current(|| ()).is_none())
         {
-            select! { biased; _ = &mut forward_cancelled => {}, _ = tx_measure_peer_result.send(MeasurePeerEvent::Cancelled(session_id)) => {} }
+            select! { biased; _ = &mut forward_cancelled => {}, _ = tx_measure_peer_result.send(MeasurePeerEvent::Cancelled(session_id, node_id)) => {} }
         }
         return;
     }
@@ -545,7 +545,7 @@ async fn measure_peer_in_epoch(
                         .send(MeasurePeerEvent::XForm(session_id.clone(), x_form))
                 });
                 if let Some(slot) = slot {
-                    slot.send(MeasurePeerEvent::Cancelled(session_id));
+                    slot.send(MeasurePeerEvent::Cancelled(session_id, node_id));
                 }
             } else {
                 slot.send(MeasurePeerEvent::XForm(session_id, x_form));
@@ -1266,7 +1266,7 @@ mod tests {
             let pong = encode_message(PONG, &Payload { entries: vec![PayloadEntry::SessionMembership(SessionMembership::from(session.session_id)), PayloadEntry::HostTime(HostTime::new(Duration::microseconds(100))), PayloadEntry::GhostTime(crate::link::payload::GhostTime::new(Duration::microseconds(1_000_000))), PayloadEntry::PrevGhostTime(PrevGhostTime::new(Duration::microseconds(1_000_100)))] }).unwrap();
             let sender = route.dispatch().lock().unwrap().get(&endpoint.into()).unwrap().clone();
             for _ in 0..11 { sender.send((pong.clone(), endpoint.into())).await.unwrap(); }
-            assert!(matches!(results.recv().await, Some(MeasurePeerEvent::Cancelled(key)) if key.matches(&session)), "rejected publication must not silently end the result stream");
+            assert!(matches!(results.recv().await, Some(MeasurePeerEvent::Cancelled(key, _)) if key.matches(&session)), "rejected publication must not silently end the result stream");
             assert!(service.measurement_map.lock().unwrap().is_empty());
             assert!(route.dispatch().lock().unwrap().is_empty());
             assert!(results.try_recv().is_err());
@@ -1506,7 +1506,7 @@ mod tests {
                 while !dispatch.lock().unwrap().is_empty() || !measurements.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
                 assert!(matches!(rx.try_recv(),Ok(MeasurePeerEvent::XForm(_,x)) if x==GhostXForm::default()));
                 if !after_completion { job.await.unwrap(); }
-                assert!(matches!(rx.recv().await, Some(MeasurePeerEvent::Cancelled(_))), "retired registration must publish retryable cancellation, never a queued success");
+                assert!(matches!(rx.recv().await, Some(MeasurePeerEvent::Cancelled(_, _))), "retired registration must publish retryable cancellation, never a queued success");
                 assert!(rx.try_recv().is_err());
             }
         }).await.expect("invalidated measurements and their blocked result forwarders must terminate");
@@ -1693,7 +1693,7 @@ mod tests {
             let session = crate::link::sessions::Session::new(SessionId::default(), Default::default(), Default::default());
             let peer = PeerState { measurement_endpoint: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)), ..Default::default() };
             tx_peer.send(MeasurePeerEvent::PeerState(session.key(), peer.clone())).await.unwrap();
-            assert!(matches!(rx_result.recv().await, Some(MeasurePeerEvent::Cancelled(key)) if key.matches(&session)), "advertised endpoint without a route must report Cancelled, not a failed transform");
+            assert!(matches!(rx_result.recv().await, Some(MeasurePeerEvent::Cancelled(key, _)) if key.matches(&session)), "advertised endpoint without a route must report Cancelled, not a failed transform");
             tx_result.send(MeasurePeerEvent::XForm(session.key(), GhostXForm::default())).await.unwrap();
             tx_peer.send(MeasurePeerEvent::PeerState(session.key(), peer)).await.unwrap();
             drop(tx_peer.reserve().await.unwrap());

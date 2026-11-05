@@ -60,10 +60,7 @@ impl Encode for Timeline {
     ) -> core::result::Result<(), crate::encoding::EncodeError> {
         self.tempo.encode_to(out)?;
         self.beat_origin.encode_to(out)?;
-        self.time_origin
-            .num_microseconds()
-            .unwrap()
-            .encode_to(out)?;
+        super::micros(self.time_origin).encode_to(out)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {
@@ -146,7 +143,7 @@ pub fn update_session_timeline_from_client(
     let new_beat_origin = Beats {
         value: i64::max(
             cur_session.to_beats(x_form.host_to_ghost(at_time)).value,
-            cur_session.beat_origin.value + 1_i64,
+            cur_session.beat_origin.value.saturating_add(1),
         ),
     };
 

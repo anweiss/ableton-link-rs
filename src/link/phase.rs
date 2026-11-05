@@ -7,26 +7,26 @@ use super::timeline::Timeline;
 /// quantum except that negative beat values are handled correctly.
 /// If the given quantum is zero, returns zero.
 pub fn phase(beats: Beats, quantum: Beats) -> Beats {
-    if quantum.value == 0 {
-        Beats { value: 0 }
+    let quantum = i128::from(quantum.value).abs();
+    Beats::from_microbeats(if quantum == 0 {
+        0
     } else {
-        // Handle negative beat values by doing the computation relative to an
-        // origin that is on the nearest quantum boundary less than -(abs(x))
-        let quantum_micros = quantum.micro_beats();
-        let quantum_bins = (beats.micro_beats().abs() + quantum_micros) / quantum_micros;
-        let quantum_beats = quantum_bins * quantum_micros;
-        (beats + Beats::from_microbeats(quantum_beats)).r#mod(quantum)
-    }
+        i128::from(beats.value).rem_euclid(quantum) as i64
+    })
 }
 
 /// Return the least value greater than x that matches the phase of
 /// target with respect to the given quantum. If the given quantum
 /// is 0, x is returned.
 pub fn next_phase_match(x: Beats, target: Beats, quantum: Beats) -> Beats {
-    let desired_phase = phase(target, quantum);
-    let x_phase = phase(x, quantum);
-    let phase_diff = (desired_phase - x_phase + quantum).r#mod(quantum);
-    x + phase_diff
+    let quantum = i128::from(quantum.value).abs();
+    if quantum == 0 {
+        return x;
+    }
+    let offset = (i128::from(target.value) - i128::from(x.value)).rem_euclid(quantum);
+    Beats::from_microbeats(
+        (i128::from(x.value) + offset).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+    )
 }
 
 /// Return the closest value to x that matches the phase of the target

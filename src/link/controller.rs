@@ -821,7 +821,11 @@ impl Controller {
         self.discovery.measurement_service.stop().await;
         self.discovery.stop().await;
         self.dispatch.gate.stop().await;
-        self.session_peer_counter.lock().unwrap().session_peer_count = 0;
+        retry_state(|| {
+            try_state(&self.session_peer_counter)?.session_peer_count = 0;
+            Some(())
+        })
+        .await;
 
         // Reset while dispatch and discovery are still disabled. Opening first
         // lets a resumed result handler race this new lifecycle's state reset.
@@ -911,13 +915,27 @@ impl Controller {
         info!("Notified background tasks of disable");
 
         // Reset peer count to 0 when disabled, like the C++ implementation
-        if let Ok(mut counter) = self.session_peer_counter.try_lock() {
-            counter.session_peer_count = 0;
-            info!("Reset session peer count to 0");
-        }
+        retry_state(|| {
+            try_state(&self.session_peer_counter)?.session_peer_count = 0;
+            Some(())
+        })
+        .await;
 
         // Clear all peers from the discovery
-        self.discovery.observer.reset_peers();
+        self.discovery.observer.reset_peers_async().await;
+        // Closing the gate can cancel a promoted session's queued join. Publish
+        // a coherent local incarnation before accepting further disabled edits.
+        reset_state(
+            self.peer_state.clone(),
+            self.session_state.clone(),
+            self.client_state.clone(),
+            self.discovery.clone(),
+            self.sessions.clone(),
+            self.clock,
+            self.start_stop_sync_enabled.clone(),
+            self.managed_tempo_callback.clone(),
+        )
+        .await;
         info!("Reset discovery peers");
 
         // Give some time for the bye bye message to be sent and background tasks to wind down
@@ -931,140 +949,41 @@ impl Controller {
         // notifier. Final drop cancels the owned long-lived tasks.
     }
 
-    pub async fn set_state(&self, mut new_client_state: IncomingClientState) {
-        info!("setting state");
-        if let Some(timeline) = new_client_state.timeline.as_mut() {
-            *timeline = clamp_tempo(*timeline);
-            if let Ok(mut client_state) = self.client_state.try_lock() {
-                client_state.timeline = *timeline;
-            }
-        }
-
-        if let Some(mut start_stop_state) = new_client_state.start_stop_state {
-            let current_start_stop_state = if let Ok(client_state) = self.client_state.try_lock() {
-                client_state.start_stop_state
-            } else {
-                return; // If we can't access the state, exit early
-            };
-
-            start_stop_state =
-                select_preferred_start_stop_state(current_start_stop_state, start_stop_state);
-
-            if let Ok(mut client_state) = self.client_state.try_lock() {
-                client_state.start_stop_state = start_stop_state;
-            }
-        }
-
-        self.handle_client_state(new_client_state).await
+    pub async fn set_state(&self, new_client_state: IncomingClientState) {
+        self.handle_client_state(new_client_state).await;
     }
 
     pub async fn handle_client_state(&self, client_state: IncomingClientState) {
-        let mut must_update_discovery = false;
-
-        info!("client_state: {:?}", client_state);
-
-        if let Some(timeline) = client_state.timeline {
-            let (session_timeline, ghost_x_form) =
-                if let Ok(session_state) = self.session_state.try_lock() {
-                    (session_state.timeline, session_state.ghost_x_form)
-                } else {
-                    return; // If we can't access session state, exit early
-                };
-
-            let session_timeline = update_session_timeline_from_client(
-                session_timeline,
-                timeline,
-                client_state.timeline_timestamp,
-                ghost_x_form,
-            );
-
-            self.sessions.reset_timeline(session_timeline);
-
-            // setSessionTimeline
-            let peer_session_id = if let Ok(peer_state) = self.peer_state.try_lock() {
-                peer_state.session_id()
-            } else {
-                return; // If we can't access peer state, exit early
-            };
-
-            if let Ok(mut peers) = self.peers.try_lock() {
-                for peer in peers
-                    .iter_mut()
-                    .filter(|p| p.peer_state.session_id() == peer_session_id)
-                {
-                    peer.peer_state.node_state.timeline = session_timeline;
-                }
-            }
-
-            let ghost_x_form = if let Ok(session_state) = self.session_state.try_lock() {
-                session_state.ghost_x_form
-            } else {
-                return; // If we can't access session state, exit early
-            };
-
-            update_session_timing(
-                self.session_state.clone(),
-                self.client_state.clone(),
-                session_timeline,
-                ghost_x_form,
-                self.clock,
-                self.start_stop_sync_enabled.clone(),
-                self.managed_tempo_callback.clone(),
-                peer_session_id,
-            );
-
-            must_update_discovery = true;
-        }
-
-        if let Some(client_start_stop_state) = client_state.start_stop_state {
-            let sync_enabled = if let Ok(enabled) = self.start_stop_sync_enabled.try_lock() {
-                *enabled
-            } else {
-                return; // If we can't access sync enabled state, exit early
-            };
-
-            if sync_enabled {
-                let new_ghost_time = if let Ok(session_state) = self.session_state.try_lock() {
-                    session_state
-                        .ghost_x_form
-                        .host_to_ghost(client_start_stop_state.timestamp)
-                } else {
-                    return; // If we can't access session state, exit early
-                };
-
-                let current_timestamp = if let Ok(session_state) = self.session_state.try_lock() {
-                    session_state.start_stop_state.timestamp
-                } else {
-                    return; // If we can't access session state, exit early
-                };
-
-                if new_ghost_time > current_timestamp {
-                    if let Ok(mut session_state) = self.session_state.try_lock() {
-                        session_state.start_stop_state =
-                            map_start_stop_state_from_client_to_session(
-                                client_start_stop_state,
-                                session_state.timeline,
-                                session_state.ghost_x_form,
-                            );
-
-                        if let Ok(mut client_state) = self.client_state.try_lock() {
-                            client_state.start_stop_state = client_start_stop_state;
-                        }
-
-                        must_update_discovery = true;
-                    }
-                }
-            }
-        }
-
-        if must_update_discovery {
-            info!("updating discovery");
-            update_discovery(
-                self.session_state.clone(),
-                self.peer_state.clone(),
-                self.discovery.clone(),
-            )
+        loop {
+            let result = retry_state(|| {
+                try_session_commit(
+                    &self.sessions,
+                    &self.peers,
+                    &self.peer_state,
+                    &self.session_state,
+                    &self.client_state,
+                    &self.session_peer_counter,
+                    &self.start_stop_sync_enabled,
+                    &self.discovery,
+                    |state| state.client_edit(&client_state, self.clock),
+                )
+            })
             .await;
+            match result {
+                ClientCommit::WaitingForPublication => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await
+                }
+                ClientCommit::Complete(changed) => {
+                    if let Some(tempo) = changed {
+                        dispatch_current_tempo(
+                            &self.session_state,
+                            &self.managed_tempo_callback,
+                            tempo,
+                        );
+                    }
+                    return;
+                }
+            }
         }
     }
 
@@ -1154,7 +1073,13 @@ async fn refresh_peer_count(
     .await
 }
 
+enum ClientCommit {
+    WaitingForPublication,
+    Complete(Option<tempo::Tempo>),
+}
+
 struct SessionCommit<'a> {
+    published: &'a mut crate::link::sessions::SessionKey,
     current: &'a mut Session,
     others: &'a mut Vec<Session>,
     peers: &'a mut Vec<ControllerPeer>,
@@ -1182,6 +1107,7 @@ fn try_session_commit<R>(
     let mut current = try_state(&sessions.current)?;
     let mut others = try_state(&sessions.other_sessions)?;
     let mut peers = try_state(peers)?;
+    let mut published = try_state(&sessions.published)?;
     let mut peer = try_state(peer_state)?;
     let mut session = try_state(session_state)?;
     let mut client = try_state(client_state)?;
@@ -1197,6 +1123,7 @@ fn try_session_commit<R>(
         Some(try_state(&discovery.peer_state)?)
     };
     Some(commit(&mut SessionCommit {
+        published: &mut published,
         current: &mut current,
         others: &mut others,
         peers: &mut peers,
@@ -1213,6 +1140,7 @@ fn try_session_commit<R>(
 
 impl SessionCommit<'_> {
     fn publish_discovery(&mut self) {
+        *self.published = self.current.key();
         self.peer.node_state.timeline = self.session.timeline;
         self.peer.node_state.start_stop_state = self.session.start_stop_state;
         *self.responder_id = self.peer.session_id();
@@ -1251,7 +1179,6 @@ impl SessionCommit<'_> {
             self.sync_enabled,
             id,
         );
-        self.publish_discovery();
         *self.current = Session::new(
             id,
             timeline,
@@ -1263,13 +1190,16 @@ impl SessionCommit<'_> {
         self.others.clear();
         self.peers.clear();
         self.counter.session_peer_count = 0;
+        self.publish_discovery();
         changed
     }
 
     fn refresh_timing(&mut self, clock: Clock) -> Option<tempo::Tempo> {
         // A promotion's pending join owns publication of its identity. A timeline
         // announcement may refresh only the session already published locally.
-        if self.current.session_id != self.peer.session_id() {
+        if !self.published.matches(self.current)
+            || self.current.session_id != self.peer.session_id()
+        {
             return None;
         }
         let session = self.current.clone();
@@ -1284,6 +1214,66 @@ impl SessionCommit<'_> {
         );
         self.publish_discovery();
         changed
+    }
+
+    fn client_edit(&mut self, incoming: &IncomingClientState, clock: Clock) -> ClientCommit {
+        if !self.published.matches(self.current)
+            || self.current.session_id != self.peer.session_id()
+            || self.current.measurement.x_form != self.session.ghost_x_form
+        {
+            return ClientCommit::WaitingForPublication;
+        }
+        // Calculation and installation share the publication/ownership guards;
+        // no A-domain edit can be installed into a pending B incarnation.
+        let key = self.current.key();
+        let mut changed = None;
+        if let Some(timeline) = incoming.timeline {
+            let timeline = clamp_tempo(timeline);
+            let mapping = self.session.ghost_x_form;
+            let target = update_session_timeline_from_client(
+                self.session.timeline,
+                timeline,
+                incoming.timeline_timestamp,
+                mapping,
+            );
+            self.current.timeline = target;
+            for other in self.others.iter_mut().filter(|other| key.matches(other)) {
+                other.timeline = target;
+            }
+            for peer in self
+                .peers
+                .iter_mut()
+                .filter(|peer| peer.peer_state.session_id() == key.session_id)
+            {
+                peer.peer_state.node_state.timeline = target;
+            }
+            self.client.timeline = timeline;
+            changed = update_timing_guarded(
+                self.session,
+                self.client,
+                target,
+                mapping,
+                clock,
+                self.sync_enabled,
+                key.session_id,
+            );
+        }
+        if let Some(incoming) = incoming.start_stop_state {
+            let state = select_preferred_start_stop_state(self.client.start_stop_state, incoming);
+            self.client.start_stop_state = state;
+            if self.sync_enabled
+                && self.session.ghost_x_form.host_to_ghost(state.timestamp)
+                    > self.session.start_stop_state.timestamp
+            {
+                self.session.start_stop_state = map_start_stop_state_from_client_to_session(
+                    state,
+                    self.session.timeline,
+                    self.session.ghost_x_form,
+                );
+            }
+        }
+        self.publish_discovery();
+        ClientCommit::Complete(changed)
     }
 
     fn join(&mut self, queued: &Session, clock: Clock) -> Option<tempo::Tempo> {
@@ -1687,6 +1677,410 @@ pub struct SessionPeerCounter {
 #[cfg(test)]
 mod dispatch_gate_tests {
     #[tokio::test]
+    async fn admission_disable_waits_for_public_guards_without_parking_owned_io() {
+        for held_kind in 0..3 {
+            let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+                .await
+                .unwrap();
+            let before = controller.sessions.current.lock().unwrap().key();
+            let current = controller.sessions.current.clone();
+            let others = controller.sessions.other_sessions.clone();
+            let peers = controller.peers.clone();
+            let (ready, ready_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            fn hold<T>(
+                state: Arc<Mutex<T>>,
+                ready: std::sync::mpsc::Sender<()>,
+                release: std::sync::mpsc::Receiver<()>,
+            ) {
+                let _guard = state.lock().unwrap();
+                ready.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            let holder = std::thread::spawn(move || match held_kind {
+                0 => hold(current, ready, release_rx),
+                1 => hold(others, ready, release_rx),
+                _ => hold(peers, ready, release_rx),
+            });
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let io = controller.io.take().unwrap();
+            let work = io.spawn(async move {
+                controller.disable().await;
+                controller
+            });
+            let heartbeat = io.spawn(async {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            });
+            let responsive = matches!(
+                tokio::time::timeout(Duration::from_millis(100), heartbeat).await,
+                Ok(Ok(()))
+            );
+            let pending = !work.is_finished();
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            let mut controller = tokio::time::timeout(Duration::from_secs(2), work)
+                .await
+                .unwrap()
+                .unwrap();
+            controller.io = Some(io);
+            assert!(
+                responsive && pending,
+                "disable must await lock contention without parking IO: {held_kind}"
+            );
+            assert!(!before.matches(&controller.sessions.current.lock().unwrap()));
+            assert!(controller
+                .sessions
+                .published
+                .lock()
+                .unwrap()
+                .matches(&controller.sessions.current.lock().unwrap()));
+            assert!(controller.peers.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_disable_cancels_pending_promotion_without_stranding_disabled_edits() {
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let local = controller.peer_state.lock().unwrap().ident();
+        let remote = Session::new(
+            SessionId(NodeId::from_array([93; 8])),
+            Timeline::default(),
+            SessionMeasurement::default(),
+        );
+        controller
+            .sessions
+            .other_sessions
+            .lock()
+            .unwrap()
+            .push(remote.clone());
+        let (joins, mut queued) = tokio::sync::mpsc::channel(1);
+        let _owner = crate::link::sessions::handle_successful_measurement(
+            remote.key(),
+            GhostXForm {
+                slope: 1.0,
+                intercept: chrono::Duration::seconds(100),
+            },
+            controller.sessions.other_sessions.clone(),
+            controller.sessions.current.clone(),
+            controller.clock,
+            joins,
+            controller.peers.clone(),
+            controller.sessions.tx_measure_peer_state.clone(),
+        )
+        .await;
+        queued.recv().await.unwrap();
+        assert!(!controller
+            .sessions
+            .published
+            .lock()
+            .unwrap()
+            .matches(&controller.sessions.current.lock().unwrap()));
+        controller.disable().await;
+        let timeline = Timeline {
+            tempo: tempo::Tempo::new(135.0),
+            ..controller.client_state.lock().unwrap().timeline
+        };
+        tokio::time::timeout(
+            TEST_TIMEOUT,
+            controller.set_state(IncomingClientState {
+                timeline: Some(timeline),
+                start_stop_state: None,
+                timeline_timestamp: controller.clock.micros(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            controller.sessions.current.lock().unwrap().session_id,
+            SessionId(local)
+        );
+        assert!(controller
+            .sessions
+            .published
+            .lock()
+            .unwrap()
+            .matches(&controller.sessions.current.lock().unwrap()));
+        assert_eq!(
+            controller.client_state.lock().unwrap().timeline.tempo,
+            tempo::Tempo::new(135.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_client_edit_waits_for_promoted_clock_publication() {
+        for same_wire_id in [false, true] {
+            let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+                .await
+                .unwrap();
+            let before = *controller.session_state.lock().unwrap();
+            let original = controller.sessions.current.lock().unwrap().clone();
+            let remote = Session::new(
+                if same_wire_id {
+                    original.session_id
+                } else {
+                    SessionId(NodeId::from_array([94; 8]))
+                },
+                Timeline {
+                    tempo: tempo::Tempo::new(130.0),
+                    ..before.timeline
+                },
+                SessionMeasurement {
+                    x_form: GhostXForm {
+                        slope: 1.0,
+                        intercept: before.ghost_x_form.intercept + chrono::Duration::seconds(10),
+                    },
+                    timestamp: controller.clock.micros(),
+                },
+            );
+            controller
+                .sessions
+                .other_sessions
+                .lock()
+                .unwrap()
+                .push(remote.clone());
+            controller.peers.lock().unwrap().push(ControllerPeer {
+                peer_state: PeerState {
+                    node_state: NodeState {
+                        node_id: NodeId::from_array([95; 8]),
+                        session_id: remote.session_id,
+                        timeline: remote.timeline,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            });
+            let (joins, mut queued) = tokio::sync::mpsc::channel(1);
+            let _owner = crate::link::sessions::handle_successful_measurement(
+                remote.key(),
+                remote.measurement.x_form,
+                controller.sessions.other_sessions.clone(),
+                controller.sessions.current.clone(),
+                controller.clock,
+                joins,
+                controller.peers.clone(),
+                controller.sessions.tx_measure_peer_state.clone(),
+            )
+            .await;
+            let promoted = queued.recv().await.unwrap();
+            let host_edit = Timeline {
+                tempo: tempo::Tempo::new(155.0),
+                ..controller.client_state.lock().unwrap().timeline
+            };
+            let at = controller.clock.micros();
+            let mut edit = Box::pin(controller.set_state(IncomingClientState {
+                timeline: Some(host_edit),
+                start_stop_state: None,
+                timeline_timestamp: at,
+            }));
+            assert!(edit
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            assert_eq!(
+                controller.sessions.current.lock().unwrap().timeline,
+                remote.timeline,
+                "an A-clock calculation must not mutate pending B"
+            );
+            assert_eq!(*controller.session_state.lock().unwrap(), before);
+            join_session(
+                promoted,
+                controller.peer_state.clone(),
+                controller.session_state.clone(),
+                controller.client_state.clone(),
+                controller.clock,
+                controller.start_stop_sync_enabled.clone(),
+                controller.discovery.clone(),
+                controller.peers.clone(),
+                controller.session_peer_counter.clone(),
+                controller.sessions.clone(),
+                controller.tempo_callback.clone(),
+            )
+            .await;
+            tokio::time::timeout(TEST_TIMEOUT, edit).await.unwrap();
+            let expected = update_session_timeline_from_client(
+                remote.timeline,
+                host_edit,
+                at,
+                remote.measurement.x_form,
+            );
+            assert_eq!(
+                controller.sessions.current.lock().unwrap().timeline,
+                expected
+            );
+            assert_eq!(controller.session_state.lock().unwrap().timeline, expected);
+            assert_eq!(controller.peer_state.lock().unwrap().timeline(), expected);
+            assert_eq!(
+                controller.client_state.lock().unwrap().timeline_session_id,
+                remote.session_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_received_extreme_beats_survive_join_start_stop_and_client_edit() {
+        for origin in [i64::MIN, i64::MAX] {
+            let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+                .await
+                .unwrap();
+            *controller.start_stop_sync_enabled.lock().unwrap() = true;
+            let (ack, mut acknowledged) = tokio::sync::mpsc::channel(4);
+            *controller.audio_endpoint_callback.lock().unwrap() =
+                Some(Arc::new(Mutex::new(Box::new(move |_, _| {
+                    ack.try_send(()).unwrap();
+                }))));
+            controller.enable().await;
+            let local = controller
+                .discovery
+                .socket_probes()
+                .into_iter()
+                .filter_map(|socket| socket.upgrade())
+                .find_map(|socket| match socket.local_addr().unwrap() {
+                    std::net::SocketAddr::V4(addr) if !addr.ip().is_unspecified() => {
+                        Some(*addr.ip())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let node = NodeId::from_array([91; 8]);
+            let id = SessionId(node);
+            let packet = |second: bool| {
+                let state = PeerState {
+                    node_state: NodeState {
+                        node_id: node,
+                        session_id: id,
+                        timeline: Timeline {
+                            tempo: tempo::Tempo::new(120.0),
+                            ..Default::default()
+                        },
+                        start_stop_state: StartStopState {
+                            is_playing: second,
+                            timestamp: chrono::Duration::seconds(if second { 2 } else { 1 }),
+                            ..Default::default()
+                        },
+                    },
+                    measurement_endpoint: Some("127.0.0.1:12345".parse().unwrap()),
+                    audio_endpoint: second.then(|| "127.0.0.1:12346".parse().unwrap()),
+                };
+                let mut bytes = crate::discovery::messages::encode_message(
+                    node,
+                    30,
+                    crate::discovery::messages::RESPONSE,
+                    &crate::link::payload::Payload::from(state),
+                    0,
+                )
+                .unwrap();
+                let timeline = bytes.windows(4).position(|entry| entry == b"tmln").unwrap() + 16;
+                bytes[timeline..timeline + 8].copy_from_slice(&origin.to_be_bytes());
+                let start_stop = bytes.windows(4).position(|entry| entry == b"stst").unwrap() + 9;
+                bytes[start_stop..start_stop + 8].copy_from_slice(
+                    &(if origin == i64::MIN {
+                        i64::MAX
+                    } else {
+                        i64::MIN
+                    })
+                    .to_be_bytes(),
+                );
+                bytes
+            };
+            controller
+                .discovery
+                .receive_peer_state_fixture(local, &packet(false))
+                .await;
+            tokio::time::timeout(TEST_TIMEOUT, acknowledged.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let candidate = controller
+                .sessions
+                .other_sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|session| session.session_id == id)
+                .unwrap()
+                .clone();
+            assert_eq!(
+                candidate.timeline.beat_origin.value, origin,
+                "raw decoder must have accepted the adversarial beat value"
+            );
+            let (joins, mut queued) = tokio::sync::mpsc::channel(1);
+            let _owner = crate::link::sessions::handle_successful_measurement(
+                candidate.key(),
+                GhostXForm {
+                    slope: 1.0,
+                    intercept: chrono::Duration::seconds(100),
+                },
+                controller.sessions.other_sessions.clone(),
+                controller.sessions.current.clone(),
+                controller.clock,
+                joins,
+                controller.peers.clone(),
+                controller.sessions.tx_measure_peer_state.clone(),
+            )
+            .await;
+            let promoted = queued.recv().await.unwrap();
+            join_session(
+                promoted,
+                controller.peer_state.clone(),
+                controller.session_state.clone(),
+                controller.client_state.clone(),
+                controller.clock,
+                controller.start_stop_sync_enabled.clone(),
+                controller.discovery.clone(),
+                controller.peers.clone(),
+                controller.session_peer_counter.clone(),
+                controller.sessions.clone(),
+                controller.tempo_callback.clone(),
+            )
+            .await;
+            controller
+                .discovery
+                .receive_peer_state_fixture(local, &packet(true))
+                .await;
+            tokio::time::timeout(TEST_TIMEOUT, acknowledged.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                controller
+                    .session_state
+                    .lock()
+                    .unwrap()
+                    .start_stop_state
+                    .beats
+                    .value,
+                if origin == i64::MIN {
+                    i64::MAX
+                } else {
+                    i64::MIN
+                }
+            );
+            assert_eq!(
+                controller.client_state.lock().unwrap().timeline_session_id,
+                id
+            );
+            let edit = Timeline {
+                tempo: tempo::Tempo::new(150.0),
+                ..controller.client_state.lock().unwrap().timeline
+            };
+            controller
+                .set_state(IncomingClientState {
+                    timeline: Some(edit),
+                    start_stop_state: None,
+                    timeline_timestamp: controller.clock.micros(),
+                })
+                .await;
+            assert_eq!(
+                controller.session_state.lock().unwrap().timeline.tempo,
+                tempo::Tempo::new(150.0)
+            );
+            controller.disable().await;
+        }
+    }
+
+    #[tokio::test]
     async fn owned_io_candidate_timeline_cannot_relabel_current_client() {
         use crate::discovery::peers::PeerStateMessageType;
         let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
@@ -1805,7 +2199,7 @@ mod dispatch_gate_tests {
             },
         });
         let (joins, mut queued) = tokio::sync::mpsc::channel(1);
-        crate::link::sessions::handle_successful_measurement(
+        let _remeasurement = crate::link::sessions::handle_successful_measurement(
             remote.key(),
             before.ghost_x_form,
             controller.sessions.other_sessions.clone(),
@@ -1961,7 +2355,7 @@ mod dispatch_gate_tests {
             ready.send(()).unwrap();
             release.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        for held_kind in 0..10 {
+        for held_kind in 0..11 {
             let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
                 .await
                 .unwrap();
@@ -1991,7 +2385,7 @@ mod dispatch_gate_tests {
                 },
             });
             let (joins, mut queued) = mpsc::channel(1);
-            crate::link::sessions::handle_successful_measurement(
+            let _remeasurement = crate::link::sessions::handle_successful_measurement(
                 remote.key(),
                 GhostXForm {
                     slope: 1.0,
@@ -2049,6 +2443,7 @@ mod dispatch_gate_tests {
             let current = controller.sessions.current.clone();
             let others = controller.sessions.other_sessions.clone();
             let peers = controller.peers.clone();
+            let published = controller.sessions.published.clone();
             let (ready, ready_rx) = std::sync::mpsc::channel();
             let (release, release_rx) = std::sync::mpsc::channel();
             let holder = std::thread::spawn(move || match held_kind {
@@ -2061,7 +2456,8 @@ mod dispatch_gate_tests {
                 6 => hold(pong_form, ready, release_rx),
                 7 => hold(current, ready, release_rx),
                 8 => hold(others, ready, release_rx),
-                _ => hold(peers, ready, release_rx),
+                9 => hold(peers, ready, release_rx),
+                _ => hold(published, ready, release_rx),
             });
             ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             let peer = controller.peer_state.clone();
@@ -2312,7 +2708,7 @@ mod dispatch_gate_tests {
                     .collect::<Vec<_>>();
                 *controller.peers.lock().unwrap() = peers;
                 let (joins, mut queued) = mpsc::channel(1);
-                crate::link::sessions::handle_successful_measurement(
+                let _remeasurement = crate::link::sessions::handle_successful_measurement(
                     remote.key(),
                     GhostXForm {
                         slope: 1.0,

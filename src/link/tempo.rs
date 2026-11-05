@@ -25,7 +25,7 @@ impl Display for Tempo {
 impl From<Duration> for Tempo {
     fn from(value: Duration) -> Self {
         Tempo {
-            value: 60.0 * 1e6 / value.num_microseconds().unwrap() as f64,
+            value: 60.0 * 1e6 / super::micros(value) as f64,
         }
     }
 }
@@ -45,7 +45,7 @@ impl Tempo {
 
     pub fn micros_to_beats(&self, micros: Duration) -> Beats {
         Beats::new(
-            micros.num_microseconds().unwrap() as f64
+            super::micros(micros) as f64
                 / self.micros_per_beat().num_microseconds().unwrap() as f64,
         )
     }
