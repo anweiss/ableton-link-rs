@@ -289,6 +289,9 @@ The minimum Chrono version is now **0.4.39**, including for `no_std` consumers.
 Elapsed time, timeline beat differences and clock scaling retain wide intermediates
 through conversion and origin/intercept addition. Public `Beats` operators still
 saturate; timeline composition does not use their narrowed intermediate results.
+Tempo periods stay wide in both beat conversion directions. Forced-beat requests
+re-anchor an unrepresentable origin when a bounded quantum-boundary anchor exists;
+the public rounding correction clamps at Chrono's duration limits.
 PONG ghost timestamps saturate at the final signed-microsecond wire boundary.
 Gateway node publication acquires peer and both responder guards cooperatively
 before any mutation. Checked announcement commits release timeout state while
@@ -297,9 +300,13 @@ waiting on interface/revision guards and remain lease/deadline/epoch cancellable
 Clock payload fields and start/stop timestamps clamp only when encoded as signed
 wire microseconds. PONG sample sums and differences remain wide through averaging;
 individual received fields must still be representable in the wire format.
-`Tempo::beats_to_micros`, timeline conversion and forward ghost scaling can return
+`Tempo::micros_per_beat`, `Tempo::beats_to_micros`, timeline conversion and forward ghost scaling can return
 Chrono durations beyond the signed-microsecond range. Callers must handle
 `num_microseconds() == None` instead of unwrapping an arbitrary derived duration.
+Measurement workers acquire public sample, success and retry-counter mutexes
+cooperatively with poison recovery. Sample append returns its count under the same
+guard; completion drains under one guard, and timer state waits remain cancellable
+by completion without parking the current-thread executor.
 Managed discovery forwarding and measurement publication use the same cooperative
 interface-lease checks; timeout lookup, pruning and shutdown also release guards
 before waiting. Ignoring an `Option<RemeasurementTask>` returned by a public result

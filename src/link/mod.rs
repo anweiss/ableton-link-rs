@@ -561,7 +561,7 @@ impl SessionState {
             force_beat_at_time_impl(
                 &mut self.state.timeline,
                 Beats::new(beat),
-                time + Duration::microseconds(1),
+                duration_from_nanos(duration_nanos(time) + 1_000),
                 Beats::new(quantum),
             );
         }
@@ -602,6 +602,24 @@ mod tests {
     use tracing::info;
 
     use super::*;
+
+    #[test]
+    fn review_round_public_force_beat_handles_duration_limits() {
+        for time in [Duration::MAX, Duration::MIN] {
+            let mut state = SessionState::new(
+                ApiState {
+                    timeline: Timeline {
+                        tempo: Tempo::new(120.0),
+                        ..Timeline::default()
+                    },
+                    ..ApiState::default()
+                },
+                false,
+            );
+            state.force_beat_at_time(0.0, time, 0.0);
+            assert_eq!(state.beat_at_time(time, 0.0), 0.0);
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_disable_keeps_atomic_and_controller_enabled_flags_consistent() {

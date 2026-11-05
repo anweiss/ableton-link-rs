@@ -112,12 +112,35 @@ pub fn force_beat_at_time_impl(
     let cur_beat_at_time = to_phase_encoded_microbeats(timeline, time, quantum);
     let closest_in_phase =
         closest_phase_match_wide(cur_beat_at_time, beat.value.into(), quantum.value.into());
-    *timeline = shift_client_timeline_wide(*timeline, closest_in_phase - cur_beat_at_time);
+    let time_origin = shifted_time_origin_nanos(*timeline, closest_in_phase - cur_beat_at_time);
     // Narrow only after both magnitude adjustments have cancelled.
-    timeline.beat_origin = narrow(
-        (i128::from(timeline.beat_origin.value) + i128::from(beat.value))
-            .saturating_sub(closest_in_phase),
-    );
+    let beat_origin = (i128::from(timeline.beat_origin.value) + i128::from(beat.value))
+        .saturating_sub(closest_in_phase);
+    let min_time = super::duration_nanos(Duration::MIN);
+    let max_time = super::duration_nanos(Duration::MAX);
+    if !(i64::MIN as i128..=i64::MAX as i128).contains(&beat_origin)
+        || !(min_time..=max_time).contains(&time_origin)
+    {
+        // A quantum-boundary origin makes raw and phase-encoded beats agree.
+        let boundary = i128::from(beat.value) - phase_wide(beat.value.into(), quantum.value.into());
+        for origin in [boundary, boundary + i128::from(quantum.value).abs()] {
+            if !(i64::MIN as i128..=i64::MAX as i128).contains(&origin) {
+                continue;
+            }
+            let elapsed = timeline
+                .tempo
+                .micros_from_microbeats(i128::from(beat.value) - origin);
+            let anchored_time =
+                super::duration_nanos(time).saturating_sub(elapsed.saturating_mul(1_000));
+            if (min_time..=max_time).contains(&anchored_time) {
+                timeline.beat_origin = narrow(origin);
+                timeline.time_origin = super::duration_from_nanos(anchored_time);
+                return;
+            }
+        }
+    }
+    timeline.beat_origin = narrow(beat_origin);
+    timeline.time_origin = super::duration_from_nanos(time_origin);
 }
 
 /// Shift client timeline by the given beat offset
@@ -126,14 +149,21 @@ pub fn shift_client_timeline(timeline: Timeline, shift: Beats) -> Timeline {
 }
 
 fn shift_client_timeline_wide(mut timeline: Timeline, shift: i128) -> Timeline {
-    let origin = i128::from(timeline.beat_origin.value);
-    // Round each beat-to-time conversion as before, but do not clamp either
-    // intermediate Duration before their difference and the final origin.
-    let delta = timeline.tempo.micros_from_microbeats(shift - origin)
-        - timeline.tempo.micros_from_microbeats(-origin);
-    timeline.time_origin =
-        super::duration_from_nanos(super::duration_nanos(timeline.time_origin) - delta * 1_000);
+    timeline.time_origin = super::duration_from_nanos(shifted_time_origin_nanos(timeline, shift));
     timeline
+}
+
+fn shifted_time_origin_nanos(timeline: Timeline, shift: i128) -> i128 {
+    let origin = i128::from(timeline.beat_origin.value);
+    let period = timeline.tempo.period_micros();
+    // Cancel the whole-period terms before multiplication, preserving each
+    // original conversion's rounding even when their magnitudes exceed i128.
+    let remainder = period % 1_000_000;
+    let delta = shift.saturating_mul(period / 1_000_000).saturating_add(
+        super::round_ratio((shift - origin) * remainder, 1_000_000)
+            - super::round_ratio(-origin * remainder, 1_000_000),
+    );
+    super::duration_nanos(timeline.time_origin).saturating_sub(delta.saturating_mul(1_000))
 }
 
 #[cfg(test)]
@@ -142,8 +172,32 @@ mod tests {
     use crate::link::tempo::Tempo;
 
     #[test]
-    fn force_beat_saturates_zero_period_magnitude() {
-        for (micros, expected) in [(-1, i64::MAX), (1, i64::MIN)] {
+    fn review_round_force_beat_reanchors_large_times() {
+        for time in [
+            Duration::microseconds(i64::MAX),
+            Duration::microseconds(i64::MIN),
+            Duration::MAX,
+            Duration::MIN,
+        ] {
+            for quantum in [0.0, 4.0, -4.0] {
+                for beat in [-1.0, 0.0, 1.0] {
+                    let mut timeline = Timeline {
+                        tempo: Tempo::new(120.0),
+                        beat_origin: Beats::default(),
+                        time_origin: Duration::zero(),
+                    };
+                    let beat = Beats::new(beat);
+                    let quantum = Beats::new(quantum);
+                    force_beat_at_time_impl(&mut timeline, beat, time, quantum);
+                    assert_eq!(to_phase_encoded_beats(&timeline, time, quantum), beat);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn force_beat_reanchors_zero_period_magnitude() {
+        for micros in [-1, 1] {
             let mut timeline = Timeline {
                 tempo: Tempo::new(1e20),
                 beat_origin: Beats::default(),
@@ -155,8 +209,12 @@ mod tests {
                 Duration::microseconds(micros),
                 Beats::default(),
             );
-            assert_eq!(timeline.beat_origin.value, expected);
-            assert_eq!(timeline.time_origin, Duration::zero());
+            assert_eq!(timeline.beat_origin.value, 0);
+            assert_eq!(timeline.time_origin, Duration::microseconds(micros));
+            assert_eq!(
+                to_phase_encoded_beats(&timeline, Duration::microseconds(micros), Beats::default()),
+                Beats::default()
+            );
         }
     }
 

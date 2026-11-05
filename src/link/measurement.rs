@@ -28,6 +28,7 @@ use crate::{
         },
         Result,
     },
+    platform::io_context::{retry_state, try_state},
 };
 
 use super::{
@@ -943,23 +944,26 @@ impl Measurement {
                         }
 
                         let Some(samples) = pong_samples(host_time, prev_host_time, ghost_time, prev_ghost_time) else { continue; };
-                        {
+                        let sample_count = {
                             let mut samples = Some(samples);
-                            let append = crate::platform::io_context::retry_state(|| {
-                                let mut data = crate::platform::io_context::try_state(&data)?;
-                                let mut publish = || data.extend(samples.take().unwrap());
-                                if let Some(route) = &route { route.try_while_current(publish).map(|result| result.is_some()) }
-                                else { publish(); Some(true) }
+                            let append = retry_state(|| {
+                                let mut data = try_state(&data)?;
+                                let mut publish = || {
+                                    data.extend(samples.take().unwrap());
+                                    data.len()
+                                };
+                                if let Some(route) = &route { route.try_while_current(publish) }
+                                else { Some(Some(publish())) }
                             });
-                            let appended = select! {
+                            select! {
                                 biased;
-                                _ = async { match &route { Some(route) => route.invalidated().await, None => std::future::pending().await } } => false,
+                                _ = async { match &route { Some(route) => route.invalidated().await, None => std::future::pending().await } } => None,
                                 result = append => result,
-                            };
-                            if !appended { break; }
-                        }
+                            }
+                        };
+                        let Some(sample_count) = sample_count else { break; };
 
-                        if data.lock().unwrap_or_else(|e| e.into_inner()).len() > NUMBER_DATA_POINTS {
+                        if sample_count > NUMBER_DATA_POINTS {
                             if let Err(error) = tx_timer.send(()).await {
                                 debug!("measurement timer closed during cancellation: {}", error);
                             }
@@ -999,12 +1003,11 @@ pub(crate) async fn reset_timer(
 ) {
     loop {
         select! {
-            _  = tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()) => {
-                info!(
-                    "measurements_start {}",
-                    measurements_started.try_lock().unwrap()
-                );
-                if *measurements_started.try_lock().unwrap() < NUMBER_MEASUREMENTS {
+            done = async {
+                tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()).await;
+                let started = retry_state(|| Some(*try_state(&measurements_started)?)).await;
+                info!("measurements_start {}", started);
+                if started < NUMBER_MEASUREMENTS {
                     let ht = HostTime {
                         time: clock.micros(),
                     };
@@ -1019,20 +1022,29 @@ pub(crate) async fn reset_timer(
                     .await {
                         debug!("Failed to send ping to {}: {}", measurement_endpoint, e);
                         publish_samples(&tx_measurement, Vec::new());
-                        break;
+                        return true;
                     }
 
                     tokio::time::sleep(Duration::seconds(1).to_std().unwrap()).await;
 
-                    *measurements_started.try_lock().unwrap() += 1;
+                    retry_state(|| {
+                        let mut started = try_state(&measurements_started)?;
+                        *started = started.saturating_add(1);
+                        Some(())
+                    }).await;
+                    false
                 } else {
-                    data.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    retry_state(|| {
+                        try_state(&data)?.clear();
+                        Some(())
+                    }).await;
                     info!("measuring {} failed", measurement_endpoint);
 
-                    let data = data.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    publish_samples(&tx_measurement, data);
-                    break;
+                    publish_samples(&tx_measurement, Vec::new());
+                    true
                 }
+            } => {
+                if done { break; }
             }
             _ = finished_notifier.notified() => {
                 break;
@@ -1047,12 +1059,15 @@ async fn finish(
     data: Arc<Mutex<Vec<(f64, f64)>>>,
     tx_measurement: Sender<Vec<(f64, f64)>>,
 ) {
-    *success.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    retry_state(|| {
+        *try_state(&success)? = true;
+        Some(())
+    })
+    .await;
     debug!("measuring {} done", measurement_endpoint);
 
-    let d = data.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let d = retry_state(|| Some(mem::take(&mut *try_state(&data)?))).await;
     publish_samples(&tx_measurement, d);
-    data.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 pub async fn send_ping(
@@ -1161,6 +1176,109 @@ fn pong_samples(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn review_round_completion_yields_to_public_mutex_holders() {
+        for hold_success in [false, true] {
+            let expected = vec![(1.0, 2.0)];
+            let data = Arc::new(Mutex::new(expected.clone()));
+            let success = Arc::new(Mutex::new(false));
+            let held_data = data.clone();
+            let held_success = success.clone();
+            let (ready, ready_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let data_guard = (!hold_success).then(|| held_data.lock().unwrap());
+                let success_guard = hold_success.then(|| held_success.lock().unwrap());
+                ready.send(()).unwrap();
+                let released = release_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_ok();
+                drop(data_guard);
+                drop(success_guard);
+                released
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            let task = tokio::spawn(finish(
+                success.clone(),
+                "127.0.0.1:12345".parse().unwrap(),
+                data.clone(),
+                tx,
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let released = release.send(()).is_ok();
+            let executor_progressed = holder.join().unwrap();
+            task.await.unwrap();
+            assert!(
+                released && executor_progressed,
+                "completion parked the current-thread executor"
+            );
+            assert_eq!(rx.recv().await.unwrap(), expected);
+            assert!(data.lock().unwrap().is_empty());
+            assert!(*success.lock().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn review_round_timer_completion_cancels_contended_state_waits() {
+        for hold_counter in [false, true] {
+            let data = Arc::new(Mutex::new(vec![(1.0, 2.0)]));
+            let counter = Arc::new(Mutex::new(NUMBER_MEASUREMENTS));
+            let held_data = data.clone();
+            let held_counter = counter.clone();
+            let (ready, ready_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let data_guard = (!hold_counter).then(|| held_data.lock().unwrap());
+                let counter_guard = hold_counter.then(|| held_counter.lock().unwrap());
+                ready.send(()).unwrap();
+                let released = release_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_ok();
+                drop(data_guard);
+                drop(counter_guard);
+                released
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            let finished = Arc::new(Notify::new());
+            let mut task = tokio::spawn(reset_timer(
+                counter,
+                Clock::new(),
+                None,
+                "127.0.0.1:12345".parse().unwrap(),
+                data,
+                tx,
+                finished.clone(),
+                None,
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            finished.notify_one();
+            let completed =
+                tokio::time::timeout(std::time::Duration::from_millis(200), &mut task).await;
+            let released = release.send(()).is_ok();
+            let executor_progressed = holder.join().unwrap();
+            if completed.is_err() {
+                task.abort();
+            }
+            assert!(
+                released && executor_progressed,
+                "timer parked the current-thread executor"
+            );
+            completed
+                .expect("completion must cancel the state retry")
+                .unwrap();
+            assert!(
+                rx.try_recv().is_err(),
+                "completion must win over the timeout drain"
+            );
+        }
+    }
+
     #[test]
     fn wide_boundary_pong_samples_average_before_narrowing() {
         for value in [i64::MIN, i64::MAX] {
