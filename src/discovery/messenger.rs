@@ -198,9 +198,29 @@ impl LocalDelivery {
     }
 }
 
+#[cfg(test)]
+struct SendPause {
+    ready: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+    blocked: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+pub(crate) struct BroadcastFixture {
+    pub sockets: InterfaceSockets,
+    pub source: SocketAddr,
+    pub lease_cancelled: Arc<AtomicBool>,
+    pub ready: tokio::sync::oneshot::Receiver<()>,
+    pub resume: tokio::sync::oneshot::Sender<()>,
+    pub blocked: tokio::sync::oneshot::Receiver<()>,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
 /// A send/receive socket bound to a single network interface.
 #[derive(Clone)]
 pub struct InterfaceSocket {
+    #[cfg(test)]
+    send_pause: Arc<Mutex<Option<SendPause>>>,
     socket: Arc<UdpSocket>,
     receiver: Arc<PacketSocket>,
     identity: Ipv4Interface,
@@ -231,6 +251,8 @@ impl InterfaceSocket {
             measurement_responder: self.measurement_responder,
             measurement_dispatch: self.measurement_dispatch.clone(),
             local_delivery: self.local_delivery.clone(),
+            #[cfg(test)]
+            send_pause: self.send_pause.clone(),
             siblings: Vec::new(),
         }
     }
@@ -688,6 +710,48 @@ pub struct Messenger {
 }
 
 impl Messenger {
+    #[cfg(test)]
+    pub(crate) fn broadcast_epoch_fixture(
+        &self,
+        to: SocketAddrV4,
+        gate: Arc<crate::link::controller::DispatchGate>,
+    ) -> BroadcastFixture {
+        let entry = tests::interface_socket();
+        let source = entry.socket.local_addr().unwrap();
+        let lease_cancelled = entry.cancel.cancelled.clone();
+        let (ready, ready_rx) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        let (blocked, blocked_rx) = tokio::sync::oneshot::channel();
+        *entry.send_pause.lock().unwrap() = Some(SendPause {
+            ready,
+            resume: resume_rx,
+            blocked,
+        });
+        let sockets = Arc::new(Mutex::new(HashMap::from([(entry.identity.addr, entry)])));
+        let task = tokio::spawn(broadcast_state_loop(
+            1,
+            20,
+            Arc::new(Mutex::new(Instant::now() - Duration::from_secs(2))),
+            sockets.clone(),
+            self.peer_state.clone(),
+            to,
+            self.notifier.clone(),
+            self.enabled.clone(),
+            self.group_id,
+            false,
+            Some(gate),
+        ));
+        BroadcastFixture {
+            sockets,
+            source,
+            lease_cancelled,
+            ready: ready_rx,
+            resume,
+            blocked: blocked_rx,
+            task,
+        }
+    }
+
     pub(crate) fn set_measurement_responder(
         &mut self,
         responder: crate::link::pingresponder::PingResponder,
@@ -925,6 +989,7 @@ impl Messenger {
             self.enabled.clone(),
             self.group_id,
             false,
+            Some(context.gate.clone()),
         );
         async move {
             // Each per-interface socket receives the unicast responses triggered by the
@@ -1063,6 +1128,8 @@ fn add_interface_locked(
         measurement_responder,
         measurement_dispatch: Arc::new(Mutex::new(HashMap::new())),
         local_delivery: Arc::new(LocalDelivery(Mutex::new(local_identity.clone()))),
+        #[cfg(test)]
+        send_pause: Default::default(),
         siblings: Vec::new(),
     };
 
@@ -1897,6 +1964,7 @@ pub async fn broadcast_state(
         enabled,
         group_id,
         true,
+        None,
     )
     .await;
 }
@@ -1912,6 +1980,7 @@ async fn broadcast_state_loop(
     enabled: Arc<Mutex<bool>>,
     group_id: SessionGroupId,
     stop_on_notify: bool,
+    gate: Option<Arc<crate::link::controller::DispatchGate>>,
 ) {
     let lbt = last_broadcast_time.clone();
 
@@ -1964,14 +2033,21 @@ async fn broadcast_state_loop(
                     };
 
                     if should_broadcast {
-                        // Announce ourselves through every interface, so peers on any
-                        // of them can discover us.
-                        let entries = select! {
-                            _ = n.notified() => { if stop_on_notify { return; } continue; },
-                            entries = interface_socket_entries_async(&interface_sockets) => entries,
+                        let announce = async {
+                            let entries=interface_socket_entries_async(&interface_sockets).await;
+                            for entry in entries {
+                                send_peer_state_via(entry.socket.clone(),peer_state.clone(),ttl,ALIVE,to,lbt.clone(),group_id,Some((&entry,&interface_sockets))).await;
+                            }
                         };
-                        for entry in entries {
-                            send_peer_state_via(entry.socket.clone(), peer_state.clone(), ttl, ALIVE, to, lbt.clone(), group_id, Some((&entry, &interface_sockets))).await;
+                        let work = async {
+                            if let Some(gate)=&gate {
+                                let epoch=gate.epoch();
+                                gate.run_in_epoch(epoch,announce).await;
+                            } else {announce.await;}
+                        };
+                        select! {
+                            _ = n.notified(), if stop_on_notify => return,
+                            _ = work => {},
                         }
                     }
                 }
@@ -2085,6 +2161,18 @@ async fn send_registered(
     message: &[u8],
     to: SocketAddrV4,
 ) -> std::io::Result<()> {
+    #[cfg(test)]
+    let mut blocked = None;
+    #[cfg(test)]
+    if parse_message_header(message).is_ok_and(|(header, _)| header.message_type == ALIVE) {
+        let pause = crate::platform::io_context::try_state(&entry.send_pause)
+            .and_then(|mut pause| pause.take());
+        if let Some(pause) = pause {
+            let _ = pause.ready.send(());
+            let _ = pause.resume.await;
+            blocked = Some(pause.blocked);
+        }
+    }
     loop {
         select! {
             biased;
@@ -2099,7 +2187,11 @@ async fn send_registered(
             result = crate::platform::io_context::retry_state(|| {
             let sockets = match sockets.try_lock() {
                 Ok(sockets) => sockets,
-                Err(std::sync::TryLockError::WouldBlock) => return None,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    #[cfg(test)]
+                    if let Some(ready)=blocked.take() {let _=ready.send(());}
+                    return None;
+                },
                 Err(std::sync::TryLockError::Poisoned(_)) => return Some(Err(std::io::Error::other("interface socket map is poisoned"))),
             };
             let current = sockets.get(&entry.identity.addr).is_some_and(|current| {
@@ -3052,6 +3144,7 @@ mod tests {
                     context.enabled.clone(),
                     0,
                     false,
+                    Some(context.gate.clone()),
                 ));
                 let send_route = route.clone();
                 let mut send = io.spawn(async move {
@@ -4052,7 +4145,9 @@ mod tests {
                 identity: Ipv4Interface { addr, index: u32::try_from(info.if_index).unwrap(), name: "measurement-source-fixture".into() },
                 cancel: Cancel::default(), topology: None, generation: 0,
                 measurement_responder: true, measurement_dispatch: Arc::new(Mutex::new(HashMap::new())),
-            local_delivery: Arc::new(LocalDelivery::snapshot()), siblings: Vec::new(),
+            local_delivery: Arc::new(LocalDelivery::snapshot()), #[cfg(test)]
+            send_pause: Default::default(),
+            siblings: Vec::new(),
             };
             let (tx_event, _rx_event) = tokio::sync::mpsc::channel(1);
             let mut context = receive_context(tx_event);
@@ -5314,6 +5409,8 @@ mod tests {
             measurement_responder: false,
             measurement_dispatch: Arc::new(Mutex::new(HashMap::new())),
             local_delivery: Arc::new(LocalDelivery::snapshot()),
+            #[cfg(test)]
+            send_pause: Default::default(),
             siblings: Vec::new(),
         }
     }
@@ -5344,6 +5441,7 @@ mod tests {
             enabled.clone(),
             0,
             false,
+            None,
         ));
         let mut buf = [0; MAX_MESSAGE_SIZE];
         for _ in 0..3 {
@@ -5416,6 +5514,7 @@ mod tests {
             Arc::new(Mutex::new(true)),
             0,
             false,
+            None,
         ));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(broadcast.as_mut().poll(&mut context).is_pending());

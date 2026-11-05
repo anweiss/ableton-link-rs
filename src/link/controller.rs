@@ -2198,6 +2198,125 @@ mod dispatch_gate_tests {
         }
     }
 
+    async fn check_broadcast_epoch(rapid: bool) {
+        use crate::discovery::messages::{parse_message_header, parse_payload};
+        use crate::link::payload::PayloadEntry;
+        use std::net::{Ipv4Addr, SocketAddr};
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        controller.enable().await;
+        let receiver = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let SocketAddr::V4(destination) = receiver.local_addr().unwrap() else {
+            panic!("IPv4")
+        };
+        let gateway = controller.discovery.clone();
+        let fixture = controller
+            .io
+            .as_ref()
+            .unwrap()
+            .spawn(async move { gateway.broadcast_epoch_fixture(destination) })
+            .await
+            .unwrap();
+        let old_epoch = controller.discovery.gate.epoch();
+        tokio::time::timeout(Duration::from_secs(2), fixture.ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let sockets = fixture.sockets.clone();
+        let (held, held_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = sockets.lock().unwrap();
+            held.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        fixture.resume.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), fixture.blocked)
+            .await
+            .unwrap()
+            .unwrap();
+        let io = controller.io.take().unwrap();
+        let work = io.spawn(async move {
+            controller.disable().await;
+            controller
+        });
+        let completed = tokio::time::timeout(Duration::from_millis(300), work).await;
+        let disabled_before_release = completed.is_ok();
+        let mut controller = completed.unwrap().unwrap();
+        controller.io = Some(io);
+        assert!(!controller.discovery.gate.is_open());
+        assert!(!fixture.lease_cancelled.load(Ordering::SeqCst));
+        let mut edit = controller.client_state.lock().unwrap().timeline;
+        edit.tempo = tempo::Tempo::new(150.0);
+        controller
+            .set_state(IncomingClientState {
+                timeline: Some(edit),
+                start_stop_state: None,
+                timeline_timestamp: controller.clock.micros(),
+            })
+            .await;
+        if rapid {
+            controller.enable().await;
+            assert!(controller.discovery.gate.epoch() > old_epoch);
+        }
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let mut bytes = [0; crate::discovery::messages::MAX_MESSAGE_SIZE];
+        let silent_when_disabled = if rapid {
+            true
+        } else {
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv_from(&mut bytes))
+                .await
+                .is_err()
+        };
+        if !rapid {
+            controller.enable().await;
+            assert!(controller.discovery.gate.epoch() > old_epoch);
+        }
+        controller.notifier.notify_waiters();
+        let (size, source) =
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        let (header, offset) = parse_message_header(&bytes[..size]).unwrap();
+        let payload = parse_payload(&bytes[offset..size]).unwrap();
+        let tempo = payload.entries.iter().find_map(|entry| match entry {
+            PayloadEntry::Timeline(timeline) => Some(timeline.tempo),
+            _ => None,
+        });
+        let lease_reused = !fixture.lease_cancelled.load(Ordering::SeqCst)
+            && fixture.sockets.lock().unwrap().len() == 1;
+        fixture.task.abort();
+        let _ = fixture.task.await;
+        controller.disable().await;
+        assert!(
+            disabled_before_release && silent_when_disabled && lease_reused,
+            "old epoch cannot survive disable; the registration remains reusable: rapid={rapid}"
+        );
+        assert_eq!(source, fixture.source);
+        assert_eq!(header.message_type, crate::discovery::messages::ALIVE);
+        assert_eq!(
+            tempo,
+            Some(tempo::Tempo::new(150.0)),
+            "rapid re-enable must not revive the captured120BPM announcement"
+        );
+    }
+
+    #[tokio::test]
+    async fn wide_broadcast_disabled_epoch_sends_nothing_with_live_lease() {
+        check_broadcast_epoch(false).await;
+    }
+
+    #[tokio::test]
+    async fn wide_broadcast_rapid_reenable_does_not_revive_old_announcement() {
+        check_broadcast_epoch(true).await;
+    }
+
     #[tokio::test]
     async fn wide_socket_enable_waits_for_complete_drain_without_parking_io() {
         for held_kind in 0..3 {

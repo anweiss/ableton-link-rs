@@ -52,6 +52,15 @@ pub enum OnEvent {
 
 impl PeerGateway {
     #[cfg(test)]
+    pub(crate) fn broadcast_epoch_fixture(
+        &self,
+        to: std::net::SocketAddrV4,
+    ) -> super::messenger::BroadcastFixture {
+        self.messenger
+            .broadcast_epoch_fixture(to, self.gate.clone())
+    }
+
+    #[cfg(test)]
     pub(crate) fn hold_discovery_boundary_fixture(
         &self,
         hints: bool,
