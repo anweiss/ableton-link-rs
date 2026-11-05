@@ -302,6 +302,7 @@ and time can encode the request, including an effective quantum boundary just
 outside the stored origin's range. Re-anchoring retains nanosecond precision when
 whole-microsecond rounding misses the requested microbeat, including at Chrono's
 duration limits. Ordinary timeline shifts retain their existing conversion rounding.
+A clamped anchor is accepted only if it still encodes the requested microbeat.
 The public rounding correction clamps at Chrono's duration limits.
 Link Classic and LinkAudio tempo encoders saturate signed wire periods without
 changing the sign of a negative out-of-range value.
