@@ -69,7 +69,10 @@ weakening exact source-endpoint matching in the measurement dispatcher. The
 wildcard socket remains available for standalone measurement/responder usage.
 Managed outbound PINGs use the captured discovery registration too. Hints are
 keyed by peer identity and advertised endpoint, expire with the announcement TTL,
-and are cleared on restart. A missing or stale hint fails closed. Each interface
+and are cleared on restart. Expired and invalidated leases are pruned on lookup,
+recording, and reconciliation. The cache holds at most 1,024 hints overall and 16
+endpoints per node; insertion at a limit evicts the earliest-expiring hint. Refresh
+of an existing key does not evict another hint. A missing or stale hint fails closed. Each interface
 registration owns a separate PONG dispatch table, so identical remote endpoints
 on different adapters do not overwrite each other's routes. All PING retries use
 the checked registered send path; this still does not close the atomic OS index
@@ -96,10 +99,18 @@ Each socket reader owns one delivery task and a 64-event discovery handoff queue
 It reserves capacity before decoding ALIVE/RESPONSE state or recording a route;
 overflow updates are discarded rather than blocking measurement datagrams or
 accumulating routing hints. The delivery task uses the lifecycle gate's receive
-permit and preparation drain, cancels a blocked event send when the gate closes,
-and is aborted when its owning reader exits. The bounded saturation regression
+permit and preparation drain. Every queued item retains its captured ingress
+lease; closure or lease invalidation interrupts its event-capacity wait. With
+capacity reserved, the worker verifies the exact socket remains registered and
+its generation is current, then records the route and publishes synchronously
+under the interface-map lock. No route is recorded merely by queueing an update.
+The worker is aborted when its owning reader exits. The bounded saturation regression
 keeps the public discovery queue full while real UDP PING/PONG round trips finish,
-then verifies stop/restart discards stale handoff events.
+then verifies stop/restart discards stale handoff events. A separate real-UDP
+wildcard-reader regression fills downstream capacity, invalidates the old ingress
+registration while its delivery waits, and verifies that only a replacement
+registration's event and route survive when capacity returns. This local lease
+proof does not establish atomic physical OS interface incarnation identity.
 
 Measurement completion uses a private capacity-one terminal channel per job.
 Success, timeout and send failure compete without blocking that private channel;
