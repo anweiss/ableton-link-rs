@@ -399,6 +399,13 @@ microsecond rather than zero. This is a compatibility change for callers relying
 on the former input truncation. Wire timestamps remain signed microseconds;
 their format is unchanged.
 The public rounding correction clamps at Chrono's duration limits.
+The public inverse also retains results beyond signed wire-microsecond limits;
+an identity transform preserves Chrono's endpoints. Client/session composition
+keeps intermediate beats and mapped times wide until offset cancellation is
+complete, while preserving its existing separate rounding steps. Wider tempo
+scaling divides without overflowing its intermediate numerator. These paths use
+signed 128-bit intermediates; affine results outside that range still saturate,
+so arbitrary out-of-range cancellation is not an exactness guarantee.
 Link Classic and LinkAudio tempo encoders saturate signed wire periods without
 changing the sign of a negative out-of-range value.
 PONG ghost timestamps saturate at the final signed-microsecond wire boundary.

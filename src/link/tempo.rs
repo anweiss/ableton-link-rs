@@ -62,7 +62,52 @@ impl Tempo {
     }
 
     pub(crate) fn microbeats_from_nanos(&self, nanos: i128) -> i128 {
-        super::round_ratio(nanos * 1_000, self.period_micros())
+        let period = self.period_micros();
+        if period == 0 {
+            return super::round_ratio(nanos, period);
+        }
+        if let Some(scaled) = nanos.checked_mul(1_000) {
+            return super::round_ratio(scaled, period);
+        }
+        let negative = (nanos < 0) != (period < 0);
+        let magnitude = nanos.unsigned_abs();
+        let denominator = period.unsigned_abs();
+        let remainder = magnitude % denominator;
+        let scale = 1_000_u128;
+        let mut fraction = 0_u128;
+        let mut residue = 0_u128;
+        // Divide the remainder's small product without forming an overflowing numerator.
+        for bit in (0..u128::BITS - scale.leading_zeros()).rev() {
+            fraction *= 2;
+            if residue >= denominator - residue {
+                residue -= denominator - residue;
+                fraction += 1;
+            } else {
+                residue *= 2;
+            }
+            if scale >> bit & 1 != 0 {
+                if residue >= denominator - remainder {
+                    residue -= denominator - remainder;
+                    fraction += 1;
+                } else {
+                    residue += remainder;
+                }
+            }
+        }
+        let rounded = (magnitude / denominator)
+            .saturating_mul(scale)
+            .saturating_add(fraction)
+            .saturating_add(u128::from(residue >= denominator.div_ceil(2)));
+        let bounded = rounded.min(i128::MAX as u128) as i128;
+        if negative {
+            if rounded > i128::MAX as u128 {
+                i128::MIN
+            } else {
+                -bounded
+            }
+        } else {
+            bounded
+        }
     }
 
     pub(crate) fn micros_from_microbeats(&self, beats: i128) -> i128 {
@@ -115,6 +160,26 @@ impl crate::encoding::Decode for Tempo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duration_boundary_wide_scaling_divides_before_narrowing() {
+        for (bpm, nanos, expected) in [
+            (0.0, i128::MAX, 1_000),
+            (0.0, i128::MIN, -1_000),
+            (-0.0, i128::MIN, 1_000),
+            (-0.0, i128::MAX, -1_000),
+            (0.0, i128::MAX / 2, 500),
+            (60_000_000.0, i128::MAX, i128::MAX),
+            (60_000_000.0, i128::MIN, i128::MIN),
+            (-60_000_000.0, i128::MIN, i128::MAX),
+            (-60_000_000.0, i128::MAX, i128::MIN),
+            (f64::INFINITY, i128::MAX, i128::MAX),
+            (f64::INFINITY, i128::MIN, i128::MIN),
+            (f64::INFINITY, 0, 0),
+        ] {
+            assert_eq!(Tempo::new(bpm).microbeats_from_nanos(nanos), expected);
+        }
+    }
 
     #[test]
     fn review_round_tempo_preserves_wide_periods() {
