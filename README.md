@@ -387,6 +387,11 @@ outside the stored origin's range. Re-anchoring retains nanosecond precision whe
 whole-microsecond rounding misses the requested microbeat, including at Chrono's
 duration limits. Ordinary timeline shifts retain their existing conversion rounding.
 A clamped anchor is accepted only if it still encodes the requested microbeat.
+For raw tempos with a rounded beat-period magnitude below 1,000 microseconds,
+nanosecond samples can skip microbeats. If the nearest anchors miss, forcing
+solves the quantum congruence over the nanosecond residues instead of limiting
+the search to two neighboring boundaries. This fallback checks at most 1,998
+residue candidates, respecting both duration limits and storable origins.
 Timeline beat-to-time and phase-inverse conversions retain nanosecond offsets.
 `Tempo::from(Duration)` now includes nanoseconds in its input period instead of
 truncating to microseconds: a 500 ns period produces 120,000,000 BPM rather than
@@ -447,6 +452,9 @@ remain independent. Combined local edits preflight both fields before changing
 revisions, peer state or publication. The lower-level
 `controller::update_session_timing` now returns `Result<(), CommitError>` too;
 handle rejection. Its existing best-effort lock-contention behavior is unchanged.
+Rusthut retries rejected playback alignment from a fresh capture while playback
+remains active, with a 100 ms backoff for every commit error. Stopping clears
+that backoff; successful alignment is not repeated on each display refresh.
 `triple_buffer` is now a dev-dependency for the retained comparison tests, not
 part of the normal `std` dependency graph. Its obsolete implicit Cargo feature
 is removed; downstream feature lists must stop requesting `triple_buffer`.
