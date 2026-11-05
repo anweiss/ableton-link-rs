@@ -344,12 +344,16 @@ async fn on_peer_state_in_epoch(
         return;
     }
     let peer_id = msg.node_state.ident();
-    let new_to = (
-        deadline.min(Instant::now() + std::time::Duration::from_secs(3)),
-        peer_id,
-    );
     {
         let mut timeouts = peer_timeouts.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if deadline <= now {
+            return;
+        }
+        let new_to = (
+            deadline.min(now + std::time::Duration::from_secs(3)),
+            peer_id,
+        );
         timeouts.retain(|(_, id)| id != &peer_id);
         let position = timeouts
             .iter()
@@ -563,6 +567,69 @@ mod tests {
     use crate::{discovery::messenger::new_udp_reuseport, link::sessions::SessionId};
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_rechecks_receive_deadline_after_timeout_lock_contention() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let id = NodeId::from_array([81; 8]);
+            let other = NodeId::from_array([82; 8]);
+            let original = vec![
+                (Instant::now() + std::time::Duration::from_secs(100), id),
+                (Instant::now() + std::time::Duration::from_secs(200), other),
+            ];
+            let timeouts = Arc::new(Mutex::new(original.clone()));
+            let held = timeouts.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let _guard = held.lock().unwrap();
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(4));
+            });
+            ready_rx.await.unwrap();
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            let (tx, mut rx) = mpsc::channel(1);
+            let work = tokio::spawn(on_peer_state(
+                PeerStateMessageType {
+                    node_state: NodeState {
+                        node_id: id,
+                        ..NodeState::default()
+                    },
+                    ttl: 30,
+                    expires_at: Some(deadline),
+                    measurement_endpoint: None,
+                    audio_endpoint: None,
+                },
+                timeouts.clone(),
+                tx.clone(),
+                Instant::now(),
+                Arc::new(Notify::new()),
+                other,
+            ));
+            while tx.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "capacity must be reserved before expiry while the mutex is held"
+            );
+            tokio::time::sleep_until(deadline + std::time::Duration::from_millis(20)).await;
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            work.await.unwrap();
+            assert!(
+                rx.try_recv().is_err(),
+                "expired input must not publish after a lock wait"
+            );
+            assert_eq!(
+                *timeouts.lock().unwrap(),
+                original,
+                "expired input must not replace even an existing same-peer timeout"
+            );
+        })
+        .await
+        .expect("lock contention must not renew an expired announcement");
+    }
 
     #[tokio::test]
     async fn gateway_preserves_receive_deadlines_and_rejects_expired_state() {
