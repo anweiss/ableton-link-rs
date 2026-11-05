@@ -297,7 +297,7 @@ pub async fn unique_session_peer_count_async(
 pub enum PeerStateChange {
     SessionMembership,
     SessionTimeline(SessionId, Timeline),
-    SessionStartStopState(SessionId, StartStopState),
+    SessionStartStopState(SessionId, Timeline, StartStopState),
     PeerLeft,
     /// A peer's discovered audio endpoint was seen for the first time or has
     /// since changed. Rust analogue of upstream's `Peers`' `AudioEndpointCallback`,
@@ -509,9 +509,11 @@ fn apply_peer(
         peer.peer_state.session_id() == state.session_id()
             && peer.peer_state.timeline() == state.timeline()
     });
-    let start_stop_changed = !peers
-        .iter()
-        .any(|peer| peer.peer_state.start_stop_state() == state.start_stop_state());
+    let start_stop_changed = !peers.iter().any(|peer| {
+        peer.peer_state.session_id() == state.session_id()
+            && peer.peer_state.timeline() == state.timeline()
+            && peer.peer_state.start_stop_state() == state.start_stop_state()
+    });
     let previous = peers
         .iter()
         .position(|peer| peer.peer_state.ident() == state.ident());
@@ -526,9 +528,10 @@ fn apply_peer(
             state.timeline(),
         ));
     }
-    if start_stop_changed {
+    if timeline_changed || start_stop_changed {
         changes.push(PeerStateChange::SessionStartStopState(
             state.session_id(),
+            state.timeline(),
             state.start_stop_state(),
         ));
     }

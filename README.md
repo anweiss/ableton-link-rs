@@ -381,6 +381,19 @@ whole-microsecond rounding misses the requested microbeat, including at Chrono's
 duration limits. Ordinary timeline shifts retain their existing conversion rounding.
 A clamped anchor is accepted only if it still encodes the requested microbeat.
 Timeline beat-to-time and phase-inverse conversions retain nanosecond offsets.
+`Tempo::from(Duration)` now includes nanoseconds in its input period instead of
+truncating to microseconds: a 500 ns period produces 120,000,000 BPM rather than
+infinity. Its `micros_per_beat` result still rounds the period to whole
+microseconds, so sub-microsecond periods are not promised an inverse round trip.
+`Tempo::micros_to_beats` and `Timeline::to_beats` now include sub-microsecond
+input time before rounding to microbeats, rather than truncating it first.
+At 120 BPM, a 500 ns offset now yields one microbeat instead of zero.
+`Timeline::from_beats` now rounds its offset to nanoseconds, not microseconds:
+one microbeat at 120 BPM now yields 500 ns instead of 1 microsecond.
+`Tempo::beats_to_micros` still rounds to whole microseconds; its name does not
+describe the separate nanosecond timeline inverse. Callers must not use exact
+whole-microsecond comparisons for timeline inverse results. These precision
+changes apply to the raw public types in both default and `no_std` builds.
 Controller client/session and start/stop mappings use internal nanosecond clock
 conversions so publication does not discard an accepted alignment. The public
 `GhostXForm` methods now retain fractional-microsecond inputs through scaling or
@@ -399,6 +412,29 @@ complete, while preserving its existing separate rounding steps. Wider tempo
 scaling divides without overflowing its intermediate numerator. These paths use
 signed 128-bit intermediates; affine results outside that range still saturate,
 so arbitrary out-of-range cancellation is not an exactness guarantee.
+`update_client_timeline_from_session` now returns `Result<Timeline, CommitError>`.
+It rejects a mapped session-zero boundary outside Chrono, an unstorable canonical
+beat origin, a zero/nonfinite inverse slope, or a composition that changes the
+beat at the observation time.
+Moving the anchor merely to preserve that raw beat is not sufficient: the origin
+also defines public quantum phase. Handle `TimelineOriginExhausted` rather than
+publishing a clamped or phase-changing replacement.
+`update_session_timeline_from_client` also rejects an out-of-Chrono final origin.
+Managed receipt and join rejection retain the last accepted session, mapping,
+client state and capture revision; a rejected promotion is retired so a later
+announcement can create a fresh candidate.
+`PeerStateChange::SessionStartStopState` now carries
+`(SessionId, Timeline, StartStopState)`; preserve the advertised timeline even
+when its separate notification was deduplicated. Received playback is applied
+only when that timeline matches accepted timing at wire precision: clamped
+tempo's rounded beat period, beat origin, and signed-microsecond time origin.
+An ignored or rejected timeline cannot supply playback under another peer's
+accepted timeline. A newly announced timeline reoffers unchanged playback so a
+valid recovery is not lost to deduplication. Unrelated endpoint notifications
+remain independent. Combined local edits preflight both fields before changing
+revisions, peer state or publication. The lower-level
+`controller::update_session_timing` now returns `Result<(), CommitError>` too;
+handle rejection. Its existing best-effort lock-contention behavior is unchanged.
 Link Classic and LinkAudio tempo encoders saturate signed wire periods without
 changing the sign of a negative out-of-range value.
 PONG ghost timestamps saturate at the final signed-microsecond wire boundary.
@@ -729,7 +765,7 @@ values underrun audibly.
 
 | Type | Description |
 |------|-------------|
-| `Beats` | Beat position with microsecond precision |
+| `Beats` | Beat position stored as integer microbeats |
 | `Tempo` | Tempo in BPM with conversion utilities |
 | `Timeline` | Maps between beat and time coordinates |
 | `GhostXForm` | Linear transform between host and ghost time |
@@ -929,6 +965,9 @@ not provide; it replaces the now-deprecated `AsyncFd::new`.
 Linux and macOS networking enable both the `net` and `time` features of `rustix`,
 including the time types used by its socket timeout helpers. This dependency
 remains optional under `std`; `no_std` builds do not enable it.
+Unused direct `async-trait`, `winapi`, and `mach2` dependencies have been removed.
+Platform implementations retain their used safe wrappers and Windows SDK
+bindings; transitive dependencies of those wrappers are managed separately.
 
 ## Contributing
 
