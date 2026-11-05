@@ -324,7 +324,7 @@ pub async fn on_peer_state(
 }
 
 async fn on_peer_state_in_epoch(
-    msg: PeerStateMessageType,
+    mut msg: PeerStateMessageType,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
     tx_peer_event: Sender<PeerEvent>,
     epoch: Instant,
@@ -337,6 +337,7 @@ async fn on_peer_state_in_epoch(
     let deadline = msg
         .expires_at
         .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(u64::from(msg.ttl)));
+    msg.expires_at = Some(deadline);
     let slot = select! {
         biased;
         _ = PeerObservation::invalidated(msg.observation.as_deref()) => return,
@@ -360,11 +361,9 @@ async fn on_peer_state_in_epoch(
                     return;
                 }
                 timeouts.retain(|(_, id)| *id != peer_id);
-                slot.send(if msg.observation.is_some() {
-                    PeerEvent::Observed(msg)
-                } else {
-                    PeerEvent::PeerLeft(peer_id)
-                });
+                // Once the timeout is removed, cleanup is an irrevocable FIFO
+                // obligation. Dropped newer traffic must not cancel peer removal.
+                slot.send(PeerEvent::PeerLeft(peer_id));
             } else {
                 let new_to = (
                     deadline.min(now + std::time::Duration::from_secs(3)),
@@ -376,15 +375,7 @@ async fn on_peer_state_in_epoch(
                     .position(|(time, _)| *time >= new_to.0)
                     .unwrap_or(timeouts.len());
                 timeouts.insert(position, new_to);
-                slot.send(if msg.observation.is_some() {
-                    PeerEvent::Observed(msg)
-                } else {
-                    PeerEvent::SawPeer(PeerState {
-                        node_state: msg.node_state,
-                        measurement_endpoint: msg.measurement_endpoint,
-                        audio_endpoint: msg.audio_endpoint,
-                    })
-                });
+                slot.send(PeerEvent::Observed(msg));
             }
         };
         if let Some(observation) = observation {
@@ -578,7 +569,7 @@ mod tests {
             .await;
             assert!(!timeouts.is_poisoned());
             assert!(find_peer(&id, timeouts.clone()).await);
-            assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
+            assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(_))));
             on_byebye(id, timeouts.clone(), tx.clone(), cancel.clone()).await;
             assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(node)) if node == id));
             assert!(!find_peer(&id, timeouts.clone()).await);
@@ -591,7 +582,7 @@ mod tests {
                 NodeId::default(),
             )
             .await;
-            assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
+            assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(_))));
             assert!(matches!(rx.recv().await, Some(PeerEvent::PeerTimedOut(node)) if node == id));
             assert!(timeouts.lock().unwrap().is_empty());
         })
@@ -686,7 +677,7 @@ mod tests {
             );
             rx.recv().await.unwrap();
             renewal.await;
-            assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
+            assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(_))));
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             assert!(
                 rx.try_recv().is_err(),
@@ -804,7 +795,7 @@ mod tests {
                     assert!(timeouts.lock().unwrap().is_empty());
                 } else {
                     assert_eq!(timeouts.lock().unwrap()[0].0, deadline);
-                    assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
+                    assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(_))));
                     assert!(matches!(rx.recv().await, Some(PeerEvent::PeerTimedOut(_))));
                 }
             }

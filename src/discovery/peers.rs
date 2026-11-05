@@ -31,7 +31,7 @@ pub struct PeerStateMessageType {
 }
 
 pub enum PeerEvent {
-    /// Managed state or withdrawal, still subject to its receive revision.
+    /// Gateway announcement with its original deadline and optional receive revision.
     Observed(PeerStateMessageType),
     SawPeer(PeerState),
     PeerLeft(NodeId),
@@ -304,6 +304,7 @@ async fn observed_peer(
                 },
                 &peers,
                 &self_peer_state,
+                Some(deadline),
             )
         };
         if !changes.is_empty() {
@@ -327,7 +328,7 @@ async fn saw_peer(
     let Ok(slot) = tx.reserve().await else {
         return;
     };
-    let changes = apply_peer(state, &peers, &self_peer_state);
+    let changes = apply_peer(state, &peers, &self_peer_state, None);
     if !changes.is_empty() {
         slot.send(changes);
     }
@@ -337,13 +338,10 @@ fn apply_peer(
     state: PeerState,
     peers: &Mutex<Vec<ControllerPeer>>,
     self_peer_state: &Mutex<PeerState>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Vec<PeerStateChange> {
-    if state.ident()
-        == self_peer_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .ident()
-    {
+    let self_peer_state = self_peer_state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.ident() == self_peer_state.ident() {
         return Vec::new();
     }
     let mut peers = peers.lock().unwrap_or_else(|e| e.into_inner());
@@ -383,6 +381,11 @@ fn apply_peer(
             state.ident(),
             state.audio_endpoint,
         ));
+    }
+    // State guards may have blocked beyond the receive deadline. Recheck after
+    // both guards and the change calculation, immediately before publication.
+    if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+        return Vec::new();
     }
     let peer = ControllerPeer { peer_state: state };
     if let Some(index) = previous {
@@ -443,6 +446,137 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn three_gaps_standalone_gateway_preserves_deadline_through_observer_wait() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for explicit in [false, true] {
+                let (events, rx_events) = mpsc::channel(1);
+                let (changes, mut rx_changes) = mpsc::channel(1);
+                changes.send(Vec::new()).await.unwrap();
+                let peers = Arc::new(Mutex::new(Vec::new()));
+                let _observer = GatewayObserver::new(
+                    rx_events,
+                    Arc::new(Mutex::new(PeerState::default())),
+                    Arc::new(Mutex::new(SessionPeerCounter::default())),
+                    changes,
+                    peers.clone(),
+                    Arc::new(Notify::new()),
+                )
+                .await;
+                let start = tokio::time::Instant::now();
+                let deadline =
+                    start + std::time::Duration::from_millis(if explicit { 100 } else { 1000 });
+                super::super::gateway::on_peer_state(
+                    PeerStateMessageType {
+                        node_state: crate::link::node::NodeState {
+                            node_id: NodeId::from_array([83; 8]),
+                            ..Default::default()
+                        },
+                        ttl: 1,
+                        expires_at: explicit.then_some(deadline),
+                        observation: None,
+                        measurement_endpoint: None,
+                        audio_endpoint: None,
+                    },
+                    Arc::new(Mutex::new(Vec::new())),
+                    events.clone(),
+                    start,
+                    Arc::new(Notify::new()),
+                    NodeId::default(),
+                )
+                .await;
+                while events.capacity() == 0 {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::sleep_until(deadline + std::time::Duration::from_millis(30)).await;
+                rx_changes.recv().await.unwrap();
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(40), rx_changes.recv())
+                        .await
+                        .is_err(),
+                    "expired standalone gateway input must not publish observer changes"
+                );
+                assert!(peers.lock().unwrap().is_empty());
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn three_gaps_observer_rechecks_deadline_after_each_state_lock() {
+        for hold_self in [false, true] {
+            let mut original = PeerState::default();
+            original.node_state.node_id = NodeId::from_array([81; 8]);
+            let mut other = original.clone();
+            other.node_state.node_id = NodeId::from_array([82; 8]);
+            let before = vec![
+                ControllerPeer {
+                    peer_state: original.clone(),
+                },
+                ControllerPeer { peer_state: other },
+            ];
+            let peers = Arc::new(Mutex::new(before.clone()));
+            let self_state = Arc::new(Mutex::new(PeerState::default()));
+            let held_peers = peers.clone();
+            let held_self = self_state.clone();
+            let (ready, ready_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let peer_guard = (!hold_self).then(|| held_peers.lock().unwrap());
+                let self_guard = hold_self.then(|| held_self.lock().unwrap());
+                ready.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+                drop((peer_guard, self_guard));
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            let probe = tx.clone();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+            let work = tokio::spawn(observed_peer(
+                PeerStateMessageType {
+                    node_state: original.node_state,
+                    ttl: 30,
+                    expires_at: Some(deadline),
+                    observation: None,
+                    measurement_endpoint: Some("127.0.0.1:12345".parse().unwrap()),
+                    audio_endpoint: None,
+                },
+                peers.clone(),
+                self_state,
+                tx,
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while probe.capacity() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep_until(deadline + std::time::Duration::from_millis(20)).await;
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), work)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                *peers.lock().unwrap(),
+                before,
+                "expired state must not mutate either peer"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "expired state must not emit changes"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn observer_drains_disabled_events_before_admitting_fresh_peers() {

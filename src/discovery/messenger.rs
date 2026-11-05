@@ -2193,7 +2193,7 @@ mod tests {
                 NodeId::default(),
             )
             .await;
-            assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(state)) if state.ttl == 0));
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(id)) if id == peer.ident()));
             assert!(timeouts.lock().unwrap().is_empty());
             assert!(rx.try_recv().is_err());
         })
@@ -2351,6 +2351,112 @@ mod tests {
             super::super::gateway::on_peer_state(new, timeouts.clone(), tx, Instant::now(), Arc::new(Notify::new()), NodeId::default()).await;
             assert!(matches!(rx.recv().await, Some(super::super::peers::PeerEvent::Observed(state)) if state.measurement_endpoint == fresh.measurement_endpoint && state.ttl == 1));
         }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn three_gaps_committed_withdrawal_survives_dropped_successor_and_reannounces() {
+        use super::super::{
+            gateway::on_peer_state,
+            peers::{ControllerPeer, GatewayObserver, PeerStateChange},
+        };
+        use crate::link::controller::SessionPeerCounter;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (route, _cancel) = MeasurementRoute::test_fixture();
+            let routes = MeasurementRoutes::default();
+            let (handoff, mut pending) = tokio::sync::mpsc::channel(1);
+            let peer = PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::from_array([84; 8]),
+                    ..NodeState::default()
+                },
+                ..PeerState::default()
+            };
+            let timeouts = Arc::new(Mutex::new(vec![(
+                Instant::now() + Duration::from_secs(30),
+                peer.ident(),
+            )]));
+            let peers = Arc::new(Mutex::new(vec![ControllerPeer {
+                peer_state: peer.clone(),
+            }]));
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let (changes, mut changed) = tokio::sync::mpsc::channel(1);
+            changes.send(Vec::new()).await.unwrap();
+            let _observer = GatewayObserver::new(
+                rx,
+                Arc::new(Mutex::new(PeerState::default())),
+                Arc::new(Mutex::new(SessionPeerCounter::default())),
+                changes,
+                peers.clone(),
+                Arc::new(Notify::new()),
+            )
+            .await;
+            queued_state(&handoff, &routes, &route, &peer, 0);
+            let OnEvent::PeerState(withdrawn) = pending.recv().await.unwrap().event else {
+                panic!("withdrawal")
+            };
+            let revision = withdrawn.observation.clone().unwrap();
+            on_peer_state(
+                withdrawn,
+                timeouts.clone(),
+                tx.clone(),
+                Instant::now(),
+                Arc::new(Notify::new()),
+                NodeId::default(),
+            )
+            .await;
+            while tx.capacity() == 0 {
+                tokio::task::yield_now().await;
+            }
+            assert!(timeouts.lock().unwrap().is_empty());
+            assert_eq!(peers.lock().unwrap().len(), 1);
+            // Occupy the entire handoff with another node, then observe a newer
+            // positive announcement for the withdrawn node which cannot be admitted.
+            let filler = PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::from_array([85; 8]),
+                    ..NodeState::default()
+                },
+                ..PeerState::default()
+            };
+            queued_state(&handoff, &routes, &route, &filler, 30);
+            assert_eq!(handoff.capacity(), 0);
+            queued_state(&handoff, &routes, &route, &peer, 30);
+            assert!(revision.revision.cancel.is_cancelled());
+            changed.recv().await.unwrap();
+            let delta = changed.recv().await.unwrap();
+            assert!(matches!(delta.as_slice(), [PeerStateChange::PeerLeft]));
+            assert!(
+                peers.lock().unwrap().is_empty(),
+                "committed departure must not orphan a peer without a timeout"
+            );
+            assert!(timeouts.lock().unwrap().is_empty());
+            pending.recv().await.unwrap();
+            assert!(
+                pending.try_recv().is_err(),
+                "newer positive traffic was dropped, not a cleanup successor"
+            );
+            queued_state(&handoff, &routes, &route, &peer, 30);
+            let OnEvent::PeerState(fresh) = pending.recv().await.unwrap().event else {
+                panic!("fresh announcement")
+            };
+            on_peer_state(
+                fresh,
+                timeouts.clone(),
+                tx,
+                Instant::now(),
+                Arc::new(Notify::new()),
+                NodeId::default(),
+            )
+            .await;
+            let delta = changed.recv().await.unwrap();
+            assert!(delta
+                .iter()
+                .any(|change| matches!(change, PeerStateChange::SessionMembership)));
+            assert_eq!(peers.lock().unwrap().len(), 1);
+            assert_eq!(timeouts.lock().unwrap().len(), 1);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -3901,7 +4007,9 @@ mod tests {
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("the loop is still running after the bad datagram");
-        assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == node));
+        assert!(
+            matches!(event, Some(OnEvent::PeerState(state)) if state.node_state.ident() == node && state.ttl == 0)
+        );
         cancel.cancel();
         tokio::time::timeout(Duration::from_secs(5), worker)
             .await
