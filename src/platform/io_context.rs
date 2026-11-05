@@ -11,6 +11,25 @@ use tokio::{runtime::Handle, sync::oneshot};
 
 use super::thread::ThreadPriority;
 
+// A compound attempt must release every guard before returning None. Retrying
+// remains part of its caller's cancellable task, never an unowned blocking job.
+pub(crate) async fn retry_state<T>(mut attempt: impl FnMut() -> Option<T>) -> T {
+    loop {
+        if let Some(value) = attempt() {
+            return value;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+pub(crate) fn try_state<T>(mutex: &Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 struct PriorityGuard(ThreadPriority);
 
 impl Drop for PriorityGuard {
