@@ -564,6 +564,7 @@ impl Controller {
         let mut dispatch = DispatchTasks::new();
         let (sessions, session_task) = Sessions::with_dispatch_gate(
             Session {
+                incarnation: Arc::new(()),
                 session_id,
                 timeline,
                 measurement: SessionMeasurement {
@@ -1273,32 +1274,69 @@ pub async fn join_session(
     sessions: Sessions,
     tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
 ) {
+    let changed = {
+        let current = sessions.current.clone();
+        let mut current = current.lock().unwrap_or_else(|e| e.into_inner());
+        join_session_current(
+            &mut current,
+            session,
+            peer_state,
+            session_state.clone(),
+            client_state,
+            clock,
+            start_stop_sync_enabled,
+            discovery,
+            peers,
+            session_peer_count,
+            sessions,
+        )
+    };
+    if let Some(tempo) = changed {
+        dispatch_current_tempo(&session_state, &tempo_callback, tempo);
+    }
+}
+
+fn join_session_current(
+    current: &mut Session,
+    session: Session,
+    peer_state: Arc<Mutex<PeerState>>,
+    session_state: Arc<Mutex<SessionState>>,
+    client_state: Arc<Mutex<ClientState>>,
+    clock: Clock,
+    start_stop_sync_enabled: Arc<Mutex<bool>>,
+    discovery: Arc<PeerGateway>,
+    peers: Arc<Mutex<Vec<ControllerPeer>>>,
+    session_peer_count: Arc<Mutex<SessionPeerCounter>>,
+    sessions: Sessions,
+) -> Option<tempo::Tempo> {
+    if !session.key().matches(current) {
+        return None;
+    }
     let session_id_changed = if let Ok(ps) = peer_state.try_lock() {
         ps.session_id() != session.session_id
     } else {
         debug!("Failed to lock peer_state in join_session");
-        return;
+        return None;
     };
 
     if let Ok(mut ps) = peer_state.try_lock() {
         ps.node_state.session_id = session.session_id;
     } else {
         debug!("Failed to lock peer_state to update session_id");
-        return;
+        return None;
     };
 
     if session_id_changed {
         reset_session_start_stop_state(session_state.clone())
     }
 
-    update_session_timing(
+    let changed = update_session_timing_inner(
         session_state.clone(),
         client_state.clone(),
         session.timeline,
         session.measurement.x_form,
         clock,
         start_stop_sync_enabled.clone(),
-        tempo_callback.clone(),
         session.session_id,
     );
 
@@ -1311,7 +1349,7 @@ pub async fn join_session(
         );
     }
 
-    update_discovery(session_state.clone(), peer_state.clone(), discovery.clone()).await;
+    update_discovery_now(session_state.clone(), peer_state.clone(), discovery.clone());
 
     if session_id_changed {
         info!(
@@ -1336,7 +1374,8 @@ pub async fn join_session(
         };
 
         if should_reset {
-            reset_state(
+            return reset_state_current(
+                current,
                 peer_state.clone(),
                 session_state.clone(),
                 client_state,
@@ -1344,11 +1383,11 @@ pub async fn join_session(
                 sessions,
                 clock,
                 start_stop_sync_enabled,
-                tempo_callback,
             )
-            .await;
+            .or(changed);
         }
     }
+    changed
 }
 
 pub async fn reset_state(
@@ -1356,11 +1395,40 @@ pub async fn reset_state(
     session_state: Arc<Mutex<SessionState>>,
     client_state: Arc<Mutex<ClientState>>,
     discovery: Arc<PeerGateway>,
-    mut sessions: Sessions,
+    sessions: Sessions,
     clock: Clock,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
     tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
 ) {
+    let changed = {
+        let current = sessions.current.clone();
+        let mut current = current.lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_current(
+            &mut current,
+            peer_state,
+            session_state.clone(),
+            client_state,
+            discovery,
+            sessions,
+            clock,
+            start_stop_sync_enabled,
+        )
+    };
+    if let Some(tempo) = changed {
+        dispatch_current_tempo(&session_state, &tempo_callback, tempo);
+    }
+}
+
+fn reset_state_current(
+    current: &mut Session,
+    peer_state: Arc<Mutex<PeerState>>,
+    session_state: Arc<Mutex<SessionState>>,
+    client_state: Arc<Mutex<ClientState>>,
+    discovery: Arc<PeerGateway>,
+    sessions: Sessions,
+    clock: Clock,
+    start_stop_sync_enabled: Arc<Mutex<bool>>,
+) -> Option<tempo::Tempo> {
     // Preserve the existing NodeId to maintain peer identity across enable/disable cycles
     let existing_node_id = if let Ok(peer_state_guard) = peer_state.try_lock() {
         peer_state_guard.node_state.node_id
@@ -1411,32 +1479,45 @@ pub async fn reset_state(
 
     reset_session_start_stop_state(session_state.clone());
 
-    update_session_timing(
+    let changed = update_session_timing_inner(
         session_state.clone(),
         client_state.clone(),
         new_tl,
         x_form,
         clock,
         start_stop_sync_enabled,
-        tempo_callback,
         s_id,
     );
 
-    update_discovery(session_state.clone(), peer_state.clone(), discovery.clone()).await;
+    update_discovery_now(session_state.clone(), peer_state.clone(), discovery.clone());
 
-    sessions.reset_session(Session {
+    *current = Session {
+        incarnation: Arc::new(()),
         session_id: s_id,
         timeline: new_tl,
         measurement: SessionMeasurement {
             x_form,
             timestamp: host_time,
         },
-    });
-
+    };
+    sessions
+        .other_sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     discovery.observer.reset_peers();
+    changed
 }
 
 pub async fn update_discovery(
+    session_state: Arc<Mutex<SessionState>>,
+    peer_state: Arc<Mutex<PeerState>>,
+    discovery: Arc<PeerGateway>,
+) {
+    update_discovery_now(session_state, peer_state, discovery);
+}
+
+fn update_discovery_now(
     session_state: Arc<Mutex<SessionState>>,
     peer_state: Arc<Mutex<PeerState>>,
     discovery: Arc<PeerGateway>,
@@ -1452,7 +1533,7 @@ pub async fn update_discovery(
             return; // Skip update if we can't get the lock
         };
 
-    let (node_id, session_id, measurement_endpoint) =
+    let (node_id, session_id, _measurement_endpoint) =
         if let Ok(peer_state_guard) = peer_state.try_lock() {
             (
                 peer_state_guard.node_state.node_id,
@@ -1463,18 +1544,15 @@ pub async fn update_discovery(
             return; // Skip update if we can't get the lock
         };
 
-    discovery
-        .update_node_state(
-            NodeState {
-                node_id,
-                session_id,
-                timeline,
-                start_stop_state,
-            },
-            measurement_endpoint,
-            ghost_xform,
-        )
-        .await;
+    discovery.update_node_state_now(
+        NodeState {
+            node_id,
+            session_id,
+            timeline,
+            start_stop_state,
+        },
+        ghost_xform,
+    );
 }
 
 pub fn reset_session_start_stop_state(session_state: Arc<Mutex<SessionState>>) {
@@ -1493,6 +1571,28 @@ pub fn update_session_timing(
     tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
     session_id: SessionId,
 ) {
+    if let Some(tempo) = update_session_timing_inner(
+        session_state.clone(),
+        client_state,
+        new_timeline,
+        new_x_form,
+        clock,
+        start_stop_sync_enabled,
+        session_id,
+    ) {
+        dispatch_current_tempo(&session_state, &tempo_callback, tempo);
+    }
+}
+
+fn update_session_timing_inner(
+    session_state: Arc<Mutex<SessionState>>,
+    client_state: Arc<Mutex<ClientState>>,
+    new_timeline: Timeline,
+    new_x_form: GhostXForm,
+    clock: Clock,
+    start_stop_sync_enabled: Arc<Mutex<bool>>,
+    session_id: SessionId,
+) -> Option<tempo::Tempo> {
     let new_timeline = clamp_tempo(new_timeline);
     let mut changed_tempo = None;
 
@@ -1533,9 +1633,7 @@ pub fn update_session_timing(
             }
         }
     }
-    if let Some(tempo) = changed_tempo {
-        dispatch_current_tempo(&session_state, &tempo_callback, tempo);
-    }
+    changed_tempo
 }
 
 fn dispatch_current_tempo(
@@ -1652,6 +1750,79 @@ pub struct SessionPeerCounter {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
+    #[tokio::test]
+    async fn queued_join_cannot_restore_an_incarnation_replaced_by_live_reset() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+                .await
+                .unwrap();
+            let mut queued = controller.sessions.current.lock().unwrap().clone();
+            queued.timeline.tempo = tempo::Tempo::new(95.0);
+            queued.measurement.x_form = GhostXForm {
+                slope: 1.0,
+                intercept: chrono::Duration::seconds(30),
+            };
+            *controller.sessions.current.lock().unwrap() = queued.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(queued.clone()).await.unwrap();
+            reset_state(
+                controller.peer_state.clone(),
+                controller.session_state.clone(),
+                controller.client_state.clone(),
+                controller.discovery.clone(),
+                controller.sessions.clone(),
+                controller.clock,
+                controller.start_stop_sync_enabled.clone(),
+                controller.managed_tempo_callback.clone(),
+            )
+            .await;
+            let expected_peer = controller.peer_state.lock().unwrap().clone();
+            let expected_session = *controller.session_state.lock().unwrap();
+            let expected_client = *controller.client_state.lock().unwrap();
+            assert!(!queued
+                .key()
+                .matches(&controller.sessions.current.lock().unwrap()));
+            assert_eq!(
+                queued.session_id,
+                controller.sessions.current.lock().unwrap().session_id,
+                "fixture must exercise same wire ID"
+            );
+            join_session(
+                rx.recv().await.unwrap(),
+                controller.peer_state.clone(),
+                controller.session_state.clone(),
+                controller.client_state.clone(),
+                controller.clock,
+                controller.start_stop_sync_enabled.clone(),
+                controller.discovery.clone(),
+                controller.peers.clone(),
+                controller.session_peer_counter.clone(),
+                controller.sessions.clone(),
+                controller.managed_tempo_callback.clone(),
+            )
+            .await;
+            assert_eq!(*controller.peer_state.lock().unwrap(), expected_peer);
+            assert_eq!(
+                controller.session_state.lock().unwrap().ghost_x_form,
+                expected_session.ghost_x_form
+            );
+            assert_eq!(
+                controller.session_state.lock().unwrap().timeline,
+                expected_session.timeline
+            );
+            assert_eq!(
+                controller.client_state.lock().unwrap().timeline,
+                expected_client.timeline
+            );
+            assert_eq!(
+                controller.client_state.lock().unwrap().timeline_session_id,
+                expected_client.timeline_session_id
+            );
+        })
+        .await
+        .unwrap();
+    }
+
     use super::*;
     use std::{future::Future, task::Context, task::Waker, time::Duration};
     use tokio::sync::oneshot;
@@ -1787,6 +1958,7 @@ mod dispatch_gate_tests {
         let (tx_join, rx_join) = tokio::sync::mpsc::channel(1);
         let (sessions, task) = Sessions::with_dispatch_gate(
             Session {
+                incarnation: Arc::new(()),
                 session_id: SessionId::default(),
                 timeline: Timeline::default(),
                 measurement: SessionMeasurement::default(),
@@ -1806,14 +1978,15 @@ mod dispatch_gate_tests {
     async fn restart_discards_results_buffered_while_disabled() {
         use crate::link::measurement::MeasurePeerEvent;
 
-        let (dispatch, _, tx, mut joined) = session_dispatch();
+        let (dispatch, sessions, tx, mut joined) = session_dispatch();
         dispatch.gate.start().await;
+        let key = sessions.current.lock().unwrap().key();
         for cycle in 1..=3 {
             let x_form = GhostXForm {
                 slope: 1.0,
                 intercept: chrono::Duration::seconds(cycle),
             };
-            tx.send(MeasurePeerEvent::XForm(SessionId::default(), x_form))
+            tx.send(MeasurePeerEvent::XForm(key.clone(), x_form))
                 .await
                 .unwrap();
             let session = tokio::time::timeout(TEST_TIMEOUT, joined.recv())
@@ -1824,7 +1997,7 @@ mod dispatch_gate_tests {
 
             dispatch.gate.stop().await;
             tx.send(MeasurePeerEvent::XForm(
-                SessionId::default(),
+                key.clone(),
                 GhostXForm {
                     slope: 1.0,
                     intercept: chrono::Duration::seconds(100),
@@ -1851,24 +2024,43 @@ mod dispatch_gate_tests {
 
         let (dispatch, sessions, tx, mut joined) = session_dispatch();
         dispatch.gate.start().await;
+        let key = sessions.current.lock().unwrap().key();
         for seconds in 1..=2 {
             let x_form = GhostXForm {
                 slope: 1.0,
                 intercept: chrono::Duration::seconds(seconds),
             };
-            tx.send(MeasurePeerEvent::XForm(SessionId::default(), x_form))
+            tx.send(MeasurePeerEvent::XForm(key.clone(), x_form))
                 .await
                 .unwrap();
             tokio::time::timeout(TEST_TIMEOUT, async {
-                while sessions.current.lock().unwrap().measurement.x_form != x_form {
-                    tokio::task::yield_now().await;
+                if seconds == 1 {
+                    while sessions.current.lock().unwrap().measurement.x_form != x_form {
+                        tokio::task::yield_now().await;
+                    }
+                } else {
+                    while tx.capacity() == 0 {
+                        tokio::task::yield_now().await;
+                    }
                 }
             })
             .await
             .unwrap();
         }
-        // The first join fills the queue; the second result has been applied
-        // but its send is blocked. stop() must cancel that send, not deadlock.
+        // The first join fills the queue; the second result was consumed but
+        // cannot commit until notification capacity exists. stop() cancels it.
+        assert_eq!(joined.len(), 1);
+        assert!(dispatch.gate.in_flight.try_write().is_err());
+        assert_eq!(
+            sessions
+                .current
+                .lock()
+                .unwrap()
+                .measurement
+                .x_form
+                .intercept,
+            chrono::Duration::seconds(1)
+        );
         tokio::time::timeout(TEST_TIMEOUT, dispatch.gate.stop())
             .await
             .unwrap();
@@ -1885,7 +2077,7 @@ mod dispatch_gate_tests {
             slope: 1.0,
             intercept: chrono::Duration::seconds(3),
         };
-        tx.send(MeasurePeerEvent::XForm(SessionId::default(), fresh))
+        tx.send(MeasurePeerEvent::XForm(key.clone(), fresh))
             .await
             .unwrap();
         assert_eq!(
@@ -2317,6 +2509,7 @@ mod dispatch_gate_tests {
                 .send(OnEvent::PeerState(
                     crate::discovery::peers::PeerStateMessageType {
                         expires_at: None,
+                        observation: None,
                         node_state: NodeState {
                             node_id: NodeId::from_array([99; 8]),
                             session_id: SessionId(NodeId::from_array([99; 8])),

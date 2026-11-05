@@ -186,14 +186,14 @@ impl PingResponder {
     }
 
     pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
-        *self
-            .session_id
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = session_id;
-        *self
-            .ghost_x_form
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = x_form;
+        self.update_node_state_now(session_id, x_form);
+    }
+
+    pub(crate) fn update_node_state_now(&self, session_id: SessionId, x_form: GhostXForm) {
+        let mut current_id = self.session_id.lock().unwrap_or_else(|e| e.into_inner());
+        let mut current_form = self.ghost_x_form.lock().unwrap_or_else(|e| e.into_inner());
+        *current_id = session_id;
+        *current_form = x_form;
     }
 }
 

@@ -115,19 +115,53 @@ traffic can refresh an existing published route even when the handoff is full;
 it cannot add a route for an unpublished identity. Cache sweeps drain each shared
 topology monitor once. Same-adapter address selection prefers the peer's link-local
 scope and verified subnet; source addresses never select a different adapter.
-A later scan refreshes failed local-identity snapshots without replacing the socket.
+Periodic adapter and local-identity enumeration run in the blocking scan together; reconciliation
+reuses that one snapshot, including retrying failed identities without replacing sockets.
 Managed measurement cancellation follows the captured lease through queued PONGs
 and final result publication. PONG samples are appended only after every applicable
 time sum validates, and standalone early failure reporting observes cancellation.
 
-### Breaking discovery metadata change
+Queued announcements own node-scoped supersession tokens independently of endpoint-keyed
+route hints. Socket receipt, timestamp capture, decoding and revision admission share
+one interface-map critical section, so an earlier reader cannot admit behind a newer
+withdrawal. Tokens and captured leases survive the bounded handoff, gateway queue and
+observer wait. Each stage reserves downstream capacity before a synchronous checked
+commit; the observer commits peer changes and its notification together. The weak
+index owns no tombstones or leases: live keys are bounded by owned handoff/delivery
+items plus the bounded gateway/observer queues and handlers (not arbitrary copies
+retained by external consumers). Dead keys are reclaimed on the next observation.
+TTL-zero and managed BYEBYE are explicit existing-peer withdrawals; expired positive
+announcements are discarded. Wire TTL is preserved and expires_at carries exact life.
 
-`PeerStateMessageType` struct literals must now include `expires_at`. Use
-`expires_at: None` for standalone callers that want TTL to start when the gateway
-accepts the call, or `Some(tokio::time::Instant)` for an original receive deadline.
-Managed socket readers always supply the deadline; intermediate code must preserve
-it rather than replace it with a new TTL. Wire bytes and method signatures do not
-change. Both replacement PR merge commits must carry a breaking-change marker.
+### Breaking managed-event and measurement identity changes
+
+- `PeerStateMessageType` literals add `expires_at` and `observation`. Standalone
+  callers use `None` for both. Managed forwarders must preserve the original deadline,
+  opaque `Arc<PeerObservation>` and advertised `ttl`; never regenerate any of them.
+  A true zero TTL withdraws existing state. Managed BYEBYE is normalized to this
+  zero-TTL peer-state event; standalone `receive_bye_bye` still emits `OnEvent::Byebye`.
+- `PeerEvent::Observed(PeerStateMessageType)` carries managed state to `GatewayObserver`.
+  Exhaustive matches need the new variant. Forward it intact to the stock observer;
+  converting it to unguarded `SawPeer` discards ordering and lease protection.
+- Construct sessions with `Session::new(id, timeline, measurement)` rather than struct
+  literals. Cloning retains a local incarnation; `reset_session` replaces it even for
+  the same wire ID. Capture `session.key()` **when requesting** a measurement.
+- `MeasurePeerEvent::PeerState` and `XForm` now carry `SessionKey` instead of `SessionId`;
+  obtain the wire ID through `key.session_id`. Forward the same key with the result.
+  `Cancelled(key)` is retryable lease retirement, not a successful transform or a
+  lifecycle-wide shutdown. Managed candidates retry only while that incarnation lives.
+- `measure_peer`, `measure_peer_with_socket`, `handle_successful_measurement` and
+  `handle_failed_measurement` take `SessionKey` in the former session-ID position.
+  Standalone users may create `SessionKey::new(id)` once for an independent attempt;
+  managed callers must use the originating session's key, not reconstruct it later.
+
+These are source-breaking changes, not wire-format changes. Managed result commits
+check the originating incarnation before success/failure mutation and after capacity
+waits. Controller consumption validates queued joins under the same current-session
+lock as resets; user callbacks run after that lock is released. Lease cancellation
+still observes lifecycle shutdown while reporting its retryable terminal result.
+Pruning and departure reserve notification capacity before changing timeout state,
+then recheck/remove/publish under one poison-recovering guard.
 
 Interface scanning retains IPv4 link-local addresses for networks without DHCP,
 while excluding adapters the OS reports as operationally down. This applies to
@@ -1021,12 +1055,3 @@ This implementation aims for full compatibility with the official Ableton Link s
 ## Support
 
 For questions about this Rust implementation, please [open an issue](https://github.com/anweiss/ableton-link-rs/issues). For general Ableton Link questions, contact <link-devs@ableton.com>.
-
-Queued announcements own per-identity supersession tokens independently of active
-route hints. Newer received updates, TTL-zero withdrawals and BYEBYE invalidate
-older pending work; removing or expiring a hint cannot erase that cancellation.
-The weak token index allocates only for admitted handoff work, never for dropped
-traffic. Its live size is bounded by the64 queued items plus one delivery item
-per reader, and dead keys are reclaimed on the next observation. It retains no
-unbounded tombstones or extra route leases. ALIVE handoff admission precedes its
-response send, so response backpressure cannot postpone supersession tracking.

@@ -39,7 +39,7 @@ use super::{
     node::NodeId,
     payload::{HostTime, Payload, PayloadEntry},
     pingresponder::{encode_message, PingResponder, MESSAGE_HEADER_SIZE, PING},
-    sessions::SessionId,
+    sessions::{SessionId, SessionKey},
     state::SessionState,
 };
 
@@ -98,8 +98,10 @@ impl MeasurementEndpointV4 {
 
 #[derive(Clone, Debug)]
 pub enum MeasurePeerEvent {
-    PeerState(SessionId, PeerState),
-    XForm(SessionId, GhostXForm),
+    PeerState(SessionKey, PeerState),
+    XForm(SessionKey, GhostXForm),
+    /// A captured ingress retired; retry only this originating incarnation.
+    Cancelled(SessionKey),
 }
 
 /// A datagram received on the shared unicast socket, along with its sender.
@@ -196,7 +198,7 @@ impl MeasurementService {
                                 tokio::select! {
                                     biased;
                                     _ = open.closed() => {}
-                                    _ = t_peer.send(MeasurePeerEvent::XForm(session_id, GhostXForm::default())) => {}
+                                    _ = t_peer.send(MeasurePeerEvent::Cancelled(session_id)) => {}
                                 }
                                 continue;
                             }
@@ -310,7 +312,7 @@ pub async fn measure_peer(
     clock: Clock,
     measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
     tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
-    session_id: SessionId,
+    session_id: SessionKey,
     state: PeerState,
     notifier: Arc<Notify>,
 ) {
@@ -330,7 +332,7 @@ async fn measure_peer_with_socket_factory(
     clock: Clock,
     measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
     tx_measure_peer_result: Sender<MeasurePeerEvent>,
-    session_id: SessionId,
+    session_id: SessionKey,
     state: PeerState,
     notifier: Arc<Notify>,
     socket_factory: impl FnOnce() -> io::Result<Arc<UdpSocket>>,
@@ -368,7 +370,7 @@ pub async fn measure_peer_with_socket(
     clock: Clock,
     measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
     tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
-    session_id: SessionId,
+    session_id: SessionKey,
     state: PeerState,
     notifier: Arc<Notify>,
     socket: Arc<UdpSocket>,
@@ -430,7 +432,7 @@ async fn measure_peer_in_epoch(
     clock: Clock,
     measurement_map: Arc<Mutex<HashMap<NodeId, Measurement>>>,
     tx_measure_peer_result: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
-    session_id: SessionId,
+    session_id: SessionKey,
     state: PeerState,
     notifier: Arc<Notify>,
     socket: Arc<UdpSocket>,
@@ -482,6 +484,14 @@ async fn measure_peer_in_epoch(
     )
     .await;
     if measurement.cancelled {
+        drop(registration);
+        drop(measurement);
+        if forward_route
+            .as_ref()
+            .is_some_and(|route| route.while_current(|| ()).is_none())
+        {
+            select! { biased; _ = &mut forward_cancelled => {}, _ = tx_measure_peer_result.send(MeasurePeerEvent::Cancelled(session_id)) => {} }
+        }
         return;
     }
     measurement.job = registration.job.clone();
@@ -491,11 +501,11 @@ async fn measure_peer_in_epoch(
         .insert(node_id, measurement);
 
     tokio::spawn(async move {
-        let _registration = registration;
         let forward = async move {
             let Some(data) = rx_measurement.recv().await else {
                 return;
             };
+            drop(registration);
             let x_form = if data.is_empty() {
                 GhostXForm::default()
             } else {
@@ -523,11 +533,18 @@ async fn measure_peer_in_epoch(
             let slot = select! {
                 biased;
                 _ = &mut forward_cancelled => return,
-                _ = route_invalidated(forward_route.as_ref()) => return,
                 result = tx_measure_peer_result.reserve() => match result { Ok(slot) => slot, Err(_) => return },
             };
             if let Some(route) = &forward_route {
-                route.while_current(|| slot.send(MeasurePeerEvent::XForm(session_id, x_form)));
+                let mut slot = Some(slot);
+                route.while_current(|| {
+                    slot.take()
+                        .unwrap()
+                        .send(MeasurePeerEvent::XForm(session_id.clone(), x_form))
+                });
+                if let Some(slot) = slot {
+                    slot.send(MeasurePeerEvent::Cancelled(session_id));
+                }
             } else {
                 slot.send(MeasurePeerEvent::XForm(session_id, x_form));
             }
@@ -643,6 +660,8 @@ impl Drop for MeasurementTasks {
 
 #[derive(Debug)]
 pub struct Measurement {
+    #[cfg(test)]
+    fail_followup_once: Arc<std::sync::atomic::AtomicBool>,
     route: Option<MeasurementRoute>,
     pub unicast_socket: Option<Arc<UdpSocket>>,
     pub session_id: SessionId,
@@ -727,6 +746,8 @@ impl Measurement {
         let data = Arc::new(Mutex::new(vec![]));
 
         let mut measurement = Measurement {
+            #[cfg(test)]
+            fail_followup_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             route: route.clone(),
             unicast_socket: Some(unicast_socket.clone()),
             session_id: state.node_state.session_id,
@@ -827,6 +848,8 @@ impl Measurement {
         let endpoint = *self.measurement_endpoint.as_ref().unwrap();
 
         let clock = self.clock;
+        #[cfg(test)]
+        let fail_followup_once = self.fail_followup_once.clone();
         let route = self.route.clone();
         let s_id = self.session_id;
         let data = self.data.clone();
@@ -884,11 +907,13 @@ impl Measurement {
                             ],
                         };
 
-                        if let Err(e) =
+                        let followup = async {
+                            #[cfg(test)]
+                            if fail_followup_once.swap(false, std::sync::atomic::Ordering::SeqCst) { return Err(io::Error::from(io::ErrorKind::ConnectionReset)); }
                             send_ping_via(socket.clone(), route.clone(), endpoint, &payload).await
-                        {
+                        };
+                        if let Err(e) = followup.await {
                             debug!("failed to send ping to {}: {}", endpoint, e);
-                            break;
                         }
 
                         let Some(samples) = pong_samples(host_time, prev_host_time, ghost_time, prev_ghost_time) else { continue; };
@@ -1041,7 +1066,7 @@ pub fn median(mut numbers: Vec<f64>) -> f64 {
 
 async fn report_failed_measurement(
     tx: &Sender<MeasurePeerEvent>,
-    session_id: SessionId,
+    session_id: SessionKey,
     notifier: &Arc<Notify>,
 ) {
     let cancelled = notifier.notified();
@@ -1088,6 +1113,90 @@ fn pong_samples(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn retired_first_measurement_recovers_on_a_new_valid_route() {
+        use crate::link::sessions::{Session, SessionMeasurement, SessionMembership, Sessions};
+        use crate::link::timeline::Timeline;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let clock = Clock::new();
+            let id = SessionId(NodeId::from_array([1; 8]));
+            let peer_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let SocketAddr::V4(endpoint) = peer_socket.local_addr().unwrap() else { panic!("IPv4") };
+            let state = PeerState { node_state: NodeState { node_id: id.0, session_id: id, ..NodeState::default() }, measurement_endpoint: Some(endpoint), ..PeerState::default() };
+            let routes = MeasurementRoutes::default();
+            let (old_route, retire) = MeasurementRoute::test_fixture();
+            routes.test_record(&state, old_route);
+            let (request_tx, requests) = mpsc::channel(1);
+            let (result_tx, results) = mpsc::channel(1);
+            let (join_tx, mut joins) = mpsc::channel(1);
+            let shared = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let service = MeasurementService::new_with_routes(shared, Arc::new(Mutex::new(PeerState::default())), Arc::new(Mutex::new(SessionState::default())), clock, result_tx, Arc::new(Notify::new()), requests, Some(routes.clone())).await;
+            let (sessions, task) = Sessions::with_dispatch_gate(Session::new(SessionId(NodeId::from_array([2; 8])), Timeline::default(), SessionMeasurement::default()), request_tx, Arc::new(Mutex::new(vec![crate::discovery::peers::ControllerPeer { peer_state: state.clone() }])), clock, join_tx, results, Arc::new(DispatchGate::new_open()));
+            sessions.saw_session_timeline(id, Timeline::default()).await;
+            let origin = sessions.other_sessions.lock().unwrap().iter().find(|session| session.session_id == id).unwrap().key();
+            let mut buffer = [0; MAX_MESSAGE_SIZE];
+            peer_socket.recv_from(&mut buffer).await.unwrap();
+            retire();
+            let (fresh_route, _retire_fresh) = MeasurementRoute::test_fixture();
+            let fresh_endpoint = fresh_route.socket().local_addr().unwrap();
+            routes.test_record(&state, fresh_route.clone());
+            let (_, source) = peer_socket.recv_from(&mut buffer).await.unwrap();
+            assert_eq!(source, fresh_endpoint, "candidate must retry through the replacement ingress without a changed timeline");
+            let pong = encode_message(PONG, &Payload { entries: vec![PayloadEntry::SessionMembership(SessionMembership::from(id)), PayloadEntry::HostTime(HostTime::new(Duration::microseconds(100))), PayloadEntry::GhostTime(crate::link::payload::GhostTime::new(Duration::microseconds(1_000_000))), PayloadEntry::PrevGhostTime(PrevGhostTime::new(Duration::microseconds(1_000_100)))] }).unwrap();
+            let sender = fresh_route.dispatch().lock().unwrap().get(&endpoint.into()).unwrap().clone();
+            for _ in 0..11 { sender.send((pong.clone(), endpoint.into())).await.unwrap(); }
+            let joined = joins.recv().await.unwrap();
+            assert!(origin.matches(&joined));
+            assert_eq!(joined.session_id, id);
+            assert!(joined.measurement.x_form.intercept > Duration::zero());
+            task.abort(); let _ = task.await;
+            drop(service);
+        }).await.expect("route retirement must terminate the original attempt and permit same-candidate recovery");
+    }
+
+    #[tokio::test]
+    async fn transient_followup_ping_failure_keeps_listener_for_retry_replies() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let SocketAddr::V4(endpoint) = socket.local_addr().unwrap() else {
+                panic!("IPv4")
+            };
+            let mut measurement = inert_measurement(Arc::new(()), endpoint);
+            measurement.unicast_socket = Some(socket);
+            measurement
+                .fail_followup_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel(2);
+            measurement.listen(rx).await;
+            let pong = encode_message(
+                PONG,
+                &Payload {
+                    entries: vec![
+                        PayloadEntry::HostTime(HostTime::new(Duration::microseconds(100))),
+                        PayloadEntry::GhostTime(crate::link::payload::GhostTime::new(
+                            Duration::microseconds(200),
+                        )),
+                        PayloadEntry::PrevGhostTime(PrevGhostTime::new(Duration::microseconds(
+                            300,
+                        ))),
+                    ],
+                },
+            )
+            .unwrap();
+            tx.send((pong.clone(), endpoint.into())).await.unwrap();
+            tx.send((pong, endpoint.into())).await.unwrap();
+            drop(tx);
+            measurement.tasks.0.pop().unwrap().await.unwrap();
+            assert_eq!(
+                measurement.data.lock().unwrap().len(),
+                4,
+                "send errors must not terminate the sole PONG consumer"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
     use std::net::IpAddr;
 
     use local_ip_address::list_afinet_netifas;
@@ -1108,6 +1217,7 @@ mod tests {
     fn inert_measurement(job: Arc<()>, endpoint: SocketAddrV4) -> Measurement {
         let (tx_timer, _rx_timer) = mpsc::channel(1);
         Measurement {
+            fail_followup_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             route: None,
             unicast_socket: None,
             session_id: SessionId::default(),
@@ -1130,9 +1240,12 @@ mod tests {
             for mode in 0..4 {
                 let (tx, mut rx) = mpsc::channel(1);
                 let id = SessionId::default();
-                tx.send(MeasurePeerEvent::XForm(id, GhostXForm::default()))
-                    .await
-                    .unwrap();
+                tx.send(MeasurePeerEvent::XForm(
+                    SessionKey::new(id),
+                    GhostXForm::default(),
+                ))
+                .await
+                .unwrap();
                 let cancel = Arc::new(Notify::new());
                 let measurements = Arc::new(Mutex::new(HashMap::new()));
                 let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
@@ -1143,7 +1256,7 @@ mod tests {
                                 Clock::new(),
                                 measurements.clone(),
                                 tx.clone(),
-                                id,
+                                SessionKey::new(id),
                                 PeerState::default(),
                                 cancel.clone(),
                             )
@@ -1154,7 +1267,7 @@ mod tests {
                                 Clock::new(),
                                 measurements.clone(),
                                 tx.clone(),
-                                id,
+                                SessionKey::new(id),
                                 PeerState::default(),
                                 cancel.clone(),
                                 socket,
@@ -1167,7 +1280,7 @@ mod tests {
                                 Clock::new(),
                                 measurements.clone(),
                                 tx.clone(),
-                                id,
+                                SessionKey::new(id),
                                 PeerState {
                                     measurement_endpoint: Some(SocketAddrV4::new(
                                         Ipv4Addr::LOCALHOST,
@@ -1185,7 +1298,7 @@ mod tests {
                                 Clock::new(),
                                 measurements.clone(),
                                 tx.clone(),
-                                id,
+                                SessionKey::new(id),
                                 PeerState::default(),
                                 cancel.clone(),
                                 || panic!("missing endpoint must not allocate"),
@@ -1219,20 +1332,22 @@ mod tests {
                 let peer=UdpSocket::bind((Ipv4Addr::LOCALHOST,0)).await.unwrap();
                 let SocketAddr::V4(endpoint)=peer.local_addr().unwrap() else { panic!("IPv4") };
                 let state=PeerState { measurement_endpoint:Some(endpoint), ..PeerState::default() };
-                let (tx,mut rx)=mpsc::channel(1); tx.send(MeasurePeerEvent::XForm(SessionId::default(),GhostXForm::default())).await.unwrap();
+                let (tx,mut rx)=mpsc::channel(1); tx.send(MeasurePeerEvent::XForm(SessionKey::new(SessionId::default()),GhostXForm::default())).await.unwrap();
                 let measurements=Arc::new(Mutex::new(HashMap::new())); let dispatch=route.dispatch();
-                let job=tokio::spawn(measure_peer_in_epoch(Clock::new(),measurements.clone(),tx.clone(),state.session_id(),state,Arc::new(Notify::new()),route.socket(),dispatch.clone(),None,Some(route)));
+                let mut job=tokio::spawn(measure_peer_in_epoch(Clock::new(),measurements.clone(),tx.clone(),SessionKey::new(state.session_id()),state,Arc::new(Notify::new()),route.socket(),dispatch.clone(),None,Some(route)));
                 let mut buffer=[0;512]; peer.recv_from(&mut buffer).await.unwrap();
                 let pong=encode_message(PONG,&Payload { entries:vec![PayloadEntry::HostTime(HostTime::new(Duration::microseconds(100))),PayloadEntry::GhostTime(GhostTime::new(Duration::microseconds(200))),PayloadEntry::PrevGhostTime(PrevGhostTime::new(Duration::microseconds(300)))] }).unwrap();
                 let sender=dispatch.lock().unwrap().get(&SocketAddr::V4(endpoint)).unwrap().clone();
                 for _ in 0..11 { sender.try_send((pong.clone(),endpoint.into())).unwrap(); }
                 if after_completion {
-                    job.await.unwrap(); // terminal success reached the separate, blocked result forwarder
+                    (&mut job).await.unwrap(); // terminal success reached the separate, blocked result forwarder
                     invalidate();
-                } else { invalidate(); job.await.unwrap(); }
+                } else { invalidate(); }
                 while !dispatch.lock().unwrap().is_empty() || !measurements.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
                 assert!(matches!(rx.try_recv(),Ok(MeasurePeerEvent::XForm(_,x)) if x==GhostXForm::default()));
-                assert!(rx.try_recv().is_err(),"retired registration must not publish a queued success");
+                if !after_completion { job.await.unwrap(); }
+                assert!(matches!(rx.recv().await, Some(MeasurePeerEvent::Cancelled(_))), "retired registration must publish retryable cancellation, never a queued success");
+                assert!(rx.try_recv().is_err());
             }
         }).await.expect("invalidated measurements and their blocked result forwarders must terminate");
     }
@@ -1411,7 +1526,7 @@ mod tests {
             let (tx_result, _rx_result) = mpsc::channel(1);
             tx_result
                 .send(MeasurePeerEvent::XForm(
-                    SessionId::default(),
+                    SessionKey::new(SessionId::default()),
                     GhostXForm::default(),
                 ))
                 .await
@@ -1430,7 +1545,7 @@ mod tests {
             .await;
             tx_peer
                 .send(MeasurePeerEvent::PeerState(
-                    SessionId::default(),
+                    SessionKey::new(SessionId::default()),
                     PeerState::default(),
                 ))
                 .await

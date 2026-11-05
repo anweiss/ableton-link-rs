@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::Duration;
 use tokio::{
     net::UdpSocket,
     select,
@@ -25,7 +24,7 @@ use crate::link::{
 };
 
 use super::{
-    messenger::{send_byebye, Messenger},
+    messenger::{send_byebye, Messenger, PeerObservation},
     peers::{
         ControllerPeer, GatewayObserver, PeerEvent, PeerState, PeerStateChange,
         PeerStateMessageType,
@@ -58,7 +57,7 @@ impl PeerGateway {
 
     pub(crate) async fn stop(&self) {
         self.gate.stop().await;
-        self.peer_timeouts.lock().unwrap().clear();
+        lock_timeouts(&self.peer_timeouts).clear();
     }
 
     #[cfg(test)]
@@ -162,13 +161,17 @@ impl PeerGateway {
         _measurement_endpoint: Option<SocketAddrV4>,
         ghost_xform: GhostXForm,
     ) {
-        self.measurement_service
-            .update_node_state(node_state.session_id, ghost_xform)
-            .await;
+        self.update_node_state_now(node_state, ghost_xform);
+    }
 
-        if let Ok(mut state) = self.peer_state.try_lock() {
-            state.node_state = node_state;
-        }
+    pub(crate) fn update_node_state_now(&self, node_state: NodeState, ghost_xform: GhostXForm) {
+        self.measurement_service
+            .ping_responder
+            .update_node_state_now(node_state.session_id, ghost_xform);
+        self.peer_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .node_state = node_state;
     }
 
     pub async fn listen(&self, rx_event: Receiver<OnEvent>, notifier: Arc<Notify>) {
@@ -337,34 +340,59 @@ async fn on_peer_state_in_epoch(
         .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(u64::from(msg.ttl)));
     let slot = select! {
         biased;
-        _ = tokio::time::sleep_until(deadline) => return,
+        _ = PeerObservation::invalidated(msg.observation.as_deref()) => return,
+        _ = tokio::time::sleep_until(deadline), if msg.ttl > 0 => return,
         result = tx_peer_event.reserve() => match result { Ok(slot) => slot, Err(_) => return },
     };
-    if deadline <= Instant::now() {
+    if msg.ttl > 0 && deadline <= Instant::now() {
         return;
     }
     let peer_id = msg.node_state.ident();
     {
-        let mut timeouts = peer_timeouts.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        if deadline <= now {
-            return;
+        let mut timeouts = lock_timeouts(&peer_timeouts);
+        let observation = msg.observation.clone();
+        let commit = || {
+            let now = Instant::now();
+            if msg.ttl > 0 && deadline <= now {
+                return;
+            }
+            if msg.ttl == 0 {
+                if !timeouts.iter().any(|(_, id)| *id == peer_id) {
+                    return;
+                }
+                timeouts.retain(|(_, id)| *id != peer_id);
+                slot.send(if msg.observation.is_some() {
+                    PeerEvent::Observed(msg)
+                } else {
+                    PeerEvent::PeerLeft(peer_id)
+                });
+            } else {
+                let new_to = (
+                    deadline.min(now + std::time::Duration::from_secs(3)),
+                    peer_id,
+                );
+                timeouts.retain(|(_, id)| *id != peer_id);
+                let position = timeouts
+                    .iter()
+                    .position(|(time, _)| *time >= new_to.0)
+                    .unwrap_or(timeouts.len());
+                timeouts.insert(position, new_to);
+                slot.send(if msg.observation.is_some() {
+                    PeerEvent::Observed(msg)
+                } else {
+                    PeerEvent::SawPeer(PeerState {
+                        node_state: msg.node_state,
+                        measurement_endpoint: msg.measurement_endpoint,
+                        audio_endpoint: msg.audio_endpoint,
+                    })
+                });
+            }
+        };
+        if let Some(observation) = observation {
+            observation.while_current(commit);
+        } else {
+            commit();
         }
-        let new_to = (
-            deadline.min(now + std::time::Duration::from_secs(3)),
-            peer_id,
-        );
-        timeouts.retain(|(_, id)| id != &peer_id);
-        let position = timeouts
-            .iter()
-            .position(|(time, _)| *time >= new_to.0)
-            .unwrap_or(timeouts.len());
-        timeouts.insert(position, new_to);
-        slot.send(PeerEvent::SawPeer(PeerState {
-            node_state: msg.node_state,
-            measurement_endpoint: msg.measurement_endpoint,
-            audio_endpoint: msg.audio_endpoint,
-        }));
     }
 
     cancel.notify_waiters();
@@ -378,63 +406,44 @@ async fn on_peer_state_in_epoch(
     .await;
 }
 
+fn lock_timeouts(
+    timeouts: &Mutex<Vec<(Instant, NodeId)>>,
+) -> std::sync::MutexGuard<'_, Vec<(Instant, NodeId)>> {
+    timeouts.lock().unwrap_or_else(|error| {
+        timeouts.clear_poison();
+        error.into_inner()
+    })
+}
+
 pub async fn on_byebye(
     peer_id: NodeId,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
     tx_peer_event: Sender<PeerEvent>,
     notifier: Arc<Notify>,
 ) {
-    info!("Processing BYEBYE from peer {}", peer_id);
-
-    if find_peer(&peer_id, peer_timeouts.clone()).await {
-        info!(
-            "Found peer {} in timeout list, sending PeerLeft event",
-            peer_id
-        );
-        let peer_event = tx_peer_event.clone();
-        if let Err(e) = peer_event.send(PeerEvent::PeerLeft(peer_id)).await {
-            debug!("Failed to send PeerLeft event: {:?}", e);
-        } else {
-            info!("Successfully sent PeerLeft event for peer {}", peer_id);
-        }
-
-        if let Ok(mut timeouts) = peer_timeouts.try_lock() {
-            timeouts.retain(|(_, id)| id != &peer_id);
-            info!("Removed peer {} from timeout list", peer_id);
-        } else {
-            debug!(
-                "Could not acquire peer_timeouts lock to remove peer {}",
-                peer_id
-            );
-        }
-    } else {
-        info!(
-            "Peer {} not found in timeout list (may have already been removed)",
-            peer_id
-        );
+    if !find_peer(&peer_id, peer_timeouts.clone()).await {
+        return;
     }
-
-    notifier.notify_waiters();
+    let Ok(slot) = tx_peer_event.reserve().await else {
+        return;
+    };
+    let mut timeouts = lock_timeouts(&peer_timeouts);
+    if timeouts.iter().any(|(_, id)| *id == peer_id) {
+        timeouts.retain(|(_, id)| *id != peer_id);
+        slot.send(PeerEvent::PeerLeft(peer_id));
+    }
+    if timeouts.is_empty() {
+        notifier.notify_waiters();
+    }
 }
 
 pub async fn find_peer(
     peer_id: &NodeId,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
 ) -> bool {
-    match peer_timeouts.try_lock() {
-        Ok(timeouts) => {
-            let found = timeouts.iter().any(|(_, id)| id == peer_id);
-            debug!("find_peer: Looking for peer {}, found: {}", peer_id, found);
-            found
-        }
-        Err(_) => {
-            debug!(
-                "Could not acquire peer_timeouts lock in find_peer for {}",
-                peer_id
-            );
-            false
-        }
-    }
+    lock_timeouts(&peer_timeouts)
+        .iter()
+        .any(|(_, id)| id == peer_id)
 }
 
 pub async fn schedule_next_pruning(
@@ -453,100 +462,49 @@ async fn schedule_next_pruning_in_epoch(
     cancel: Arc<Notify>,
     lifecycle: Option<(Arc<DispatchGate>, u64)>,
 ) {
-    let pt = peer_timeouts.clone();
-
-    let has_timeouts = peer_timeouts
-        .try_lock()
-        .map(|timeouts| !timeouts.is_empty())
-        .unwrap_or(false);
-
-    if !has_timeouts {
+    if lock_timeouts(&peer_timeouts).is_empty() {
         return;
     }
-
-    let (timeout_instant, peer_id) = {
-        if let Ok(timeouts) = pt.try_lock() {
-            if let Some((timeout, peer_id)) = timeouts.first().copied() {
-                let timeout_instant = timeout + Duration::milliseconds(100).to_std().unwrap();
-                (timeout_instant, peer_id)
-            } else {
-                return; // No timeouts available
-            }
-        } else {
-            return; // Cannot acquire lock
-        }
-    };
-
-    debug!(
-        "scheduling next pruning for {}ms since gateway initialization epoch because of peer {}",
-        timeout_instant.duration_since(epoch).as_millis(),
-        peer_id
-    );
-
+    // Register before spawning so a renewal cannot be missed before the worker polls.
+    let mut cancelled = Box::pin(cancel.notified_owned());
+    cancelled.as_mut().enable();
     tokio::spawn(async move {
         let prune = async {
-            select! {
-                _ = tokio::time::sleep_until(timeout_instant) => {
-                    let has_timeouts = peer_timeouts.try_lock()
-                        .map(|timeouts| !timeouts.is_empty())
-                        .unwrap_or(false);
-
-                    if !has_timeouts {
-                        return;
-                    }
-                    let expired_peers = prune_expired_peers(peer_timeouts.clone(), epoch);
-                    for peer in expired_peers.iter() {
-                        info!("pruning peer {}", peer.1);
-                        if let Err(e) = tx_peer_event
-                            .send(PeerEvent::PeerTimedOut(peer.1))
-                            .await
-                        {
-                            debug!("Failed to send PeerTimedOut event: {:?}", e);
-                            // Receiver has been dropped, no point in continuing
-                            return;
-                        }
-                    }
+            loop {
+                let deadline = lock_timeouts(&peer_timeouts).first().map(|(time, _)| *time);
+                let Some(deadline) = deadline else {
+                    return;
+                };
+                tokio::time::sleep_until(deadline + std::time::Duration::from_millis(100)).await;
+                let Ok(slot) = tx_peer_event.reserve().await else {
+                    return;
+                };
+                // A renewal can win while capacity is unavailable. Removal and
+                // publication share one guard with the announcement commit.
+                let mut timeouts = lock_timeouts(&peer_timeouts);
+                if timeouts
+                    .first()
+                    .is_some_and(|(time, _)| *time <= Instant::now())
+                {
+                    let (_, peer) = timeouts.remove(0);
+                    debug!(
+                        "pruning peer {} after {:?}",
+                        peer,
+                        Instant::now().duration_since(epoch)
+                    );
+                    slot.send(PeerEvent::PeerTimedOut(peer));
                 }
-                _ = cancel.notified() => {}
             }
         };
+        let run = async {
+            select! { biased; _ = &mut cancelled => {}, _ = prune => {} }
+        };
         if let Some((gate, epoch)) = lifecycle {
-            gate.run_in_epoch(epoch, prune).await;
+            gate.run_in_epoch(epoch, run).await;
         } else {
-            prune.await;
+            run.await;
         }
     });
-}
-
-fn prune_expired_peers(
-    peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
-    epoch: Instant,
-) -> Vec<(Instant, NodeId)> {
-    info!(
-        "pruning peers @ {}ms since gateway initialization epoch",
-        Instant::now().duration_since(epoch).as_millis(),
-    );
-
-    // find the first element in pt whose timeout value is not less than Instant::now()
-    // NOTE: peer_timeouts will be empty if byebye message is received prior to pruning
-
-    let i = peer_timeouts.try_lock().ok().and_then(|timeouts| {
-        timeouts
-            .iter()
-            .position(|(timeout, _)| timeout >= &Instant::now())
-    });
-
-    if let Some(i) = i {
-        peer_timeouts
-            .try_lock()
-            .map(|mut timeouts| timeouts.drain(0..i).collect::<Vec<_>>())
-            .unwrap_or_default()
-    } else {
-        peer_timeouts
-            .try_lock()
-            .map(|mut timeouts| timeouts.drain(..).collect::<Vec<_>>())
-            .unwrap_or_default()
-    }
 }
 
 impl Drop for PeerGateway {
@@ -560,6 +518,188 @@ impl Drop for PeerGateway {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn byebye_does_not_cancel_pruning_of_other_peers() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let first = NodeId::from_array([71; 8]);
+            let second = NodeId::from_array([72; 8]);
+            let now = Instant::now();
+            let timeouts = Arc::new(Mutex::new(vec![
+                (now + std::time::Duration::from_millis(10), first),
+                (now + std::time::Duration::from_millis(20), second),
+            ]));
+            let (tx, mut rx) = mpsc::channel(1);
+            let cancel = Arc::new(Notify::new());
+            schedule_next_pruning(timeouts.clone(), now, tx.clone(), cancel.clone()).await;
+            on_byebye(first, timeouts.clone(), tx, cancel).await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(id)) if id == first));
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerTimedOut(id)) if id == second));
+            assert!(timeouts.lock().unwrap().is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
+    fn announcement(id: NodeId, ttl: u8) -> PeerStateMessageType {
+        PeerStateMessageType {
+            node_state: NodeState {
+                node_id: id,
+                ..NodeState::default()
+            },
+            ttl,
+            expires_at: None,
+            observation: None,
+            measurement_endpoint: None,
+            audio_endpoint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn poisoned_timeouts_remain_findable_removable_and_prunable() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let id = NodeId::from_array([80; 8]);
+            let timeouts = Arc::new(Mutex::new(Vec::new()));
+            let poisoned = timeouts.clone();
+            assert!(std::thread::spawn(move || {
+                let _guard = poisoned.lock().unwrap();
+                panic!("fixture poison");
+            })
+            .join()
+            .is_err());
+            let (tx, mut rx) = mpsc::channel(4);
+            let cancel = Arc::new(Notify::new());
+            on_peer_state(
+                announcement(id, 1),
+                timeouts.clone(),
+                tx.clone(),
+                Instant::now(),
+                cancel.clone(),
+                NodeId::default(),
+            )
+            .await;
+            assert!(!timeouts.is_poisoned());
+            assert!(find_peer(&id, timeouts.clone()).await);
+            assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
+            on_byebye(id, timeouts.clone(), tx.clone(), cancel.clone()).await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(node)) if node == id));
+            assert!(!find_peer(&id, timeouts.clone()).await);
+            on_peer_state(
+                announcement(id, 1),
+                timeouts.clone(),
+                tx,
+                Instant::now(),
+                cancel,
+                NodeId::default(),
+            )
+            .await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerTimedOut(node)) if node == id));
+            assert!(timeouts.lock().unwrap().is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_departure_keeps_timeout_and_zero_ttl_withdraws_existing_peer() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let id = NodeId::from_array([79; 8]);
+            let original = vec![(Instant::now() + std::time::Duration::from_secs(2), id)];
+            let timeouts = Arc::new(Mutex::new(original.clone()));
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(PeerEvent::PeerLeft(NodeId::default()))
+                .await
+                .unwrap();
+            let mut departure = Box::pin(on_byebye(
+                id,
+                timeouts.clone(),
+                tx.clone(),
+                Arc::new(Notify::new()),
+            ));
+            assert!(std::future::Future::poll(
+                departure.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending());
+            drop(departure);
+            assert_eq!(*timeouts.lock().unwrap(), original);
+            rx.recv().await.unwrap();
+            on_peer_state(
+                announcement(id, 0),
+                timeouts.clone(),
+                tx.clone(),
+                Instant::now(),
+                Arc::new(Notify::new()),
+                NodeId::default(),
+            )
+            .await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(node)) if node == id));
+            assert!(timeouts.lock().unwrap().is_empty());
+            on_peer_state(
+                announcement(id, 0),
+                timeouts.clone(),
+                tx,
+                Instant::now(),
+                Arc::new(Notify::new()),
+                NodeId::default(),
+            )
+            .await;
+            assert!(
+                rx.try_recv().is_err(),
+                "unknown zero-TTL messages must not add peers or emit departures"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pruning_rechecks_after_backpressured_renewal() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let id = NodeId::from_array([78; 8]);
+            let deadline = Instant::now() + std::time::Duration::from_millis(80);
+            let timeouts = Arc::new(Mutex::new(vec![(deadline, id)]));
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(PeerEvent::PeerLeft(NodeId::default()))
+                .await
+                .unwrap();
+            let epoch = Instant::now();
+            let cancel = Arc::new(Notify::new());
+            let mut renewal = Box::pin(on_peer_state(
+                announcement(id, 30),
+                timeouts.clone(),
+                tx.clone(),
+                epoch,
+                cancel.clone(),
+                NodeId::default(),
+            ));
+            assert!(std::future::Future::poll(
+                renewal.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending());
+            schedule_next_pruning(timeouts.clone(), epoch, tx.clone(), cancel.clone()).await;
+            tokio::time::sleep_until(deadline + std::time::Duration::from_millis(180)).await;
+            assert_eq!(
+                timeouts.lock().unwrap().len(),
+                1,
+                "pruning must not remove before reserving notification capacity"
+            );
+            rx.recv().await.unwrap();
+            renewal.await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "obsolete pruning must not follow the renewal"
+            );
+            assert!(timeouts.lock().unwrap()[0].0 > deadline);
+            cancel.notify_waiters();
+        })
+        .await
+        .unwrap();
+    }
+
     use std::net::IpAddr;
 
     use local_ip_address::list_afinet_netifas;
@@ -597,6 +737,7 @@ mod tests {
                     },
                     ttl: 30,
                     expires_at: Some(deadline),
+                    observation: None,
                     measurement_endpoint: None,
                     audio_endpoint: None,
                 },
@@ -644,8 +785,9 @@ mod tests {
                 };
                 let state = PeerStateMessageType {
                     node_state: NodeState::default(),
-                    ttl: if expired { 2 } else { 0 },
+                    ttl: if expired { 2 } else { 1 },
                     expires_at: Some(deadline),
+                    observation: None,
                     measurement_endpoint: None,
                     audio_endpoint: None,
                 };

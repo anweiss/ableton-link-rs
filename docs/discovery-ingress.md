@@ -312,19 +312,28 @@ shim dependency or replaced by an unsupported-platform success path.
 
 ## Source migration
 
-`PeerStateMessageType` adds `expires_at: Option<tokio::time::Instant>`. Existing
-standalone struct literals use None to retain call-time TTL semantics; managed
-forwarders preserve Some(original_receive_deadline). This is a source-breaking
-metadata change, not a wire-format change. Same-adapter alias selection uses
+`PeerStateMessageType` adds `expires_at: Option<tokio::time::Instant>` and
+`observation: Option<Arc<PeerObservation>>`. Standalone literals use None for both;
+managed forwarders retain both fields and the wire TTL. `PeerEvent::Observed` must
+be forwarded intact to `GatewayObserver`; managed BYEBYE is a zero-TTL peer-state
+withdrawal. Session construction uses `Session::new`; requests/results and standalone
+measurement/result helpers use the originating `SessionKey` (`session.key()`). The
+new `MeasurePeerEvent::Cancelled(key)` denotes retryable registration retirement.
+See README's migration list for every affected public signature and enum. These
+source-breaking changes do not change the wire format. Same-adapter alias selection uses
 verified subnet masks and link-local scope only after the ingress index is fixed.
-Local-delivery identity is refreshed on subsequent scans, including for leases
-captured before an enumeration failure recovered. This does not close #154.
+Periodic local-delivery identity is collected with interface enumeration in the blocking
+scan and reused for all registrations in that reconciliation, including leases
+captured before a failed identity snapshot recovered. This does not close #154.
 
-Queued announcements own per-identity supersession tokens independently of active
-route hints. Newer received updates, TTL-zero withdrawals and BYEBYE invalidate
-older pending work; removing or expiring a hint cannot erase that cancellation.
-The weak token index allocates only for admitted handoff work, never for dropped
-traffic. Its live size is bounded by the64 queued items plus one delivery item
-per reader, and dead keys are reclaimed on the next observation. It retains no
-unbounded tombstones or extra route leases. ALIVE handoff admission precedes its
-response send, so response backpressure cannot postpone supersession tracking.
+Queued announcements own node-scoped supersession tokens independently of endpoint-keyed
+route hints. Socket receipt, timestamp capture, decoding and revision admission share
+one interface-map critical section, so an earlier reader cannot admit behind a newer
+withdrawal. Tokens and captured leases survive the bounded handoff, gateway queue and
+observer wait. Each stage reserves downstream capacity before a synchronous checked
+commit; the observer commits peer changes and its notification together. The weak
+index owns no tombstones or leases: live keys are bounded by owned handoff/delivery
+items plus the bounded gateway/observer queues and handlers (not arbitrary copies
+retained by external consumers). Dead keys are reclaimed on the next observation.
+TTL-zero and managed BYEBYE are explicit existing-peer withdrawals; expired positive
+announcements are discarded. Wire TTL is preserved and expires_at carries exact life.

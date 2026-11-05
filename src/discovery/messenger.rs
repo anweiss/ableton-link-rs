@@ -169,6 +169,7 @@ impl LocalDelivery {
                 .collect(),
         }
     }
+    #[cfg(test)]
     fn snapshot() -> Self {
         Self(Mutex::new(Self::identity()))
     }
@@ -341,7 +342,7 @@ struct EventRevision {
     received: Instant,
     cancel: Cancel,
 }
-type PendingRevisions = HashMap<(NodeId, Option<SocketAddrV4>), Weak<EventRevision>>;
+type PendingRevisions = HashMap<NodeId, Weak<EventRevision>>;
 
 #[derive(Clone, Default)]
 pub(crate) struct MeasurementRoutes(
@@ -350,36 +351,33 @@ pub(crate) struct MeasurementRoutes(
 );
 
 impl MeasurementRoutes {
+    #[cfg(test)]
+    pub(crate) fn test_record(&self, peer: &PeerState, route: MeasurementRoute) {
+        self.record(peer.ident(), peer.measurement_endpoint, 30, route);
+    }
+
     fn observe(
         &self,
         peer: NodeId,
-        endpoint: Option<SocketAddrV4>,
+        _endpoint: Option<SocketAddrV4>,
         received: Instant,
         admitted: bool,
     ) -> Option<Arc<EventRevision>> {
         let mut pending = self.1.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|_, revision| revision.strong_count() > 0);
-        let affected = |(node, address): &(NodeId, Option<SocketAddrV4>)| {
-            *node == peer && (endpoint.is_none() || address.is_none() || *address == endpoint)
-        };
         if pending
-            .iter()
-            .filter(|(key, _)| affected(key))
-            .filter_map(|(_, revision)| revision.upgrade())
-            .any(|revision| revision.received > received)
+            .get(&peer)
+            .and_then(Weak::upgrade)
+            .is_some_and(|revision| revision.received > received)
         {
             return None;
         }
-        pending.retain(|key, revision| {
-            if affected(key) {
-                if let Some(revision) = revision.upgrade() {
-                    revision.cancel.cancel();
-                }
-                false
-            } else {
-                true
-            }
-        });
+        if let Some(revision) = pending
+            .remove(&peer)
+            .and_then(|revision| revision.upgrade())
+        {
+            revision.cancel.cancel();
+        }
         // Only bounded queued work owns revisions. Dropped traffic never allocates
         // a tombstone; a cancelled item's own token survives cache hint removal.
         if !admitted {
@@ -389,7 +387,7 @@ impl MeasurementRoutes {
             received,
             cancel: Cancel::default(),
         });
-        pending.insert((peer, endpoint), Arc::downgrade(&revision));
+        pending.insert(peer, Arc::downgrade(&revision));
         Some(revision)
     }
 
@@ -499,6 +497,38 @@ impl MeasurementRoutes {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(peer, _), hint| *peer != node || hint.observed > received);
+    }
+}
+
+/// Opaque ownership of a managed observation. Keep this value when forwarding
+/// a peer message: it preserves node ordering and its original ingress lease.
+#[derive(Clone)]
+pub struct PeerObservation {
+    revision: Arc<EventRevision>,
+    ingress: MeasurementRoute,
+    routes: MeasurementRoutes,
+}
+
+impl PeerObservation {
+    pub(crate) async fn invalidated(observation: Option<&Self>) {
+        if let Some(observation) = observation {
+            select! {
+                _ = observation.revision.cancel.cancelled() => {},
+                _ = observation.ingress.invalidated() => {},
+            }
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    pub(crate) fn while_current<T>(&self, commit: impl FnOnce() -> T) -> Option<T> {
+        self.ingress
+            .while_current(|| {
+                // Same order as receive/admission: interface map, then revision index.
+                let _pending = self.routes.1.lock().unwrap_or_else(|e| e.into_inner());
+                (!self.revision.cancel.is_cancelled()).then(commit)
+            })
+            .flatten()
     }
 }
 
@@ -655,14 +685,16 @@ impl Messenger {
                 Vec::new()
             }
         };
+        let local_identity = LocalDelivery::identity();
         for interface in initial_interfaces {
-            match add_interface(
+            match add_interface_with_identity(
                 &socket,
                 &interface_sockets,
                 interface.clone(),
                 Some(topology.clone()),
                 generation,
                 false,
+                &local_identity,
             ) {
                 Ok(_) => info!(
                     "joined Ableton Link multicast group on interface {}",
@@ -834,13 +866,14 @@ fn interface_socket_entries(sockets: &InterfaceSockets) -> Vec<InterfaceSocket> 
 
 /// Join the multicast group on `addr` and create the ephemeral socket used to send
 /// discovery messages through that interface.
-fn add_interface(
+fn add_interface_with_identity(
     multicast_socket: &Arc<UdpSocket>,
     interface_sockets: &InterfaceSockets,
     identity: Ipv4Interface,
     topology: Option<Arc<Topology>>,
     generation: u64,
     measurement_responder: bool,
+    local_identity: &LocalIdentity,
 ) -> Result<InterfaceSocket, std::io::Error> {
     let addr = identity.addr;
     let receiver = Arc::new(PacketSocket::new(
@@ -856,7 +889,7 @@ fn add_interface(
         generation,
         measurement_responder,
         measurement_dispatch: Arc::new(Mutex::new(HashMap::new())),
-        local_delivery: Arc::new(LocalDelivery::snapshot()),
+        local_delivery: Arc::new(LocalDelivery(Mutex::new(local_identity.clone()))),
         siblings: Vec::new(),
     };
 
@@ -979,6 +1012,12 @@ impl SetupFailures {
     }
 }
 
+async fn scan_interface_snapshot(
+    scan: impl FnOnce() -> std::io::Result<(Vec<Ipv4Interface>, LocalIdentity)> + Send + 'static,
+) -> Result<std::io::Result<(Vec<Ipv4Interface>, LocalIdentity)>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(scan).await
+}
+
 async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContext) {
     let mut children = tokio::task::JoinSet::new();
     let mut failures = SetupFailures::default();
@@ -1020,7 +1059,11 @@ async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContex
             },
             None => 0,
         };
-        let current = match tokio::task::spawn_blocking(scan_discovery_interfaces).await {
+        let (current, local_identity) = match scan_interface_snapshot(|| {
+            Ok((scan_discovery_interfaces()?, LocalDelivery::identity()))
+        })
+        .await
+        {
             Ok(Ok(current)) => current,
             Ok(Err(error)) => {
                 warn!("discovery interface scan failed: {}", error);
@@ -1053,6 +1096,7 @@ async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContex
             &context,
             &mut children,
             &current,
+            &local_identity,
             generation,
             &mut failures,
         );
@@ -1082,6 +1126,7 @@ fn reconcile_interfaces(
         context,
         children,
         current,
+        &LocalDelivery::identity(),
         generation,
         &mut SetupFailures::default(),
     );
@@ -1092,13 +1137,13 @@ fn reconcile_interfaces_at(
     context: &ReceiveContext,
     children: &mut tokio::task::JoinSet<()>,
     current: &[Ipv4Interface],
+    local_identity: &LocalIdentity,
     generation: u64,
     failures: &mut SetupFailures,
 ) {
     failures.forget_except(current);
-    let local_identity = LocalDelivery::identity();
     for entry in interface_socket_entries(&context.interface_sockets) {
-        entry.local_delivery.refresh(&local_identity);
+        entry.local_delivery.refresh(local_identity);
     }
 
     let entries = interface_socket_entries(&context.interface_sockets);
@@ -1122,13 +1167,14 @@ fn reconcile_interfaces_at(
 
     let mut changed = !stale_addrs.is_empty();
     for addr in &new_addrs {
-        match add_interface(
+        match add_interface_with_identity(
             multicast_socket,
             &context.interface_sockets,
             addr.clone(),
             context.topology.clone(),
             generation,
             context.measurement_responder.is_some(),
+            local_identity,
         ) {
             Ok(entry) => {
                 changed = true;
@@ -1182,11 +1228,22 @@ fn socket_for_ingress(
         .map(InterfaceSocket::lease)
 }
 
+#[cfg(test)]
 async fn receive_datagram(
     receiver: &PacketSocket,
     sockets: &InterfaceSockets,
     buf: &mut [u8],
     owner: Option<&Cancel>,
+) -> std::io::Result<(usize, SocketAddr, Option<InterfaceSocket>)> {
+    receive_datagram_observing(receiver, sockets, buf, owner, |_, _| {}).await
+}
+
+async fn receive_datagram_observing(
+    receiver: &PacketSocket,
+    sockets: &InterfaceSockets,
+    buf: &mut [u8],
+    owner: Option<&Cancel>,
+    mut observe: impl FnMut(&[u8], Option<&InterfaceSocket>),
 ) -> std::io::Result<(usize, SocketAddr, Option<InterfaceSocket>)> {
     loop {
         receiver.readable().await?;
@@ -1227,6 +1284,7 @@ async fn receive_datagram(
                     Some(entry) if entry.is_current()? => Some(entry),
                     _ => None,
                 };
+                observe(&buf[..size], route.as_ref());
                 Ok((size, info.addr_src, route))
             })
         };
@@ -1269,7 +1327,7 @@ async fn event_superseded(revision: Option<&Arc<EventRevision>>) {
 
 async fn event_expired(event: &OnEvent) {
     match event {
-        OnEvent::PeerState(state) if state.expires_at.is_some() => {
+        OnEvent::PeerState(state) if state.ttl > 0 && state.expires_at.is_some() => {
             tokio::time::sleep_until(state.expires_at.unwrap()).await
         }
         _ => std::future::pending().await,
@@ -1293,7 +1351,7 @@ fn receive_loop(
         let pending_delivery = context.pending_delivery.clone();
         let mut delivery_task = tokio::task::JoinSet::new();
         delivery_task.spawn(async move {
-            while let Some((_permit, _, mut event)) = crate::link::controller::gated_recv(
+            while let Some((_permit, _, event)) = crate::link::controller::gated_recv(
                 &delivery_gate,
                 &mut delivery_open,
                 &mut pending,
@@ -1310,37 +1368,18 @@ fn receive_loop(
                     _ = event_superseded(event.revision.as_ref()) => continue,
                     result = events.reserve() => match result { Ok(slot) => slot, Err(_) => break },
                 };
-                // No await from the registration check through event publication.
-                // This covers wildcard readers that survive an ingress removal.
-                let Ok(sockets) = event.ingress.sockets.lock() else {
+                let OnEvent::PeerState(state) = event.event else {
                     continue;
                 };
-                let entry = &event.ingress.entry;
-                let registered = sockets.get(&entry.identity.addr).is_some_and(|group| {
-                    group
-                        .registrations()
-                        .any(|current| Arc::ptr_eq(&current.socket, &entry.socket))
-                });
-                if !registered
-                    || !entry.is_current().unwrap_or(false)
-                    || event
-                        .revision
-                        .as_ref()
-                        .is_some_and(|revision| revision.cancel.is_cancelled())
-                {
-                    continue;
-                }
-                match &mut event.event {
-                    OnEvent::PeerState(state) => {
-                        let expires = state.expires_at.expect("managed announcement deadline");
-                        let now = Instant::now();
-                        if expires <= now {
-                            continue;
-                        }
-                        state.ttl = expires
-                            .duration_since(now)
-                            .as_secs()
-                            .min(u64::from(u8::MAX)) as u8;
+                let observation = state.observation.clone().expect("managed observation");
+                observation.while_current(|| {
+                    let expires = state.expires_at.expect("managed announcement deadline");
+                    if state.ttl > 0 && expires <= Instant::now() {
+                        return;
+                    }
+                    if state.ttl == 0 {
+                        routes.remove_peer_before(state.node_state.ident(), event.received);
+                    } else {
                         routes.record_received(
                             state.node_state.ident(),
                             state.measurement_endpoint,
@@ -1350,11 +1389,8 @@ fn receive_loop(
                             false,
                         );
                     }
-                    OnEvent::Byebye(node) => routes.remove_peer_before(*node, event.received),
-                }
-                if entry.is_current().unwrap_or(false) {
-                    slot.send(event.event);
-                }
+                    slot.send(OnEvent::PeerState(state));
+                });
             }
         });
         loop {
@@ -1384,7 +1420,11 @@ fn receive_loop(
                 biased;
                 _ = &mut cancelled => break,
                 _ = open.closed() => continue,
-                result = receive_datagram(&receive_socket, &context.interface_sockets, &mut buf, cancel.as_ref()) => result,
+                result = receive_datagram_observing(&receive_socket, &context.interface_sockets, &mut buf, cancel.as_ref(), |bytes, ingress| {
+                    #[cfg(test)]
+                    if context.fail_receive_once.load(Ordering::Relaxed) { return; }
+                    observe_discovery(&context, &handoff, bytes, ingress);
+                }) => result,
             };
             #[cfg(test)]
             let received = if context.fail_receive_once.swap(false, Ordering::Relaxed) {
@@ -1403,7 +1443,6 @@ fn receive_loop(
                     continue;
                 }
             };
-            let received_at = Instant::now();
             if ingress.is_none() {
                 debug!(
                     "discarding discovery datagram without a registered ingress from {}",
@@ -1446,7 +1485,7 @@ fn receive_loop(
                 continue;
             }
 
-            let (header, header_len) = match parse_message_header(&buf[..amt]) {
+            let (header, _header_len) = match parse_message_header(&buf[..amt]) {
                 Ok(header) => header,
                 Err(e) => {
                     debug!("ignoring malformed message from {}: {}", src, e);
@@ -1466,7 +1505,11 @@ fn receive_loop(
             } else {
                 debug!(
                     "received message type {} from peer {} at {}",
-                    MESSAGE_TYPES[header.message_type as usize], header.ident, src
+                    MESSAGE_TYPES
+                        .get(header.message_type as usize)
+                        .unwrap_or(&"UNKNOWN"),
+                    header.ident,
+                    src
                 );
             }
 
@@ -1494,84 +1537,14 @@ fn receive_loop(
                                 return;
                             }
 
-                            queue_peer_state(
-                                &handoff,
-                                received_at,
-                                header,
-                                &buf[header_len..amt],
-                                ingress.as_ref().map(|entry| {
-                                    (
-                                        &context.measurement_routes,
-                                        MeasurementRoute {
-                                            entry: entry.lease(),
-                                            sockets: context.interface_sockets.clone(),
-                                        },
-                                    )
-                                }),
-                            );
                             if let Some(entry) = &ingress {
                                 send_ingress_response(entry, &context, src).await;
                             } else {
                                 warn!("no registered ingress interface for response to {}", src);
                             }
                         }
-                        RESPONSE => {
-                            if !is_enabled {
-                                debug!(
-                                "ignoring RESPONSE message from peer {} because Link is disabled",
-                                header.ident
-                            );
-                                return;
-                            }
-
-                            queue_peer_state(
-                                &handoff,
-                                received_at,
-                                header,
-                                &buf[header_len..amt],
-                                ingress.as_ref().map(|entry| {
-                                    (
-                                        &context.measurement_routes,
-                                        MeasurementRoute {
-                                            entry: entry.lease(),
-                                            sockets: context.interface_sockets.clone(),
-                                        },
-                                    )
-                                }),
-                            );
-                        }
-                        BYEBYE => {
-                            info!("Received BYEBYE message from peer {}", header.ident);
-                            if let Some(entry) = &ingress {
-                                let ingress = MeasurementRoute {
-                                    entry: entry.lease(),
-                                    sockets: context.interface_sockets.clone(),
-                                };
-                                let slot = handoff.try_reserve().ok();
-                                let revision = ingress
-                                    .while_current(|| {
-                                        let revision = context.measurement_routes.observe(
-                                            header.ident,
-                                            None,
-                                            received_at,
-                                            slot.is_some(),
-                                        );
-                                        context
-                                            .measurement_routes
-                                            .remove_peer_before(header.ident, received_at);
-                                        revision
-                                    })
-                                    .flatten();
-                                if let (Some(slot), Some(revision)) = (slot, revision) {
-                                    slot.send(DiscoveryEvent {
-                                        event: OnEvent::Byebye(header.ident),
-                                        ingress,
-                                        received: received_at,
-                                        revision: Some(revision),
-                                    });
-                                }
-                            }
-                        }
+                        RESPONSE => {}
+                        BYEBYE => {}
                         _ => {
                             tracing::warn!(
                                 "unknown message type {} from peer {}",
@@ -1959,6 +1932,59 @@ async fn receive_peer_state_with_route(
     }
 }
 
+fn observe_discovery(
+    context: &ReceiveContext,
+    handoff: &Sender<DiscoveryEvent>,
+    bytes: &[u8],
+    ingress: Option<&InterfaceSocket>,
+) {
+    let Some(entry) = ingress else {
+        return;
+    };
+    if bytes.starts_with(&crate::link::pingresponder::PROTOCOL_HEADER) {
+        return;
+    }
+    let received = Instant::now();
+    let Ok((mut header, len)) = parse_message_header(bytes) else {
+        return;
+    };
+    if !matches!(header.message_type, ALIVE | RESPONSE | BYEBYE) {
+        return;
+    }
+    if context
+        .peer_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .ident()
+        == header.ident
+        && header.group_id == context.group_id
+    {
+        return;
+    }
+    if header.message_type != BYEBYE && !*context.enabled.lock().unwrap_or_else(|e| e.into_inner())
+    {
+        return;
+    }
+    let payload = if header.message_type == BYEBYE {
+        header.ttl = 0;
+        &[][..]
+    } else {
+        &bytes[len..]
+    };
+    queue_peer_state_current(
+        handoff,
+        received,
+        header,
+        payload,
+        &context.measurement_routes,
+        MeasurementRoute {
+            entry: entry.lease(),
+            sockets: context.interface_sockets.clone(),
+        },
+    );
+}
+
+#[cfg(test)]
 fn queue_peer_state(
     tx: &Sender<DiscoveryEvent>,
     received: Instant,
@@ -1969,38 +1995,53 @@ fn queue_peer_state(
     let Some((routes, ingress)) = route else {
         return;
     };
+    ingress.while_current(|| {
+        queue_peer_state_current(tx, received, header, buf, routes, ingress.clone())
+    });
+}
+
+// Caller holds the ingress map from recv through observation/admission. A reader
+// cannot retain an older timestamp outside that serialized region.
+fn queue_peer_state_current(
+    tx: &Sender<DiscoveryEvent>,
+    received: Instant,
+    header: MessageHeader,
+    buf: &[u8],
+    routes: &MeasurementRoutes,
+    ingress: MeasurementRoute,
+) {
     let expires = received + Duration::from_secs(u64::from(header.ttl));
-    let Some(mut event) = peer_state_event(header, buf, None) else {
+    let Some(OnEvent::PeerState(mut state)) = peer_state_event(header, buf, None) else {
         return;
     };
     let slot = tx.try_reserve().ok();
-    let revision = if let OnEvent::PeerState(state) = &mut event {
-        state.expires_at = Some(expires);
-        ingress
-            .while_current(|| {
-                let revision = routes.observe(
-                    state.node_state.ident(),
-                    state.measurement_endpoint,
-                    received,
-                    slot.is_some() && expires > Instant::now(),
-                );
-                routes.record_received(
-                    state.node_state.ident(),
-                    state.measurement_endpoint,
-                    received,
-                    expires,
-                    ingress.clone(),
-                    true,
-                );
-                revision
-            })
-            .flatten()
+    let revision = routes.observe(
+        state.node_state.ident(),
+        state.measurement_endpoint,
+        received,
+        slot.is_some() && (state.ttl == 0 || expires > Instant::now()),
+    );
+    if state.ttl == 0 {
+        routes.remove_peer_before(state.node_state.ident(), received);
     } else {
-        None
-    };
+        routes.record_received(
+            state.node_state.ident(),
+            state.measurement_endpoint,
+            received,
+            expires,
+            ingress.clone(),
+            true,
+        );
+    }
     if let (Some(slot), Some(revision)) = (slot, revision) {
+        state.expires_at = Some(expires);
+        state.observation = Some(Arc::new(PeerObservation {
+            revision: revision.clone(),
+            ingress: ingress.clone(),
+            routes: routes.clone(),
+        }));
         slot.send(DiscoveryEvent {
-            event,
+            event: OnEvent::PeerState(state),
             ingress,
             received,
             revision: Some(revision),
@@ -2045,6 +2086,7 @@ fn peer_state_event(
         node_state,
         ttl: header.ttl,
         expires_at: Some(Instant::now() + Duration::from_secs(u64::from(header.ttl))),
+        observation: None,
         measurement_endpoint,
         audio_endpoint,
     }))
@@ -2092,6 +2134,402 @@ pub fn send_byebye(node_state: NodeId) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn gateway_capacity_wait_is_cancelled_by_newer_ttl_zero() {
+        use super::super::{gateway::on_peer_state, peers::PeerEvent};
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (route, _cancel) = MeasurementRoute::test_fixture();
+            let routes = MeasurementRoutes::default();
+            let (handoff, mut pending) = tokio::sync::mpsc::channel(1);
+            let peer = PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::from_array([73; 8]),
+                    ..NodeState::default()
+                },
+                ..PeerState::default()
+            };
+            queued_state(&handoff, &routes, &route, &peer, 30);
+            let OnEvent::PeerState(old) = pending.recv().await.unwrap().event else {
+                panic!("state")
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(PeerEvent::PeerLeft(NodeId::default()))
+                .await
+                .unwrap();
+            let original = vec![(Instant::now() + Duration::from_secs(3), peer.ident())];
+            let timeouts = Arc::new(Mutex::new(original.clone()));
+            let mut work = Box::pin(on_peer_state(
+                old,
+                timeouts.clone(),
+                tx.clone(),
+                Instant::now(),
+                Arc::new(Notify::new()),
+                NodeId::default(),
+            ));
+            assert!(std::future::Future::poll(
+                work.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending());
+            queued_state(&handoff, &routes, &route, &peer, 0);
+            let OnEvent::PeerState(withdrawn) = pending.recv().await.unwrap().event else {
+                panic!("withdrawal")
+            };
+            work.await;
+            assert_eq!(
+                *timeouts.lock().unwrap(),
+                original,
+                "superseded wait must not renew old timeout"
+            );
+            rx.recv().await.unwrap();
+            on_peer_state(
+                withdrawn,
+                timeouts.clone(),
+                tx,
+                Instant::now(),
+                Arc::new(Notify::new()),
+                NodeId::default(),
+            )
+            .await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(state)) if state.ttl == 0));
+            assert!(timeouts.lock().unwrap().is_empty());
+            assert!(rx.try_recv().is_err());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_ttl_one_keeps_wire_value_and_original_deadline_after_handoff() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let listener = Arc::new(
+                PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap(),
+            );
+            let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let context = receive_context(tx);
+            let work = tokio::spawn(receive_loop(listener.clone(), None, context));
+            peer.send_to(
+                &encode_message(
+                    NodeId::from_array([74; 8]),
+                    1,
+                    RESPONSE,
+                    &Payload::default(),
+                    0,
+                )
+                .unwrap(),
+                listener.local_addr().unwrap(),
+            )
+            .await
+            .unwrap();
+            let Some(OnEvent::PeerState(state)) = rx.recv().await else {
+                panic!("state")
+            };
+            assert_eq!(state.ttl, 1);
+            assert_eq!(
+                state.expires_at,
+                Some(
+                    state.observation.as_ref().unwrap().revision.received + Duration::from_secs(1)
+                )
+            );
+            assert!(state.expires_at.unwrap() > Instant::now());
+            work.abort();
+            let _ = work.await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn identity_enumeration_is_offloaded_and_one_snapshot_is_reused() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let probe = entered.clone();
+        let (release, released) = std::sync::mpsc::channel();
+        let task = tokio::spawn(scan_interface_snapshot(move || {
+            probe.store(true, Ordering::SeqCst);
+            released.recv_timeout(Duration::from_secs(2)).unwrap();
+            Ok((
+                Vec::new(),
+                LocalIdentity {
+                    addresses: HashSet::from([IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+                    ..LocalIdentity::default()
+                },
+            ))
+        }));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The current-thread executor remains available while enumeration waits.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        release.send(()).unwrap();
+        let (_, identity) = task.await.unwrap().unwrap().unwrap();
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let context = receive_context(tx);
+        let entries = interface_socket_entries(&context.interface_sockets);
+        let current: Vec<_> = entries.iter().map(|entry| entry.identity.clone()).collect();
+        let socket = entries[0].socket.clone();
+        let mut children = tokio::task::JoinSet::new();
+        reconcile_interfaces_at(
+            &socket,
+            &context,
+            &mut children,
+            &current,
+            &identity,
+            0,
+            &mut SetupFailures::default(),
+        );
+        for entry in interface_socket_entries(&context.interface_sockets) {
+            assert_eq!(
+                entry.local_delivery.0.lock().unwrap().addresses,
+                identity.addresses
+            );
+            assert!(
+                entry
+                    .local_delivery
+                    .0
+                    .lock()
+                    .unwrap()
+                    .loopback_indices
+                    .is_empty(),
+                "reconciliation must use the supplied snapshot, not enumerate again"
+            );
+        }
+        children.shutdown().await;
+    }
+
+    fn queued_state(
+        tx: &Sender<DiscoveryEvent>,
+        routes: &MeasurementRoutes,
+        route: &MeasurementRoute,
+        peer: &PeerState,
+        ttl: u8,
+    ) {
+        let bytes =
+            encode_message(peer.ident(), ttl, RESPONSE, &Payload::from(peer.clone()), 0).unwrap();
+        let (header, len) = parse_message_header(&bytes).unwrap();
+        queue_peer_state(
+            tx,
+            Instant::now(),
+            header,
+            &bytes[len..],
+            Some((routes, route.clone())),
+        );
+    }
+
+    #[tokio::test]
+    async fn node_revisions_survive_different_endpoints_and_gateway_backpressure() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (route, _cancel) = MeasurementRoute::test_fixture();
+            let routes = MeasurementRoutes::default();
+            let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(1);
+            let (second_tx, mut second_rx) = tokio::sync::mpsc::channel(1);
+            let old = PeerState { node_state: NodeState { node_id: NodeId::from_array([77; 8]), ..NodeState::default() }, measurement_endpoint: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 10001)), ..PeerState::default() };
+            let fresh = PeerState { measurement_endpoint: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 10002)), ..old.clone() };
+            queued_state(&first_tx, &routes, &route, &old, 1);
+            let OnEvent::PeerState(old) = first_rx.recv().await.unwrap().event else { panic!("state") };
+            assert_eq!(old.ttl, 1);
+            let deadline = old.expires_at;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(super::super::peers::PeerEvent::PeerLeft(NodeId::default())).await.unwrap();
+            let timeouts = Arc::new(Mutex::new(Vec::new()));
+            let pending = tokio::spawn(super::super::gateway::on_peer_state(old.clone(), timeouts.clone(), tx.clone(), Instant::now(), Arc::new(Notify::new()), NodeId::default()));
+            tokio::task::yield_now().await;
+            queued_state(&second_tx, &routes, &route, &fresh, 1);
+            let OnEvent::PeerState(new) = second_rx.recv().await.unwrap().event else { panic!("state") };
+            pending.await.unwrap();
+            assert!(timeouts.lock().unwrap().is_empty());
+            assert!(old.observation.as_ref().unwrap().while_current(|| ()).is_none());
+            assert_eq!(old.expires_at, deadline);
+            assert_eq!(new.ttl, 1, "wire TTL must not be floored");
+            rx.recv().await.unwrap();
+            super::super::gateway::on_peer_state(new, timeouts.clone(), tx, Instant::now(), Arc::new(Notify::new()), NodeId::default()).await;
+            assert!(matches!(rx.recv().await, Some(super::super::peers::PeerEvent::Observed(state)) if state.measurement_endpoint == fresh.measurement_endpoint && state.ttl == 1));
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_withdrawal_cancels_gateway_and_observer_waits() {
+        use super::super::{
+            gateway::on_peer_state,
+            peers::{ControllerPeer, GatewayObserver, PeerEvent},
+        };
+        use crate::link::controller::SessionPeerCounter;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (route, _cancel) = MeasurementRoute::test_fixture();
+            let routes = MeasurementRoutes::default();
+            let (handoff, mut queued) = tokio::sync::mpsc::channel(2);
+            let peer = PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::from_array([76; 8]),
+                    ..NodeState::default()
+                },
+                ..PeerState::default()
+            };
+            let timeouts = Arc::new(Mutex::new(vec![(
+                Instant::now() + Duration::from_secs(30),
+                peer.ident(),
+            )]));
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let (changes, mut changed) = tokio::sync::mpsc::channel(1);
+            changes.send(Vec::new()).await.unwrap();
+            let peers = Arc::new(Mutex::new(vec![ControllerPeer {
+                peer_state: peer.clone(),
+            }]));
+            let _observer = GatewayObserver::new(
+                rx,
+                Arc::new(Mutex::new(PeerState::default())),
+                Arc::new(Mutex::new(SessionPeerCounter::default())),
+                changes,
+                peers.clone(),
+                Arc::new(Notify::new()),
+            )
+            .await;
+            queued_state(&handoff, &routes, &route, &peer, 30);
+            let OnEvent::PeerState(old) = queued.recv().await.unwrap().event else {
+                panic!("state")
+            };
+            tx.send(PeerEvent::Observed(old)).await.unwrap();
+            while tx.capacity() == 0 {
+                tokio::task::yield_now().await;
+            }
+            queued_state(&handoff, &routes, &route, &peer, 0);
+            let OnEvent::PeerState(withdrawn) = queued.recv().await.unwrap().event else {
+                panic!("withdrawal")
+            };
+            on_peer_state(
+                withdrawn,
+                timeouts.clone(),
+                tx,
+                Instant::now(),
+                Arc::new(Notify::new()),
+                NodeId::default(),
+            )
+            .await;
+            assert!(timeouts.lock().unwrap().is_empty());
+            changed.recv().await.unwrap();
+            let delta = changed.recv().await.unwrap();
+            assert!(matches!(
+                delta.as_slice(),
+                [super::super::peers::PeerStateChange::PeerLeft]
+            ));
+            assert!(peers.lock().unwrap().is_empty());
+            assert!(
+                changed.try_recv().is_err(),
+                "superseded positive state must not publish observer changes"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn receive_observation_and_admission_are_serialized_across_readers() {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            let (tx, _) = tokio::sync::mpsc::channel(1);
+            let context = receive_context(tx);
+            let listener_a = Arc::new(
+                PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap(),
+            );
+            let listener_b = Arc::new(
+                PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap(),
+            );
+            let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let node = NodeId::from_array([75; 8]);
+            let state = PeerState {
+                node_state: NodeState {
+                    node_id: node,
+                    ..NodeState::default()
+                },
+                ..PeerState::default()
+            };
+            let (handoff, mut queued) = tokio::sync::mpsc::channel(2);
+            peer.send_to(
+                &encode_message(node, 30, RESPONSE, &Payload::from(state.clone()), 0).unwrap(),
+                listener_a.local_addr().unwrap(),
+            )
+            .await
+            .unwrap();
+            let (entered, entered_rx) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let a_context = context.clone();
+            let a_handoff = handoff.clone();
+            let a = tokio::spawn(async move {
+                let mut entered = Some(entered);
+                let a_sockets = a_context.interface_sockets.clone();
+                let mut buffer = [0; MAX_MESSAGE_SIZE];
+                receive_datagram_observing(
+                    &listener_a,
+                    &a_sockets,
+                    &mut buffer,
+                    None,
+                    move |bytes, ingress| {
+                        entered.take().unwrap().send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(2)).unwrap();
+                        observe_discovery(&a_context, &a_handoff, bytes, ingress);
+                    },
+                )
+                .await
+                .unwrap();
+            });
+            entered_rx.await.unwrap();
+            peer.send_to(
+                &encode_message(node, 0, RESPONSE, &Payload::from(state), 0).unwrap(),
+                listener_b.local_addr().unwrap(),
+            )
+            .await
+            .unwrap();
+            let b_context = context.clone();
+            let b_handoff = handoff;
+            let started = Arc::new(AtomicBool::new(false));
+            let observed = Arc::new(AtomicBool::new(false));
+            let b_started = started.clone();
+            let b_observed = observed.clone();
+            let b = tokio::spawn(async move {
+                b_started.store(true, Ordering::SeqCst);
+                let mut buffer = [0; MAX_MESSAGE_SIZE];
+                receive_datagram_observing(
+                    &listener_b,
+                    &b_context.interface_sockets,
+                    &mut buffer,
+                    None,
+                    |bytes, ingress| {
+                        b_observed.store(true, Ordering::SeqCst);
+                        observe_discovery(&b_context, &b_handoff, bytes, ingress)
+                    },
+                )
+                .await
+                .unwrap();
+            });
+            let arbiter = std::thread::spawn(move || {
+                let until = std::time::Instant::now() + Duration::from_secs(1);
+                while !started.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+                    std::thread::yield_now();
+                }
+                assert!(started.load(Ordering::SeqCst));
+                std::thread::sleep(Duration::from_millis(30));
+                let premature = observed.load(Ordering::SeqCst);
+                release.send(()).unwrap();
+                assert!(
+                    !premature,
+                    "newer observation must wait for earlier read/admission"
+                );
+            });
+            a.await.unwrap();
+            b.await.unwrap();
+            arbiter.join().unwrap();
+            let old = queued.recv().await.unwrap();
+            let newer = queued.recv().await.unwrap();
+            assert!(old.revision.unwrap().cancel.is_cancelled());
+            assert!(matches!(newer.event, OnEvent::PeerState(state) if state.ttl == 0));
+        })
+        .await
+        .unwrap();
+    }
+
     use std::net::Ipv6Addr;
 
     use super::*;
@@ -2588,6 +3026,13 @@ mod tests {
 
     #[tokio::test]
     async fn messenger_enables_measurement_on_initial_and_reconciled_registrations() {
+        let _trace = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_test_writer()
+                .finish(),
+        );
+
         use crate::link::{
             clock::Clock, ghostxform::GhostXForm, pingresponder, sessions::SessionId,
         };
@@ -2627,6 +3072,9 @@ mod tests {
                     measurement_endpoint: Some(destination), ..PeerState::default()
                 };
                 let announcement = encode_message(remote.ident(), 30, RESPONSE, &Payload::from(remote.clone()), 0).unwrap();
+                for invalid in [vec![0], vec![0; 20], encode_message(remote.ident(), 30, u8::MAX, &Payload::default(), 0).unwrap()] {
+                    peer.send_to(&invalid, endpoint).await.unwrap();
+                }
                 peer.send_to(&announcement, endpoint).await.unwrap();
                 assert!(matches!(events.recv().await, Some(OnEvent::PeerState(_))));
                 let route = messenger.measurement_routes.resolve(&remote).expect("measurement must retain discovery ingress");
@@ -2960,7 +3408,18 @@ mod tests {
             )
             .await
             .unwrap();
-            let Some(OnEvent::PeerState(state)) = rx.recv().await else {
+            let next = rx.recv().await;
+            let next = if ttl == 0 {
+                let Some(OnEvent::PeerState(withdrawn)) = next else {
+                    panic!("explicit withdrawal");
+                };
+                assert_eq!(withdrawn.ttl, 0);
+                assert_eq!(withdrawn.node_state.ident(), remote.ident());
+                rx.recv().await
+            } else {
+                next
+            };
+            let Some(OnEvent::PeerState(state)) = next else {
                 panic!("fresh announcement")
             };
             assert_eq!(
@@ -3380,7 +3839,9 @@ mod tests {
             let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .unwrap();
-            assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == node));
+            assert!(
+                matches!(event, Some(OnEvent::PeerState(state)) if state.node_state.ident() == node && state.ttl == 0)
+            );
             gate.stop().await;
             let drained = drain_count.load(Ordering::SeqCst);
             sender
@@ -3453,7 +3914,9 @@ mod tests {
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap();
-        assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == fresh));
+        assert!(
+            matches!(event, Some(OnEvent::PeerState(state)) if state.node_state.ident() == fresh && state.ttl == 0)
+        );
         worker.abort();
         assert!(worker.await.unwrap_err().is_cancelled());
     }
@@ -3502,7 +3965,9 @@ mod tests {
         let event = tokio::time::timeout(Duration::from_secs(5), rx_event.recv())
             .await
             .unwrap();
-        assert!(matches!(event, Some(OnEvent::Byebye(id)) if id == node));
+        assert!(
+            matches!(event, Some(OnEvent::PeerState(state)) if state.node_state.ident() == node && state.ttl == 0)
+        );
         worker.abort();
         assert!(worker.await.unwrap_err().is_cancelled());
     }
