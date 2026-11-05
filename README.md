@@ -290,8 +290,10 @@ Elapsed time, timeline beat differences and clock scaling retain wide intermedia
 through conversion and origin/intercept addition. Public `Beats` operators still
 saturate; timeline composition does not use their narrowed intermediate results.
 Tempo periods stay wide in both beat conversion directions. Forced-beat requests
-re-anchor an unrepresentable origin when a bounded quantum-boundary anchor exists;
-the public rounding correction clamps at Chrono's duration limits.
+re-anchor before narrowing an unrepresentable origin when a bounded stored origin
+and time can encode the request, including an effective quantum boundary just
+outside the stored origin's range. The public rounding correction clamps at
+Chrono's duration limits.
 Link Classic and LinkAudio tempo encoders saturate signed wire periods without
 changing the sign of a negative out-of-range value.
 PONG ghost timestamps saturate at the final signed-microsecond wire boundary.

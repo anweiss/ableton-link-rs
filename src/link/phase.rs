@@ -121,19 +121,21 @@ pub fn force_beat_at_time_impl(
     if !(i64::MIN as i128..=i64::MAX as i128).contains(&beat_origin)
         || !(min_time..=max_time).contains(&time_origin)
     {
-        // A quantum-boundary origin makes raw and phase-encoded beats agree.
+        // The effective boundary is the closest quantum multiple to the stored
+        // origin, and can lie just outside that origin's i64 range.
         let boundary = i128::from(beat.value) - phase_wide(beat.value.into(), quantum.value.into());
-        for origin in [boundary, boundary + i128::from(quantum.value).abs()] {
-            if !(i64::MIN as i128..=i64::MAX as i128).contains(&origin) {
+        for boundary in [boundary, boundary + i128::from(quantum.value).abs()] {
+            let origin = narrow(boundary);
+            if closest_phase_match_wide(origin.value.into(), 0, quantum.value.into()) != boundary {
                 continue;
             }
             let elapsed = timeline
                 .tempo
-                .micros_from_microbeats(i128::from(beat.value) - origin);
+                .micros_from_microbeats(i128::from(beat.value) - boundary);
             let anchored_time =
                 super::duration_nanos(time).saturating_sub(elapsed.saturating_mul(1_000));
             if (min_time..=max_time).contains(&anchored_time) {
-                timeline.beat_origin = narrow(origin);
+                timeline.beat_origin = origin;
                 timeline.time_origin = super::duration_from_nanos(anchored_time);
                 return;
             }
@@ -170,6 +172,24 @@ fn shifted_time_origin_nanos(timeline: Timeline, shift: i128) -> i128 {
 mod tests {
     use super::*;
     use crate::link::tempo::Tempo;
+
+    #[test]
+    fn review_round_force_beat_keeps_effective_quantum_boundaries() {
+        for (time, beat, quantum) in [
+            (Duration::MIN, i64::MAX, i64::MIN),
+            (Duration::MAX, i64::MIN, 4_000_000),
+        ] {
+            let mut timeline = Timeline {
+                tempo: Tempo::new(60.0),
+                beat_origin: Beats::default(),
+                time_origin: Duration::zero(),
+            };
+            let beat = Beats::from_microbeats(beat);
+            let quantum = Beats::from_microbeats(quantum);
+            force_beat_at_time_impl(&mut timeline, beat, time, quantum);
+            assert_eq!(to_phase_encoded_beats(&timeline, time, quantum), beat);
+        }
+    }
 
     #[test]
     fn review_round_force_beat_reanchors_large_times() {
