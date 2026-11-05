@@ -68,10 +68,16 @@ impl GhostXForm {
     }
 
     pub(crate) fn ghost_to_host_nanos(&self, ghost_time: Duration) -> Duration {
+        self.ghost_nanos_to_host(super::duration_nanos(ghost_time))
+    }
+
+    pub(crate) fn ghost_nanos_to_host(&self, ghost_nanos: i128) -> Duration {
+        let difference = ghost_nanos.saturating_sub(super::duration_nanos(self.intercept));
         if self.slope == 0.0 || !self.slope.is_finite() {
-            return self.ghost_to_host(ghost_time);
+            return Duration::microseconds(
+                (difference as f64 / 1_000.0 / self.slope).round() as i64
+            );
         }
-        let difference = super::duration_nanos(ghost_time) - super::duration_nanos(self.intercept);
         if difference == 0 {
             return Duration::zero();
         }

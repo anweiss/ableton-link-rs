@@ -10,7 +10,10 @@ use super::{
 use crate::link::IncomingClientState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioCommitTicket(u64);
+pub struct AudioCommitTicket {
+    queue: core::num::NonZeroU64,
+    sequence: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AudioQueueError {
@@ -143,6 +146,7 @@ impl AcceptedState {
 
 /// Non-blocking accepted snapshots and a bounded acknowledged proposal queue.
 pub struct SafeRtSessionStateHandler {
+    queue_id: Option<core::num::NonZeroU64>,
     accepted: AcceptedState,
     has_pending_updates: AtomicBool,
     pending: Mutex<PendingUpdate>,
@@ -151,6 +155,7 @@ pub struct SafeRtSessionStateHandler {
 impl SafeRtSessionStateHandler {
     pub fn new(initial_state: ClientState) -> Self {
         Self {
+            queue_id: super::sessions::new_edit_revision(),
             accepted: AcceptedState::new(initial_state),
             has_pending_updates: AtomicBool::new(false),
             pending: Mutex::new(PendingUpdate::default()),
@@ -176,6 +181,7 @@ impl SafeRtSessionStateHandler {
         incoming_state: IncomingClientState,
         origin: Option<super::sessions::SessionEditOrigin>,
     ) -> Result<AudioCommitTicket, AudioQueueError> {
+        let queue = self.queue_id.ok_or(AudioQueueError::TicketExhausted)?;
         let mut pending = self.pending.try_lock().map_err(|_| AudioQueueError::Busy)?;
         if pending.incoming.is_some() || pending.result.is_some() {
             return Err(AudioQueueError::Busy);
@@ -187,7 +193,10 @@ impl SafeRtSessionStateHandler {
         pending.incoming = Some(incoming_state);
         pending.origin = origin;
         self.has_pending_updates.store(true, Ordering::Release);
-        Ok(AudioCommitTicket(pending.sequence))
+        Ok(AudioCommitTicket {
+            queue,
+            sequence: pending.sequence,
+        })
     }
 
     /// Peek at the pending request, preserving its changed-field mask.
@@ -199,10 +208,17 @@ impl SafeRtSessionStateHandler {
 
     /// Peek without consuming: cancellation of a non-RT drain leaves the request queued.
     pub fn pending_update(&self) -> Option<(AudioCommitTicket, IncomingClientState)> {
+        let queue = self.queue_id?;
         let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending
-            .incoming
-            .map(|incoming| (AudioCommitTicket(pending.sequence), incoming))
+        pending.incoming.map(|incoming| {
+            (
+                AudioCommitTicket {
+                    queue,
+                    sequence: pending.sequence,
+                },
+                incoming,
+            )
+        })
     }
 
     pub(crate) fn pending_update_from_origin(
@@ -212,10 +228,14 @@ impl SafeRtSessionStateHandler {
         IncomingClientState,
         Option<super::sessions::SessionEditOrigin>,
     )> {
+        let queue = self.queue_id?;
         let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.incoming.map(|incoming| {
             (
-                AudioCommitTicket(pending.sequence),
+                AudioCommitTicket {
+                    queue,
+                    sequence: pending.sequence,
+                },
                 incoming,
                 pending.origin,
             )
@@ -232,8 +252,11 @@ impl SafeRtSessionStateHandler {
         ticket: AudioCommitTicket,
         result: Result<(), CommitError>,
     ) -> bool {
+        if self.queue_id != Some(ticket.queue) {
+            return false;
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if ticket.0 != pending.sequence || pending.incoming.is_none() {
+        if ticket.sequence != pending.sequence || pending.incoming.is_none() {
             return false;
         }
         pending.incoming = None;
@@ -248,8 +271,11 @@ impl SafeRtSessionStateHandler {
         &self,
         ticket: AudioCommitTicket,
     ) -> Result<Option<Result<(), CommitError>>, AudioQueueError> {
+        if self.queue_id != Some(ticket.queue) {
+            return Err(AudioQueueError::UnknownTicket);
+        }
         let mut pending = self.pending.try_lock().map_err(|_| AudioQueueError::Busy)?;
-        if ticket.0 != pending.sequence {
+        if ticket.sequence != pending.sequence {
             return Err(AudioQueueError::UnknownTicket);
         }
         if pending.incoming.is_some() {
@@ -291,6 +317,52 @@ mod tests {
                 timestamp: Duration::zero(),
             },
         }
+    }
+
+    #[test]
+    fn ordering_foreign_ticket_cannot_complete_or_acknowledge_another_queue() {
+        let first = SafeRtSessionStateHandler::new(create_test_client_state());
+        let second = SafeRtSessionStateHandler::new(create_test_client_state());
+        let incoming = IncomingClientState {
+            timeline: None,
+            start_stop_state: None,
+            timeline_timestamp: Duration::zero(),
+        };
+        let first_ticket = first.update_rt_client_state(incoming).unwrap();
+        let second_ticket = second.update_rt_client_state(incoming).unwrap();
+        assert_ne!(first_ticket, second_ticket);
+        assert!(!second.complete_pending_update(first_ticket, Ok(())));
+        assert_eq!(second.pending_update(), Some((second_ticket, incoming)));
+        assert!(second.complete_pending_update(second_ticket, Ok(())));
+        assert_eq!(
+            second.take_commit_result(first_ticket),
+            Err(AudioQueueError::UnknownTicket)
+        );
+        assert_eq!(second.take_commit_result(second_ticket), Ok(Some(Ok(()))));
+        assert!(first.complete_pending_update(first_ticket, Ok(())));
+        assert_eq!(first.take_commit_result(first_ticket), Ok(Some(Ok(()))));
+    }
+
+    #[test]
+    fn ordering_exhausted_queue_identity_and_sequence_fail_closed() {
+        let mut handler = SafeRtSessionStateHandler::new(create_test_client_state());
+        let incoming = IncomingClientState {
+            timeline: None,
+            start_stop_state: None,
+            timeline_timestamp: Duration::zero(),
+        };
+        handler.pending.lock().unwrap().sequence = u64::MAX;
+        assert_eq!(
+            handler.update_rt_client_state(incoming),
+            Err(AudioQueueError::TicketExhausted)
+        );
+        handler.pending.lock().unwrap().sequence = 0;
+        handler.queue_id = None;
+        assert_eq!(
+            handler.update_rt_client_state(incoming),
+            Err(AudioQueueError::TicketExhausted)
+        );
+        assert!(!handler.has_pending_updates());
     }
 
     #[test]
