@@ -1158,3 +1158,9 @@ session/registry guards, resetting a peerless remote promotion even if both coun
 independent caller's ownership ends. It waits for a peer and channel capacity, sends at
 most one request, and exits when the request receiver closes. Public session-result
 handlers also stop their waiting request when its originating current incarnation changes.
+
+Join/reset commits acquire identity, session/client timing, sync policy, peer count,
+and responder publication guards in the same cooperative attempt as session and peer
+ownership. A busy guard means retry, not completed/no-change. No state is mutated until
+all required guards are held; callbacks run after release. This includes peerless resets
+and equal-timing joins whose client session identity still needs to change.

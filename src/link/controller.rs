@@ -1176,6 +1176,148 @@ async fn refresh_peer_count(
     .await
 }
 
+struct SessionCommit<'a> {
+    current: &'a mut Session,
+    others: &'a mut Vec<Session>,
+    peers: &'a mut Vec<ControllerPeer>,
+    peer: &'a mut PeerState,
+    session: &'a mut SessionState,
+    client: &'a mut ClientState,
+    counter: &'a mut SessionPeerCounter,
+    sync_enabled: bool,
+    responder_id: &'a mut SessionId,
+    responder_form: &'a mut GhostXForm,
+    gateway_peer: Option<&'a mut PeerState>,
+}
+
+fn try_session_commit<R>(
+    sessions: &Sessions,
+    peers: &Mutex<Vec<ControllerPeer>>,
+    peer_state: &Mutex<PeerState>,
+    session_state: &Mutex<SessionState>,
+    client_state: &Mutex<ClientState>,
+    counter: &Mutex<SessionPeerCounter>,
+    sync_enabled: &Mutex<bool>,
+    discovery: &PeerGateway,
+    commit: impl FnOnce(&mut SessionCommit<'_>) -> R,
+) -> Option<R> {
+    let mut current = try_state(&sessions.current)?;
+    let mut others = try_state(&sessions.other_sessions)?;
+    let mut peers = try_state(peers)?;
+    let mut peer = try_state(peer_state)?;
+    let mut session = try_state(session_state)?;
+    let mut client = try_state(client_state)?;
+    let mut counter = try_state(counter)?;
+    let sync_enabled = try_state(sync_enabled)?;
+    let responder = &discovery.measurement_service.ping_responder;
+    let mut responder_id = try_state(&responder.session_id)?;
+    let mut responder_form = try_state(&responder.ghost_x_form)?;
+    // Public helpers can be given a separate caller-side discovery snapshot.
+    let mut gateway_peer = if std::ptr::eq(peer_state, discovery.peer_state.as_ref()) {
+        None
+    } else {
+        Some(try_state(&discovery.peer_state)?)
+    };
+    Some(commit(&mut SessionCommit {
+        current: &mut current,
+        others: &mut others,
+        peers: &mut peers,
+        peer: &mut peer,
+        session: &mut session,
+        client: &mut client,
+        counter: &mut counter,
+        sync_enabled: *sync_enabled,
+        responder_id: &mut responder_id,
+        responder_form: &mut responder_form,
+        gateway_peer: gateway_peer.as_deref_mut(),
+    }))
+}
+
+impl SessionCommit<'_> {
+    fn publish_discovery(&mut self) {
+        self.peer.node_state.timeline = self.session.timeline;
+        self.peer.node_state.start_stop_state = self.session.start_stop_state;
+        *self.responder_id = self.peer.session_id();
+        *self.responder_form = self.session.ghost_x_form;
+        if let Some(peer) = &mut self.gateway_peer {
+            peer.node_state = self.peer.node_state.clone();
+        }
+    }
+
+    fn reset(&mut self, clock: Clock) -> Option<tempo::Tempo> {
+        let node = if self.peer.ident() == NodeId::default() {
+            NodeId::new()
+        } else {
+            self.peer.ident()
+        };
+        let id = SessionId(node);
+        let x_form = init_x_form(clock);
+        let host_time = -x_form.intercept;
+        let timeline = Timeline {
+            tempo: self.session.timeline.tempo,
+            beat_origin: self
+                .session
+                .timeline
+                .to_beats(self.session.ghost_x_form.host_to_ghost(host_time)),
+            time_origin: x_form.host_to_ghost(host_time),
+        };
+        self.peer.node_state.node_id = node;
+        self.peer.node_state.session_id = id;
+        self.session.start_stop_state = StartStopState::default();
+        let changed = update_timing_guarded(
+            self.session,
+            self.client,
+            timeline,
+            x_form,
+            clock,
+            self.sync_enabled,
+            id,
+        );
+        self.publish_discovery();
+        *self.current = Session::new(
+            id,
+            timeline,
+            SessionMeasurement {
+                x_form,
+                timestamp: host_time,
+            },
+        );
+        self.others.clear();
+        self.peers.clear();
+        self.counter.session_peer_count = 0;
+        changed
+    }
+
+    fn join(&mut self, queued: &Session, clock: Clock) -> Option<tempo::Tempo> {
+        if !queued.key().matches(self.current) {
+            return None;
+        }
+        // All required guards are held: contention cannot masquerade as a stale
+        // notification or leave only part of this transition published.
+        let session = self.current.clone();
+        let count = count_session_peers(session.session_id, self.peers, self.peer.ident());
+        if session.session_id.0 != self.peer.ident() && count == 0 {
+            return self.reset(clock);
+        }
+        if self.peer.session_id() != session.session_id {
+            self.session.start_stop_state = StartStopState::default();
+        }
+        self.peer.node_state.session_id = session.session_id;
+        let changed = update_timing_guarded(
+            self.session,
+            self.client,
+            session.timeline,
+            session.measurement.x_form,
+            clock,
+            self.sync_enabled,
+            session.session_id,
+        );
+        self.publish_discovery();
+        self.counter.session_peer_count = count;
+        changed
+    }
+}
+
 pub async fn join_session(
     session: Session,
     peer_state: Arc<Mutex<PeerState>>,
@@ -1190,141 +1332,22 @@ pub async fn join_session(
     tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
 ) {
     let changed = retry_state(|| {
-        let mut current = try_state(&sessions.current)?;
-        let mut others = try_state(&sessions.other_sessions)?;
-        let mut peers = try_state(&peers)?;
-        Some(join_session_current(
-            &mut current,
-            session.clone(),
-            peer_state.clone(),
-            session_state.clone(),
-            client_state.clone(),
-            clock,
-            start_stop_sync_enabled.clone(),
-            discovery.clone(),
-            &mut peers,
-            session_peer_count.clone(),
-            &mut others,
-        ))
+        try_session_commit(
+            &sessions,
+            &peers,
+            &peer_state,
+            &session_state,
+            &client_state,
+            &session_peer_count,
+            &start_stop_sync_enabled,
+            &discovery,
+            |state| state.join(&session, clock),
+        )
     })
     .await;
     if let Some(tempo) = changed {
         dispatch_current_tempo(&session_state, &tempo_callback, tempo);
     }
-}
-
-fn join_session_current(
-    current: &mut Session,
-    session: Session,
-    peer_state: Arc<Mutex<PeerState>>,
-    session_state: Arc<Mutex<SessionState>>,
-    client_state: Arc<Mutex<ClientState>>,
-    clock: Clock,
-    start_stop_sync_enabled: Arc<Mutex<bool>>,
-    discovery: Arc<PeerGateway>,
-    peers: &mut Vec<ControllerPeer>,
-    session_peer_count: Arc<Mutex<SessionPeerCounter>>,
-    others: &mut Vec<Session>,
-) -> Option<tempo::Tempo> {
-    if !session.key().matches(current) {
-        return None;
-    }
-    // The queued identity grants ownership, not authority to restore older fields.
-    let session = current.clone();
-    let self_id = peer_state.try_lock().ok()?.ident();
-    if session.session_id.0 != self_id
-        && count_session_peers(session.session_id, peers, self_id) == 0
-    {
-        return reset_state_current(
-            current,
-            peer_state,
-            session_state,
-            client_state,
-            discovery,
-            others,
-            peers,
-            clock,
-            start_stop_sync_enabled,
-        );
-    }
-
-    let session_id_changed = if let Ok(ps) = peer_state.try_lock() {
-        ps.session_id() != session.session_id
-    } else {
-        debug!("Failed to lock peer_state in join_session");
-        return None;
-    };
-
-    if let Ok(mut ps) = peer_state.try_lock() {
-        ps.node_state.session_id = session.session_id;
-    } else {
-        debug!("Failed to lock peer_state to update session_id");
-        return None;
-    };
-
-    if session_id_changed {
-        reset_session_start_stop_state(session_state.clone())
-    }
-
-    let changed = update_session_timing_inner(
-        session_state.clone(),
-        client_state.clone(),
-        session.timeline,
-        session.measurement.x_form,
-        clock,
-        start_stop_sync_enabled.clone(),
-        session.session_id,
-    );
-
-    // Verify that client state was actually updated
-    if let Ok(client_state_check) = client_state.try_lock() {
-        info!(
-            "after joining session {}, client state tempo is now: {}",
-            session.session_id,
-            client_state_check.timeline.tempo.bpm()
-        );
-    }
-
-    update_discovery_now(session_state.clone(), peer_state.clone(), discovery.clone());
-
-    if session_id_changed {
-        info!(
-            "joining session {} with tempo {}",
-            session.session_id,
-            session.timeline.tempo.bpm().round()
-        );
-
-        // session_peer_counter(session_id, peers, session_peer_count);
-
-        let should_reset = if let (Ok(peer_state_guard), Ok(mut session_peer_count_guard)) =
-            (peer_state.try_lock(), session_peer_count.try_lock())
-        {
-            let s_id = peer_state_guard.session_id();
-            let count = count_session_peers(s_id, peers, peer_state_guard.ident());
-            let old_count = session_peer_count_guard.session_peer_count;
-            session_peer_count_guard.session_peer_count = count;
-
-            old_count != count && count == 0
-        } else {
-            false
-        };
-
-        if should_reset {
-            return reset_state_current(
-                current,
-                peer_state.clone(),
-                session_state.clone(),
-                client_state,
-                discovery,
-                others,
-                peers,
-                clock,
-                start_stop_sync_enabled,
-            )
-            .or(changed);
-        }
-    }
-    changed
 }
 
 pub async fn reset_state(
@@ -1363,122 +1386,32 @@ async fn reset_state_if_peerless(
     expected: Option<SessionId>,
 ) {
     let changed = retry_state(|| {
-        let mut current = try_state(&sessions.current)?;
-        let mut others = try_state(&sessions.other_sessions)?;
-        let mut peers = try_state(&sessions.peers)?;
-        let state = try_state(&peer_state)?;
-        if let Some(expected) = expected {
-            if current.session_id != expected
-                || state.session_id() != expected
-                || count_session_peers(expected, &peers, state.ident()) != 0
-            {
-                return Some(None);
-            }
-        }
-        drop(state);
-        Some(reset_state_current(
-            &mut current,
-            peer_state.clone(),
-            session_state.clone(),
-            client_state.clone(),
-            discovery.clone(),
-            &mut others,
-            &mut peers,
-            clock,
-            start_stop_sync_enabled.clone(),
-        ))
+        try_session_commit(
+            &sessions,
+            &sessions.peers,
+            &peer_state,
+            &session_state,
+            &client_state,
+            &discovery.session_peer_counter,
+            &start_stop_sync_enabled,
+            &discovery,
+            |state| {
+                if let Some(expected) = expected {
+                    if state.current.session_id != expected
+                        || state.peer.session_id() != expected
+                        || count_session_peers(expected, state.peers, state.peer.ident()) != 0
+                    {
+                        return None;
+                    }
+                }
+                state.reset(clock)
+            },
+        )
     })
     .await;
     if let Some(tempo) = changed {
         dispatch_current_tempo(&session_state, &tempo_callback, tempo);
     }
-}
-
-fn reset_state_current(
-    current: &mut Session,
-    peer_state: Arc<Mutex<PeerState>>,
-    session_state: Arc<Mutex<SessionState>>,
-    client_state: Arc<Mutex<ClientState>>,
-    discovery: Arc<PeerGateway>,
-    others: &mut Vec<Session>,
-    peers: &mut Vec<ControllerPeer>,
-    clock: Clock,
-    start_stop_sync_enabled: Arc<Mutex<bool>>,
-) -> Option<tempo::Tempo> {
-    // Preserve the existing NodeId to maintain peer identity across enable/disable cycles
-    let existing_node_id = if let Ok(peer_state_guard) = peer_state.try_lock() {
-        peer_state_guard.node_state.node_id
-    } else {
-        NodeId::default()
-    };
-
-    // Only generate a new NodeId if this is the very first initialization
-    let n_id = if existing_node_id == NodeId::default() {
-        NodeId::new()
-    } else {
-        existing_node_id
-    };
-
-    // Create a temporary session while waiting for discovery
-    // This session will be replaced if we find a better session on the network
-    let s_id = SessionId(n_id);
-
-    if let Ok(mut peer_state_guard) = peer_state.try_lock() {
-        peer_state_guard.node_state.node_id = n_id;
-        peer_state_guard.node_state.session_id = s_id;
-    }
-
-    let x_form = init_x_form(clock);
-    let host_time = -x_form.intercept;
-
-    let (timeline, ghost_x_form) = if let Ok(session_state_guard) = session_state.try_lock() {
-        (
-            session_state_guard.timeline,
-            session_state_guard.ghost_x_form,
-        )
-    } else {
-        // Fallback to default values if lock fails
-        (Timeline::default(), GhostXForm::default())
-    };
-
-    let new_tl = Timeline {
-        tempo: timeline.tempo,
-        beat_origin: timeline.to_beats(ghost_x_form.host_to_ghost(host_time)),
-        time_origin: x_form.host_to_ghost(host_time),
-        // time_origin: Duration::zero(),
-    };
-
-    info!(
-        "initializing temporary session {} with timeline {:?} (preserving NodeId: {})",
-        s_id, new_tl, n_id,
-    );
-
-    reset_session_start_stop_state(session_state.clone());
-
-    let changed = update_session_timing_inner(
-        session_state.clone(),
-        client_state.clone(),
-        new_tl,
-        x_form,
-        clock,
-        start_stop_sync_enabled,
-        s_id,
-    );
-
-    update_discovery_now(session_state.clone(), peer_state.clone(), discovery.clone());
-
-    *current = Session {
-        incarnation: Arc::new(()),
-        session_id: s_id,
-        timeline: new_tl,
-        measurement: SessionMeasurement {
-            x_form,
-            timestamp: host_time,
-        },
-    };
-    others.clear();
-    peers.clear();
-    changed
 }
 
 pub async fn update_discovery(
@@ -1565,47 +1498,51 @@ fn update_session_timing_inner(
     start_stop_sync_enabled: Arc<Mutex<bool>>,
     session_id: SessionId,
 ) -> Option<tempo::Tempo> {
-    let new_timeline = clamp_tempo(new_timeline);
-    let mut changed_tempo = None;
+    let mut session_state = try_state(&session_state)?;
+    let mut client_state = try_state(&client_state)?;
+    let sync_enabled = try_state(&start_stop_sync_enabled)?;
+    update_timing_guarded(
+        &mut session_state,
+        &mut client_state,
+        new_timeline,
+        new_x_form,
+        clock,
+        *sync_enabled,
+        session_id,
+    )
+}
 
-    if let Ok(mut session_state) = session_state.try_lock() {
-        let old_timeline = session_state.timeline;
-        let old_x_form = session_state.ghost_x_form;
-
-        if old_timeline != new_timeline || old_x_form != new_x_form {
-            session_state.timeline = new_timeline;
-            session_state.ghost_x_form = new_x_form;
-
-            if let Ok(mut client_state_guard) = client_state.try_lock() {
-                let old_client_timeline = client_state_guard.timeline;
-                client_state_guard.timeline = update_client_timeline_from_session(
-                    old_client_timeline, // Current client timeline
-                    new_timeline,        // Session timeline to sync to
-                    clock.micros(),
-                    new_x_form,
-                );
-                client_state_guard.timeline_session_id = session_id;
-
-                if let Ok(start_stop_enabled) = start_stop_sync_enabled.try_lock() {
-                    if *start_stop_enabled
-                        && session_state.start_stop_state != StartStopState::default()
-                    {
-                        client_state_guard.start_stop_state =
-                            map_start_stop_state_from_session_to_client(
-                                session_state.start_stop_state,
-                                session_state.timeline,
-                                session_state.ghost_x_form,
-                            );
-                    }
-                }
-            }
-
-            if old_timeline.tempo != new_timeline.tempo {
-                changed_tempo = Some(new_timeline.tempo);
-            }
+fn update_timing_guarded(
+    session: &mut SessionState,
+    client: &mut ClientState,
+    new_timeline: Timeline,
+    new_x_form: GhostXForm,
+    clock: Clock,
+    sync_enabled: bool,
+    session_id: SessionId,
+) -> Option<tempo::Tempo> {
+    let timeline = clamp_tempo(new_timeline);
+    let old = session.timeline;
+    let changed = old != timeline || session.ghost_x_form != new_x_form;
+    if changed {
+        session.timeline = timeline;
+        session.ghost_x_form = new_x_form;
+        client.timeline = update_client_timeline_from_session(
+            client.timeline,
+            timeline,
+            clock.micros(),
+            new_x_form,
+        );
+        if sync_enabled && session.start_stop_state != StartStopState::default() {
+            client.start_stop_state = map_start_stop_state_from_session_to_client(
+                session.start_stop_state,
+                timeline,
+                new_x_form,
+            );
         }
     }
-    changed_tempo
+    client.timeline_session_id = session_id;
+    (old.tempo != timeline.tempo).then_some(timeline.tempo)
 }
 
 fn dispatch_current_tempo(
@@ -1722,6 +1659,335 @@ pub struct SessionPeerCounter {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
+    #[test]
+    fn owned_io_timing_update_does_not_partially_mutate_contended_client() {
+        let clock = Clock::new();
+        let initial = init_session_state(tempo::Tempo::new(120.0), clock);
+        let id = SessionId(NodeId::from_array([98; 8]));
+        let session = Arc::new(Mutex::new(initial));
+        let client = Arc::new(Mutex::new(init_client_state(initial, SessionId::default())));
+        let sync = Arc::new(Mutex::new(false));
+        let held = client.lock().unwrap();
+        let timeline = Timeline {
+            tempo: tempo::Tempo::new(147.0),
+            ..initial.timeline
+        };
+        assert!(update_session_timing_inner(
+            session.clone(),
+            client.clone(),
+            timeline,
+            initial.ghost_x_form,
+            clock,
+            sync.clone(),
+            id
+        )
+        .is_none());
+        assert_eq!(
+            session.lock().unwrap().timeline,
+            initial.timeline,
+            "no session mutation before obtaining the client guard"
+        );
+        drop(held);
+        assert!(update_session_timing_inner(
+            session.clone(),
+            client.clone(),
+            timeline,
+            initial.ghost_x_form,
+            clock,
+            sync.clone(),
+            id
+        )
+        .is_some());
+        let same_timing_id = SessionId(NodeId::from_array([99; 8]));
+        assert!(update_session_timing_inner(
+            session,
+            client.clone(),
+            timeline,
+            initial.ghost_x_form,
+            clock,
+            sync,
+            same_timing_id
+        )
+        .is_none());
+        assert_eq!(
+            client.lock().unwrap().timeline_session_id,
+            same_timing_id,
+            "equal timing still publishes the new session identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_io_live_join_waits_for_every_publication_guard() {
+        check_join_commit_guards(false).await;
+    }
+
+    #[tokio::test]
+    async fn owned_io_peerless_reset_waits_for_every_publication_guard() {
+        check_join_commit_guards(true).await;
+    }
+
+    async fn check_join_commit_guards(peerless: bool) {
+        use crate::discovery::peers::{GatewayObserver, PeerEvent};
+        use tokio::sync::mpsc;
+        fn hold<T>(
+            state: Arc<Mutex<T>>,
+            ready: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        ) {
+            let _guard = state.lock().unwrap();
+            ready.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        for held_kind in 0..10 {
+            let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+                .await
+                .unwrap();
+            let local = controller.peer_state.lock().unwrap().ident();
+            let remote = Session::new(
+                SessionId(NodeId::from_array([96; 8])),
+                Timeline {
+                    tempo: tempo::Tempo::new(146.0),
+                    ..Default::default()
+                },
+                SessionMeasurement::default(),
+            );
+            controller
+                .sessions
+                .other_sessions
+                .lock()
+                .unwrap()
+                .push(remote.clone());
+            controller.peers.lock().unwrap().push(ControllerPeer {
+                peer_state: PeerState {
+                    node_state: NodeState {
+                        node_id: NodeId::from_array([97; 8]),
+                        session_id: remote.session_id,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            });
+            let (joins, mut queued) = mpsc::channel(1);
+            crate::link::sessions::handle_successful_measurement(
+                remote.key(),
+                GhostXForm {
+                    slope: 1.0,
+                    intercept: chrono::Duration::seconds(100),
+                },
+                controller.sessions.other_sessions.clone(),
+                controller.sessions.current.clone(),
+                controller.clock,
+                joins,
+                controller.peers.clone(),
+                controller.sessions.tx_measure_peer_state.clone(),
+            )
+            .await;
+            let promoted = queued.recv().await.unwrap();
+            let (events, rx_events) = mpsc::channel(1);
+            let (changes, mut changed) = mpsc::channel(1);
+            let _observer = GatewayObserver::new(
+                rx_events,
+                controller.peer_state.clone(),
+                controller.session_peer_counter.clone(),
+                changes,
+                controller.peers.clone(),
+                Arc::new(Notify::new()),
+                Some(controller.sessions.clone()),
+            )
+            .await;
+            if peerless {
+                events
+                    .send(PeerEvent::PeerLeft(NodeId::from_array([97; 8])))
+                    .await
+                    .unwrap();
+                changed.recv().await.unwrap();
+            }
+            let before_peer = controller.peer_state.lock().unwrap().clone();
+            let before_session = *controller.session_state.lock().unwrap();
+            let before_client = *controller.client_state.lock().unwrap();
+            let before_current = controller.sessions.current.lock().unwrap().clone();
+            let before_others = controller.sessions.other_sessions.lock().unwrap().clone();
+            let before_peers = controller.peers.lock().unwrap().clone();
+            let before_count = controller
+                .session_peer_counter
+                .lock()
+                .unwrap()
+                .session_peer_count;
+            let responder = &controller.discovery.measurement_service.ping_responder;
+            let before_id = *responder.session_id.lock().unwrap();
+            let before_form = *responder.ghost_x_form.lock().unwrap();
+            let peer = controller.peer_state.clone();
+            let session = controller.session_state.clone();
+            let client = controller.client_state.clone();
+            let enabled = controller.start_stop_sync_enabled.clone();
+            let count = controller.session_peer_counter.clone();
+            let pong_id = responder.session_id.clone();
+            let pong_form = responder.ghost_x_form.clone();
+            let current = controller.sessions.current.clone();
+            let others = controller.sessions.other_sessions.clone();
+            let peers = controller.peers.clone();
+            let (ready, ready_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || match held_kind {
+                0 => hold(peer, ready, release_rx),
+                1 => hold(session, ready, release_rx),
+                2 => hold(client, ready, release_rx),
+                3 => hold(enabled, ready, release_rx),
+                4 => hold(count, ready, release_rx),
+                5 => hold(pong_id, ready, release_rx),
+                6 => hold(pong_form, ready, release_rx),
+                7 => hold(current, ready, release_rx),
+                8 => hold(others, ready, release_rx),
+                _ => hold(peers, ready, release_rx),
+            });
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let peer = controller.peer_state.clone();
+            let session = controller.session_state.clone();
+            let client = controller.client_state.clone();
+            let enabled = controller.start_stop_sync_enabled.clone();
+            let discovery = controller.discovery.clone();
+            let peers = controller.peers.clone();
+            let count = controller.session_peer_counter.clone();
+            let sessions = controller.sessions.clone();
+            let callback = controller.tempo_callback.clone();
+            let clock = controller.clock;
+            let work = controller.io.as_ref().unwrap().spawn(async move {
+                join_session(
+                    promoted, peer, session, client, clock, enabled, discovery, peers, count,
+                    sessions, callback,
+                )
+                .await
+            });
+            let mut heartbeat = controller.io.as_ref().unwrap().spawn(async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            });
+            let responsive = matches!(
+                tokio::time::timeout(Duration::from_millis(80), &mut heartbeat).await,
+                Ok(Ok(()))
+            );
+            let pending = !work.is_finished();
+            let unchanged = tokio::time::timeout(
+                Duration::from_millis(80),
+                retry_state(|| {
+                    let peer = if held_kind == 0 {
+                        None
+                    } else {
+                        Some(try_state(&controller.peer_state)?)
+                    };
+                    let session = if held_kind == 1 {
+                        None
+                    } else {
+                        Some(try_state(&controller.session_state)?)
+                    };
+                    let client = if held_kind == 2 {
+                        None
+                    } else {
+                        Some(try_state(&controller.client_state)?)
+                    };
+                    let count = if held_kind == 4 {
+                        None
+                    } else {
+                        Some(try_state(&controller.session_peer_counter)?)
+                    };
+                    let id = if held_kind == 5 {
+                        None
+                    } else {
+                        Some(try_state(&responder.session_id)?)
+                    };
+                    let form = if held_kind == 6 {
+                        None
+                    } else {
+                        Some(try_state(&responder.ghost_x_form)?)
+                    };
+                    let current = if held_kind == 7 {
+                        None
+                    } else {
+                        Some(try_state(&controller.sessions.current)?)
+                    };
+                    let others = if held_kind == 8 {
+                        None
+                    } else {
+                        Some(try_state(&controller.sessions.other_sessions)?)
+                    };
+                    let peers = if held_kind == 9 {
+                        None
+                    } else {
+                        Some(try_state(&controller.peers)?)
+                    };
+                    Some(
+                        peer.as_ref().is_none_or(|p| **p == before_peer)
+                            && session.as_ref().is_none_or(|s| {
+                                s.timeline == before_session.timeline
+                                    && s.ghost_x_form == before_session.ghost_x_form
+                                    && s.start_stop_state == before_session.start_stop_state
+                            })
+                            && client.as_ref().is_none_or(|c| {
+                                c.timeline == before_client.timeline
+                                    && c.timeline_session_id == before_client.timeline_session_id
+                                    && c.start_stop_state == before_client.start_stop_state
+                            })
+                            && count
+                                .as_ref()
+                                .is_none_or(|c| c.session_peer_count == before_count)
+                            && id.as_ref().is_none_or(|id| **id == before_id)
+                            && form.as_ref().is_none_or(|form| **form == before_form)
+                            && current.as_ref().is_none_or(|c| {
+                                before_current.key().matches(c)
+                                    && c.timeline == before_current.timeline
+                                    && c.measurement.x_form == before_current.measurement.x_form
+                            })
+                            && others.as_ref().is_none_or(|o| {
+                                o.len() == before_others.len()
+                                    && o.iter()
+                                        .zip(&before_others)
+                                        .all(|(a, b)| b.key().matches(a))
+                            })
+                            && peers.as_ref().is_none_or(|p| **p == before_peers),
+                    )
+                }),
+            )
+            .await
+                == Ok(true);
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), work)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(responsive && pending && unchanged,"all publication must wait without parking or partial mutation: peerless={peerless}, held={held_kind}, responsive={responsive}, pending={pending}, unchanged={unchanged}");
+            let expected = if peerless {
+                SessionId(local)
+            } else {
+                remote.session_id
+            };
+            let peer = controller.peer_state.lock().unwrap();
+            let session = controller.session_state.lock().unwrap();
+            let client = controller.client_state.lock().unwrap();
+            let current = controller.sessions.current.lock().unwrap();
+            assert_eq!(current.session_id, expected);
+            assert_eq!(peer.session_id(), expected);
+            assert_eq!(peer.ident(), local);
+            assert_eq!(client.timeline_session_id, expected);
+            assert_eq!(peer.timeline(), session.timeline);
+            assert_eq!(*responder.session_id.lock().unwrap(), expected);
+            assert_eq!(
+                *responder.ghost_x_form.lock().unwrap(),
+                session.ghost_x_form
+            );
+            assert_eq!(
+                controller
+                    .session_peer_counter
+                    .lock()
+                    .unwrap()
+                    .session_peer_count,
+                usize::from(!peerless)
+            );
+            assert_eq!(peer.measurement_endpoint, before_peer.measurement_endpoint);
+            assert_eq!(peer.audio_endpoint, before_peer.audio_endpoint);
+            assert_eq!(remote.key().matches(&current), !peerless);
+        }
+    }
+
     #[tokio::test]
     async fn owned_io_managed_count_preserves_survivor_without_parking_executor() {
         let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
