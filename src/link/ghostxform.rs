@@ -19,6 +19,12 @@ impl Default for GhostXForm {
 
 impl GhostXForm {
     pub fn host_to_ghost(&self, host_time: Duration) -> Duration {
+        if self.slope == 1.0 {
+            return super::duration_from_nanos(
+                super::round_ratio(super::duration_nanos(host_time), 1_000) * 1_000
+                    + super::duration_nanos(self.intercept),
+            );
+        }
         let offset =
             (self.slope * (super::duration_nanos(host_time) as f64 / 1_000.0)).round() as i128;
         super::duration_from_nanos(
@@ -77,6 +83,24 @@ mod tests {
 
     #[test]
     fn wide_boundary_forward_scaling_and_intercept_cancellation() {
+        let identity = GhostXForm {
+            slope: 1.0,
+            intercept: Duration::zero(),
+        };
+        for input in [
+            Duration::MIN,
+            Duration::MAX,
+            Duration::microseconds(i64::MAX) + Duration::microseconds(1),
+            Duration::microseconds(i64::MIN) - Duration::microseconds(1),
+        ] {
+            assert_eq!(identity.host_to_ghost(input), input);
+        }
+        for (input, expected) in [(1_499, 1), (1_500, 2), (-1_499, -1), (-1_500, -2)] {
+            assert_eq!(
+                identity.host_to_ghost(Duration::nanoseconds(input)),
+                Duration::microseconds(expected)
+            );
+        }
         for sign in [-1, 1] {
             let input = Duration::microseconds(sign * i64::MAX) * 2;
             let form = GhostXForm {
