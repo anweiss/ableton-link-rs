@@ -2593,6 +2593,10 @@ pub async fn receive_bye_bye(tx: Sender<OnEvent>, node_id: NodeId) {
 }
 
 pub fn send_byebye(node_state: NodeId) {
+    send_byebye_to(node_state, SocketAddrV4::new(MULTICAST_ADDR, LINK_PORT));
+}
+
+pub(crate) fn send_byebye_to(node_state: NodeId, destination: SocketAddrV4) {
     info!("sending bye bye");
 
     let socket = match new_std_udp_reuseport(MULTICAST_IP_ANY.into()) {
@@ -2618,7 +2622,7 @@ pub fn send_byebye(node_state: NodeId) {
         }
     };
 
-    if let Err(e) = socket.send_to(&message, (MULTICAST_ADDR, LINK_PORT)) {
+    if let Err(e) = socket.send_to(&message, destination) {
         warn!("Failed to send BYEBYE: {}", e);
     }
 }
