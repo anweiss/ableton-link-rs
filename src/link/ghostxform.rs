@@ -91,17 +91,29 @@ impl GhostXForm {
 
     pub(crate) fn ghost_nanos_to_host(&self, ghost_nanos: i128) -> Duration {
         self.ghost_nanos_to_host_units(ghost_nanos, 1)
+            .unwrap_or_else(core::convert::identity)
     }
 
-    fn ghost_nanos_to_host_units(&self, ghost_nanos: i128, unit: u128) -> Duration {
+    pub(crate) fn checked_ghost_nanos_to_host(&self, ghost_nanos: i128) -> Option<Duration> {
+        if self.slope == 0.0 || !self.slope.is_finite() {
+            return None;
+        }
+        self.ghost_nanos_to_host_units(ghost_nanos, 1).ok()
+    }
+
+    fn ghost_nanos_to_host_units(
+        &self,
+        ghost_nanos: i128,
+        unit: u128,
+    ) -> core::result::Result<Duration, Duration> {
         let difference = ghost_nanos.saturating_sub(super::duration_nanos(self.intercept));
         if self.slope == 0.0 || !self.slope.is_finite() {
-            return Duration::microseconds(
-                (difference as f64 / 1_000.0 / self.slope).round() as i64
-            );
+            return Ok(Duration::microseconds(
+                (difference as f64 / 1_000.0 / self.slope).round() as i64,
+            ));
         }
         if difference == 0 {
-            return Duration::zero();
+            return Ok(Duration::zero());
         }
         let (mantissa, exponent, sign) = num_traits::float::FloatCore::integer_decode(self.slope);
         let denominator = u128::from(mantissa) * unit;
@@ -127,11 +139,11 @@ impl GhostXForm {
             let mut remainder = magnitude % denominator;
             for _ in 0..exponent.unsigned_abs() {
                 if quotient > limit / 2 {
-                    return if negative {
+                    return Err(if negative {
                         Duration::MIN
                     } else {
                         Duration::MAX
-                    };
+                    });
                 }
                 quotient *= 2;
                 remainder *= 2;
@@ -141,10 +153,14 @@ impl GhostXForm {
                 }
             }
             quotient + u128::from(remainder >= denominator.div_ceil(2))
+        };
+        let nanos = (units.min(limit) * unit) as i128;
+        let duration = super::duration_from_nanos(if negative { -nanos } else { nanos });
+        if units > limit {
+            Err(duration)
+        } else {
+            Ok(duration)
         }
-        .min(limit);
-        let nanos = (units * unit) as i128;
-        super::duration_from_nanos(if negative { -nanos } else { nanos })
     }
 
     pub fn host_to_ghost(&self, host_time: Duration) -> Duration {
@@ -202,6 +218,7 @@ impl GhostXForm {
 
     pub fn ghost_to_host(&self, ghost_time: Duration) -> Duration {
         self.ghost_nanos_to_host_units(super::duration_nanos(ghost_time), 1_000)
+            .unwrap_or_else(core::convert::identity)
     }
 }
 

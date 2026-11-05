@@ -772,13 +772,14 @@ impl Controller {
                             );
 
                             sessions_loop.saw_session_timeline(*peer_session, *timeline).await;
-                            refresh_current_session_timing(
+                            let _ = refresh_current_session_timing(
                                 &sessions_loop, &peer_state_loop, &s_state_loop, &c_state_loop,
                                 &s_stop_sync_enabled_loop, &discovery_loop, clock, &tempo_cb_loop,
                             ).await;
                         }
                         PeerStateChange::SessionStartStopState(
                             peer_session,
+                            peer_timeline,
                             peer_start_stop_state,
                         ) => {
                             // handle_start_stop_state_from_session
@@ -792,7 +793,7 @@ impl Controller {
                                 );
 
                             apply_received_start_stop(
-                                *peer_session, *peer_start_stop_state, &sessions_loop,
+                                *peer_session, *peer_timeline, *peer_start_stop_state, &sessions_loop,
                                 &peer_state_loop, &s_state_loop, &c_state_loop,
                                 &s_stop_sync_enabled_loop, &discovery_loop, clock, &tempo_cb_loop,
                             ).await;
@@ -1169,7 +1170,7 @@ enum ClientCommit {
 }
 
 struct SessionCommit<'a> {
-    published: &'a mut crate::link::sessions::SessionKey,
+    published: &'a mut Session,
     current: &'a mut Session,
     others: &'a mut Vec<Session>,
     peers: &'a mut Vec<ControllerPeer>,
@@ -1230,7 +1231,7 @@ fn try_session_commit<R>(
 
 impl SessionCommit<'_> {
     fn publish_discovery(&mut self) {
-        *self.published = self.current.key();
+        *self.published = self.current.clone();
         self.peer.node_state.timeline = self.session.timeline;
         self.peer.node_state.start_stop_state = self.session.start_stop_state;
         *self.responder_id = self.peer.session_id();
@@ -1240,7 +1241,23 @@ impl SessionCommit<'_> {
         }
     }
 
-    fn reset(&mut self, clock: Clock) -> Option<tempo::Tempo> {
+    fn reject_pending_timing(&mut self) {
+        let rejected = std::mem::replace(self.current, self.published.clone());
+        if !self.published.matches(&rejected) {
+            self.others
+                .retain(|other| !self.published.matches(other) && !rejected.matches(other));
+        } else {
+            for other in self
+                .others
+                .iter_mut()
+                .filter(|other| self.published.matches(other))
+            {
+                *other = self.published.clone();
+            }
+        }
+    }
+
+    fn reset(&mut self, clock: Clock) -> Result<Option<tempo::Tempo>, super::error::CommitError> {
         let node = if self.peer.ident() == NodeId::default() {
             NodeId::new()
         } else {
@@ -1257,18 +1274,28 @@ impl SessionCommit<'_> {
                 .to_beats(self.session.ghost_x_form.host_to_ghost_nanos(host_time)),
             time_origin: x_form.host_to_ghost_nanos(host_time),
         };
-        self.peer.node_state.node_id = node;
-        self.peer.node_state.session_id = id;
-        self.session.start_stop_state = StartStopState::default();
-        let changed = update_timing_guarded(
-            self.session,
-            self.client,
+        let mut session = *self.session;
+        let mut client = *self.client;
+        session.start_stop_state = StartStopState::default();
+        let changed = match update_timing_guarded(
+            &mut session,
+            &mut client,
             timeline,
             x_form,
             clock,
             self.sync_enabled,
             id,
-        );
+        ) {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.reject_pending_timing();
+                return Err(error);
+            }
+        };
+        self.peer.node_state.node_id = node;
+        self.peer.node_state.session_id = id;
+        *self.session = session;
+        *self.client = client;
         *self.current = Session::new(
             id,
             timeline,
@@ -1281,7 +1308,7 @@ impl SessionCommit<'_> {
         self.peers.clear();
         self.counter.session_peer_count = 0;
         self.publish_discovery();
-        changed
+        Ok(changed)
     }
 
     fn invalidate_client_captures(&mut self) {
@@ -1292,17 +1319,20 @@ impl SessionCommit<'_> {
         }
     }
 
-    fn refresh_timing(&mut self, clock: Clock) -> Option<tempo::Tempo> {
+    fn refresh_timing(
+        &mut self,
+        clock: Clock,
+    ) -> Result<Option<tempo::Tempo>, super::error::CommitError> {
         // A promotion's pending join owns publication of its identity. A timeline
         // announcement may refresh only the session already published locally.
         if !self.published.matches(self.current)
             || self.current.session_id != self.peer.session_id()
         {
-            return None;
+            return Ok(None);
         }
         let session = self.current.clone();
         let before = *self.client;
-        let changed = update_timing_guarded(
+        let changed = match update_timing_guarded(
             self.session,
             self.client,
             session.timeline,
@@ -1310,12 +1340,18 @@ impl SessionCommit<'_> {
             clock,
             self.sync_enabled,
             session.session_id,
-        );
+        ) {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.reject_pending_timing();
+                return Err(error);
+            }
+        };
         if *self.client != before {
             self.invalidate_client_captures();
         }
         self.publish_discovery();
-        changed
+        Ok(changed)
     }
 
     #[cfg(test)]
@@ -1335,6 +1371,7 @@ impl SessionCommit<'_> {
         if !self.published.matches(self.current)
             || self.current.session_id != self.peer.session_id()
             || self.current.measurement.x_form != self.session.ghost_x_form
+            || (incoming.timeline.is_none() && self.current.timeline != self.session.timeline)
         {
             return ClientCommit::WaitingForPublication;
         }
@@ -1381,13 +1418,30 @@ impl SessionCommit<'_> {
             }
             None => None,
         };
+        let prepared = if let Some(timeline) = incoming.timeline {
+            let mut session = *self.session;
+            let mut client = *self.client;
+            client.timeline = clamp_tempo(timeline);
+            match update_timing_guarded(
+                &mut session,
+                &mut client,
+                target.expect("timeline preflight succeeded"),
+                self.session.ghost_x_form,
+                clock,
+                self.sync_enabled,
+                key.session_id,
+            ) {
+                Ok(changed) => Some((session, client, changed)),
+                Err(error) => return ClientCommit::Rejected(error),
+            }
+        } else {
+            None
+        };
         let mut changed = None;
         if incoming.timeline.is_some() || incoming.start_stop_state.is_some() {
             self.current.invalidate_edit_origin();
         }
-        if let Some(timeline) = incoming.timeline {
-            let timeline = clamp_tempo(timeline);
-            let mapping = self.session.ghost_x_form;
+        if incoming.timeline.is_some() {
             let target = target.expect("timeline preflight succeeded");
             self.current.set_timeline(target);
             for other in self.others.iter_mut().filter(|other| key.matches(other)) {
@@ -1401,16 +1455,11 @@ impl SessionCommit<'_> {
             {
                 peer.peer_state.node_state.timeline = target;
             }
-            self.client.timeline = timeline;
-            changed = update_timing_guarded(
-                self.session,
-                self.client,
-                target,
-                mapping,
-                clock,
-                self.sync_enabled,
-                key.session_id,
-            );
+            let (session, client, tempo) =
+                prepared.expect("client composition preflight succeeded");
+            *self.session = session;
+            *self.client = client;
+            changed = tempo;
         }
         if let Some(state) = incoming.start_stop_state {
             self.client.start_stop_state = state;
@@ -1428,6 +1477,7 @@ impl SessionCommit<'_> {
     fn received_start_stop(
         &mut self,
         source: SessionId,
+        advertised: Timeline,
         incoming: StartStopState,
         clock: Clock,
     ) -> ClientCommit {
@@ -1437,43 +1487,63 @@ impl SessionCommit<'_> {
         if !self.published.matches(self.current)
             || self.peer.session_id() != source
             || self.current.measurement.x_form != self.session.ghost_x_form
+            || self.current.timeline != self.session.timeline
         {
             return ClientCommit::WaitingForPublication;
         }
+        let advertised = clamp_tempo(advertised);
+        if advertised.beat_origin != self.session.timeline.beat_origin
+            || advertised.tempo.period_micros() != self.session.timeline.tempo.period_micros()
+            || super::micros(advertised.time_origin)
+                != super::micros(self.session.timeline.time_origin)
+        {
+            return ClientCommit::Complete(None);
+        }
         if incoming.timestamp <= self.session.start_stop_state.timestamp {
             return ClientCommit::Complete(None);
+        }
+        let mut session = *self.session;
+        let mut client = *self.client;
+        session.start_stop_state = incoming;
+        let changed = match update_timing_guarded(
+            &mut session,
+            &mut client,
+            self.current.timeline,
+            self.current.measurement.x_form,
+            clock,
+            self.sync_enabled,
+            source,
+        ) {
+            Ok(changed) => changed,
+            Err(error) => return ClientCommit::Rejected(error),
+        };
+        if self.sync_enabled {
+            let observation = clock.micros().max(client.start_stop_state.timestamp);
+            client.start_stop_state = map_start_stop_state_from_session_to_client(
+                incoming,
+                session.timeline,
+                session.ghost_x_form,
+            );
+            client.start_stop_state.timestamp = observation;
         }
         self.current.invalidate_edit_origin();
         let key = self.current.key();
         for other in self.others.iter_mut().filter(|other| key.matches(other)) {
             other.edit_revision = self.current.edit_revision;
         }
-        self.session.start_stop_state = incoming;
-        let changed = update_timing_guarded(
-            self.session,
-            self.client,
-            self.current.timeline,
-            self.current.measurement.x_form,
-            clock,
-            self.sync_enabled,
-            source,
-        );
-        if self.sync_enabled {
-            let observation = clock.micros().max(self.client.start_stop_state.timestamp);
-            self.client.start_stop_state = map_start_stop_state_from_session_to_client(
-                incoming,
-                self.session.timeline,
-                self.session.ghost_x_form,
-            );
-            self.client.start_stop_state.timestamp = observation;
-        }
+        *self.session = session;
+        *self.client = client;
         self.publish_discovery();
         ClientCommit::Complete(changed)
     }
 
-    fn join(&mut self, queued: &Session, clock: Clock) -> Option<tempo::Tempo> {
+    fn join(
+        &mut self,
+        queued: &Session,
+        clock: Clock,
+    ) -> Result<Option<tempo::Tempo>, super::error::CommitError> {
         if !queued.key().matches(self.current) {
-            return None;
+            return Ok(None);
         }
         // All required guards are held: contention cannot masquerade as a stale
         // notification or leave only part of this transition published.
@@ -1482,26 +1552,36 @@ impl SessionCommit<'_> {
         if session.session_id.0 != self.peer.ident() && count == 0 {
             return self.reset(clock);
         }
+        let mut session_state = *self.session;
+        let mut client = *self.client;
         if self.peer.session_id() != session.session_id {
-            self.session.start_stop_state = StartStopState::default();
+            session_state.start_stop_state = StartStopState::default();
         }
         let before = *self.client;
-        self.peer.node_state.session_id = session.session_id;
-        let changed = update_timing_guarded(
-            self.session,
-            self.client,
+        let changed = match update_timing_guarded(
+            &mut session_state,
+            &mut client,
             session.timeline,
             session.measurement.x_form,
             clock,
             self.sync_enabled,
             session.session_id,
-        );
+        ) {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.reject_pending_timing();
+                return Err(error);
+            }
+        };
+        self.peer.node_state.session_id = session.session_id;
+        *self.session = session_state;
+        *self.client = client;
         if *self.client != before {
             self.invalidate_client_captures();
         }
         self.publish_discovery();
         self.counter.session_peer_count = count;
-        changed
+        Ok(changed)
     }
 }
 
@@ -1514,7 +1594,7 @@ async fn refresh_current_session_timing(
     discovery: &Arc<PeerGateway>,
     clock: Clock,
     tempo_callback: &Arc<Mutex<Option<TempoCallback>>>,
-) {
+) -> Result<(), super::error::CommitError> {
     let changed = retry_state(|| {
         try_session_commit(
             sessions,
@@ -1529,13 +1609,20 @@ async fn refresh_current_session_timing(
         )
     })
     .await;
-    if let Some(tempo) = changed {
-        dispatch_current_tempo(session_state, tempo_callback, tempo);
+    match changed {
+        Ok(Some(tempo)) => dispatch_current_tempo(session_state, tempo_callback, tempo),
+        Ok(None) => {}
+        Err(error) => {
+            info!("Rejected received session timing: {}", error);
+            return Err(error);
+        }
     }
+    Ok(())
 }
 
 async fn apply_received_start_stop(
     source: SessionId,
+    advertised: Timeline,
     incoming: StartStopState,
     sessions: &Sessions,
     peer: &Arc<Mutex<PeerState>>,
@@ -1557,7 +1644,7 @@ async fn apply_received_start_stop(
                 &discovery.session_peer_counter,
                 sync,
                 discovery,
-                |state| state.received_start_stop(source, incoming, clock),
+                |state| state.received_start_stop(source, advertised, incoming, clock),
             )
         })
         .await;
@@ -1603,8 +1690,10 @@ pub async fn join_session(
         )
     })
     .await;
-    if let Some(tempo) = changed {
-        dispatch_current_tempo(&session_state, &tempo_callback, tempo);
+    match changed {
+        Ok(Some(tempo)) => dispatch_current_tempo(&session_state, &tempo_callback, tempo),
+        Ok(None) => {}
+        Err(error) => info!("Rejected session join timing: {}", error),
     }
 }
 
@@ -1659,7 +1748,7 @@ async fn reset_state_if_peerless(
                         || state.peer.session_id() != expected
                         || count_session_peers(expected, state.peers, state.peer.ident()) != 0
                     {
-                        return None;
+                        return Ok(None);
                     }
                 }
                 state.reset(clock)
@@ -1667,8 +1756,10 @@ async fn reset_state_if_peerless(
         )
     })
     .await;
-    if let Some(tempo) = changed {
-        dispatch_current_tempo(&session_state, &tempo_callback, tempo);
+    match changed {
+        Ok(Some(tempo)) => dispatch_current_tempo(&session_state, &tempo_callback, tempo),
+        Ok(None) => {}
+        Err(error) => info!("Rejected session reset timing: {}", error),
     }
 }
 
@@ -1677,7 +1768,7 @@ async fn reset_state_if_peerless(
 pub async fn update_discovery(controller: &Controller) {
     #[cfg(test)]
     pause_publication(controller).await;
-    refresh_current_session_timing(
+    let _ = refresh_current_session_timing(
         &controller.sessions,
         &controller.peer_state,
         &controller.session_state,
@@ -1714,7 +1805,7 @@ pub fn update_session_timing(
     start_stop_sync_enabled: Arc<Mutex<bool>>,
     tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
     session_id: SessionId,
-) {
+) -> Result<(), super::error::CommitError> {
     if let Some(tempo) = update_session_timing_inner(
         session_state.clone(),
         client_state,
@@ -1723,9 +1814,10 @@ pub fn update_session_timing(
         clock,
         start_stop_sync_enabled,
         session_id,
-    ) {
+    )? {
         dispatch_current_tempo(&session_state, &tempo_callback, tempo);
     }
+    Ok(())
 }
 
 fn update_session_timing_inner(
@@ -1736,10 +1828,16 @@ fn update_session_timing_inner(
     clock: Clock,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
     session_id: SessionId,
-) -> Option<tempo::Tempo> {
-    let mut session_state = try_state(&session_state)?;
-    let mut client_state = try_state(&client_state)?;
-    let sync_enabled = try_state(&start_stop_sync_enabled)?;
+) -> Result<Option<tempo::Tempo>, super::error::CommitError> {
+    let Some(mut session_state) = try_state(&session_state) else {
+        return Ok(None);
+    };
+    let Some(mut client_state) = try_state(&client_state) else {
+        return Ok(None);
+    };
+    let Some(sync_enabled) = try_state(&start_stop_sync_enabled) else {
+        return Ok(None);
+    };
     update_timing_guarded(
         &mut session_state,
         &mut client_state,
@@ -1759,19 +1857,20 @@ fn update_timing_guarded(
     clock: Clock,
     sync_enabled: bool,
     session_id: SessionId,
-) -> Option<tempo::Tempo> {
+) -> Result<Option<tempo::Tempo>, super::error::CommitError> {
     let timeline = clamp_tempo(new_timeline);
     let old = session.timeline;
     let changed = old != timeline || session.ghost_x_form != new_x_form;
     if changed {
-        session.timeline = timeline;
-        session.ghost_x_form = new_x_form;
-        client.timeline = update_client_timeline_from_session(
+        let client_timeline = update_client_timeline_from_session(
             client.timeline,
             timeline,
             clock.micros(),
             new_x_form,
-        );
+        )?;
+        session.timeline = timeline;
+        session.ghost_x_form = new_x_form;
+        client.timeline = client_timeline;
         if sync_enabled && session.start_stop_state != StartStopState::default() {
             let observation = client.start_stop_state.timestamp;
             client.start_stop_state = map_start_stop_state_from_session_to_client(
@@ -1783,7 +1882,7 @@ fn update_timing_guarded(
         }
     }
     client.timeline_session_id = session_id;
-    (old.tempo != timeline.tempo).then_some(timeline.tempo)
+    Ok((old.tempo != timeline.tempo).then_some(timeline.tempo))
 }
 
 fn dispatch_current_tempo(
@@ -2040,7 +2139,7 @@ mod dispatch_gate_tests {
                 timestamp: chrono::Duration::zero(),
             },
         );
-        let mut published = current.key();
+        let mut published = current.clone();
         let mut others = vec![current.clone()];
         let mut peer = PeerState {
             node_state: NodeState {
@@ -2084,6 +2183,385 @@ mod dispatch_gate_tests {
     }
 
     #[test]
+    fn ordering_composition_exhaustion_rejects_both_fields_before_mutation() {
+        use crate::link::error::CommitError;
+        for time_origin in [chrono::Duration::MIN, chrono::Duration::MAX] {
+            ordering_fixture(|state| {
+                state.session.ghost_x_form.slope = 2.0;
+                state.current.measurement.x_form = state.session.ghost_x_form;
+                state.published.measurement.x_form = state.session.ghost_x_form;
+                *state.responder_form = state.session.ghost_x_form;
+                let before = (
+                    state.current.edit_origin(),
+                    state.published.edit_origin(),
+                    *state.session,
+                    *state.client,
+                    state.peer.timeline(),
+                    state.others[0].edit_origin(),
+                    state.peers[0].peer_state.timeline(),
+                    *state.responder_id,
+                    *state.responder_form,
+                );
+                let incoming = IncomingClientState {
+                    timeline: Some(Timeline {
+                        tempo: tempo::Tempo::new(150.0),
+                        time_origin,
+                        ..state.client.timeline
+                    }),
+                    timeline_timestamp: chrono::Duration::nanoseconds(1),
+                    start_stop_state: Some(ClientStartStopState {
+                        is_playing: true,
+                        timestamp: chrono::Duration::nanoseconds(1),
+                        ..Default::default()
+                    }),
+                };
+                assert!(matches!(
+                    state.client_edit(&incoming, Clock::new()),
+                    ClientCommit::Rejected(CommitError::TimelineOriginExhausted)
+                ));
+                assert_eq!(
+                    before,
+                    (
+                        state.current.edit_origin(),
+                        state.published.edit_origin(),
+                        *state.session,
+                        *state.client,
+                        state.peer.timeline(),
+                        state.others[0].edit_origin(),
+                        state.peers[0].peer_state.timeline(),
+                        *state.responder_id,
+                        *state.responder_form,
+                    )
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn ordering_received_composition_rollback_preserves_accepted_revision() {
+        ordering_fixture(|state| {
+            let before = (
+                state.current.edit_origin(),
+                state.published.edit_origin(),
+                *state.session,
+                *state.client,
+                state.peer.timeline(),
+                *state.responder_id,
+                *state.responder_form,
+            );
+            state.current.set_timeline(Timeline {
+                tempo: tempo::Tempo::new(999.0),
+                beat_origin: Beats::from_microbeats(1),
+                time_origin: chrono::Duration::microseconds(i64::MAX),
+            });
+            let pending = IncomingClientState {
+                timeline: None,
+                timeline_timestamp: chrono::Duration::nanoseconds(1),
+                start_stop_state: Some(ClientStartStopState {
+                    is_playing: true,
+                    timestamp: chrono::Duration::nanoseconds(1),
+                    ..Default::default()
+                }),
+            };
+            assert!(matches!(
+                state.client_edit(&pending, Clock::new()),
+                ClientCommit::WaitingForPublication
+            ));
+            assert_eq!(
+                state.refresh_timing(Clock::new()),
+                Err(super::super::CommitError::TimelineOriginExhausted)
+            );
+            assert_eq!(
+                before,
+                (
+                    state.current.edit_origin(),
+                    state.published.edit_origin(),
+                    *state.session,
+                    *state.client,
+                    state.peer.timeline(),
+                    *state.responder_id,
+                    *state.responder_form,
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn ordering_rejected_promotion_restores_the_published_incarnation() {
+        ordering_fixture(|state| {
+            let before = (
+                state.current.edit_origin(),
+                *state.session,
+                *state.client,
+                state.peer.session_id(),
+                *state.responder_id,
+                *state.responder_form,
+                state.counter.session_peer_count,
+            );
+            let candidate = Session::new(
+                SessionId(NodeId::from_array([141; 8])),
+                Timeline {
+                    tempo: tempo::Tempo::new(999.0),
+                    beat_origin: Beats::from_microbeats(1),
+                    time_origin: chrono::Duration::microseconds(i64::MAX),
+                },
+                state.current.measurement,
+            );
+            let mut remote = state.peer.clone();
+            remote.node_state.node_id = candidate.session_id.0;
+            remote.node_state.session_id = candidate.session_id;
+            state.peers.push(ControllerPeer { peer_state: remote });
+            *state.current = candidate.clone();
+            assert_eq!(
+                state.join(&candidate, Clock::new()),
+                Err(super::super::CommitError::TimelineOriginExhausted)
+            );
+            assert!(state.published.matches(state.current));
+            assert!(!state.others.iter().any(|other| candidate.matches(other)));
+            assert_eq!(
+                before,
+                (
+                    state.current.edit_origin(),
+                    *state.session,
+                    *state.client,
+                    state.peer.session_id(),
+                    *state.responder_id,
+                    *state.responder_form,
+                    state.counter.session_peer_count,
+                )
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn ordering_rejected_timeline_packet_cannot_publish_its_playback_state() {
+        rejected_timeline_packet_fixture(false).await;
+    }
+
+    #[tokio::test]
+    async fn ordering_ignored_timeline_packet_cannot_publish_its_playback_state() {
+        rejected_timeline_packet_fixture(true).await;
+    }
+
+    async fn rejected_timeline_packet_fixture(include_ignored: bool) {
+        async fn receive(
+            controller: &Controller,
+            local: std::net::Ipv4Addr,
+            peer: PeerState,
+            acknowledged: &mut tokio::sync::mpsc::Receiver<()>,
+        ) {
+            let packet = crate::discovery::messages::encode_message(
+                peer.node_state.node_id,
+                30,
+                crate::discovery::messages::RESPONSE,
+                &crate::link::payload::Payload::from(peer),
+                0,
+            )
+            .unwrap();
+            controller
+                .discovery
+                .receive_peer_state_fixture(local, &packet)
+                .await;
+            tokio::time::timeout(TEST_TIMEOUT, acknowledged.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        *controller.start_stop_sync_enabled.lock().unwrap() = true;
+        let node = NodeId::from_array([142; 8]);
+        let other_node = NodeId::from_array([143; 8]);
+        let (ack, mut acknowledged) = tokio::sync::mpsc::channel(1);
+        *controller.audio_endpoint_callback.lock().unwrap() =
+            Some(Arc::new(Mutex::new(Box::new(move |peer, _| {
+                if peer == node || peer == other_node {
+                    ack.try_send(()).unwrap();
+                }
+            }))));
+        controller.enable().await;
+        let before = *controller.session_state.lock().unwrap();
+        let capture = controller.capture_client_state().unwrap();
+        let id = controller.sessions.current.lock().unwrap().session_id;
+        let local = controller
+            .discovery
+            .socket_probes()
+            .into_iter()
+            .filter_map(|socket| socket.upgrade())
+            .find_map(|socket| match socket.local_addr().unwrap() {
+                std::net::SocketAddr::V4(address) if !address.ip().is_unspecified() => {
+                    Some(*address.ip())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let mut peer = PeerState {
+            node_state: NodeState {
+                node_id: node,
+                session_id: id,
+                timeline: Timeline {
+                    tempo: tempo::Tempo::new(999.0),
+                    beat_origin: Beats::from_microbeats(
+                        before.timeline.beat_origin.value.checked_add(1).unwrap(),
+                    ),
+                    time_origin: chrono::Duration::microseconds(i64::MAX),
+                },
+                start_stop_state: StartStopState {
+                    is_playing: true,
+                    beats: Beats::new(4.0),
+                    timestamp: chrono::Duration::seconds(1),
+                },
+            },
+            measurement_endpoint: Some("127.0.0.1:12345".parse().unwrap()),
+            audio_endpoint: Some("127.0.0.1:12346".parse().unwrap()),
+        };
+        for port in [12346_u16, 12347] {
+            peer.audio_endpoint = Some(format!("127.0.0.1:{port}").parse().unwrap());
+            peer.node_state.start_stop_state.timestamp =
+                chrono::Duration::seconds(i64::from(port - 12345));
+            receive(&controller, local, peer.clone(), &mut acknowledged).await;
+            assert_eq!(*controller.session_state.lock().unwrap(), before);
+            assert_eq!(controller.capture_client_state().unwrap(), capture);
+        }
+
+        let mut other = peer.clone();
+        other.node_state.node_id = other_node;
+        if include_ignored {
+            other.node_state.timeline.beat_origin = before.timeline.beat_origin;
+            other.node_state.start_stop_state.timestamp = chrono::Duration::seconds(3);
+            other.audio_endpoint = Some("127.0.0.1:12348".parse().unwrap());
+            receive(&controller, local, other.clone(), &mut acknowledged).await;
+            assert_eq!(*controller.session_state.lock().unwrap(), before);
+            assert_eq!(controller.capture_client_state().unwrap(), capture);
+        }
+
+        other.node_state.timeline = Timeline {
+            beat_origin: Beats::from_microbeats(
+                before.timeline.beat_origin.value.checked_add(2).unwrap(),
+            ),
+            ..before.timeline
+        };
+        other.audio_endpoint = Some("127.0.0.1:12349".parse().unwrap());
+        receive(&controller, local, other.clone(), &mut acknowledged).await;
+        let accepted = *controller.session_state.lock().unwrap();
+        let accepted_capture = controller.capture_client_state().unwrap();
+        assert_eq!(accepted.timeline, other.node_state.timeline);
+        assert_eq!(accepted.start_stop_state, other.node_state.start_stop_state);
+
+        peer.node_state.start_stop_state.timestamp = chrono::Duration::seconds(5);
+        peer.audio_endpoint = Some("127.0.0.1:12350".parse().unwrap());
+        receive(&controller, local, peer.clone(), &mut acknowledged).await;
+        assert_eq!(*controller.session_state.lock().unwrap(), accepted);
+        assert_eq!(controller.capture_client_state().unwrap(), accepted_capture);
+
+        peer.node_state.timeline = Timeline {
+            beat_origin: Beats::from_microbeats(
+                before.timeline.beat_origin.value.checked_add(3).unwrap(),
+            ),
+            ..before.timeline
+        };
+        peer.node_state.start_stop_state.is_playing = false;
+        peer.node_state.start_stop_state.timestamp = chrono::Duration::seconds(6);
+        peer.audio_endpoint = Some("127.0.0.1:12351".parse().unwrap());
+        receive(&controller, local, peer.clone(), &mut acknowledged).await;
+        let recovered = *controller.session_state.lock().unwrap();
+        assert_eq!(recovered.timeline, peer.node_state.timeline);
+        assert_eq!(recovered.start_stop_state, peer.node_state.start_stop_state);
+        assert_ne!(controller.capture_client_state().unwrap(), capture);
+        controller.disable().await;
+    }
+
+    #[tokio::test]
+    async fn ordering_rejected_receipt_restores_capturable_accepted_state() {
+        let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let before = controller.capture_client_state().unwrap();
+        let accepted = *controller.session_state.lock().unwrap();
+        let id = controller.sessions.current.lock().unwrap().session_id;
+        controller
+            .sessions
+            .saw_session_timeline(
+                id,
+                Timeline {
+                    tempo: tempo::Tempo::new(999.0),
+                    beat_origin: Beats::from_microbeats(1),
+                    time_origin: chrono::Duration::microseconds(i64::MAX),
+                },
+            )
+            .await;
+        assert!(controller.capture_client_state().is_none());
+        update_discovery(&controller).await;
+        assert_eq!(controller.capture_client_state().unwrap(), before);
+        assert_eq!(*controller.session_state.lock().unwrap(), accepted);
+    }
+
+    #[test]
+    fn ordering_received_playback_requires_wire_equivalent_timing() {
+        for bpm in [120.0, 128.5] {
+            ordering_fixture(|state| {
+                let timeline = Timeline {
+                    tempo: tempo::Tempo::new(bpm),
+                    time_origin: chrono::Duration::nanoseconds(1_500),
+                    ..state.current.timeline
+                };
+                state.current.set_timeline(timeline);
+                state.session.timeline = timeline;
+                state.client.timeline = timeline;
+                *state.published = state.current.clone();
+                let bytes = crate::encoding::encode_to_vec(&timeline).unwrap();
+                let advertised = <Timeline as crate::encoding::Decode>::decode_from(&bytes)
+                    .unwrap()
+                    .0;
+                assert_ne!(advertised, timeline);
+                let incoming = StartStopState {
+                    is_playing: true,
+                    timestamp: chrono::Duration::seconds(1),
+                    ..Default::default()
+                };
+                let before = (*state.session, *state.client, state.current.edit_origin());
+                for incompatible in [
+                    Timeline {
+                        time_origin: advertised.time_origin + chrono::Duration::microseconds(1),
+                        ..advertised
+                    },
+                    Timeline {
+                        tempo: tempo::Tempo::new(121.0),
+                        ..advertised
+                    },
+                ] {
+                    assert!(matches!(
+                        state.received_start_stop(
+                            state.current.session_id,
+                            incompatible,
+                            incoming,
+                            Clock::new()
+                        ),
+                        ClientCommit::Complete(None)
+                    ));
+                    assert_eq!(
+                        (*state.session, *state.client, state.current.edit_origin()),
+                        before
+                    );
+                }
+                assert!(matches!(
+                    state.received_start_stop(
+                        state.current.session_id,
+                        advertised,
+                        incoming,
+                        Clock::new()
+                    ),
+                    ClientCommit::Complete(_)
+                ));
+                assert_eq!(state.session.start_stop_state, incoming);
+                assert_ne!(state.current.edit_origin(), before.2);
+            });
+        }
+    }
+
+    #[test]
     fn ordering_playback_revision_rejects_equal_observation_aba() {
         ordering_fixture(|state| {
             state.client.start_stop_state.timestamp = chrono::Duration::seconds(100);
@@ -2093,6 +2571,7 @@ mod dispatch_gate_tests {
                 assert!(matches!(
                     state.received_start_stop(
                         state.current.session_id,
+                        state.current.timeline,
                         StartStopState {
                             is_playing,
                             timestamp: chrono::Duration::microseconds(timestamp),
@@ -2302,7 +2781,12 @@ mod dispatch_gate_tests {
                     ..Default::default()
                 };
                 assert!(matches!(
-                    state.received_start_stop(state.current.session_id, remote, clock),
+                    state.received_start_stop(
+                        state.current.session_id,
+                        state.current.timeline,
+                        remote,
+                        clock
+                    ),
                     ClientCommit::Complete(_)
                 ));
                 let observed = state.client.start_stop_state.timestamp;
@@ -2378,7 +2862,8 @@ mod dispatch_gate_tests {
                     Clock::new(),
                     false,
                     SessionId::default(),
-                );
+                )
+                .unwrap();
                 assert_eq!(to_phase_encoded_beats(&client.timeline, at, quantum), beat);
             }
         }
@@ -3390,6 +3875,8 @@ mod dispatch_gate_tests {
                 .unwrap();
             let node = NodeId::from_array([91; 8]);
             let id = SessionId(node);
+            let timeline_origin =
+                chrono::Duration::seconds(if origin == i64::MAX { 200 } else { 0 });
             let packet = |second: bool| {
                 let state = PeerState {
                     node_state: NodeState {
@@ -3397,6 +3884,7 @@ mod dispatch_gate_tests {
                         session_id: id,
                         timeline: Timeline {
                             tempo: tempo::Tempo::new(120.0),
+                            time_origin: timeline_origin,
                             ..Default::default()
                         },
                         start_stop_state: StartStopState {
@@ -3450,6 +3938,7 @@ mod dispatch_gate_tests {
                 candidate.timeline.beat_origin.value, origin,
                 "raw decoder must have accepted the adversarial beat value"
             );
+            assert_eq!(candidate.timeline.time_origin, timeline_origin);
             let (joins, mut queued) = tokio::sync::mpsc::channel(1);
             let _owner = crate::link::sessions::handle_successful_measurement(
                 candidate.key(),
@@ -3517,11 +4006,13 @@ mod dispatch_gate_tests {
             } else {
                 i64::MIN
             }) - i128::from(origin);
-            let expected_nanos = beat_difference * 500 - 100_000_000_000;
+            let expected_nanos = crate::link::duration_nanos(timeline_origin)
+                + beat_difference * 500
+                - 100_000_000_000;
             assert_eq!(
                 crate::link::duration_nanos(received_host_time),
                 expected_nanos,
-                "received start/stop must retain the full beat difference before subtracting the 100-second intercept"
+                "received start/stop must add the timeline origin and full beat difference before subtracting the 100-second intercept"
             );
             let edit = Timeline {
                 tempo: tempo::Tempo::new(150.0),
@@ -3701,7 +4192,8 @@ mod dispatch_gate_tests {
             controller.clock,
             &controller.tempo_callback,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             controller.client_state.lock().unwrap().timeline_session_id,
             previous,
@@ -3772,6 +4264,7 @@ mod dispatch_gate_tests {
             sync.clone(),
             id
         )
+        .unwrap()
         .is_none());
         assert_eq!(
             session.lock().unwrap().timeline,
@@ -3788,6 +4281,7 @@ mod dispatch_gate_tests {
             sync.clone(),
             id
         )
+        .unwrap()
         .is_some());
         let same_timing_id = SessionId(NodeId::from_array([99; 8]));
         assert!(update_session_timing_inner(
@@ -3799,6 +4293,7 @@ mod dispatch_gate_tests {
             sync,
             same_timing_id
         )
+        .unwrap()
         .is_none());
         assert_eq!(
             client.lock().unwrap().timeline_session_id,

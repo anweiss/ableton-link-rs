@@ -161,6 +161,10 @@ pub struct Session {
 }
 
 impl Session {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        self.session_id == other.session_id && Arc::ptr_eq(&self.incarnation, &other.incarnation)
+    }
+
     pub(crate) fn invalidate_edit_origin(&mut self) {
         self.edit_revision = new_edit_revision();
     }
@@ -255,7 +259,7 @@ pub(crate) fn new_edit_revision() -> Option<NonZeroU64> {
 
 #[derive(Clone)]
 pub struct Sessions {
-    pub(crate) published: Arc<Mutex<SessionKey>>,
+    pub(crate) published: Arc<Mutex<Session>>,
     pub other_sessions: Arc<Mutex<Vec<Session>>>,
     pub current: Arc<Mutex<Session>>,
     pub is_founding: Arc<Mutex<bool>>,
@@ -302,7 +306,7 @@ impl Sessions {
         gate: Arc<DispatchGate>,
     ) -> (Self, tokio::task::JoinHandle<()>) {
         let other_sessions = Arc::new(Mutex::new(vec![init.clone()]));
-        let published = Arc::new(Mutex::new(init.key()));
+        let published = Arc::new(Mutex::new(init.clone()));
         let current = Arc::new(Mutex::new(init));
 
         let other_sessions_loop = other_sessions.clone();
@@ -2053,7 +2057,7 @@ mod tests {
                 let others = Arc::new(Mutex::new(vec![b.clone()]));
                 let (tx_request, _rx_request) = tokio::sync::mpsc::channel(1);
                 let mut sessions = Sessions {
-                    published: Arc::new(Mutex::new(a.key())),
+                    published: Arc::new(Mutex::new(a.clone())),
                     current: current.clone(),
                     other_sessions: others.clone(),
                     is_founding: Arc::new(Mutex::new(false)),
@@ -2201,7 +2205,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let sessions = Sessions {
-            published: Arc::new(Mutex::new(current.key())),
+            published: Arc::new(Mutex::new(current.clone())),
             current: Arc::new(Mutex::new(current)),
             other_sessions: Arc::new(Mutex::new(Vec::new())),
             is_founding: Arc::new(Mutex::new(false)),
