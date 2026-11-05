@@ -8,7 +8,7 @@ use tokio::sync::{
     mpsc::{Receiver, Sender},
     Notify,
 };
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::link::{
     controller::{gated_recv, DispatchGate, SessionPeerCounter},
@@ -24,11 +24,15 @@ pub struct PeerStateMessageType {
     pub ttl: u8,
     /// Original receive deadline. None preserves standalone caller TTL semantics.
     pub expires_at: Option<tokio::time::Instant>,
+    /// Preserve managed ordering/ingress ownership when forwarding. None for standalone messages.
+    pub observation: Option<Arc<super::messenger::PeerObservation>>,
     pub measurement_endpoint: Option<SocketAddrV4>,
     pub audio_endpoint: Option<SocketAddrV4>,
 }
 
 pub enum PeerEvent {
+    /// Managed state or withdrawal, still subject to its receive revision.
+    Observed(PeerStateMessageType),
     SawPeer(PeerState),
     PeerLeft(NodeId),
     PeerTimedOut(NodeId),
@@ -83,6 +87,15 @@ impl GatewayObserver {
             {
                 let handle = async {
                     match peer_event {
+                        PeerEvent::Observed(message) => {
+                            observed_peer(
+                                message,
+                                peers.clone(),
+                                peer_state_loop.clone(),
+                                tx_peer_state_change.clone(),
+                            )
+                            .await;
+                        }
                         PeerEvent::SawPeer(peer_state) => {
                             saw_peer(
                                 peer_state,
@@ -260,194 +273,148 @@ pub enum PeerStateChange {
     AudioEndpoint(NodeId, Option<SocketAddrV4>),
 }
 
+async fn observed_peer(
+    message: PeerStateMessageType,
+    peers: Arc<Mutex<Vec<ControllerPeer>>>,
+    self_peer_state: Arc<Mutex<PeerState>>,
+    tx: Sender<Vec<PeerStateChange>>,
+) {
+    let deadline = message.expires_at.unwrap_or_else(|| {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(u64::from(message.ttl))
+    });
+    let slot = tokio::select! {
+        biased;
+        _ = super::messenger::PeerObservation::invalidated(message.observation.as_deref()) => return,
+        _ = tokio::time::sleep_until(deadline), if message.ttl > 0 => return,
+        result = tx.reserve() => match result { Ok(slot) => slot, Err(_) => return },
+    };
+    let observation = message.observation.clone();
+    let commit = || {
+        if message.ttl > 0 && deadline <= tokio::time::Instant::now() {
+            return;
+        }
+        let changes = if message.ttl == 0 {
+            remove_peer(message.node_state.ident(), &peers)
+        } else {
+            apply_peer(
+                PeerState {
+                    node_state: message.node_state,
+                    measurement_endpoint: message.measurement_endpoint,
+                    audio_endpoint: message.audio_endpoint,
+                },
+                &peers,
+                &self_peer_state,
+            )
+        };
+        if !changes.is_empty() {
+            slot.send(changes);
+        }
+    };
+    if let Some(observation) = observation {
+        observation.while_current(commit);
+    } else {
+        commit();
+    }
+}
+
 async fn saw_peer(
-    peer_seen_peer_state: PeerState,
+    state: PeerState,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     self_peer_state: Arc<Mutex<PeerState>>,
     _session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
-    tx_peer_state_change: Sender<Vec<PeerStateChange>>,
+    tx: Sender<Vec<PeerStateChange>>,
 ) {
-    // Additional safety check: Don't add ourselves to our own peer list
-    let self_ident = match self_peer_state.try_lock() {
-        Ok(guard) => guard.ident(),
-        Err(_) => {
-            debug!("Could not acquire self_peer_state lock in saw_peer, skipping self-check");
-            // If we can't get the lock, continue anyway - the duplicate check later will catch self-peers
-            peer_seen_peer_state.ident() // This will not match unless it's actually self, which is unlikely
-        }
-    };
-
-    if peer_seen_peer_state.ident() == self_ident {
-        debug!(
-            "ignoring peer state from self (node {})",
-            peer_seen_peer_state.ident()
-        );
+    let Ok(slot) = tx.reserve().await else {
         return;
+    };
+    let changes = apply_peer(state, &peers, &self_peer_state);
+    if !changes.is_empty() {
+        slot.send(changes);
     }
+}
 
-    let ps = PeerState {
-        node_state: peer_seen_peer_state.node_state,
-        measurement_endpoint: peer_seen_peer_state.measurement_endpoint,
-        audio_endpoint: peer_seen_peer_state.audio_endpoint,
-    };
-
-    let peer_session = ps.session_id();
-    let peer_timeline = ps.timeline();
-    let peer_start_stop_state = ps.start_stop_state();
-    let peer_ident = ps.ident();
-    let peer_audio_endpoint = ps.audio_endpoint;
-
-    let is_new_session_timeline = match peers.try_lock() {
-        Ok(guard) => !guard.iter().any(|p| {
-            p.peer_state.session_id() == peer_session && p.peer_state.timeline() == peer_timeline
-        }),
-        Err(_) => {
-            debug!("Could not acquire peers lock to check session timeline, assuming new");
-            true // Assume it's new if we can't check
-        }
-    };
-
-    let is_new_session_start_stop_state = match peers.try_lock() {
-        Ok(guard) => !guard
-            .iter()
-            .any(|p| p.peer_state.start_stop_state() == peer_start_stop_state),
-        Err(_) => {
-            debug!("Could not acquire peers lock to check start/stop state, assuming new");
-            true // Assume it's new if we can't check
-        }
-    };
-
-    let peer = ControllerPeer { peer_state: ps };
-
-    // Read the previously-known audio endpoint and install the new peer state
-    // under a single guard, so the "did the endpoint change" decision is made
-    // against the state we actually replaced. `audio_endpoint_change` is `Some`
-    // only when the peer list was really updated.
-    let (did_session_membership_change, audio_endpoint_change) = match peers.try_lock() {
-        Ok(mut guard) => {
-            let existing_peer_index = guard
-                .iter()
-                .position(|p| p.peer_state.ident() == peer.peer_state.ident());
-
-            match existing_peer_index {
-                Some(index) => {
-                    let old_session_id = guard[index].peer_state.session_id();
-                    let old_audio_endpoint = guard[index].peer_state.audio_endpoint;
-                    guard[index] = peer.clone();
-                    let endpoint_change = if old_audio_endpoint != peer_audio_endpoint {
-                        Some(peer_audio_endpoint)
-                    } else {
-                        None
-                    };
-                    // Session membership changed if the session ID changed
-                    (old_session_id != peer_session, endpoint_change)
-                }
-                None => {
-                    guard.push(peer.clone());
-                    (true, Some(peer_audio_endpoint))
-                }
-            }
-        }
-        Err(_) => {
-            debug!("Could not acquire peers lock to update peer list");
-            (false, None) // No change if we can't update
-        }
-    };
-
-    let mut peer_state_changes = vec![];
-
-    if is_new_session_timeline {
-        debug!("session timeline changed");
-        peer_state_changes.push(PeerStateChange::SessionTimeline(
-            peer_session,
-            peer_timeline,
+fn apply_peer(
+    state: PeerState,
+    peers: &Mutex<Vec<ControllerPeer>>,
+    self_peer_state: &Mutex<PeerState>,
+) -> Vec<PeerStateChange> {
+    if state.ident()
+        == self_peer_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ident()
+    {
+        return Vec::new();
+    }
+    let mut peers = peers.lock().unwrap_or_else(|e| e.into_inner());
+    let timeline_changed = !peers.iter().any(|peer| {
+        peer.peer_state.session_id() == state.session_id()
+            && peer.peer_state.timeline() == state.timeline()
+    });
+    let start_stop_changed = !peers
+        .iter()
+        .any(|peer| peer.peer_state.start_stop_state() == state.start_stop_state());
+    let previous = peers
+        .iter()
+        .position(|peer| peer.peer_state.ident() == state.ident());
+    let membership_changed =
+        previous.is_none_or(|index| peers[index].peer_state.session_id() != state.session_id());
+    let audio_changed =
+        previous.is_none_or(|index| peers[index].peer_state.audio_endpoint != state.audio_endpoint);
+    let mut changes = Vec::new();
+    if timeline_changed {
+        changes.push(PeerStateChange::SessionTimeline(
+            state.session_id(),
+            state.timeline(),
         ));
     }
-
-    if is_new_session_start_stop_state {
-        debug!("session start stop changed");
-        peer_state_changes.push(PeerStateChange::SessionStartStopState(
-            peer_session,
-            peer_start_stop_state,
+    if start_stop_changed {
+        changes.push(PeerStateChange::SessionStartStopState(
+            state.session_id(),
+            state.start_stop_state(),
         ));
     }
-
-    if did_session_membership_change {
-        debug!("session membership changed");
-        peer_state_changes.push(PeerStateChange::SessionMembership);
+    if membership_changed {
+        changes.push(PeerStateChange::SessionMembership);
     }
-
-    // Audio endpoint goes last, after membership, matching upstream's
-    // `sawPeerOnGateway`: it invokes `mSessionMembershipCallback()` and only
-    // then `mAudioEndpointCallback(...)`. The order is load-bearing rather
-    // than incidental - membership is what updates `session_peer_counter` and
-    // triggers any session reset, so an endpoint callback delivered first
-    // would let consumer code observing `BasicLink::num_peers()` or session
-    // state read values that the very same sighting is about to change. That
-    // is most visible on a peer's first sighting, where both fire together.
-    if let Some(endpoint) = audio_endpoint_change {
-        debug!("audio endpoint changed");
-        peer_state_changes.push(PeerStateChange::AudioEndpoint(peer_ident, endpoint));
+    // Membership must precede audio callbacks so consumers observe the updated count.
+    if audio_changed {
+        changes.push(PeerStateChange::AudioEndpoint(
+            state.ident(),
+            state.audio_endpoint,
+        ));
     }
+    let peer = ControllerPeer { peer_state: state };
+    if let Some(index) = previous {
+        peers[index] = peer;
+    } else {
+        peers.push(peer);
+    }
+    changes
+}
 
-    if !peer_state_changes.is_empty() {
-        debug!("sending peer state changes to controller");
-        if let Err(e) = tx_peer_state_change.send(peer_state_changes).await {
-            debug!("Failed to send peer state changes: {}", e);
-        }
+fn remove_peer(node: NodeId, peers: &Mutex<Vec<ControllerPeer>>) -> Vec<PeerStateChange> {
+    let mut peers = peers.lock().unwrap_or_else(|e| e.into_inner());
+    let before = peers.len();
+    peers.retain(|peer| peer.peer_state.ident() != node);
+    if before != peers.len() {
+        vec![PeerStateChange::PeerLeft]
+    } else {
+        Vec::new()
     }
 }
 
 async fn peer_left(
     node_id: NodeId,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
-    tx_peer_state_change: Sender<Vec<PeerStateChange>>,
+    tx: Sender<Vec<PeerStateChange>>,
 ) {
-    info!("Processing peer_left for node {}", node_id);
-
-    let mut did_session_membership_change = false;
-    if let Ok(mut peers_guard) = peers.try_lock() {
-        let initial_count = peers_guard.len();
-        peers_guard.retain(|peer| {
-            if peer.peer_state.ident() == node_id {
-                info!("Removing peer {} from peers list", node_id);
-                did_session_membership_change = true;
-                false
-            } else {
-                true
-            }
-        });
-        let final_count = peers_guard.len();
-        info!(
-            "Peer count changed from {} to {} after removing peer {}",
-            initial_count, final_count, node_id
-        );
-    } else {
-        debug!(
-            "Could not acquire peers lock in peer_left for node {}",
-            node_id
-        );
+    let Ok(slot) = tx.reserve().await else {
         return;
-    }
-
-    if did_session_membership_change {
-        info!(
-            "Session membership changed due to peer {} leaving, sending PeerLeft event",
-            node_id
-        );
-        if let Err(e) = tx_peer_state_change
-            .send(vec![PeerStateChange::PeerLeft])
-            .await
-        {
-            debug!("Failed to send peer left event: {}", e);
-        } else {
-            info!("Successfully sent PeerLeft event for peer {}", node_id);
-        }
-    } else {
-        info!(
-            "No session membership change for peer {} (peer not found in list)",
-            node_id
-        );
+    };
+    let changes = remove_peer(node_id, &peers);
+    if !changes.is_empty() {
+        slot.send(changes);
     }
 }
 
@@ -560,12 +527,16 @@ mod tests {
             .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while peers.lock().unwrap().is_empty() {
+            while tx_event.capacity() == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
+        assert!(
+            peers.lock().unwrap().is_empty(),
+            "capacity must precede peer mutation"
+        );
         let task = observer.task.abort_handle();
         drop(observer);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {

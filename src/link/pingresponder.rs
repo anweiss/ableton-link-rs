@@ -186,6 +186,10 @@ impl PingResponder {
     }
 
     pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
+        self.update_node_state_now(session_id, x_form);
+    }
+
+    pub(crate) fn update_node_state_now(&self, session_id: SessionId, x_form: GhostXForm) {
         let mut current_id = lock(&self.session_id);
         let mut current_form = lock(&self.ghost_x_form);
         *current_id = session_id;
