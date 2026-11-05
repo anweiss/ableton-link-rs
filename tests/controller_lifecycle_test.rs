@@ -151,11 +151,11 @@ async fn test_audio_session_state_roundtrip() {
     let link = BasicLink::new(120.0).await.unwrap();
 
     // Capture, modify, commit via audio path
-    let mut state = link.capture_audio_session_state();
+    let mut state = link.capture_audio_session_state().unwrap();
     let time = link.clock().micros();
     state.set_tempo(144.0, time);
     let ticket = link.commit_audio_session_state(state).unwrap();
-    assert_eq!(link.capture_audio_session_state().tempo(), 120.0);
+    assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 120.0);
     assert_eq!(
         link.process_audio_session_state_updates().await,
         Some((ticket, Ok(())))
@@ -163,7 +163,7 @@ async fn test_audio_session_state_roundtrip() {
     assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
 
     // Re-capture via audio path
-    let state2 = link.capture_audio_session_state();
+    let state2 = link.capture_audio_session_state().unwrap();
     assert_eq!(state2.tempo(), 144.0);
 }
 
