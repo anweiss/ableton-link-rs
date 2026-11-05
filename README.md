@@ -1117,7 +1117,12 @@ mutation and retirement: removing the last candidate peer immediately invalidate
 its incarnation, before a queued controller notification or late result can reuse it.
 Current-session retry ownership survives temporary peer absence until reset/disable.
 
-Observers acquire state guards before checked ingress publication, so contention on
+Observers copy the local identity and release its mutex before waiting for peer-list
+or ingress guards. This avoids inversion with the receive path, which reads that
+identity under ingress serialization; coordinated session guards still cover resets.
+Discovery admission and receive timestamps remain serialized, including withdrawals:
+state contention does not discard them or restart their TTL.
+Observers acquire peer/session guards before checked ingress publication, so contention on
 those guards does not retain the interface-map/revision locks needed by PING/PONG.
 Measurement sample append likewise acquires its data guard before its ingress check.
 All receive deadlines are still rechecked after blocking state acquisition. A rejected
