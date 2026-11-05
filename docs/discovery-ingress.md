@@ -444,3 +444,14 @@ quantum or MIN/-1 returns zero. Phase arithmetic uses wide intermediates. Receiv
 extreme beat origins and start/stop values therefore do not overflow during joining
 or client conversion. Inverse ghost-clock conversion retains the wide difference
 through division and saturates only the final host-microsecond conversion.
+
+Client edits use the accepted current timeline under the matching published identity
+and mapping, even when a same-incarnation announcement is ahead of local publication.
+Received start/stop updates use that same cooperative commit boundary: no timing or
+client state changes before every publication guard is acquired, and the ordered
+receive batch remains epoch-cancellable while waiting. An intervening join cannot
+cause a responder to publish a new identity with an old session's clock snapshot.
+
+`controller::update_discovery` now accepts `&Controller`, replacing three independent
+state arguments. It reads and publishes through the owner's full guarded boundary;
+callers no longer provide separately captured session, peer and gateway state.
