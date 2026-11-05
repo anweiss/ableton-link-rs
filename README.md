@@ -445,6 +445,9 @@ Moving the anchor merely to preserve that raw beat is not sufficient: the origin
 also defines public quantum phase. Handle `TimelineOriginExhausted` rather than
 publishing a clamped or phase-changing replacement.
 `update_session_timeline_from_client` also rejects an out-of-Chrono final origin.
+It preserves a fractional mapped zero anchor even when the previous timeline
+rounds to beat zero there; only an identical canonical zero time and tempo
+leave the session timeline unchanged.
 Managed publication additionally rejects session time origins outside the signed
 wire-microsecond range with `TimelineOriginExhausted`, before either timeline or
 playback state changes. Raw composition helpers retain their wider Chrono range,
