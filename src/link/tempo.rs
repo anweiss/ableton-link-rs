@@ -77,6 +77,17 @@ impl Tempo {
                 1_000_000,
             ))
     }
+
+    pub(crate) fn nanos_from_microbeats(&self, beats: i128) -> i128 {
+        let period = self.period_micros();
+        (beats / 1_000)
+            .saturating_mul(period)
+            .saturating_add((beats % 1_000).saturating_mul(period / 1_000))
+            .saturating_add(super::round_ratio(
+                (beats % 1_000) * (period % 1_000),
+                1_000,
+            ))
+    }
 }
 
 impl crate::encoding::Encode for Tempo {

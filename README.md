@@ -303,6 +303,11 @@ outside the stored origin's range. Re-anchoring retains nanosecond precision whe
 whole-microsecond rounding misses the requested microbeat, including at Chrono's
 duration limits. Ordinary timeline shifts retain their existing conversion rounding.
 A clamped anchor is accepted only if it still encodes the requested microbeat.
+Timeline beat-to-time and phase-inverse conversions retain nanosecond offsets.
+Controller client/session and start/stop mappings use internal nanosecond clock
+conversions so publication does not discard an accepted alignment. The public
+`GhostXForm` methods retain their existing microsecond rounding; wire timestamps
+remain signed microseconds.
 The public rounding correction clamps at Chrono's duration limits.
 Link Classic and LinkAudio tempo encoders saturate signed wire periods without
 changing the sign of a negative out-of-range value.

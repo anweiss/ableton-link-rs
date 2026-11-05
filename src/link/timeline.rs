@@ -58,10 +58,8 @@ impl Timeline {
 
     pub(crate) fn time_at_microbeats(&self, beats: i128) -> Duration {
         let difference = beats - i128::from(self.beat_origin.value);
-        let elapsed = self.tempo.micros_from_microbeats(difference);
-        super::duration_from_nanos(
-            super::duration_nanos(self.time_origin).saturating_add(elapsed.saturating_mul(1_000)),
-        )
+        let elapsed = self.tempo.nanos_from_microbeats(difference);
+        super::duration_from_nanos(super::duration_nanos(self.time_origin).saturating_add(elapsed))
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -130,7 +128,7 @@ pub fn update_client_timeline_from_session(
         time_origin: at_time,
     };
 
-    let host_beat_zero = x_form.ghost_to_host(session.from_beats(Beats { value: 0i64 }));
+    let host_beat_zero = x_form.ghost_to_host_nanos(session.from_beats(Beats { value: 0i64 }));
     Timeline {
         tempo: temp_tl.tempo,
         beat_origin: temp_tl.to_beats(host_beat_zero),
@@ -144,7 +142,7 @@ pub fn update_session_timeline_from_client(
     at_time: Duration,
     x_form: GhostXForm,
 ) -> Timeline {
-    let ghost_beat_0 = x_form.host_to_ghost(client.time_origin);
+    let ghost_beat_0 = x_form.host_to_ghost_nanos(client.time_origin);
 
     let zero = Beats { value: 0i64 };
 
@@ -160,7 +158,9 @@ pub fn update_session_timeline_from_client(
 
     let new_beat_origin = Beats {
         value: i64::max(
-            cur_session.to_beats(x_form.host_to_ghost(at_time)).value,
+            cur_session
+                .to_beats(x_form.host_to_ghost_nanos(at_time))
+                .value,
             cur_session.beat_origin.value.saturating_add(1),
         ),
     };
@@ -197,7 +197,7 @@ mod tests {
         };
         assert_eq!(
             timeline.from_beats(Beats::from_microbeats(i64::MAX)),
-            Duration::microseconds(i64::MAX) + Duration::microseconds(1)
+            Duration::microseconds(i64::MAX) + Duration::nanoseconds(500)
         );
         let timeline = Timeline {
             time_origin: Duration::microseconds(-i64::MAX),
@@ -205,7 +205,7 @@ mod tests {
         };
         assert_eq!(
             timeline.from_beats(Beats::from_microbeats(i64::MAX)),
-            Duration::microseconds(1)
+            Duration::nanoseconds(500)
         );
         let timeline = Timeline {
             tempo: Tempo::new(120.0),
@@ -222,11 +222,11 @@ mod tests {
         };
         assert_eq!(
             reversed.from_beats(Beats::from_microbeats(i64::MIN)),
-            -Duration::microseconds(i64::MAX) - Duration::microseconds(1)
+            -Duration::microseconds(i64::MAX) - Duration::nanoseconds(500)
         );
         assert_eq!(
             timeline.from_beats(Beats::from_microbeats(i64::MIN + 1)),
-            Duration::microseconds(1)
+            Duration::nanoseconds(500)
         );
     }
 
