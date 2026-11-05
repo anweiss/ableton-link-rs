@@ -1257,3 +1257,12 @@ lifecycle checks never block on the enabled flag. Synchronous setup helpers rema
 synchronous. The owned-runtime regression overlaps raw withdrawals, encoded PING
 traffic, scanning/reconciliation and broadcasting under five contended guards,
 and checks original-deadline expiry, registered-source delivery and cancellation.
+
+An owned ALIVE broadcast holds its originating discovery-epoch permit through
+snapshot acquisition and the registered send. Closing that epoch cancels a send
+waiting on the interface map before disable completes, even though the interface
+lease remains live. Re-enabling cannot revive the old announcement; fresh work
+uses the new epoch. The shared notifier remains a wakeup, not an inferred stop.
+Wire regressions pause after snapshot/encoding, complete actual controller disable
+with an unchanged registration, and distinguish a fresh150BPM announcement from
+the captured120BPM payload during rapid re-enable.
