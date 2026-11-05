@@ -18,6 +18,100 @@ impl Default for GhostXForm {
 }
 
 impl GhostXForm {
+    pub(crate) fn host_to_ghost_nanos(&self, host_time: Duration) -> Duration {
+        let nanos = super::duration_nanos(host_time);
+        if nanos == 0 || !self.slope.is_finite() {
+            return self.host_to_ghost(host_time);
+        }
+        let (mantissa, exponent, sign) = num_traits::float::FloatCore::integer_decode(self.slope);
+        let magnitude = nanos.unsigned_abs();
+        let mantissa = u128::from(mantissa);
+        // The exact product needs more than 128 bits at Chrono's endpoints.
+        let lower = (magnitude & u128::from(u64::MAX)) * mantissa;
+        let upper = (magnitude >> 64) * mantissa;
+        let (lower, carry) = lower.overflowing_add(upper << 64);
+        let upper = (upper >> 64) + u128::from(carry);
+        let limit = i128::MAX as u128;
+        let magnitude = if exponent < 0 {
+            let shift = u32::from(exponent.unsigned_abs());
+            let overflow = shift < 128 && upper >> shift != 0;
+            let whole = match shift {
+                1..=127 => (lower >> shift) | (upper << (128 - shift)),
+                128 => upper,
+                129..=255 => upper >> (shift - 128),
+                _ => 0,
+            };
+            let round_up = match shift {
+                1..=128 => lower >> (shift - 1) & 1 != 0,
+                129..=256 => upper >> (shift - 129) & 1 != 0,
+                _ => false,
+            };
+            if overflow {
+                limit
+            } else {
+                whole.saturating_add(u128::from(round_up)).min(limit)
+            }
+        } else {
+            let shift = exponent as u32;
+            if upper != 0 || shift >= 127 || lower > limit >> shift {
+                limit
+            } else {
+                lower << shift
+            }
+        } as i128;
+        let offset = if (nanos < 0) != (sign < 0) {
+            -magnitude
+        } else {
+            magnitude
+        };
+        super::duration_from_nanos(offset.saturating_add(super::duration_nanos(self.intercept)))
+    }
+
+    pub(crate) fn ghost_to_host_nanos(&self, ghost_time: Duration) -> Duration {
+        if self.slope == 0.0 || !self.slope.is_finite() {
+            return self.ghost_to_host(ghost_time);
+        }
+        let difference = super::duration_nanos(ghost_time) - super::duration_nanos(self.intercept);
+        if difference == 0 {
+            return Duration::zero();
+        }
+        let (mantissa, exponent, sign) = num_traits::float::FloatCore::integer_decode(self.slope);
+        let denominator = u128::from(mantissa);
+        let magnitude = difference.unsigned_abs();
+        let negative = (difference < 0) != (sign < 0);
+        let nanos = if exponent >= 0 {
+            let shift = exponent as u32;
+            if shift >= 128 || denominator > u128::MAX >> shift {
+                0
+            } else {
+                let denominator = denominator << shift;
+                magnitude / denominator
+                    + u128::from(magnitude % denominator >= denominator.div_ceil(2))
+            }
+        } else {
+            let mut quotient = magnitude / denominator;
+            let mut remainder = magnitude % denominator;
+            let limit = super::duration_nanos(Duration::MAX) as u128;
+            for _ in 0..exponent.unsigned_abs() {
+                if quotient > limit / 2 {
+                    return if negative {
+                        Duration::MIN
+                    } else {
+                        Duration::MAX
+                    };
+                }
+                quotient *= 2;
+                remainder *= 2;
+                if remainder >= denominator {
+                    remainder -= denominator;
+                    quotient += 1;
+                }
+            }
+            quotient + u128::from(remainder >= denominator.div_ceil(2))
+        } as i128;
+        super::duration_from_nanos(if negative { -nanos } else { nanos })
+    }
+
     pub fn host_to_ghost(&self, host_time: Duration) -> Duration {
         let nanos = super::duration_nanos(host_time);
         if nanos == 0 {
@@ -110,6 +204,41 @@ impl GhostXForm {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nanosecond_alignment_clock_mapping_preserves_fractional_origins() {
+        let identity = GhostXForm {
+            slope: 1.0,
+            intercept: Duration::zero(),
+        };
+        for time in [
+            Duration::MIN,
+            Duration::MAX,
+            Duration::nanoseconds(-500),
+            Duration::nanoseconds(1),
+        ] {
+            assert_eq!(identity.host_to_ghost_nanos(time), time);
+            assert_eq!(identity.ghost_to_host_nanos(time), time);
+        }
+        for (slope, scaled) in [
+            (0.5, 400),
+            (1.25, 1000),
+            (2.0, 1600),
+            (-0.5, -400),
+            (-1.25, -1000),
+        ] {
+            for sign in [-1, 1] {
+                let form = GhostXForm {
+                    slope,
+                    intercept: Duration::nanoseconds(137),
+                };
+                let host = Duration::nanoseconds(sign * 800);
+                let ghost = Duration::nanoseconds(sign * scaled + 137);
+                assert_eq!(form.host_to_ghost_nanos(host), ghost);
+                assert_eq!(form.ghost_to_host_nanos(ghost), host);
+            }
+        }
+    }
+
     #[test]
     fn clock_precision_forward_preserves_cancelling_integer_and_fractional_parts() {
         let micros = (1_i64 << 62) + 511;

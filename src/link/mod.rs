@@ -604,6 +604,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nanosecond_alignment_round_trips_public_inverse() {
+        for (bpm, microbeats) in [(120.0, 1), (150.0, 2)] {
+            for time in [Duration::zero(), Duration::MAX, Duration::MIN] {
+                let mut state = SessionState::default();
+                state.set_tempo(bpm, Duration::zero());
+                let beat = Beats::from_microbeats(microbeats).floating();
+                state.force_beat_at_time(beat, time, 4.0);
+                let recovered = state.time_at_beat(beat, 4.0);
+                assert_eq!(recovered, time);
+                assert_eq!(state.beat_at_time(recovered, 4.0), beat);
+            }
+        }
+    }
+
+    #[test]
     fn public_force_microbeats_preserves_nanosecond_anchors_at_max() {
         for (bpm, microbeats, offset) in [(150.0, 2, 800), (120.0, 1, 500)] {
             for origin in [Duration::zero(), Duration::MAX] {

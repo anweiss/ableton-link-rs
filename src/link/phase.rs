@@ -145,10 +145,7 @@ pub fn force_beat_at_time_impl(
                 }
                 let offset = i128::from(beat.value) - boundary;
                 let elapsed = if precise {
-                    let period = timeline.tempo.period_micros();
-                    offset
-                        .saturating_mul(period / 1_000)
-                        .saturating_add(super::round_ratio(offset * (period % 1_000), 1_000))
+                    timeline.tempo.nanos_from_microbeats(offset)
                 } else {
                     timeline
                         .tempo

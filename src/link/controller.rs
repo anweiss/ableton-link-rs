@@ -1131,8 +1131,8 @@ impl SessionCommit<'_> {
             beat_origin: self
                 .session
                 .timeline
-                .to_beats(self.session.ghost_x_form.host_to_ghost(host_time)),
-            time_origin: x_form.host_to_ghost(host_time),
+                .to_beats(self.session.ghost_x_form.host_to_ghost_nanos(host_time)),
+            time_origin: x_form.host_to_ghost_nanos(host_time),
         };
         self.peer.node_state.node_id = node;
         self.peer.node_state.session_id = id;
@@ -1229,7 +1229,10 @@ impl SessionCommit<'_> {
             let state = select_preferred_start_stop_state(self.client.start_stop_state, incoming);
             self.client.start_stop_state = state;
             if self.sync_enabled
-                && self.session.ghost_x_form.host_to_ghost(state.timestamp)
+                && self
+                    .session
+                    .ghost_x_form
+                    .host_to_ghost_nanos(state.timestamp)
                     > self.session.start_stop_state.timestamp
             {
                 self.session.start_stop_state = map_start_stop_state_from_client_to_session(
@@ -1639,7 +1642,7 @@ fn init_session_state(tempo: tempo::Tempo, clock: Clock) -> SessionState {
 fn init_client_state(session_state: SessionState, session_id: SessionId) -> ClientState {
     let host_time = session_state
         .ghost_x_form
-        .ghost_to_host(Duration::microseconds(0));
+        .ghost_to_host_nanos(Duration::microseconds(0));
 
     ClientState {
         timeline: Timeline {
@@ -1672,8 +1675,9 @@ fn map_start_stop_state_from_session_to_client(
     session_timeline: Timeline,
     x_form: GhostXForm,
 ) -> ClientStartStopState {
-    let time = x_form.ghost_to_host(session_timeline.from_beats(session_start_stop_state.beats));
-    let timestamp = x_form.ghost_to_host(session_start_stop_state.timestamp);
+    let time =
+        x_form.ghost_to_host_nanos(session_timeline.from_beats(session_start_stop_state.beats));
+    let timestamp = x_form.ghost_to_host_nanos(session_start_stop_state.timestamp);
     ClientStartStopState {
         is_playing: session_start_stop_state.is_playing,
         time,
@@ -1687,8 +1691,8 @@ fn map_start_stop_state_from_client_to_session(
     x_form: GhostXForm,
 ) -> StartStopState {
     let session_beats =
-        session_timeline.to_beats(x_form.host_to_ghost(client_start_stop_state.time));
-    let timestamp = x_form.host_to_ghost(client_start_stop_state.timestamp);
+        session_timeline.to_beats(x_form.host_to_ghost_nanos(client_start_stop_state.time));
+    let timestamp = x_form.host_to_ghost_nanos(client_start_stop_state.timestamp);
     StartStopState {
         is_playing: client_start_stop_state.is_playing,
         beats: session_beats,
@@ -1704,6 +1708,86 @@ pub struct SessionPeerCounter {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
+    #[test]
+    fn nanosecond_alignment_survives_guarded_controller_publication() {
+        use crate::link::phase::{force_beat_at_time_impl, to_phase_encoded_beats};
+        use chrono::Duration as Delta;
+
+        for (bpm, microbeats) in [(120.0, 1), (150.0, 2)] {
+            let initial = Timeline {
+                tempo: tempo::Tempo::new(bpm),
+                ..Timeline::default()
+            };
+            let at = Delta::zero();
+            let beat = Beats::from_microbeats(microbeats);
+            let quantum = Beats::new(4.0);
+            let mut forced = initial;
+            force_beat_at_time_impl(&mut forced, beat, at, quantum);
+            for (slope, intercept) in [
+                (1.0, 0),
+                (1.001, 137),
+                (0.999, -137),
+                (2.0, 137),
+                (-1.0, -137),
+            ] {
+                let form = GhostXForm {
+                    slope,
+                    intercept: Delta::nanoseconds(intercept),
+                };
+                let target = update_session_timeline_from_client(initial, forced, at, form);
+                let mut session = SessionState {
+                    timeline: initial,
+                    ghost_x_form: form,
+                    ..SessionState::default()
+                };
+                let mut client = ClientState {
+                    timeline: forced,
+                    ..ClientState::default()
+                };
+                update_timing_guarded(
+                    &mut session,
+                    &mut client,
+                    target,
+                    form,
+                    Clock::new(),
+                    false,
+                    SessionId::default(),
+                );
+                assert_eq!(to_phase_encoded_beats(&client.timeline, at, quantum), beat);
+            }
+        }
+    }
+
+    #[test]
+    fn nanosecond_alignment_survives_start_stop_mapping() {
+        use chrono::Duration as Delta;
+
+        for (bpm, origin, microbeat) in [(120.0, -500, 2), (150.0, -800, 3)] {
+            let timeline = Timeline {
+                tempo: tempo::Tempo::new(bpm),
+                beat_origin: Beats::default(),
+                time_origin: Delta::nanoseconds(origin),
+            };
+            let beat = Beats::from_microbeats(microbeat);
+            let time = timeline.from_beats(beat);
+            let form = GhostXForm {
+                slope: 1.0,
+                intercept: Delta::zero(),
+            };
+            let client = ClientStartStopState {
+                is_playing: true,
+                time,
+                timestamp: time,
+            };
+            let session = map_start_stop_state_from_client_to_session(client, timeline, form);
+            assert_eq!(session.beats, beat);
+            assert_eq!(
+                map_start_stop_state_from_session_to_client(session, timeline, form),
+                client
+            );
+        }
+    }
+
     #[tokio::test]
     async fn admission_received_start_stop_waits_coherently_and_cancels_without_parking_io() {
         for hold_form in [false, true] {
