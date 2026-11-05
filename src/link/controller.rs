@@ -1860,15 +1860,33 @@ mod dispatch_gate_tests {
                 .await
                 .unwrap();
             tokio::time::timeout(TEST_TIMEOUT, async {
-                while sessions.current.lock().unwrap().measurement.x_form != x_form {
-                    tokio::task::yield_now().await;
+                if seconds == 1 {
+                    while sessions.current.lock().unwrap().measurement.x_form != x_form {
+                        tokio::task::yield_now().await;
+                    }
+                } else {
+                    while tx.capacity() == 0 {
+                        tokio::task::yield_now().await;
+                    }
                 }
             })
             .await
             .unwrap();
         }
-        // The first join fills the queue; the second result has been applied
-        // but its send is blocked. stop() must cancel that send, not deadlock.
+        // The first join fills the queue; the second result was consumed but
+        // cannot commit until notification capacity exists. stop() cancels it.
+        assert_eq!(joined.len(), 1);
+        assert!(dispatch.gate.in_flight.try_write().is_err());
+        assert_eq!(
+            sessions
+                .current
+                .lock()
+                .unwrap()
+                .measurement
+                .x_form
+                .intercept,
+            chrono::Duration::seconds(1)
+        );
         tokio::time::timeout(TEST_TIMEOUT, dispatch.gate.stop())
             .await
             .unwrap();
