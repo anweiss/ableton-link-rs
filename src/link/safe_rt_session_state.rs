@@ -108,9 +108,21 @@ impl AcceptedState {
         }
         // Pin before loading the index. An in-flight writer uses the other
         // slot; another writer cannot start while this reader remains pinned.
-        self.readers
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
-            .expect("too many simultaneous accepted-state readers");
+        let mut readers = self.readers.load(Ordering::SeqCst);
+        loop {
+            let next = readers
+                .checked_add(1)
+                .expect("too many simultaneous accepted-state readers");
+            match self.readers.compare_exchange_weak(
+                readers,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(current) => readers = current,
+            }
+        }
         let reader = AcceptedRead(self);
         let slot = self.published.load(Ordering::SeqCst);
         let state = match self.slots[slot].try_read() {

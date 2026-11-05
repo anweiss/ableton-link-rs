@@ -231,12 +231,14 @@ impl SessionEditOrigin {
 }
 
 fn allocate_edit_revision(counter: &AtomicU64) -> Option<NonZeroU64> {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(1)
-        })
-        .ok()
-        .and_then(NonZeroU64::new)
+    let mut value = counter.load(Ordering::Relaxed);
+    loop {
+        let next = value.checked_add(1)?;
+        match counter.compare_exchange_weak(value, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(prior) => return NonZeroU64::new(prior),
+            Err(current) => value = current,
+        }
+    }
 }
 
 #[cfg(test)]
