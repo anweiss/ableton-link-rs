@@ -77,6 +77,9 @@ impl StartStopState {
 pub struct ClientStartStopState {
     pub is_playing: bool,
     pub time: Duration,
+    /// Local capture/observation ordering, not the advertised logical wire clock.
+    /// Received updates are stamped when observed locally; clock-map refreshes
+    /// preserve this watermark rather than copying a remote future timestamp.
     pub timestamp: Duration,
 }
 

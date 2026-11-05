@@ -3,6 +3,31 @@ use thiserror::Error;
 
 use crate::encoding;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(Error))]
+pub enum CommitError {
+    #[cfg_attr(feature = "std", error("session timeline origin exhausted"))]
+    TimelineOriginExhausted,
+    #[cfg_attr(feature = "std", error("start/stop wire timestamp exhausted"))]
+    StartStopTimestampExhausted,
+    #[cfg_attr(
+        feature = "std",
+        error("client edit is stale or its captured session was replaced")
+    )]
+    StaleClientState,
+}
+
+#[cfg(not(feature = "std"))]
+impl core::fmt::Display for CommitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::TimelineOriginExhausted => "session timeline origin exhausted",
+            Self::StartStopTimestampExhausted => "start/stop wire timestamp exhausted",
+            Self::StaleClientState => "client edit is stale or its captured session was replaced",
+        })
+    }
+}
+
 #[derive(Debug)]
 #[cfg_attr(feature = "std", derive(Error))]
 pub enum Error {

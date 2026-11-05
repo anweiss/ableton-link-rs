@@ -214,8 +214,21 @@ impl LinkAudio {
     }
 
     /// Forwards to [`BasicLink::commit_app_session_state`].
-    pub async fn commit_app_session_state(&mut self, state: SessionState) {
-        self.link.commit_app_session_state(state).await;
+    pub async fn commit_app_session_state(
+        &mut self,
+        state: SessionState,
+    ) -> Result<(), crate::link::CommitError> {
+        self.link.commit_app_session_state(state).await
+    }
+
+    /// Forwards the bounded, non-RT audio commit drain.
+    pub async fn process_audio_session_state_updates(
+        &mut self,
+    ) -> Option<(
+        crate::link::AudioCommitTicket,
+        Result<(), crate::link::CommitError>,
+    )> {
+        self.link.process_audio_session_state_updates().await
     }
 
     /// The local peer name used for identification in the session.

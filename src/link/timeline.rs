@@ -141,13 +141,13 @@ pub fn update_session_timeline_from_client(
     client: Timeline,
     at_time: Duration,
     x_form: GhostXForm,
-) -> Timeline {
+) -> core::result::Result<Timeline, super::error::CommitError> {
     let ghost_beat_0 = x_form.host_to_ghost_nanos(client.time_origin);
 
     let zero = Beats { value: 0i64 };
 
     if cur_session.to_beats(ghost_beat_0) == zero && client.tempo == cur_session.tempo {
-        return cur_session;
+        return Ok(cur_session);
     }
 
     let temp_tl = Timeline {
@@ -161,15 +161,19 @@ pub fn update_session_timeline_from_client(
             cur_session
                 .to_beats(x_form.host_to_ghost_nanos(at_time))
                 .value,
-            cur_session.beat_origin.value.saturating_add(1),
+            cur_session
+                .beat_origin
+                .value
+                .checked_add(1)
+                .ok_or(super::error::CommitError::TimelineOriginExhausted)?,
         ),
     };
 
-    Timeline {
+    Ok(Timeline {
         tempo: client.tempo,
         beat_origin: new_beat_origin,
         time_origin: temp_tl.from_beats(new_beat_origin),
-    }
+    })
 }
 
 pub fn shift_client_timeline(client: Timeline, shift: Beats) -> Timeline {

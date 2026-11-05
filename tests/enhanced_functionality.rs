@@ -194,7 +194,7 @@ async fn test_enhanced_basic_link() {
 async fn test_realtime_session_state() {
     info!("Testing real-time session state handling");
 
-    let link = BasicLink::new(140.0).await.unwrap();
+    let mut link = BasicLink::new(140.0).await.unwrap();
 
     // Capture initial state
     let mut session_state = link.capture_audio_session_state();
@@ -206,7 +206,13 @@ async fn test_realtime_session_state() {
     session_state.set_is_playing(true, current_time);
 
     // Commit changes
-    link.commit_audio_session_state(session_state);
+    let ticket = link.commit_audio_session_state(session_state).unwrap();
+    assert_eq!(link.capture_audio_session_state().tempo(), 140.0);
+    assert_eq!(
+        link.process_audio_session_state_updates().await,
+        Some((ticket, Ok(())))
+    );
+    assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
 
     // Verify changes
     let updated_state = link.capture_audio_session_state();
@@ -227,6 +233,7 @@ async fn test_realtime_performance() {
 
     let start_time = std::time::Instant::now();
     let iterations = 10000;
+    let mut pending = None;
 
     // Test audio thread performance
     for i in 0..iterations {
@@ -241,7 +248,10 @@ async fn test_realtime_performance() {
         if i % 1000 == 0 {
             let mut modified_state = session_state;
             modified_state.set_tempo(120.0 + (i as f64 * 0.01), current_time);
-            link.commit_audio_session_state(modified_state);
+            match link.commit_audio_session_state(modified_state) {
+                Ok(ticket) => pending = Some(ticket),
+                Err(error) => assert_eq!(error, ableton_link_rs::link::AudioQueueError::Busy),
+            }
         }
 
         // Verify calculations are reasonable
@@ -250,6 +260,8 @@ async fn test_realtime_performance() {
     }
 
     let elapsed = start_time.elapsed();
+    assert!(pending.is_some());
+    assert_eq!(link.take_audio_commit_result(pending.unwrap()), Ok(None));
     let operations_per_second = iterations as f64 / elapsed.as_secs_f64();
 
     info!(
