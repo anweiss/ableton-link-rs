@@ -420,6 +420,11 @@ Moving the anchor merely to preserve that raw beat is not sufficient: the origin
 also defines public quantum phase. Handle `TimelineOriginExhausted` rather than
 publishing a clamped or phase-changing replacement.
 `update_session_timeline_from_client` also rejects an out-of-Chrono final origin.
+Managed publication additionally rejects session time origins outside the signed
+wire-microsecond range with `TimelineOriginExhausted`, before either timeline or
+playback state changes. Raw composition helpers retain their wider Chrono range,
+and standalone encoders still saturate. Accepted fractional-microsecond origins
+retain their nanoseconds locally and truncate to microseconds on the wire.
 Managed receipt and join rejection retain the last accepted session, mapping,
 client state and capture revision; a rejected promotion is retired so a later
 announcement can create a fresh candidate.
@@ -435,6 +440,9 @@ remain independent. Combined local edits preflight both fields before changing
 revisions, peer state or publication. The lower-level
 `controller::update_session_timing` now returns `Result<(), CommitError>` too;
 handle rejection. Its existing best-effort lock-contention behavior is unchanged.
+`triple_buffer` is now a dev-dependency for the retained comparison tests, not
+part of the normal `std` dependency graph. Its obsolete implicit Cargo feature
+is removed; downstream feature lists must stop requesting `triple_buffer`.
 Link Classic and LinkAudio tempo encoders saturate signed wire periods without
 changing the sign of a negative out-of-range value.
 PONG ghost timestamps saturate at the final signed-microsecond wire boundary.

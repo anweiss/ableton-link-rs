@@ -1859,6 +1859,9 @@ fn update_timing_guarded(
     session_id: SessionId,
 ) -> Result<Option<tempo::Tempo>, super::error::CommitError> {
     let timeline = clamp_tempo(new_timeline);
+    if timeline.time_origin.num_microseconds().is_none() {
+        return Err(super::error::CommitError::TimelineOriginExhausted);
+    }
     let old = session.timeline;
     let changed = old != timeline || session.ghost_x_form != new_x_form;
     if changed {
@@ -2234,6 +2237,118 @@ mod dispatch_gate_tests {
                     )
                 );
             });
+        }
+    }
+
+    #[test]
+    fn ordering_wire_origin_exhaustion_rejects_both_fields_before_mutation() {
+        use crate::link::error::CommitError;
+        for sign in [-1, 1] {
+            ordering_fixture(|state| {
+                let accepted = Timeline {
+                    beat_origin: Beats::from_microbeats(sign * 4_000_000_000_000_000_000),
+                    ..state.session.timeline
+                };
+                state.current.timeline = accepted;
+                state.published.timeline = accepted;
+                state.others[0].timeline = accepted;
+                state.session.timeline = accepted;
+                state.peer.node_state.timeline = accepted;
+                state.peers[0].peer_state.node_state.timeline = accepted;
+                let before = (
+                    state.current.edit_origin(),
+                    state.published.edit_origin(),
+                    *state.session,
+                    *state.client,
+                    state.peer.timeline(),
+                    state.others[0].edit_origin(),
+                    state.peers[0].peer_state.timeline(),
+                    *state.responder_id,
+                    *state.responder_form,
+                );
+                let incoming = IncomingClientState {
+                    timeline: Some(Timeline {
+                        tempo: tempo::Tempo::new(20.0),
+                        ..Timeline::default()
+                    }),
+                    timeline_timestamp: chrono::Duration::zero(),
+                    start_stop_state: Some(ClientStartStopState {
+                        is_playing: true,
+                        timestamp: chrono::Duration::nanoseconds(1),
+                        ..Default::default()
+                    }),
+                };
+                let raw = update_session_timeline_from_client(
+                    accepted,
+                    incoming.timeline.unwrap(),
+                    incoming.timeline_timestamp,
+                    state.session.ghost_x_form,
+                )
+                .unwrap();
+                assert_eq!(
+                    super::super::duration_nanos(raw.time_origin),
+                    i128::from(sign) * 12_000_000_000_000_000_000_000 + 3_000
+                );
+                assert!(raw.time_origin.num_microseconds().is_none());
+                assert!(matches!(
+                    state.client_edit(&incoming, Clock::new()),
+                    ClientCommit::Rejected(CommitError::TimelineOriginExhausted)
+                ));
+                assert_eq!(
+                    before,
+                    (
+                        state.current.edit_origin(),
+                        state.published.edit_origin(),
+                        *state.session,
+                        *state.client,
+                        state.peer.timeline(),
+                        state.others[0].edit_origin(),
+                        state.peers[0].peer_state.timeline(),
+                        *state.responder_id,
+                        *state.responder_form,
+                    )
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn ordering_wire_origin_guard_preserves_fractional_endpoint_precision() {
+        for endpoint in [i64::MIN, i64::MAX] {
+            let sign = i128::from(endpoint.signum());
+            for extra in [0, 999, 1_000] {
+                ordering_fixture(|state| {
+                    let nanos = i128::from(endpoint) * 1_000 + sign * extra;
+                    let timeline = Timeline {
+                        time_origin: super::super::duration_from_nanos(nanos),
+                        ..state.session.timeline
+                    };
+                    state.session.timeline = timeline;
+                    let before = (*state.session, *state.client);
+                    let result = update_timing_guarded(
+                        state.session,
+                        state.client,
+                        timeline,
+                        *state.responder_form,
+                        Clock::new(),
+                        true,
+                        *state.responder_id,
+                    );
+                    if extra < 1_000 {
+                        assert_eq!(result, Ok(None));
+                        assert_eq!(
+                            super::super::duration_nanos(state.session.timeline.time_origin),
+                            nanos
+                        );
+                    } else {
+                        assert_eq!(
+                            result,
+                            Err(super::super::CommitError::TimelineOriginExhausted)
+                        );
+                    }
+                    assert_eq!(before, (*state.session, *state.client));
+                });
+            }
         }
     }
 
