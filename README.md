@@ -159,8 +159,9 @@ same-ID sighting rearms measurement with a fresh incarnation rather than strandi
   lifecycle-wide shutdown. Managed candidates retry only while that incarnation lives.
 - `measure_peer`, `measure_peer_with_socket`, `handle_successful_measurement` and
   `handle_failed_measurement` take `SessionKey` in the former session-ID position.
-  Standalone users may create `SessionKey::new(id)` once for an independent attempt;
-  managed callers must use the originating session's key, not reconstruct it later.
+  Standalone users may create `SessionKey::new(id)` only for independently consumed
+  results. It cannot match an existing `Session`. Both session result handlers require
+  `session.key()` captured when requesting the measurement, including standalone setups.
 
 These are source-breaking changes, not wire-format changes. Managed result commits
 check the originating incarnation before success/failure mutation and after capacity
@@ -1062,3 +1063,28 @@ This implementation aims for full compatibility with the official Ableton Link s
 ## Support
 
 For questions about this Rust implementation, please [open an issue](https://github.com/anweiss/ableton-link-rs/issues). For general Ableton Link questions, contact <link-devs@ableton.com>.
+
+### Session-aware observers and retry ownership
+
+`PeerGateway::new` and `GatewayObserver::new` now take a final `Option<Sessions>`.
+Construct `Sessions` first and pass `Some(sessions.clone())` when results feed its
+session handlers; the observer and coordinator must share the same peer registry.
+Use `None` only for an independent peer observer whose consumer owns session state.
+The coordinated observer holds current-session and candidate guards across peer
+mutation and retirement: removing the last candidate peer immediately invalidates
+its incarnation, before a queued controller notification or late result can reuse it.
+Current-session retry ownership survives temporary peer absence until reset/disable.
+
+Observers acquire state guards before checked ingress publication, so contention on
+those guards does not retain the interface-map/revision locks needed by PING/PONG.
+Measurement sample append likewise acquires its data guard before its ingress check.
+All receive deadlines are still rechecked after blocking state acquisition. A rejected
+final sample publication reports originating-key cancellation and releases workers.
+Queued controller joins use the latest guarded snapshot of the matching incarnation,
+not the older timeline/transform carried in the notification.
+
+Public `schedule_remeasurement` is one-shot. The standalone success/failure handlers
+may rearm it after each result; they no longer accumulate permanently recurring loops.
+Managed retry workers remain lifecycle-owned and deduplicated per incarnation.
+A peer without an advertised measurement endpoint reports a failed transform, not
+retryable route retirement; public measurement constructors start no workers for it.

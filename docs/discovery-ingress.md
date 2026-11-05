@@ -343,3 +343,28 @@ a later admitted positive announcement follows it and may recreate the peer.
 Managed retry selection holds current-session, candidate and peer guards in that order.
 When no peer remains for a candidate, it retires only that incarnation; an unchanged
 same-ID sighting rearms measurement with a fresh incarnation rather than stranding it.
+
+### Session-aware observers and retry ownership
+
+`PeerGateway::new` and `GatewayObserver::new` now take a final `Option<Sessions>`.
+Construct `Sessions` first and pass `Some(sessions.clone())` when results feed its
+session handlers; the observer and coordinator must share the same peer registry.
+Use `None` only for an independent peer observer whose consumer owns session state.
+The coordinated observer holds current-session and candidate guards across peer
+mutation and retirement: removing the last candidate peer immediately invalidates
+its incarnation, before a queued controller notification or late result can reuse it.
+Current-session retry ownership survives temporary peer absence until reset/disable.
+
+Observers acquire state guards before checked ingress publication, so contention on
+those guards does not retain the interface-map/revision locks needed by PING/PONG.
+Measurement sample append likewise acquires its data guard before its ingress check.
+All receive deadlines are still rechecked after blocking state acquisition. A rejected
+final sample publication reports originating-key cancellation and releases workers.
+Queued controller joins use the latest guarded snapshot of the matching incarnation,
+not the older timeline/transform carried in the notification.
+
+Public `schedule_remeasurement` is one-shot. The standalone success/failure handlers
+may rearm it after each result; they no longer accumulate permanently recurring loops.
+Managed retry workers remain lifecycle-owned and deduplicated per incarnation.
+A peer without an advertised measurement endpoint reports a failed transform, not
+retryable route retirement; public measurement constructors start no workers for it.

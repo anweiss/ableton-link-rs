@@ -13,7 +13,7 @@ use tracing::debug;
 use crate::link::{
     controller::{gated_recv, DispatchGate, SessionPeerCounter},
     node::{NodeId, NodeState},
-    sessions::SessionId,
+    sessions::{SessionId, Sessions},
     state::StartStopState,
     timeline::Timeline,
 };
@@ -40,6 +40,7 @@ pub enum PeerEvent {
 
 pub struct GatewayObserver {
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
+    sessions: Option<Sessions>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -57,6 +58,7 @@ impl GatewayObserver {
         tx_peer_state_change: Sender<Vec<PeerStateChange>>,
         peers: Arc<Mutex<Vec<ControllerPeer>>>,
         _notifier: Arc<Notify>,
+        sessions: Option<Sessions>,
     ) -> Self {
         Self::with_dispatch_gate(
             on_peer_event,
@@ -65,6 +67,7 @@ impl GatewayObserver {
             tx_peer_state_change,
             peers,
             Arc::new(DispatchGate::new_open()),
+            sessions,
         )
         .await
     }
@@ -76,7 +79,15 @@ impl GatewayObserver {
         tx_peer_state_change: Sender<Vec<PeerStateChange>>,
         peers: Arc<Mutex<Vec<ControllerPeer>>>,
         gate: Arc<DispatchGate>,
+        sessions: Option<Sessions>,
     ) -> Self {
+        if let Some(sessions) = &sessions {
+            assert!(
+                Arc::ptr_eq(&peers, &sessions.peers),
+                "observer and sessions must share the peer registry"
+            );
+        }
+        let observer_sessions = sessions.clone();
         let observer_peers = peers.clone();
         let peer_state_loop = peer_state.clone();
 
@@ -93,6 +104,7 @@ impl GatewayObserver {
                                 peers.clone(),
                                 peer_state_loop.clone(),
                                 tx_peer_state_change.clone(),
+                                sessions.as_ref(),
                             )
                             .await;
                         }
@@ -103,14 +115,27 @@ impl GatewayObserver {
                                 peer_state_loop.clone(),
                                 session_peer_counter.clone(),
                                 tx_peer_state_change.clone(),
+                                sessions.as_ref(),
                             )
                             .await
                         }
                         PeerEvent::PeerLeft(node_id) => {
-                            peer_left(node_id, peers.clone(), tx_peer_state_change.clone()).await
+                            peer_left(
+                                node_id,
+                                peers.clone(),
+                                tx_peer_state_change.clone(),
+                                sessions.as_ref(),
+                            )
+                            .await
                         }
                         PeerEvent::PeerTimedOut(node_id) => {
-                            peer_left(node_id, peers.clone(), tx_peer_state_change.clone()).await
+                            peer_left(
+                                node_id,
+                                peers.clone(),
+                                tx_peer_state_change.clone(),
+                                sessions.as_ref(),
+                            )
+                            .await
                         }
                     }
                 };
@@ -124,6 +149,7 @@ impl GatewayObserver {
 
         Self {
             peers: observer_peers,
+            sessions: observer_sessions,
             task,
         }
     }
@@ -149,19 +175,20 @@ impl GatewayObserver {
             }
         };
 
-        if let Ok(mut peers) = self.peers.try_lock() {
+        with_observer_state(&self.peers, None, self.sessions.as_ref(), |_, peers| {
             peers.retain(|peer| peer.peer_state.session_id() != session_id_val);
-        } else {
-            debug!("Could not acquire peers lock in forget_session");
-        }
+        });
     }
 
     pub fn reset_peers(&self) {
-        if let Ok(mut peers) = self.peers.try_lock() {
-            peers.clear();
-        } else {
-            debug!("Could not acquire peers lock in reset_peers");
-        }
+        with_observer_state(&self.peers, None, self.sessions.as_ref(), |_, peers| {
+            peers.clear()
+        });
+    }
+
+    // Controller reset already owns current and has cleared all candidates.
+    pub(crate) fn reset_peers_after_session_reset(&self) {
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -273,11 +300,42 @@ pub enum PeerStateChange {
     AudioEndpoint(NodeId, Option<SocketAddrV4>),
 }
 
+fn with_observer_state<R>(
+    peers: &Mutex<Vec<ControllerPeer>>,
+    self_state: Option<&Mutex<PeerState>>,
+    sessions: Option<&Sessions>,
+    action: impl FnOnce(Option<&PeerState>, &mut Vec<ControllerPeer>) -> R,
+) -> R {
+    let current =
+        sessions.map(|sessions| sessions.current.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut others = sessions.map(|sessions| {
+        sessions
+            .other_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    });
+    let self_state = self_state.map(|state| state.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut peers = peers.lock().unwrap_or_else(|e| e.into_inner());
+    let result = action(self_state.as_deref(), &mut peers);
+    if let (Some(current), Some(others)) = (current, others.as_mut()) {
+        // Current-session retry ownership survives temporary absence. A candidate
+        // must not survive its last peer, even if its measurement is still running.
+        others.retain(|session| {
+            session.key().matches(&current)
+                || peers
+                    .iter()
+                    .any(|peer| peer.peer_state.session_id() == session.session_id)
+        });
+    }
+    result
+}
+
 async fn observed_peer(
     message: PeerStateMessageType,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     self_peer_state: Arc<Mutex<PeerState>>,
     tx: Sender<Vec<PeerStateChange>>,
+    sessions: Option<&Sessions>,
 ) {
     let deadline = message.expires_at.unwrap_or_else(|| {
         tokio::time::Instant::now() + std::time::Duration::from_secs(u64::from(message.ttl))
@@ -289,33 +347,40 @@ async fn observed_peer(
         result = tx.reserve() => match result { Ok(slot) => slot, Err(_) => return },
     };
     let observation = message.observation.clone();
-    let commit = || {
-        if message.ttl > 0 && deadline <= tokio::time::Instant::now() {
-            return;
-        }
-        let changes = if message.ttl == 0 {
-            remove_peer(message.node_state.ident(), &peers)
-        } else {
-            apply_peer(
-                PeerState {
-                    node_state: message.node_state,
-                    measurement_endpoint: message.measurement_endpoint,
-                    audio_endpoint: message.audio_endpoint,
-                },
-                &peers,
-                &self_peer_state,
-                Some(deadline),
-            )
-        };
-        if !changes.is_empty() {
-            slot.send(changes);
-        }
-    };
-    if let Some(observation) = observation {
-        observation.while_current(commit);
-    } else {
-        commit();
-    }
+    with_observer_state(
+        &peers,
+        Some(&self_peer_state),
+        sessions,
+        |self_state, peers| {
+            let commit = || {
+                if message.ttl > 0 && deadline <= tokio::time::Instant::now() {
+                    return;
+                }
+                let changes = if message.ttl == 0 {
+                    remove_peer(message.node_state.ident(), peers)
+                } else {
+                    apply_peer(
+                        PeerState {
+                            node_state: message.node_state,
+                            measurement_endpoint: message.measurement_endpoint,
+                            audio_endpoint: message.audio_endpoint,
+                        },
+                        peers,
+                        self_state.unwrap(),
+                        Some(deadline),
+                    )
+                };
+                if !changes.is_empty() {
+                    slot.send(changes);
+                }
+            };
+            if let Some(observation) = observation {
+                observation.while_current(commit);
+            } else {
+                commit();
+            }
+        },
+    );
 }
 
 async fn saw_peer(
@@ -324,27 +389,33 @@ async fn saw_peer(
     self_peer_state: Arc<Mutex<PeerState>>,
     _session_peer_counter: Arc<Mutex<SessionPeerCounter>>,
     tx: Sender<Vec<PeerStateChange>>,
+    sessions: Option<&Sessions>,
 ) {
     let Ok(slot) = tx.reserve().await else {
         return;
     };
-    let changes = apply_peer(state, &peers, &self_peer_state, None);
-    if !changes.is_empty() {
-        slot.send(changes);
-    }
+    with_observer_state(
+        &peers,
+        Some(&self_peer_state),
+        sessions,
+        |self_state, peers| {
+            let changes = apply_peer(state, peers, self_state.unwrap(), None);
+            if !changes.is_empty() {
+                slot.send(changes);
+            }
+        },
+    );
 }
 
 fn apply_peer(
     state: PeerState,
-    peers: &Mutex<Vec<ControllerPeer>>,
-    self_peer_state: &Mutex<PeerState>,
+    peers: &mut Vec<ControllerPeer>,
+    self_peer_state: &PeerState,
     deadline: Option<tokio::time::Instant>,
 ) -> Vec<PeerStateChange> {
-    let self_peer_state = self_peer_state.lock().unwrap_or_else(|e| e.into_inner());
     if state.ident() == self_peer_state.ident() {
         return Vec::new();
     }
-    let mut peers = peers.lock().unwrap_or_else(|e| e.into_inner());
     let timeline_changed = !peers.iter().any(|peer| {
         peer.peer_state.session_id() == state.session_id()
             && peer.peer_state.timeline() == state.timeline()
@@ -396,8 +467,7 @@ fn apply_peer(
     changes
 }
 
-fn remove_peer(node: NodeId, peers: &Mutex<Vec<ControllerPeer>>) -> Vec<PeerStateChange> {
-    let mut peers = peers.lock().unwrap_or_else(|e| e.into_inner());
+fn remove_peer(node: NodeId, peers: &mut Vec<ControllerPeer>) -> Vec<PeerStateChange> {
     let before = peers.len();
     peers.retain(|peer| peer.peer_state.ident() != node);
     if before != peers.len() {
@@ -411,14 +481,17 @@ async fn peer_left(
     node_id: NodeId,
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     tx: Sender<Vec<PeerStateChange>>,
+    sessions: Option<&Sessions>,
 ) {
     let Ok(slot) = tx.reserve().await else {
         return;
     };
-    let changes = remove_peer(node_id, &peers);
-    if !changes.is_empty() {
-        slot.send(changes);
-    }
+    with_observer_state(&peers, None, sessions, |_, peers| {
+        let changes = remove_peer(node_id, peers);
+        if !changes.is_empty() {
+            slot.send(changes);
+        }
+    });
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -428,6 +501,50 @@ pub struct ControllerPeer {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn origin_finality_last_departure_retires_candidate_before_result_or_reappearance() {
+        use crate::link::{
+            ghostxform::GhostXForm,
+            node::NodeState,
+            sessions::{Session, SessionMeasurement},
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for timed_out in [false, true] {
+                let id = SessionId(NodeId::from_array([1; 8]));
+                let first = PeerState { node_state: NodeState::new(id), ..Default::default() };
+                let mut second = first.clone(); second.node_state.node_id = NodeId::from_array([3; 8]);
+                let peers = Arc::new(Mutex::new(vec![ControllerPeer { peer_state: first.clone() }, ControllerPeer { peer_state: second.clone() }]));
+                let (tx_request, mut requests) = mpsc::channel(1);
+                let (tx_result, results) = mpsc::channel(1);
+                let (tx_join, mut joins) = mpsc::channel(1);
+                let (sessions, task) = Sessions::with_dispatch_gate(Session::new(SessionId(NodeId::from_array([2; 8])), Timeline::default(), SessionMeasurement::default()), tx_request, peers.clone(), Clock::new(), tx_join, results, Arc::new(DispatchGate::new_open()));
+                let (events, rx_events) = mpsc::channel(1);
+                let (changes, mut rx_changes) = mpsc::channel(1);
+                let _observer = GatewayObserver::new(rx_events, Arc::new(Mutex::new(PeerState::default())), Arc::new(Mutex::new(SessionPeerCounter::default())), changes, peers.clone(), Arc::new(Notify::new()), Some(sessions.clone())).await;
+                sessions.saw_session_timeline(id, Timeline::default()).await;
+                let MeasurePeerEvent::PeerState(old, _) = requests.recv().await.unwrap() else { panic!("initial request") };
+                events.send(PeerEvent::PeerLeft(first.ident())).await.unwrap(); rx_changes.recv().await.unwrap();
+                assert!(sessions.other_sessions.lock().unwrap().iter().any(|session| old.matches(session)), "another live peer preserves the candidate");
+                let departure = if timed_out { PeerEvent::PeerTimedOut(second.ident()) } else { PeerEvent::PeerLeft(second.ident()) };
+                events.send(departure).await.unwrap(); rx_changes.recv().await.unwrap();
+                assert!(!sessions.other_sessions.lock().unwrap().iter().any(|session| old.matches(session)), "last departure retires ownership before its notification is consumed by a controller");
+                tx_result.send(MeasurePeerEvent::XForm(old.clone(), GhostXForm { slope: 1.0, intercept: Duration::seconds(3) })).await.unwrap();
+                tokio::task::yield_now().await;
+                assert!(joins.try_recv().is_err(), "in-flight result cannot join an absent candidate");
+                events.send(PeerEvent::SawPeer(first)).await.unwrap(); rx_changes.recv().await.unwrap();
+                sessions.saw_session_timeline(id, Timeline::default()).await;
+                let MeasurePeerEvent::PeerState(fresh, _) = requests.recv().await.unwrap() else { panic!("fresh request") };
+                tx_result.send(MeasurePeerEvent::XForm(old.clone(), GhostXForm::default())).await.unwrap();
+                tx_result.send(MeasurePeerEvent::XForm(old, GhostXForm { slope: 1.0, intercept: Duration::seconds(3) })).await.unwrap();
+                tx_result.send(MeasurePeerEvent::XForm(fresh.clone(), GhostXForm { slope: 1.0, intercept: Duration::seconds(1) })).await.unwrap();
+                let joined = joins.recv().await.unwrap(); assert!(fresh.matches(&joined));
+                assert_eq!(peers.lock().unwrap().len(), 1);
+                assert!(joins.try_recv().is_err());
+                task.abort(); let _ = task.await;
+            }
+        }).await.unwrap();
+    }
+
     use std::net::IpAddr;
 
     use chrono::Duration;
@@ -462,6 +579,7 @@ mod tests {
                     changes,
                     peers.clone(),
                     Arc::new(Notify::new()),
+                    None,
                 )
                 .await;
                 let start = tokio::time::Instant::now();
@@ -550,6 +668,7 @@ mod tests {
                 peers.clone(),
                 self_state,
                 tx,
+                None,
             ));
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 while probe.capacity() != 0 {
@@ -591,6 +710,7 @@ mod tests {
             tx_changes,
             peers.clone(),
             gate.clone(),
+            None,
         )
         .await;
         let (stale, fresh, _) = init_peers();
@@ -629,6 +749,7 @@ mod tests {
             tx_changes,
             Arc::new(Mutex::new(vec![])),
             Arc::new(Notify::new()),
+            None,
         )
         .await;
         drop(tx_event);
@@ -654,6 +775,7 @@ mod tests {
             tx_changes,
             peers.clone(),
             Arc::new(Notify::new()),
+            None,
         )
         .await;
         tx_event
@@ -796,6 +918,7 @@ mod tests {
                 rx_measure_peer_state,
                 ping_responder_unicast_socket,
                 Arc::new(Mutex::new(true)), // enabled for test
+                None,
             )
             .await
             .unwrap(),
@@ -819,6 +942,7 @@ mod tests {
             gw.peer_state.clone(),
             gw.session_peer_counter.clone(),
             tx_peer_state_change.clone(),
+            None,
         )
         .await;
 
@@ -848,6 +972,7 @@ mod tests {
             gw.peer_state.clone(),
             gw.session_peer_counter.clone(),
             tx_peer_state_change.clone(),
+            None,
         )
         .await;
 
@@ -855,6 +980,7 @@ mod tests {
             foo_peer.ident(),
             gw.observer.peers.clone(),
             tx_peer_state_change.clone(),
+            None,
         )
         .await;
 
@@ -880,6 +1006,7 @@ mod tests {
                 gw.peer_state.clone(),
                 gw.session_peer_counter.clone(),
                 tx_peer_state_change.clone(),
+                None,
             )
             .await;
         }
@@ -888,6 +1015,7 @@ mod tests {
             foo_peer.ident(),
             gw.observer.peers.clone(),
             tx_peer_state_change.clone(),
+            None,
         )
         .await;
 
@@ -924,6 +1052,7 @@ mod tests {
             self_peer_state.clone(),
             session_peer_counter.clone(),
             tx_peer_state_change.clone(),
+            None,
         )
         .await;
 
@@ -963,6 +1092,7 @@ mod tests {
             self_peer_state.clone(),
             session_peer_counter.clone(),
             tx_peer_state_change.clone(),
+            None,
         )
         .await;
 
@@ -979,6 +1109,7 @@ mod tests {
             self_peer_state.clone(),
             session_peer_counter,
             tx_peer_state_change,
+            None,
         )
         .await;
 

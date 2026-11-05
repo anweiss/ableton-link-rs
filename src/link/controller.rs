@@ -541,26 +541,6 @@ impl Controller {
             SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
         )?);
 
-        let discovery = Arc::new(
-            PeerGateway::new(
-                peer_state.clone(),
-                session_state.clone(),
-                clock,
-                session_peer_counter.clone(),
-                tx_peer_state_change,
-                tx_event,
-                tx_measure_peer_result.clone(),
-                peers.clone(),
-                notifier.clone(),
-                rx_measure_peer_state,
-                ping_responder_unicast_socket,
-                enabled.clone(),
-            )
-            .await?,
-        );
-        discovery.measurement_service.stop().await;
-        discovery.stop().await;
-
         let mut dispatch = DispatchTasks::new();
         let (sessions, session_task) = Sessions::with_dispatch_gate(
             Session {
@@ -584,6 +564,27 @@ impl Controller {
             dispatch.gate.clone(),
         );
         dispatch.tasks.push(session_task);
+
+        let discovery = Arc::new(
+            PeerGateway::new(
+                peer_state.clone(),
+                session_state.clone(),
+                clock,
+                session_peer_counter.clone(),
+                tx_peer_state_change,
+                tx_event,
+                tx_measure_peer_result.clone(),
+                peers.clone(),
+                notifier.clone(),
+                rx_measure_peer_state,
+                ping_responder_unicast_socket,
+                enabled.clone(),
+                Some(sessions.clone()),
+            )
+            .await?,
+        );
+        discovery.measurement_service.stop().await;
+        discovery.stop().await;
 
         let s_state_loop = session_state.clone();
         let c_state_loop = client_state.clone();
@@ -1312,6 +1313,8 @@ fn join_session_current(
     if !session.key().matches(current) {
         return None;
     }
+    // The queued identity grants ownership, not authority to restore older fields.
+    let session = current.clone();
     let session_id_changed = if let Ok(ps) = peer_state.try_lock() {
         ps.session_id() != session.session_id
     } else {
@@ -1505,7 +1508,7 @@ fn reset_state_current(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
-    discovery.observer.reset_peers();
+    discovery.observer.reset_peers_after_session_reset();
     changed
 }
 
@@ -1750,6 +1753,58 @@ pub struct SessionPeerCounter {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
+    #[tokio::test]
+    async fn origin_finality_queued_join_uses_latest_same_incarnation_snapshot() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+                .await
+                .unwrap();
+            let queued = controller.sessions.current.lock().unwrap().clone();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(queued.clone()).await.unwrap();
+            let mut latest = queued.clone();
+            latest.timeline.tempo = tempo::Tempo::new(141.0);
+            latest.measurement.x_form = GhostXForm {
+                slope: 1.0,
+                intercept: chrono::Duration::seconds(3),
+            };
+            *controller.sessions.current.lock().unwrap() = latest.clone();
+            assert!(queued.key().matches(&latest));
+            join_session(
+                rx.recv().await.unwrap(),
+                controller.peer_state.clone(),
+                controller.session_state.clone(),
+                controller.client_state.clone(),
+                controller.clock,
+                controller.start_stop_sync_enabled.clone(),
+                controller.discovery.clone(),
+                controller.peers.clone(),
+                controller.session_peer_counter.clone(),
+                controller.sessions.clone(),
+                controller.managed_tempo_callback.clone(),
+            )
+            .await;
+            assert_eq!(
+                controller.session_state.lock().unwrap().timeline.tempo,
+                latest.timeline.tempo
+            );
+            assert_eq!(
+                controller.session_state.lock().unwrap().ghost_x_form,
+                latest.measurement.x_form
+            );
+            assert_eq!(
+                controller.peer_state.lock().unwrap().timeline().tempo,
+                latest.timeline.tempo
+            );
+            assert_eq!(
+                controller.client_state.lock().unwrap().timeline.tempo,
+                latest.timeline.tempo
+            );
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn queued_join_cannot_restore_an_incarnation_replaced_by_live_reset() {
         tokio::time::timeout(TEST_TIMEOUT, async {

@@ -192,18 +192,20 @@ impl MeasurementService {
             {
                 if let MeasurePeerEvent::PeerState(session_id, peer) = event {
                     let route = match &routes {
-                        Some(routes) => match routes.resolve(&peer) {
-                            Some(route) => Some(route),
-                            None => {
-                                tokio::select! {
-                                    biased;
-                                    _ = open.closed() => {}
-                                    _ = t_peer.send(MeasurePeerEvent::Cancelled(session_id)) => {}
+                        Some(routes) if peer.measurement_endpoint.is_some() => {
+                            match routes.resolve(&peer) {
+                                Some(route) => Some(route),
+                                None => {
+                                    tokio::select! {
+                                        biased;
+                                        _ = open.closed() => {}
+                                        _ = t_peer.send(MeasurePeerEvent::Cancelled(session_id)) => {}
+                                    }
+                                    continue;
                                 }
-                                continue;
                             }
-                        },
-                        None => None,
+                        }
+                        _ => None,
                     };
                     let socket = route
                         .as_ref()
@@ -693,9 +695,8 @@ impl Measurement {
                 .lock()
                 .unwrap()
                 .insert(SocketAddr::V4(endpoint), tx_pong);
+            spawn_pong_dispatch(socket.clone(), pong_dispatch);
         }
-
-        spawn_pong_dispatch(socket.clone(), pong_dispatch);
 
         Self::with_socket(state, clock, tx_measurement, notifier, socket, rx_pong).await
     }
@@ -763,6 +764,15 @@ impl Measurement {
             job: Arc::new(()),
         };
 
+        let Some(endpoint) = state.measurement_endpoint else {
+            select! {
+                biased;
+                _ = &mut cancelled => { measurement.cancelled = true; }
+                _ = tx_measurement.send(Vec::new()) => {}
+            }
+            return measurement;
+        };
+
         let ht = HostTime::new(clock.micros());
 
         let s = success.clone();
@@ -775,13 +785,7 @@ impl Measurement {
 
         measurement.tasks.0.push(tokio::spawn(async move {
             while rx_timer.recv().await.is_some() {
-                finish(
-                    s.clone(),
-                    state.measurement_endpoint.unwrap(),
-                    d.clone(),
-                    t.clone(),
-                )
-                .await;
+                finish(s.clone(), endpoint, d.clone(), t.clone()).await;
                 fn_loop.notify_one();
             }
         }));
@@ -796,7 +800,7 @@ impl Measurement {
         let initial_send = send_ping_via(
             unicast_socket.clone(),
             route.clone(),
-            state.measurement_endpoint.unwrap(),
+            endpoint,
             &initial_payload,
         );
         let init_bytes_sent = select! {
@@ -812,7 +816,7 @@ impl Measurement {
             measurement.measurements_started.clone(),
             clock,
             Some(unicast_socket.clone()),
-            state.measurement_endpoint.unwrap(),
+            endpoint,
             data.clone(),
             tx_terminal,
             finished_notifier.clone(),
@@ -828,24 +832,38 @@ impl Measurement {
                 measurement.cancelled = true;
                 measurement.tasks.abort();
             }
-            _ = async {
+            published = async {
                 timer.await;
                 if let Some(samples) = rx_terminal.recv().await {
                     rx_terminal.close();
                     if let Ok(slot) = tx_measurement.reserve().await {
-                        if let Some(route) = &route { route.while_current(|| slot.send(samples)); }
-                        else { slot.send(samples); }
+                        if let Some(route) = &route {
+                            #[cfg(test)]
+                            route.before_sample_publication();
+                            return route.while_current(|| slot.send(samples)).is_some();
+                        }
+                        slot.send(samples);
                     }
                 }
-            } => {}
+                true
+            } => {
+                if !published {
+                    measurement.cancelled = true;
+                    measurement.tasks.abort();
+                }
+            }
         }
 
         measurement
     }
 
     pub async fn listen(&mut self, mut rx_pong: Receiver<PongMessage>) {
-        let socket = self.unicast_socket.as_ref().unwrap().clone();
-        let endpoint = *self.measurement_endpoint.as_ref().unwrap();
+        let (Some(socket), Some(endpoint)) =
+            (self.unicast_socket.clone(), self.measurement_endpoint)
+        else {
+            debug!("measurement has no socket or endpoint to listen with");
+            return;
+        };
 
         let clock = self.clock;
         #[cfg(test)]
@@ -917,11 +935,14 @@ impl Measurement {
                         }
 
                         let Some(samples) = pong_samples(host_time, prev_host_time, ghost_time, prev_ghost_time) else { continue; };
-                        let append = || data.lock().unwrap_or_else(|e| e.into_inner()).extend(samples);
-                        if let Some(route) = &route { if route.while_current(append).is_none() { break; } }
-                        else { append(); }
+                        {
+                            let mut data = data.lock().unwrap_or_else(|e| e.into_inner());
+                            let append = || data.extend(samples);
+                            if let Some(route) = &route { if route.while_current(append).is_none() { break; } }
+                            else { append(); }
+                        }
 
-                        if data.try_lock().unwrap().len() > NUMBER_DATA_POINTS {
+                        if data.lock().unwrap_or_else(|e| e.into_inner()).len() > NUMBER_DATA_POINTS {
                             if let Err(error) = tx_timer.send(()).await {
                                 debug!("measurement timer closed during cancellation: {}", error);
                             }
@@ -988,10 +1009,10 @@ pub(crate) async fn reset_timer(
 
                     *measurements_started.try_lock().unwrap() += 1;
                 } else {
-                    data.try_lock().unwrap().clear();
+                    data.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     info!("measuring {} failed", measurement_endpoint);
 
-                    let data = data.try_lock().unwrap().clone();
+                    let data = data.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     publish_samples(&tx_measurement, data);
                     break;
                 }
@@ -1009,12 +1030,12 @@ async fn finish(
     data: Arc<Mutex<Vec<(f64, f64)>>>,
     tx_measurement: Sender<Vec<(f64, f64)>>,
 ) {
-    *success.try_lock().unwrap() = true;
+    *success.lock().unwrap_or_else(|e| e.into_inner()) = true;
     debug!("measuring {} done", measurement_endpoint);
 
-    let d = data.try_lock().unwrap().clone();
+    let d = data.lock().unwrap_or_else(|e| e.into_inner()).clone();
     publish_samples(&tx_measurement, d);
-    data.try_lock().unwrap().clear();
+    data.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 pub async fn send_ping(
@@ -1113,6 +1134,145 @@ fn pong_samples(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn origin_finality_completion_survives_contended_sample_state() {
+        let expected = vec![(1.0, 2.0), (3.0, 4.0)];
+        let data = Arc::new(Mutex::new(expected.clone()));
+        let success = Arc::new(Mutex::new(false));
+        let held = data.clone();
+        let (ready, ready_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let guard = held.lock().unwrap();
+            ready.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            drop(guard);
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let task = tokio::spawn(finish(
+            success.clone(),
+            "127.0.0.1:12345".parse().unwrap(),
+            data.clone(),
+            tx,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !*success.lock().unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        task.await
+            .expect("sample-state contention must not panic the completion worker");
+        assert_eq!(rx.recv().await.unwrap(), expected);
+        assert!(data.lock().unwrap().is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn origin_finality_endpointless_public_constructors_fail_without_workers() {
+        for direct in [true, false] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let notify = Arc::new(Notify::new());
+            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let (_pongs, pong_rx) = mpsc::channel(1);
+            let mut measurement = if direct {
+                Measurement::new(PeerState::default(), Clock::new(), tx, notify).await
+            } else {
+                Measurement::with_socket(
+                    PeerState::default(),
+                    Clock::new(),
+                    tx,
+                    notify,
+                    socket.clone(),
+                    pong_rx,
+                )
+                .await
+            };
+            assert!(rx.recv().await.unwrap().is_empty());
+            let (_tx, rx_pong) = mpsc::channel(1);
+            measurement.listen(rx_pong).await;
+            assert!(measurement.tasks.0.is_empty());
+            assert_eq!(measurement.init_bytes_sent, 0);
+            let probe = measurement.unicast_socket.as_ref().map(Arc::downgrade);
+            drop(socket);
+            drop(measurement);
+            assert!(
+                probe.is_none_or(|probe| probe.upgrade().is_none()),
+                "no dispatcher retains a missing-endpoint socket"
+            );
+        }
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(Vec::new()).await.unwrap();
+        let notifier = Arc::new(Notify::new());
+        let mut pending = Box::pin(Measurement::new(
+            PeerState::default(),
+            Clock::new(),
+            tx,
+            notifier.clone(),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        notifier.notify_waiters();
+        let measurement = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .unwrap();
+        assert!(measurement.tasks.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn origin_finality_endpointless_managed_request_is_terminal_failure() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let (tx_request, requests) = mpsc::channel(1);
+            let (tx_result, mut results) = mpsc::channel(1);
+            let service = MeasurementService::new_with_routes(socket, Arc::new(Mutex::new(PeerState::default())), Arc::new(Mutex::new(SessionState::default())), Clock::new(), tx_result, Arc::new(Notify::new()), requests, Some(MeasurementRoutes::default())).await;
+            let session = crate::link::sessions::Session::new(SessionId::default(), crate::link::timeline::Timeline::default(), crate::link::sessions::SessionMeasurement::default());
+            tx_request.send(MeasurePeerEvent::PeerState(session.key(), PeerState::default())).await.unwrap();
+            assert!(matches!(results.recv().await, Some(MeasurePeerEvent::XForm(key, xform)) if key.matches(&session) && xform == GhostXForm::default()));
+            assert!(service.measurement_map.lock().unwrap().is_empty());
+            assert!(service.pong_dispatch.lock().unwrap().is_empty());
+            assert!(results.try_recv().is_err());
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn origin_finality_rejected_sample_commit_delivers_one_cancelled_origin() {
+        use crate::link::sessions::{Session, SessionMeasurement, SessionMembership};
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let clock = Clock::new();
+            let peer_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let SocketAddr::V4(endpoint) = peer_socket.local_addr().unwrap() else { panic!("IPv4") };
+            let session = Session::new(SessionId(NodeId::from_array([1; 8])), crate::link::timeline::Timeline::default(), SessionMeasurement::default());
+            let state = PeerState { node_state: NodeState::new(session.session_id), measurement_endpoint: Some(endpoint), ..PeerState::default() };
+            let (route, _retire) = MeasurementRoute::test_fixture();
+            route.retire_at_sample_publication();
+            let routes = MeasurementRoutes::default(); routes.test_record(&state, route.clone());
+            let (tx_request, requests) = mpsc::channel(1);
+            let (tx_result, mut results) = mpsc::channel(1);
+            let service = MeasurementService::new_with_routes(Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap()), Arc::new(Mutex::new(PeerState::default())), Arc::new(Mutex::new(SessionState::default())), clock, tx_result, Arc::new(Notify::new()), requests, Some(routes)).await;
+            tx_request.send(MeasurePeerEvent::PeerState(session.key(), state)).await.unwrap();
+            let mut buffer = [0; MAX_MESSAGE_SIZE]; peer_socket.recv_from(&mut buffer).await.unwrap();
+            let pong = encode_message(PONG, &Payload { entries: vec![PayloadEntry::SessionMembership(SessionMembership::from(session.session_id)), PayloadEntry::HostTime(HostTime::new(Duration::microseconds(100))), PayloadEntry::GhostTime(crate::link::payload::GhostTime::new(Duration::microseconds(1_000_000))), PayloadEntry::PrevGhostTime(PrevGhostTime::new(Duration::microseconds(1_000_100)))] }).unwrap();
+            let sender = route.dispatch().lock().unwrap().get(&endpoint.into()).unwrap().clone();
+            for _ in 0..11 { sender.send((pong.clone(), endpoint.into())).await.unwrap(); }
+            assert!(matches!(results.recv().await, Some(MeasurePeerEvent::Cancelled(key)) if key.matches(&session)), "rejected publication must not silently end the result stream");
+            assert!(service.measurement_map.lock().unwrap().is_empty());
+            assert!(route.dispatch().lock().unwrap().is_empty());
+            assert!(results.try_recv().is_err());
+        }).await.unwrap();
+    }
+
     #[tokio::test]
     async fn retired_first_measurement_recovers_on_a_new_valid_route() {
         use crate::link::sessions::{Session, SessionMeasurement, SessionMembership, Sessions};
@@ -1754,6 +1914,7 @@ mod tests {
                 rx_measure_peer_state,
                 ping_responder_unicast_socket,
                 Arc::new(Mutex::new(true)),
+                None,
             )
             .await
             .unwrap(),
