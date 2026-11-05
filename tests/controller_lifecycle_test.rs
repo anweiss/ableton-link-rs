@@ -148,7 +148,7 @@ async fn test_tempo_callback_fires_on_each_commit() {
 async fn test_audio_session_state_roundtrip() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let mut link = BasicLink::new(120.0).await.unwrap();
+    let link = BasicLink::new(120.0).await.unwrap();
 
     // Capture, modify, commit via audio path
     let mut state = link.capture_audio_session_state();

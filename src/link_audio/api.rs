@@ -223,7 +223,7 @@ impl LinkAudio {
 
     /// Forwards the bounded, non-RT audio commit drain.
     pub async fn process_audio_session_state_updates(
-        &mut self,
+        &self,
     ) -> Option<(
         crate::link::AudioCommitTicket,
         Result<(), crate::link::CommitError>,

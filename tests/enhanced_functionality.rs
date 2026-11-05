@@ -194,7 +194,7 @@ async fn test_enhanced_basic_link() {
 async fn test_realtime_session_state() {
     info!("Testing real-time session state handling");
 
-    let mut link = BasicLink::new(140.0).await.unwrap();
+    let link = BasicLink::new(140.0).await.unwrap();
 
     // Capture initial state
     let mut session_state = link.capture_audio_session_state();

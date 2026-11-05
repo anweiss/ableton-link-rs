@@ -1,4 +1,4 @@
-use ableton_link_rs::link::{BasicLink, SessionState};
+use ableton_link_rs::link::{BasicLink, CommitError, SessionState};
 use cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{cpal, Player, SampleRate};
 use std::io::{self, Write};
@@ -622,6 +622,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .commit_app_session_state(session_state.clone())
                 .await
             {
+                if error == CommitError::StaleClientState {
+                    state_guard.is_playing = false;
+                }
                 session_state = state_guard.link.capture_app_session_state();
                 eprintln!("Link edit rejected: {error}");
             }
