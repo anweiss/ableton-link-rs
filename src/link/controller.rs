@@ -406,6 +406,69 @@ type PublicationPause = (
     tokio::sync::oneshot::Receiver<()>,
 );
 
+type WeakTempoCallback = std::sync::Weak<Mutex<Box<dyn Fn(f64) + Send>>>;
+
+struct TempoNotifications {
+    callback: Arc<Mutex<Option<TempoCallback>>>,
+    client: Arc<Mutex<ClientState>>,
+    closed: Arc<AtomicBool>,
+    registration: Mutex<Option<TempoCallback>>,
+    delivered: Mutex<(Option<WeakTempoCallback>, f64)>,
+    dispatch: tokio::sync::Mutex<()>,
+}
+
+impl TempoNotifications {
+    fn dispatch(&self, initial_requested: bool) {
+        let Ok(_dispatch) = self.dispatch.try_lock() else {
+            return;
+        };
+        let Some(registration) = try_state(&self.registration) else {
+            return;
+        };
+        let Some(mut installed) = try_state(&self.callback) else {
+            return;
+        };
+        let initial = registration.is_some();
+        let retired = registration
+            .as_ref()
+            .and_then(|callback| installed.replace(callback.clone()));
+        let callback = installed.clone();
+        drop(installed);
+        drop(registration);
+        drop(retired);
+        let Some(callback) = callback else { return };
+        let Some(invoke) = try_state(&callback) else {
+            return;
+        };
+        // Select the value only after serializing callback delivery.
+        let Some(bpm) = try_state(&self.client).map(|state| state.timeline.tempo.bpm()) else {
+            return;
+        };
+        let delivered = self.delivered.lock().unwrap_or_else(|e| e.into_inner());
+        let same_callback = delivered
+            .0
+            .as_ref()
+            .is_none_or(|old| std::sync::Weak::ptr_eq(old, &Arc::downgrade(&callback)));
+        let initial = initial || (initial_requested && delivered.0.is_none());
+        if (!initial && same_callback && delivered.1 == bpm) || self.closed.load(Ordering::Acquire)
+        {
+            return;
+        }
+        drop(delivered);
+        invoke(bpm);
+        *self.delivered.lock().unwrap_or_else(|e| e.into_inner()) =
+            (Some(Arc::downgrade(&callback)), bpm);
+        if let Some(mut registration) = try_state(&self.registration) {
+            if registration
+                .as_ref()
+                .is_some_and(|pending| Arc::ptr_eq(pending, &callback))
+            {
+                *registration = None;
+            }
+        }
+    }
+}
+
 pub struct Controller {
     #[cfg(test)]
     publication_pause: Arc<Mutex<Option<PublicationPause>>>,
@@ -414,6 +477,7 @@ pub struct Controller {
     io: Option<crate::platform::io_context::IoContext>,
     callbacks_closed: Arc<AtomicBool>,
     managed_tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
+    tempo_notifications: Arc<TempoNotifications>,
     pub tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
     /// Invoked whenever a peer's discovered audio endpoint changes. Rust
     /// analogue of upstream's `Controller::SawAudioEndpointCallback`. Set via
@@ -447,6 +511,17 @@ impl Drop for Controller {
 }
 
 impl Controller {
+    pub(crate) fn register_tempo_callback(&self, callback: TempoCallback) {
+        let retired = self
+            .tempo_notifications
+            .registration
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(callback);
+        drop(retired);
+        self.tempo_notifications.dispatch(true);
+    }
+
     #[cfg(feature = "audio")]
     pub(crate) fn spawn_on_io<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
@@ -488,25 +563,17 @@ impl Controller {
         let audio_endpoint_callback: Arc<Mutex<Option<AudioEndpointCallback>>> =
             Arc::new(Mutex::new(None));
         let callbacks_closed = Arc::new(AtomicBool::new(false));
-        let callback = tempo_callback.clone();
-        let closed = callbacks_closed.clone();
-        let current_client = client_state.clone();
-        let managed: TempoCallback = Arc::new(Mutex::new(Box::new(move |bpm| {
-            let callback = callback
-                .try_lock()
-                .ok()
-                .and_then(|callback| callback.clone());
-            if let Some(callback) = callback {
-                if let Ok(callback) = callback.try_lock() {
-                    let current = current_client
-                        .try_lock()
-                        .is_ok_and(|state| state.timeline.tempo.bpm() == bpm);
-                    if current && !closed.load(Ordering::Acquire) {
-                        callback(bpm);
-                    }
-                }
-            }
-        })));
+        let tempo_notifications = Arc::new(TempoNotifications {
+            callback: tempo_callback.clone(),
+            client: client_state.clone(),
+            closed: callbacks_closed.clone(),
+            registration: Mutex::new(None),
+            delivered: Mutex::new((None, s_state.timeline.tempo.bpm())),
+            dispatch: tokio::sync::Mutex::new(()),
+        });
+        let notifications = tempo_notifications.clone();
+        let managed: TempoCallback =
+            Arc::new(Mutex::new(Box::new(move |_| notifications.dispatch(true))));
         let managed_tempo_callback = Arc::new(Mutex::new(Some(managed)));
         let callback = audio_endpoint_callback.clone();
         let closed = callbacks_closed.clone();
@@ -558,6 +625,18 @@ impl Controller {
         )?);
 
         let mut dispatch = DispatchTasks::new();
+        let notifications = tempo_notifications.clone();
+        dispatch.tasks.push(tokio::spawn(async move {
+            let mut retry = tokio::time::interval(std::time::Duration::from_millis(10));
+            retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                retry.tick().await;
+                if notifications.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                notifications.dispatch(false);
+            }
+        }));
         let (sessions, session_task) = Sessions::with_dispatch_gate(
             Session {
                 incarnation: Arc::new(()),
@@ -760,6 +839,7 @@ impl Controller {
             io: None,
             callbacks_closed,
             managed_tempo_callback,
+            tempo_notifications,
             tempo_callback,
             audio_endpoint_callback,
             peer_state,
@@ -1777,8 +1857,9 @@ fn map_start_stop_state_from_session_to_client(
     session_timeline: Timeline,
     x_form: GhostXForm,
 ) -> ClientStartStopState {
-    let time =
-        x_form.ghost_to_host_nanos(session_timeline.from_beats(session_start_stop_state.beats));
+    let time = x_form.ghost_nanos_to_host(
+        session_timeline.nanos_at_microbeats(session_start_stop_state.beats.value.into()),
+    );
     let timestamp = x_form.ghost_to_host_nanos(session_start_stop_state.timestamp);
     ClientStartStopState {
         is_playing: session_start_stop_state.is_playing,
@@ -4327,6 +4408,71 @@ mod dispatch_gate_tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[tokio::test]
+    async fn ordering_tempo_registration_and_latest_delivery_survive_contention() {
+        for registry_busy in [true, false] {
+            let mut link = crate::link::BasicLink::new(120.0).await.unwrap();
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let values = observed.clone();
+            let registry = link.controller.tempo_callback.clone();
+            let registry_guard = registry_busy.then(|| registry.lock().unwrap());
+            link.set_tempo_callback(move |bpm| values.lock().unwrap().push(bpm));
+            let callback = link.tempo_callback.clone().unwrap();
+            let callback_guard = (!registry_busy).then(|| callback.lock().unwrap());
+            let mut expected = if registry_busy { vec![] } else { vec![120.0] };
+            for bpm in [150.0, 175.0] {
+                let current = *link.controller.client_state.lock().unwrap();
+                link.controller
+                    .set_state(IncomingClientState {
+                        timeline: Some(Timeline {
+                            tempo: tempo::Tempo::new(bpm),
+                            ..current.timeline
+                        }),
+                        start_stop_state: None,
+                        timeline_timestamp: link.clock().micros(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(*observed.lock().unwrap(), expected);
+            drop(registry_guard);
+            drop(callback_guard);
+            tokio::time::timeout(TEST_TIMEOUT, async {
+                while observed.lock().unwrap().last() != Some(&175.0) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            expected.push(175.0);
+            assert_eq!(*observed.lock().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn ordering_playback_time_maps_wide_beats_before_duration_clamping() {
+        let session = Timeline {
+            tempo: tempo::Tempo::new(60.0),
+            beat_origin: Beats::new(-1.0),
+            time_origin: chrono::Duration::MAX,
+        };
+        let form = GhostXForm {
+            slope: 2.0,
+            intercept: chrono::Duration::zero(),
+        };
+        let received = StartStopState {
+            is_playing: true,
+            beats: Beats::default(),
+            timestamp: chrono::Duration::zero(),
+        };
+        let mapped = map_start_stop_state_from_session_to_client(received, session, form);
+        let expected = crate::link::duration_from_nanos(crate::link::round_ratio(
+            crate::link::duration_nanos(chrono::Duration::MAX) + 1_000_000_000,
+            2,
+        ));
+        assert_eq!(mapped.time, expected);
+    }
+
+    #[tokio::test]
     async fn managed_tempo_cannot_follow_a_newer_public_app_callback() {
         let mut link = crate::link::BasicLink::new(121.0).await.unwrap();
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -5147,11 +5293,11 @@ mod dispatch_gate_tests {
                 timeline.tempo
             );
             assert_eq!(controller.num_peers(), 1);
-            assert_eq!(controller.dispatch.tasks.len(), 4);
+            assert_eq!(controller.dispatch.tasks.len(), 5);
 
             controller.enable().await;
             assert_eq!(controller.session_id(), peer_session);
-            assert_eq!(controller.dispatch.tasks.len(), 4);
+            assert_eq!(controller.dispatch.tasks.len(), 5);
 
             controller.disable().await;
             assert!(!controller.is_enabled());
@@ -5373,7 +5519,7 @@ mod dispatch_gate_tests {
             .iter()
             .map(tokio::task::JoinHandle::abort_handle)
             .collect();
-        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks.len(), 4);
 
         // Stand in for `enable()`, which additionally starts discovery: the
         // gate state this test is about is exactly what `enable()` sets.

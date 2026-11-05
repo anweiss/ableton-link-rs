@@ -305,7 +305,9 @@ only copyable values, not reference-counted allocations that could be freed on a
 audio thread. Process-local edit identifiers never wrap; exhaustion prevents new
 captures from authorizing commits rather than reusing an old identifier.
 `SessionState` is now `Clone`, not `Copy`; use `.clone()` if retaining a submitted
-snapshot. Commit states captured by the same `BasicLink`, rather than constructing
+snapshot. Value equality excludes private commit provenance, so equal captured
+values do not compare differently just because one capture lacked provenance.
+Commit states captured by the same `BasicLink`, rather than constructing
 an untracked `SessionState::new` or default value for submission. A contended or
 not-yet-published capture has no commit provenance and returns `StaleClientState`
 on submission processing; recapture after publication settles. Read-only captures
@@ -325,6 +327,9 @@ Audio commits now explicitly mean **queued**, not accepted.
 It never changes captured state optimistically. There is one outstanding slot:
 handle `Busy` (including lock contention) without assuming submission, and
 `TicketExhausted` rather than expecting identifiers to wrap.
+Tickets also carry a non-reused queue identity. A ticket from another instance
+returns `UnknownTicket` without acknowledging the local result; low-level
+completion rejects it too.
 Call `process_audio_session_state_updates().await` periodically from a non-RT
 application thread, including to refresh remote accepted state. It drains at most
 one request through the checked controller path; `LinkAudio` forwards this method.
@@ -342,7 +347,11 @@ state only after invoking the callback. A busy dispatcher retains the latest
 pending playback value; intermediate undelivered values may coalesce. No
 controller/cache guard is held while user callbacks run.
 Tempo notification remains in the controller and is not dispatched again
-by the drain. The lower-level `AtomicSessionState` and
+by the drain. Registration and latest-value delivery survive callback/registry
+contention and are retried on the owned IO runtime. Intermediate undelivered
+tempo changes may coalesce. The current accepted tempo is selected after
+callback serialization, and delivery is recorded after invocation.
+The lower-level `AtomicSessionState` and
 `SafeRtSessionStateHandler` follow the same proposal/completion contract:
 `process_pending_updates` peeks, `pending_update` also supplies the ticket,
 `publish_client_state` installs only a controller-accepted snapshot, and
@@ -636,7 +645,7 @@ let is_playing = state.is_playing();
 
 ```rust
 let state_a = link.capture_app_session_state();
-let state_b = state_a;
+let state_b = state_a.clone();
 assert_eq!(state_a, state_b);
 ```
 

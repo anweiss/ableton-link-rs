@@ -254,24 +254,7 @@ impl BasicLink {
         let cb: TempoCallback = Arc::new(Mutex::new(Box::new(callback)));
         self.tempo_callback = Some(cb.clone());
 
-        // Also wire the callback into the controller for peer-initiated tempo changes
-        if let Ok(mut guard) = self.controller.tempo_callback.try_lock() {
-            *guard = Some(cb);
-        }
-
-        let bpm = self
-            .controller
-            .client_state
-            .try_lock()
-            .ok()
-            .map(|state| state.timeline.tempo.bpm());
-        if let Some(bpm) = bpm {
-            if let Some(ref callback) = self.tempo_callback {
-                if let Ok(callback) = callback.try_lock() {
-                    callback(bpm);
-                }
-            }
-        }
+        self.controller.register_tempo_callback(cb);
     }
 
     pub fn set_start_stop_callback<F>(&mut self, callback: F)
@@ -565,12 +548,21 @@ impl ApiStartStopState {
 }
 
 #[cfg(feature = "std")]
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct SessionState {
     original_state: ApiState,
     state: ApiState,
     respect_quantum: bool,
     origin: Option<sessions::SessionEditOrigin>,
+}
+
+#[cfg(feature = "std")]
+impl PartialEq for SessionState {
+    fn eq(&self, other: &Self) -> bool {
+        self.original_state == other.original_state
+            && self.state == other.state
+            && self.respect_quantum == other.respect_quantum
+    }
 }
 
 #[cfg(feature = "std")]
@@ -693,6 +685,46 @@ mod tests {
     use tracing::info;
 
     use super::*;
+
+    #[tokio::test]
+    async fn ordering_session_state_equality_ignores_capture_provenance() {
+        let link = BasicLink::new(120.0).await.unwrap();
+        let captured = link.capture_app_session_state();
+        assert!(captured.origin.is_some());
+        let guard = link.controller.session_state.lock().unwrap();
+        let fallback = link.capture_app_session_state();
+        assert!(fallback.origin.is_none());
+        assert_eq!(captured, fallback);
+        drop(guard);
+        let mut edited = captured.clone();
+        edited.set_tempo(150.0, link.clock.micros());
+        assert_ne!(captured, edited);
+    }
+
+    #[tokio::test]
+    async fn ordering_audio_tickets_are_bound_to_their_link() {
+        let first = BasicLink::new(120.0).await.unwrap();
+        let second = BasicLink::new(120.0).await.unwrap();
+        let a = first
+            .commit_audio_session_state(first.capture_audio_session_state())
+            .unwrap();
+        let b = second
+            .commit_audio_session_state(second.capture_audio_session_state())
+            .unwrap();
+        assert_ne!(a, b);
+        first.process_audio_session_state_updates().await;
+        second.process_audio_session_state_updates().await;
+        assert_eq!(
+            second.take_audio_commit_result(a),
+            Err(AudioQueueError::UnknownTicket)
+        );
+        assert_eq!(
+            first.take_audio_commit_result(b),
+            Err(AudioQueueError::UnknownTicket)
+        );
+        assert_eq!(first.take_audio_commit_result(a), Ok(Some(Ok(()))));
+        assert_eq!(second.take_audio_commit_result(b), Ok(Some(Ok(()))));
+    }
 
     #[tokio::test]
     async fn ordering_callback_registration_releases_client_guard() {

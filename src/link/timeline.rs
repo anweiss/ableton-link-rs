@@ -57,9 +57,13 @@ impl Timeline {
     }
 
     pub(crate) fn time_at_microbeats(&self, beats: i128) -> Duration {
+        super::duration_from_nanos(self.nanos_at_microbeats(beats))
+    }
+
+    pub(crate) fn nanos_at_microbeats(&self, beats: i128) -> i128 {
         let difference = beats - i128::from(self.beat_origin.value);
         let elapsed = self.tempo.nanos_from_microbeats(difference);
-        super::duration_from_nanos(super::duration_nanos(self.time_origin).saturating_add(elapsed))
+        super::duration_nanos(self.time_origin).saturating_add(elapsed)
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -133,7 +137,7 @@ pub fn update_client_timeline_from_session(
         time_origin: at_time,
     };
 
-    let host_beat_zero = x_form.ghost_to_host_nanos(session.from_beats(Beats { value: 0i64 }));
+    let host_beat_zero = x_form.ghost_nanos_to_host(session.nanos_at_microbeats(0));
     Timeline {
         tempo: temp_tl.tempo,
         beat_origin: temp_tl.to_beats(host_beat_zero),
@@ -188,6 +192,39 @@ pub fn shift_client_timeline(client: Timeline, shift: Beats) -> Timeline {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wide_beat_zero_is_mapped_before_chrono_clamping() {
+        for sign in [-1, 1] {
+            for slope in [-2, 2] {
+                let session = Timeline {
+                    tempo: Tempo::new(60.0),
+                    beat_origin: Beats::new(-f64::from(sign)),
+                    time_origin: if sign < 0 {
+                        Duration::MIN
+                    } else {
+                        Duration::MAX
+                    },
+                };
+                let wide = crate::link::duration_nanos(session.time_origin)
+                    + i128::from(sign) * 1_000_000_000;
+                let expected = crate::link::duration_from_nanos(crate::link::round_ratio(
+                    wide,
+                    i128::from(slope),
+                ));
+                let mapped = update_client_timeline_from_session(
+                    Timeline::default(),
+                    session,
+                    Duration::zero(),
+                    GhostXForm {
+                        slope: f64::from(slope),
+                        intercept: Duration::zero(),
+                    },
+                );
+                assert_eq!(mapped.time_origin, expected);
+            }
+        }
+    }
+
     #[test]
     fn wide_boundary_timeline_converts_before_narrowing() {
         let timeline = Timeline {
