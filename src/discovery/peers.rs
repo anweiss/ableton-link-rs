@@ -42,6 +42,8 @@ pub struct GatewayObserver {
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     sessions: Option<Sessions>,
     task: tokio::task::JoinHandle<()>,
+    #[cfg(test)]
+    pub(crate) state_ready: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for GatewayObserver {
@@ -91,6 +93,10 @@ impl GatewayObserver {
         let observer_peers = peers.clone();
         let peer_state_loop = peer_state.clone();
 
+        #[cfg(test)]
+        let state_ready = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(test)]
+        let observed_state_ready = state_ready.clone();
         let mut open = gate.subscribe();
         let task = tokio::spawn(async move {
             while let Some((_permit, _, peer_event)) =
@@ -105,6 +111,8 @@ impl GatewayObserver {
                                 peer_state_loop.clone(),
                                 tx_peer_state_change.clone(),
                                 sessions.as_ref(),
+                                #[cfg(test)]
+                                Some(&observed_state_ready),
                             )
                             .await;
                         }
@@ -151,6 +159,8 @@ impl GatewayObserver {
             peers: observer_peers,
             sessions: observer_sessions,
             task,
+            #[cfg(test)]
+            state_ready,
         }
     }
 
@@ -175,15 +185,27 @@ impl GatewayObserver {
             }
         };
 
-        with_observer_state(&self.peers, None, self.sessions.as_ref(), |_, peers| {
-            peers.retain(|peer| peer.peer_state.session_id() != session_id_val);
-        });
+        with_observer_state(
+            &self.peers,
+            None,
+            self.sessions.as_ref(),
+            #[cfg(test)]
+            None,
+            |_, peers| {
+                peers.retain(|peer| peer.peer_state.session_id() != session_id_val);
+            },
+        );
     }
 
     pub fn reset_peers(&self) {
-        with_observer_state(&self.peers, None, self.sessions.as_ref(), |_, peers| {
-            peers.clear()
-        });
+        with_observer_state(
+            &self.peers,
+            None,
+            self.sessions.as_ref(),
+            #[cfg(test)]
+            None,
+            |_, peers| peers.clear(),
+        );
     }
 
     // Controller reset already owns current and has cleared all candidates.
@@ -304,6 +326,7 @@ fn with_observer_state<R>(
     peers: &Mutex<Vec<ControllerPeer>>,
     self_state: Option<&Mutex<PeerState>>,
     sessions: Option<&Sessions>,
+    #[cfg(test)] state_ready: Option<&std::sync::atomic::AtomicUsize>,
     action: impl FnOnce(Option<&PeerState>, &mut Vec<ControllerPeer>) -> R,
 ) -> R {
     let current =
@@ -314,9 +337,16 @@ fn with_observer_state<R>(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     });
-    let self_state = self_state.map(|state| state.lock().unwrap_or_else(|e| e.into_inner()));
+    // The receive path holds ingress while reading this identity. Release its
+    // guard before waiting for peers/ingress; session guards still cover resets.
+    let self_state =
+        self_state.map(|state| state.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    #[cfg(test)]
+    if let Some(ready) = state_ready {
+        ready.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
     let mut peers = peers.lock().unwrap_or_else(|e| e.into_inner());
-    let result = action(self_state.as_deref(), &mut peers);
+    let result = action(self_state.as_ref(), &mut peers);
     if let (Some(current), Some(others)) = (current, others.as_mut()) {
         // Current-session retry ownership survives temporary absence. A candidate
         // must not survive its last peer, even if its measurement is still running.
@@ -336,6 +366,7 @@ async fn observed_peer(
     self_peer_state: Arc<Mutex<PeerState>>,
     tx: Sender<Vec<PeerStateChange>>,
     sessions: Option<&Sessions>,
+    #[cfg(test)] state_ready: Option<&std::sync::atomic::AtomicUsize>,
 ) {
     let deadline = message.expires_at.unwrap_or_else(|| {
         tokio::time::Instant::now() + std::time::Duration::from_secs(u64::from(message.ttl))
@@ -351,7 +382,12 @@ async fn observed_peer(
         &peers,
         Some(&self_peer_state),
         sessions,
+        #[cfg(test)]
+        state_ready,
         |self_state, peers| {
+            if message.ttl > 0 && deadline <= tokio::time::Instant::now() {
+                return;
+            }
             let commit = || {
                 if message.ttl > 0 && deadline <= tokio::time::Instant::now() {
                     return;
@@ -398,6 +434,8 @@ async fn saw_peer(
         &peers,
         Some(&self_peer_state),
         sessions,
+        #[cfg(test)]
+        None,
         |self_state, peers| {
             let changes = apply_peer(state, peers, self_state.unwrap(), None);
             if !changes.is_empty() {
@@ -486,12 +524,19 @@ async fn peer_left(
     let Ok(slot) = tx.reserve().await else {
         return;
     };
-    with_observer_state(&peers, None, sessions, |_, peers| {
-        let changes = remove_peer(node_id, peers);
-        if !changes.is_empty() {
-            slot.send(changes);
-        }
-    });
+    with_observer_state(
+        &peers,
+        None,
+        sessions,
+        #[cfg(test)]
+        None,
+        |_, peers| {
+            let changes = remove_peer(node_id, peers);
+            if !changes.is_empty() {
+                slot.send(changes);
+            }
+        },
+    );
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -668,6 +713,7 @@ mod tests {
                 peers.clone(),
                 self_state,
                 tx,
+                None,
                 None,
             ));
             tokio::time::timeout(std::time::Duration::from_secs(1), async {

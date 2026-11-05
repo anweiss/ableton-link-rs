@@ -2152,6 +2152,108 @@ pub fn send_byebye(node_state: NodeId) {
 #[cfg(test)]
 mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn origin_finality_discovery_withdrawal_overlaps_observer_commit_without_inversion() {
+        use super::super::{
+            gateway::on_peer_state,
+            peers::{ControllerPeer, GatewayObserver, PeerEvent, PeerStateChange},
+        };
+        use crate::link::controller::SessionPeerCounter;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (outbound, _events) = tokio::sync::mpsc::channel(1);
+            let context = receive_context(outbound);
+            let route = MeasurementRoute {
+                retire_before_samples: Default::default(),
+                entry: context.interface_sockets.lock().unwrap()[&Ipv4Addr::LOCALHOST].lease(),
+                sockets: context.interface_sockets.clone(),
+            };
+            let peer = PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::from_array([87; 8]),
+                    timeline: crate::link::timeline::Timeline {
+                        tempo: crate::link::tempo::Tempo::new(120.0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let peers = Arc::new(Mutex::new(vec![ControllerPeer { peer_state: peer.clone() }]));
+            let timeouts = Arc::new(Mutex::new(vec![(Instant::now() + Duration::from_secs(30), peer.ident())]));
+            let held_peers = peers.clone();
+            let (ready, ready_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let _guard = held_peers.lock().unwrap();
+                ready.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let (events, rx_events) = tokio::sync::mpsc::channel(1);
+            let (changes, mut changed) = tokio::sync::mpsc::channel(1);
+            let observer = GatewayObserver::new(
+                rx_events, context.peer_state.clone(),
+                Arc::new(Mutex::new(SessionPeerCounter::default())),
+                changes, peers.clone(), Arc::new(Notify::new()), None,
+            ).await;
+            let (handoff, mut pending) = tokio::sync::mpsc::channel(1);
+            queued_state(&handoff, &context.measurement_routes, &route, &peer, 30);
+            let OnEvent::PeerState(mut old) = pending.recv().await.unwrap().event else { panic!("state") };
+            let deadline = Instant::now() + Duration::from_millis(500);
+            old.expires_at = Some(deadline);
+            let old_observation = old.observation.clone().unwrap();
+            events.send(PeerEvent::Observed(old)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while observer.state_ready.load(Ordering::Acquire) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            let listener = Arc::new(PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None).unwrap());
+            let remote = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            remote.send_to(&encode_message(peer.ident(), 0, RESPONSE, &Payload::from(peer.clone()), 0).unwrap(), listener.local_addr().unwrap()).await.unwrap();
+            let receive_context = context.clone();
+            let receive_handoff = handoff.clone();
+            let receive_listener = listener.clone();
+            let mut reader = tokio::spawn(async move {
+                let mut bytes = [0; MAX_MESSAGE_SIZE];
+                receive_datagram_observing(&receive_listener, &receive_context.interface_sockets, &mut bytes, None, |bytes, ingress| {
+                    observe_discovery(&receive_context, &receive_handoff, bytes, ingress);
+                }).await.unwrap();
+            });
+            let completed_before_release = match tokio::time::timeout(Duration::from_millis(200), &mut reader).await {
+                Ok(result) => { result.unwrap(); true }
+                Err(_) => false,
+            };
+            // Expiry lets the counterfactual retained identity guard unwind before
+            // entering ingress, so the failing regression does not deadlock teardown.
+            tokio::time::sleep_until(deadline + Duration::from_millis(10)).await;
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            if !completed_before_release { reader.await.unwrap(); }
+            assert!(completed_before_release, "production discovery receive must not wait on the observer's retained identity guard");
+            assert!(old_observation.revision.cancel.is_cancelled());
+            let OnEvent::PeerState(withdrawn) = pending.recv().await.unwrap().event else { panic!("withdrawal") };
+            assert_eq!(withdrawn.ttl, 0, "contended withdrawals must be admitted, not silently dropped");
+            on_peer_state(withdrawn, timeouts.clone(), events.clone(), Instant::now(), Arc::new(Notify::new()), NodeId::default()).await;
+            assert!(matches!(changed.recv().await.unwrap().as_slice(), [PeerStateChange::PeerLeft]));
+            assert!(peers.lock().unwrap().is_empty());
+            assert!(timeouts.lock().unwrap().is_empty());
+            assert!(changed.try_recv().is_err());
+
+            remote.send_to(&encode_message(peer.ident(), 30, RESPONSE, &Payload::from(peer.clone()), 0).unwrap(), listener.local_addr().unwrap()).await.unwrap();
+            let mut bytes = [0; MAX_MESSAGE_SIZE];
+            receive_datagram_observing(&listener, &context.interface_sockets, &mut bytes, None, |bytes, ingress| {
+                observe_discovery(&context, &handoff, bytes, ingress);
+            }).await.unwrap();
+            let OnEvent::PeerState(fresh) = pending.recv().await.unwrap().event else { panic!("fresh state") };
+            assert_eq!(fresh.expires_at, Some(fresh.observation.as_ref().unwrap().revision.received + Duration::from_secs(30)));
+            on_peer_state(fresh, timeouts.clone(), events, Instant::now(), Arc::new(Notify::new()), NodeId::default()).await;
+            assert!(changed.recv().await.unwrap().iter().any(|change| matches!(change, PeerStateChange::SessionMembership)));
+            assert_eq!(peers.lock().unwrap().as_slice(), &[ControllerPeer { peer_state: peer }]);
+            assert_eq!(timeouts.lock().unwrap().len(), 1);
+        }).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn origin_finality_state_contention_does_not_block_registered_ping_pong() {
         use super::super::peers::{GatewayObserver, PeerEvent};
         use crate::link::{controller::SessionPeerCounter, pingresponder};
