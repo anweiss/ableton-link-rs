@@ -19,19 +19,67 @@ impl Default for GhostXForm {
 
 impl GhostXForm {
     pub fn host_to_ghost(&self, host_time: Duration) -> Duration {
-        Duration::microseconds((self.slope * super::micros(host_time) as f64).round() as i64)
-            + self.intercept
+        let offset =
+            Duration::microseconds((self.slope * super::micros(host_time) as f64).round() as i64);
+        offset
+            .checked_add(&self.intercept)
+            .unwrap_or(if offset < Duration::zero() {
+                Duration::MIN
+            } else {
+                Duration::MAX
+            })
     }
 
     pub fn ghost_to_host(&self, ghost_time: Duration) -> Duration {
-        Duration::microseconds(
-            (super::micros(ghost_time - self.intercept) as f64 / self.slope).round() as i64,
-        )
+        // Preserve a wide (and potentially cancelling) difference through the
+        // division. Only the final host microseconds are saturated by the cast.
+        let nanos = |time: Duration| {
+            i128::from(time.num_seconds()) * 1_000_000_000 + i128::from(time.subsec_nanos())
+        };
+        let difference = nanos(ghost_time) - nanos(self.intercept);
+        Duration::microseconds((difference as f64 / 1_000.0 / self.slope).round() as i64)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admission_inverse_divides_wide_difference_before_saturating() {
+        let form = super::GhostXForm {
+            slope: 2.0,
+            intercept: chrono::Duration::microseconds(-i64::MAX),
+        };
+        assert_eq!(
+            form.ghost_to_host(chrono::Duration::microseconds(i64::MAX)),
+            chrono::Duration::microseconds(i64::MAX)
+        );
+        let form = super::GhostXForm {
+            slope: 2.0,
+            intercept: chrono::Duration::microseconds(i64::MAX),
+        };
+        assert_eq!(
+            form.ghost_to_host(chrono::Duration::microseconds(-i64::MAX)),
+            chrono::Duration::microseconds(i64::MIN)
+        );
+        let large = chrono::Duration::MAX - chrono::Duration::seconds(1);
+        let form = super::GhostXForm {
+            slope: 2.0,
+            intercept: large,
+        };
+        assert_eq!(
+            form.ghost_to_host(large + chrono::Duration::microseconds(4)),
+            chrono::Duration::microseconds(2)
+        );
+        let form = super::GhostXForm {
+            slope: 1.0,
+            intercept: chrono::Duration::MIN,
+        };
+        assert_eq!(
+            form.ghost_to_host(chrono::Duration::MAX),
+            chrono::Duration::microseconds(i64::MAX)
+        );
+    }
+
     use super::*;
 
     #[test]

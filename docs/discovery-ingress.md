@@ -318,7 +318,7 @@ managed forwarders retain both fields and the wire TTL. `PeerEvent::Observed` mu
 be forwarded intact to `GatewayObserver`; managed BYEBYE is a zero-TTL peer-state
 withdrawal. Session construction uses `Session::new`; requests/results and standalone
 measurement/result helpers use the originating `SessionKey` (`session.key()`). The
-new `MeasurePeerEvent::Cancelled(key)` denotes retryable registration retirement.
+new `MeasurePeerEvent::Cancelled(key, attempted_peer)` denotes retryable registration retirement.
 See README's migration list for every affected public signature and enum. These
 source-breaking changes do not change the wire format. Same-adapter alias selection uses
 verified subnet masks and link-local scope only after the ingress index is fixed.
@@ -392,10 +392,14 @@ Failed-origin retirement removes every matching incarnation entry, without delet
 distinct incarnation or its peers. Join consumption validates live peers under the same
 session/registry guards, resetting a peerless remote promotion even if both counts were zero.
 
-`schedule_remeasurement` now returns a `JoinHandle<()>`: retain it and abort it when an
-independent caller's ownership ends. It waits for a peer and channel capacity, sends at
-most one request, and exits when the request receiver closes. Public session-result
-handlers also stop their waiting request when its originating current incarnation changes.
+`schedule_remeasurement` returns `RemeasurementTask`, replacing `JoinHandle<()>`.
+Public `handle_successful_measurement` and `handle_failed_measurement` return
+`Option<RemeasurementTask>`. Retain each returned owner while a retry is wanted;
+dropping it aborts pending work instead of detaching it. `abort`, `is_finished`, and
+awaiting completion remain available. Each owner sends at most one request, cancels
+on receiver closure or replacement of its originating current incarnation, and uses
+an async channel-capacity wait plus bounded-rate peer-absence checks rather than
+5ms polling for either condition. Already committed requests are not retracted.
 
 Join/reset commits acquire identity, session/client timing, sync policy, peer count,
 and responder publication guards in the same cooperative attempt as session and peer
@@ -405,3 +409,38 @@ and equal-timing joins whose client session identity still needs to change.
 Timeline announcements publish the accepted current identity, timeline and clock mapping
 from one guarded snapshot, never a candidate's wire ID paired with the current timeline.
 A pending promotion leaves local publication to its owned join, including equal-timing joins.
+
+
+### Atomic admission and clock publication
+
+Initial sightings reserve measurement capacity before installing a candidate. Managed
+retries reserve capacity, then validate the originating key, select the latest peer,
+and publish synchronously under current/candidate/peer guards. Cancellation before
+admission leaves no candidate or queued stale request. Standalone launch also selects
+a peer only after capacity is available. `Cancelled(key, attempted_peer)` identifies
+the failed `NodeId`; managed retries rotate through endpoint-advertising peers instead
+of repeatedly choosing a leader with an unavailable route. Candidate result commits
+match the full key in every lookup and compare against the latest current session;
+results originating from a replaced current session are rejected.
+
+Construct `Sessions` with `Sessions::new`, not field literals: publication identity is
+now private coordinator state. `Sessions::reset_timeline` takes
+`(&SessionKey, GhostXForm, Timeline)` and returns `bool`; capture the key and mapping
+with the source timeline, and handle `false` if that source changed. This low-level
+synchronous helper is not a controller client-state publication API. Use async
+`Controller::set_state` for client edits: calculation and installation share the full
+publication commit, including incarnation and clock mapping. Pending promotions wait
+for their owned join; even a same-wire-ID replacement cannot receive an old-clock edit.
+`disable` cooperatively awaits peer reset and publishes a fresh local incarnation, so
+cancelling a queued promotion does not strand later edits while disabled.
+
+PING replies snapshot membership and clock together in writer lock order using
+nonblocking acquisition. A contended PING is skipped, leaving retry ownership with the
+remote measurement; no deferred reply tasks accumulate or park the sole IO executor.
+Async responder publication also waits cooperatively for both guards.
+
+Beat arithmetic saturates at the signed microbeat limits; remainder with a zero
+quantum or MIN/-1 returns zero. Phase arithmetic uses wide intermediates. Received
+extreme beat origins and start/stop values therefore do not overflow during joining
+or client conversion. Inverse ghost-clock conversion retains the wide difference
+through division and saturates only the final host-microsecond conversion.

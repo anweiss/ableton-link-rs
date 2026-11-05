@@ -143,7 +143,7 @@ pub fn update_session_timeline_from_client(
     let new_beat_origin = Beats {
         value: i64::max(
             cur_session.to_beats(x_form.host_to_ghost(at_time)).value,
-            cur_session.beat_origin.value + 1_i64,
+            cur_session.beat_origin.value.saturating_add(1),
         ),
     };
 
