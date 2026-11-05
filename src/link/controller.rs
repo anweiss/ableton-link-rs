@@ -2874,13 +2874,15 @@ mod dispatch_gate_tests {
                 .unwrap()
                 .start_stop_state
                 .time;
-            if origin == i64::MIN {
-                let expected = chrono::Duration::microseconds(i64::MAX - 99_999_999);
-                assert!((received_host_time - expected).num_microseconds().unwrap().abs() <= 2048,
-                    "received start/stop must convert the full wide beat difference before narrowing: {received_host_time:?}");
-            } else {
-                assert_eq!(received_host_time, chrono::Duration::microseconds(i64::MIN));
-            }
+            let beat_difference =
+                i128::from(if origin == i64::MIN { i64::MAX } else { i64::MIN })
+                    - i128::from(origin);
+            let expected_nanos = beat_difference * 500 - 100_000_000_000;
+            assert_eq!(
+                crate::duration_nanos(received_host_time),
+                expected_nanos,
+                "received start/stop must retain the full beat difference before subtracting the 100-second intercept"
+            );
             let edit = Timeline {
                 tempo: tempo::Tempo::new(150.0),
                 ..controller.client_state.lock().unwrap().timeline
