@@ -165,7 +165,7 @@ pub fn update_session_timeline_from_client(
 ) -> core::result::Result<Timeline, super::error::CommitError> {
     let ghost_beat_0 = x_form.host_to_ghost_wide_nanos(client.time_origin);
 
-    if cur_session.microbeats_at_nanos(ghost_beat_0) == 0 && client.tempo == cur_session.tempo {
+    if cur_session.nanos_at_microbeats(0) == ghost_beat_0 && client.tempo == cur_session.tempo {
         return Ok(cur_session);
     }
 
@@ -207,6 +207,37 @@ pub fn shift_client_timeline(client: Timeline, shift: Beats) -> Timeline {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn composition_preserves_fractional_canonical_zero() {
+        let current = Timeline {
+            tempo: Tempo::new(120.0),
+            ..Timeline::default()
+        };
+        for sign in [-1, 1] {
+            let client = Timeline {
+                time_origin: Duration::nanoseconds(sign * 200),
+                ..current
+            };
+            let updated = update_session_timeline_from_client(
+                current,
+                client,
+                Duration::zero(),
+                GhostXForm {
+                    slope: 1.0,
+                    intercept: Duration::zero(),
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                updated.from_beats(Beats::from_microbeats(0)),
+                client.time_origin,
+            );
+            let probe = Duration::nanoseconds(sign * 300);
+            assert_eq!(updated.to_beats(probe), client.to_beats(probe));
+        }
+    }
+
     #[test]
     fn precision_conversion_examples_match_documented_rounding() {
         let tempo = Tempo::new(120.0);
