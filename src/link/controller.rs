@@ -1,3 +1,4 @@
+use crate::platform::io_context::{retry_state, try_state};
 use std::{
     net::SocketAddrV4,
     sync::atomic::{AtomicBool, Ordering},
@@ -11,7 +12,7 @@ use tracing::{debug, info};
 use crate::discovery::{
     gateway::{OnEvent, PeerGateway},
     messenger::new_udp_reuseport,
-    peers::{unique_session_peer_count, ControllerPeer, PeerState, PeerStateChange},
+    peers::{count_session_peers, ControllerPeer, PeerState, PeerStateChange},
 };
 
 use super::{
@@ -631,93 +632,28 @@ impl Controller {
         let tempo_cb_loop = managed_tempo_callback.clone();
         let audio_endpoint_cb_loop = managed_audio_callback;
 
-        // An audio-endpoint notification held back because the
-        // `SessionMembership` change it was queued behind could not be applied
-        // - every read in that arm is a `try_lock` that skips the change rather
-        // than block. Dropping the notification instead is not an option:
-        // `saw_peer` has already recorded the new endpoint, so an identical
-        // later sighting is not a transition and will never re-fire the edge.
-        // It is re-emitted the next time membership is applied successfully,
-        // which is also what keeps it behind membership rather than ahead of
-        // it. A newer edge supersedes an older held one; latest wins.
-        //
-        // Stamped with the gate epoch it was deferred in: this state outlives
-        // the loop iteration and so is not reached by the channel drain a gate
-        // close performs, and an endpoint held from a previous lifecycle must
-        // not be released into the next one.
-        let mut deferred_audio_endpoint: Option<(u64, NodeId, Option<SocketAddrV4>)> = None;
-
+        // A contended membership update retains its entire ordered batch. The
+        // gate cancels that wait on disable, so no deferred edge crosses epochs.
         let gate_loop = dispatch.gate.clone();
 
         let mut gate_open = gate_loop.subscribe();
         dispatch.tasks.push(tokio::spawn(async move {
-            while let Some((_permit, epoch, peer_state_changes)) =
+            while let Some((_permit, _epoch, peer_state_changes)) =
                 gated_recv(&gate_loop, &mut gate_open, &mut rx_peer_state_change).await
             {
-                // Anything held from a lifecycle that has since been torn down
-                // and restarted is dropped rather than dispatched.
-                if let Some((deferred_epoch, peer_id, _)) = deferred_audio_endpoint {
-                    if deferred_epoch != epoch {
-                        debug!(
-                            "Discarding AudioEndpoint change for peer {} deferred in a \
-                                 previous Link lifecycle",
-                            peer_id
-                        );
-                        deferred_audio_endpoint = None;
-                    }
-                }
-                debug!("controller received peer state changes");
-                // Set when a `SessionMembership` change in this batch was
-                // abandoned. Any audio-endpoint change queued behind it is
-                // then held back rather than delivered against state the
-                // abandoned change was supposed to update.
-                let mut membership_abandoned = false;
+                let apply_changes = async {
                 for peer_state_change in peer_state_changes.iter() {
                     match peer_state_change {
                         PeerStateChange::SessionMembership => {
                             debug!("Controller received SessionMembership change");
-                            // Both reads come from one guard: taken
-                            // separately they are two chances to bail, and
-                            // two different snapshots of the same state.
-                            let ids = peer_state_loop
-                                .try_lock()
-                                .map(|ps| (ps.session_id(), ps.ident()))
-                                .ok();
-                            let (session_id, self_node_id) = match ids {
-                                Some(ids) => ids,
-                                None => {
-                                    membership_abandoned = true;
-                                    continue;
-                                }
-                            };
-
-                            let count =
-                                unique_session_peer_count(session_id, p_loop.clone(), self_node_id);
-                            let old_count = if let Ok(spc) = s_peer_counter_loop.try_lock() {
-                                spc.session_peer_count
-                            } else {
-                                membership_abandoned = true;
-                                continue;
-                            };
-
+                            let (session_id, old_count, count) = refresh_peer_count(&peer_state_loop, &p_loop, &s_peer_counter_loop).await;
                             debug!(
                                 "SessionMembership: old_count={}, new_count={}",
                                 old_count, count
                             );
 
-                            // Only update the session peer count if it has actually changed
-                            if old_count != count {
-                                if let Ok(mut spc) = s_peer_counter_loop.try_lock() {
-                                    spc.session_peer_count = count;
-                                }
-                                debug!(
-                                    "Updated session peer count from {} to {}",
-                                    old_count, count
-                                );
-                            }
-
                             if old_count != count && count == 0 {
-                                reset_state(
+                                reset_state_if_peerless(
                                     peer_state_loop.clone(),
                                     s_state_loop.clone(),
                                     c_state_loop.clone(),
@@ -726,26 +662,11 @@ impl Controller {
                                     clock,
                                     s_stop_sync_enabled_loop.clone(),
                                     tempo_cb_loop.clone(),
+                                    Some(session_id),
                                 )
                                 .await
                             }
 
-                            // Membership is now applied, so an endpoint
-                            // edge held back by an earlier abandoned
-                            // membership change can be delivered - still
-                            // after membership, which is the point.
-                            if let Some((_, peer_id, endpoint)) = deferred_audio_endpoint.take() {
-                                debug!(
-                                    "Controller releasing deferred AudioEndpoint change \
-                                         for peer {}",
-                                    peer_id
-                                );
-                                dispatch_audio_endpoint_change(
-                                    &audio_endpoint_cb_loop,
-                                    peer_id,
-                                    endpoint,
-                                );
-                            }
                         }
                         PeerStateChange::SessionTimeline(peer_session, timeline) => {
                             // handle_timeline_from_session
@@ -852,27 +773,9 @@ impl Controller {
                             }
                         }
                         PeerStateChange::PeerLeft => {
-                            let s_id = if let Ok(ps) = peer_state_loop.try_lock() {
-                                ps.session_id()
-                            } else {
-                                continue;
-                            };
-                            let peer_ident = if let Ok(ps) = peer_state_loop.try_lock() {
-                                ps.ident()
-                            } else {
-                                continue;
-                            };
-                            let count = unique_session_peer_count(s_id, p_loop.clone(), peer_ident);
-                            let old_count = if let Ok(spc) = s_peer_counter_loop.try_lock() {
-                                spc.session_peer_count
-                            } else {
-                                continue;
-                            };
-                            if let Ok(mut spc) = s_peer_counter_loop.try_lock() {
-                                spc.session_peer_count = count;
-                            }
+                            let (s_id, old_count, count) = refresh_peer_count(&peer_state_loop, &p_loop, &s_peer_counter_loop).await;
                             if old_count != count && count == 0 {
-                                reset_state(
+                                reset_state_if_peerless(
                                     peer_state_loop.clone(),
                                     s_state_loop.clone(),
                                     c_state_loop.clone(),
@@ -881,6 +784,7 @@ impl Controller {
                                     clock,
                                     s_stop_sync_enabled_loop.clone(),
                                     tempo_cb_loop.clone(),
+                                    Some(s_id),
                                 )
                                 .await;
                             }
@@ -890,15 +794,6 @@ impl Controller {
                                 "Controller received AudioEndpoint change for peer {}",
                                 peer_id
                             );
-                            if membership_abandoned {
-                                debug!(
-                                    "Deferring AudioEndpoint change for peer {}: the \
-                                         membership change it follows was not applied",
-                                    peer_id
-                                );
-                                deferred_audio_endpoint = Some((epoch, *peer_id, *endpoint));
-                                continue;
-                            }
                             dispatch_audio_endpoint_change(
                                 &audio_endpoint_cb_loop,
                                 *peer_id,
@@ -907,6 +802,8 @@ impl Controller {
                         }
                     }
                 }
+                };
+                tokio::select! { biased; _ = gate_open.closed() => {}, _ = apply_changes => {} }
             }
         }));
 
@@ -1262,6 +1159,23 @@ impl Controller {
     }
 }
 
+async fn refresh_peer_count(
+    peer_state: &Mutex<PeerState>,
+    peers: &Mutex<Vec<ControllerPeer>>,
+    counter: &Mutex<SessionPeerCounter>,
+) -> (SessionId, usize, usize) {
+    retry_state(|| {
+        let state = try_state(peer_state)?;
+        let peers = try_state(peers)?;
+        let mut counter = try_state(counter)?;
+        let count = count_session_peers(state.session_id(), &peers, state.ident());
+        let old = counter.session_peer_count;
+        counter.session_peer_count = count;
+        Some((state.session_id(), old, count))
+    })
+    .await
+}
+
 pub async fn join_session(
     session: Session,
     peer_state: Arc<Mutex<PeerState>>,
@@ -1275,23 +1189,25 @@ pub async fn join_session(
     sessions: Sessions,
     tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
 ) {
-    let changed = {
-        let current = sessions.current.clone();
-        let mut current = current.lock().unwrap_or_else(|e| e.into_inner());
-        join_session_current(
+    let changed = retry_state(|| {
+        let mut current = try_state(&sessions.current)?;
+        let mut others = try_state(&sessions.other_sessions)?;
+        let mut peers = try_state(&peers)?;
+        Some(join_session_current(
             &mut current,
-            session,
-            peer_state,
+            session.clone(),
+            peer_state.clone(),
             session_state.clone(),
-            client_state,
+            client_state.clone(),
             clock,
-            start_stop_sync_enabled,
-            discovery,
-            peers,
-            session_peer_count,
-            sessions,
-        )
-    };
+            start_stop_sync_enabled.clone(),
+            discovery.clone(),
+            &mut peers,
+            session_peer_count.clone(),
+            &mut others,
+        ))
+    })
+    .await;
     if let Some(tempo) = changed {
         dispatch_current_tempo(&session_state, &tempo_callback, tempo);
     }
@@ -1306,15 +1222,32 @@ fn join_session_current(
     clock: Clock,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
     discovery: Arc<PeerGateway>,
-    peers: Arc<Mutex<Vec<ControllerPeer>>>,
+    peers: &mut Vec<ControllerPeer>,
     session_peer_count: Arc<Mutex<SessionPeerCounter>>,
-    sessions: Sessions,
+    others: &mut Vec<Session>,
 ) -> Option<tempo::Tempo> {
     if !session.key().matches(current) {
         return None;
     }
     // The queued identity grants ownership, not authority to restore older fields.
     let session = current.clone();
+    let self_id = peer_state.try_lock().ok()?.ident();
+    if session.session_id.0 != self_id
+        && count_session_peers(session.session_id, peers, self_id) == 0
+    {
+        return reset_state_current(
+            current,
+            peer_state,
+            session_state,
+            client_state,
+            discovery,
+            others,
+            peers,
+            clock,
+            start_stop_sync_enabled,
+        );
+    }
+
     let session_id_changed = if let Ok(ps) = peer_state.try_lock() {
         ps.session_id() != session.session_id
     } else {
@@ -1367,7 +1300,7 @@ fn join_session_current(
             (peer_state.try_lock(), session_peer_count.try_lock())
         {
             let s_id = peer_state_guard.session_id();
-            let count = unique_session_peer_count(s_id, peers, peer_state_guard.ident());
+            let count = count_session_peers(s_id, peers, peer_state_guard.ident());
             let old_count = session_peer_count_guard.session_peer_count;
             session_peer_count_guard.session_peer_count = count;
 
@@ -1383,7 +1316,8 @@ fn join_session_current(
                 session_state.clone(),
                 client_state,
                 discovery,
-                sessions,
+                others,
+                peers,
                 clock,
                 start_stop_sync_enabled,
             )
@@ -1403,20 +1337,58 @@ pub async fn reset_state(
     start_stop_sync_enabled: Arc<Mutex<bool>>,
     tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
 ) {
-    let changed = {
-        let current = sessions.current.clone();
-        let mut current = current.lock().unwrap_or_else(|e| e.into_inner());
-        reset_state_current(
+    reset_state_if_peerless(
+        peer_state,
+        session_state,
+        client_state,
+        discovery,
+        sessions,
+        clock,
+        start_stop_sync_enabled,
+        tempo_callback,
+        None,
+    )
+    .await;
+}
+
+async fn reset_state_if_peerless(
+    peer_state: Arc<Mutex<PeerState>>,
+    session_state: Arc<Mutex<SessionState>>,
+    client_state: Arc<Mutex<ClientState>>,
+    discovery: Arc<PeerGateway>,
+    sessions: Sessions,
+    clock: Clock,
+    start_stop_sync_enabled: Arc<Mutex<bool>>,
+    tempo_callback: Arc<Mutex<Option<TempoCallback>>>,
+    expected: Option<SessionId>,
+) {
+    let changed = retry_state(|| {
+        let mut current = try_state(&sessions.current)?;
+        let mut others = try_state(&sessions.other_sessions)?;
+        let mut peers = try_state(&sessions.peers)?;
+        let state = try_state(&peer_state)?;
+        if let Some(expected) = expected {
+            if current.session_id != expected
+                || state.session_id() != expected
+                || count_session_peers(expected, &peers, state.ident()) != 0
+            {
+                return Some(None);
+            }
+        }
+        drop(state);
+        Some(reset_state_current(
             &mut current,
-            peer_state,
+            peer_state.clone(),
             session_state.clone(),
-            client_state,
-            discovery,
-            sessions,
+            client_state.clone(),
+            discovery.clone(),
+            &mut others,
+            &mut peers,
             clock,
-            start_stop_sync_enabled,
-        )
-    };
+            start_stop_sync_enabled.clone(),
+        ))
+    })
+    .await;
     if let Some(tempo) = changed {
         dispatch_current_tempo(&session_state, &tempo_callback, tempo);
     }
@@ -1428,7 +1400,8 @@ fn reset_state_current(
     session_state: Arc<Mutex<SessionState>>,
     client_state: Arc<Mutex<ClientState>>,
     discovery: Arc<PeerGateway>,
-    sessions: Sessions,
+    others: &mut Vec<Session>,
+    peers: &mut Vec<ControllerPeer>,
     clock: Clock,
     start_stop_sync_enabled: Arc<Mutex<bool>>,
 ) -> Option<tempo::Tempo> {
@@ -1503,12 +1476,8 @@ fn reset_state_current(
             timestamp: host_time,
         },
     };
-    sessions
-        .other_sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
-    discovery.observer.reset_peers_after_session_reset();
+    others.clear();
+    peers.clear();
     changed
 }
 
@@ -1753,6 +1722,201 @@ pub struct SessionPeerCounter {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
+    #[tokio::test]
+    async fn owned_io_managed_count_preserves_survivor_without_parking_executor() {
+        let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let id = controller.peer_state.lock().unwrap().session_id();
+        controller.peers.lock().unwrap().push(ControllerPeer {
+            peer_state: PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::from_array([93; 8]),
+                    session_id: id,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        });
+        controller
+            .session_peer_counter
+            .lock()
+            .unwrap()
+            .session_peer_count = 2;
+        let held = controller.peers.clone();
+        let (ready, ready_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            ready.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let state = controller.peer_state.clone();
+        let peers = controller.peers.clone();
+        let counter = controller.session_peer_counter.clone();
+        let count = controller
+            .io
+            .as_ref()
+            .unwrap()
+            .spawn(async move { refresh_peer_count(&state, &peers, &counter).await });
+        let mut heartbeat = controller.io.as_ref().unwrap().spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+        let responsive = matches!(
+            tokio::time::timeout(Duration::from_millis(100), &mut heartbeat).await,
+            Ok(Ok(()))
+        );
+        let premature = count.is_finished();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let (actual, old, new) = count.await.unwrap();
+        assert!(responsive && !premature,"managed counting must wait cooperatively instead of reporting zero or parking owned IO");
+        assert_eq!((actual, old, new), (id, 2, 1));
+        assert_eq!(
+            controller
+                .session_peer_counter
+                .lock()
+                .unwrap()
+                .session_peer_count,
+            1
+        );
+        assert_eq!(controller.peer_state.lock().unwrap().session_id(), id);
+    }
+
+    #[tokio::test]
+    async fn owned_io_join_rechecks_last_peer_after_actual_candidate_promotion() {
+        use crate::discovery::peers::{GatewayObserver, PeerEvent};
+        use tokio::sync::mpsc;
+        for leave_one in [false, true] {
+            tokio::time::timeout(TEST_TIMEOUT, async {
+                let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+                    .await
+                    .unwrap();
+                let local_id = controller.peer_state.lock().unwrap().ident();
+                let remote = Session::new(
+                    SessionId(NodeId::from_array([92; 8])),
+                    Timeline {
+                        tempo: tempo::Tempo::new(143.0),
+                        ..Default::default()
+                    },
+                    SessionMeasurement::default(),
+                );
+                controller
+                    .sessions
+                    .other_sessions
+                    .lock()
+                    .unwrap()
+                    .push(remote.clone());
+                let peers = [10u8, 11]
+                    .into_iter()
+                    .map(|node| ControllerPeer {
+                        peer_state: PeerState {
+                            node_state: NodeState {
+                                node_id: NodeId::from_array([node; 8]),
+                                session_id: remote.session_id,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                *controller.peers.lock().unwrap() = peers;
+                let (joins, mut queued) = mpsc::channel(1);
+                crate::link::sessions::handle_successful_measurement(
+                    remote.key(),
+                    GhostXForm {
+                        slope: 1.0,
+                        intercept: chrono::Duration::seconds(100),
+                    },
+                    controller.sessions.other_sessions.clone(),
+                    controller.sessions.current.clone(),
+                    controller.clock,
+                    joins,
+                    controller.peers.clone(),
+                    controller.sessions.tx_measure_peer_state.clone(),
+                )
+                .await;
+                let promoted = queued.recv().await.unwrap();
+                assert!(remote
+                    .key()
+                    .matches(&controller.sessions.current.lock().unwrap()));
+                let (events, rx_events) = mpsc::channel(1);
+                let (changes, mut changed) = mpsc::channel(1);
+                let _observer = GatewayObserver::new(
+                    rx_events,
+                    controller.peer_state.clone(),
+                    controller.session_peer_counter.clone(),
+                    changes,
+                    controller.peers.clone(),
+                    Arc::new(Notify::new()),
+                    Some(controller.sessions.clone()),
+                )
+                .await;
+                for node in if leave_one { vec![10u8] } else { vec![10, 11] } {
+                    events
+                        .send(PeerEvent::PeerLeft(NodeId::from_array([node; 8])))
+                        .await
+                        .unwrap();
+                    changed.recv().await.unwrap();
+                }
+                assert_eq!(
+                    controller
+                        .session_peer_counter
+                        .lock()
+                        .unwrap()
+                        .session_peer_count,
+                    0
+                );
+                assert!(
+                    remote
+                        .key()
+                        .matches(&controller.sessions.current.lock().unwrap()),
+                    "observer keeps promoted current ownership until join consumption"
+                );
+                join_session(
+                    promoted,
+                    controller.peer_state.clone(),
+                    controller.session_state.clone(),
+                    controller.client_state.clone(),
+                    controller.clock,
+                    controller.start_stop_sync_enabled.clone(),
+                    controller.discovery.clone(),
+                    controller.peers.clone(),
+                    controller.session_peer_counter.clone(),
+                    controller.sessions.clone(),
+                    controller.tempo_callback.clone(),
+                )
+                .await;
+                let current = controller.sessions.current.lock().unwrap();
+                if leave_one {
+                    assert!(remote.key().matches(&current));
+                    assert_eq!(
+                        controller
+                            .session_peer_counter
+                            .lock()
+                            .unwrap()
+                            .session_peer_count,
+                        1
+                    );
+                } else {
+                    assert_eq!(
+                        current.session_id,
+                        SessionId(local_id),
+                        "peerless remote promotion must reset even when counts were both zero"
+                    );
+                    assert!(!remote.key().matches(&current));
+                    assert_eq!(
+                        controller.peer_state.lock().unwrap().session_id(),
+                        SessionId(local_id)
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn origin_finality_queued_join_uses_latest_same_incarnation_snapshot() {
         tokio::time::timeout(TEST_TIMEOUT, async {

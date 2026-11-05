@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn parse_message_header_too_short() {
         let data = [0u8; 4]; // Way too short
-        let _ = parse_message_header(&data);
+        assert!(parse_message_header(&data).is_err());
     }
 
     #[test]
@@ -275,7 +275,7 @@ mod tests {
         // Create data of correct length but wrong protocol header
         let mut data = vec![0u8; PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE];
         data[0] = 0xFF; // Wrong protocol
-        let _ = parse_message_header(&data);
+        assert!(parse_message_header(&data).is_err());
     }
 
     #[test]

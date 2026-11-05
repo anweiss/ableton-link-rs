@@ -534,6 +534,23 @@ impl PeerObservation {
         }
     }
 
+    // None means contention (retry); Some(None) means permanently stale.
+    pub(crate) fn try_while_current<T>(&self, commit: impl FnOnce() -> T) -> Option<Option<T>> {
+        let sockets = crate::platform::io_context::try_state(&self.ingress.sockets)?;
+        let registered = sockets
+            .get(&self.ingress.entry.identity.addr)
+            .is_some_and(|group| {
+                group
+                    .registrations()
+                    .any(|entry| Arc::ptr_eq(&entry.socket, &self.ingress.entry.socket))
+            });
+        if !registered || !self.ingress.entry.is_current().unwrap_or(false) {
+            return Some(None);
+        }
+        let _pending = crate::platform::io_context::try_state(&self.routes.1)?;
+        Some((!self.revision.cancel.is_cancelled()).then(commit))
+    }
+
     pub(crate) fn while_current<T>(&self, commit: impl FnOnce() -> T) -> Option<T> {
         self.ingress
             .while_current(|| {

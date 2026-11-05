@@ -1683,39 +1683,25 @@ mod tests {
     async fn managed_missing_route_remains_cancelable_with_result_backpressure() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
-            let (tx_result, _rx_result) = mpsc::channel(1);
-            tx_result
-                .send(MeasurePeerEvent::XForm(
-                    SessionKey::new(SessionId::default()),
-                    GhostXForm::default(),
-                ))
-                .await
-                .unwrap();
+            let (tx_result, mut rx_result) = mpsc::channel(1);
             let (tx_peer, rx_peer) = mpsc::channel(1);
             let service = MeasurementService::new_with_routes(
-                socket,
-                Arc::new(Mutex::new(PeerState::default())),
-                Arc::new(Mutex::new(SessionState::default())),
-                Clock::new(),
-                tx_result,
-                Arc::new(Notify::new()),
-                rx_peer,
-                Some(MeasurementRoutes::default()),
-            )
-            .await;
-            tx_peer
-                .send(MeasurePeerEvent::PeerState(
-                    SessionKey::new(SessionId::default()),
-                    PeerState::default(),
-                ))
-                .await
-                .unwrap();
+                socket, Arc::new(Mutex::new(PeerState::default())),
+                Arc::new(Mutex::new(SessionState::default())), Clock::new(), tx_result.clone(),
+                Arc::new(Notify::new()), rx_peer, Some(MeasurementRoutes::default()),
+            ).await;
+            let session = crate::link::sessions::Session::new(SessionId::default(), Default::default(), Default::default());
+            let peer = PeerState { measurement_endpoint: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)), ..Default::default() };
+            tx_peer.send(MeasurePeerEvent::PeerState(session.key(), peer.clone())).await.unwrap();
+            assert!(matches!(rx_result.recv().await, Some(MeasurePeerEvent::Cancelled(key)) if key.matches(&session)), "advertised endpoint without a route must report Cancelled, not a failed transform");
+            tx_result.send(MeasurePeerEvent::XForm(session.key(), GhostXForm::default())).await.unwrap();
+            tx_peer.send(MeasurePeerEvent::PeerState(session.key(), peer)).await.unwrap();
             drop(tx_peer.reserve().await.unwrap());
             service.stop().await;
             assert!(service.measurement_map.lock().unwrap().is_empty());
-        })
-        .await
-        .expect("missing-route failure reporting must not block lifecycle stop");
+            assert!(matches!(rx_result.recv().await, Some(MeasurePeerEvent::XForm(..))));
+            assert!(rx_result.try_recv().is_err(), "stop cancels the blocked cancellation send");
+        }).await.expect("missing-route cancellation reporting must not block lifecycle stop");
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+use crate::platform::io_context::{retry_state, try_state};
 use std::{
     net::SocketAddrV4,
     sync::{Arc, Mutex},
@@ -13,7 +14,7 @@ use tracing::debug;
 use crate::link::{
     controller::{gated_recv, DispatchGate, SessionPeerCounter},
     node::{NodeId, NodeState},
-    sessions::{SessionId, Sessions},
+    sessions::{Session, SessionId, Sessions},
     state::StartStopState,
     timeline::Timeline,
 };
@@ -207,11 +208,6 @@ impl GatewayObserver {
             |_, peers| peers.clear(),
         );
     }
-
-    // Controller reset already owns current and has cleared all candidates.
-    pub(crate) fn reset_peers_after_session_reset(&self) {
-        self.peers.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -244,64 +240,42 @@ pub fn unique_session_peer_count(
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     self_node_id: NodeId,
 ) -> usize {
-    let all_peers = match peers.try_lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            debug!("Could not acquire peers lock in unique_session_peer_count, returning 0");
-            return 0;
-        }
-    };
-    debug!(
-        "unique_session_peer_count: looking for session_id={}, self_node_id={}",
-        session_id, self_node_id
-    );
-    debug!(
-        "unique_session_peer_count: total peers in list: {}",
-        all_peers.len()
-    );
+    count_session_peers(
+        session_id,
+        &peers.lock().unwrap_or_else(|e| e.into_inner()),
+        self_node_id,
+    )
+}
 
-    for (i, peer) in all_peers.iter().enumerate() {
-        debug!(
-            "  peer[{}]: node_id={}, session_id={}",
-            i,
-            peer.peer_state.ident(),
-            peer.peer_state.session_id()
-        );
-    }
-
-    let mut peers = all_peers
+pub(crate) fn count_session_peers(
+    session_id: SessionId,
+    peers: &[ControllerPeer],
+    self_node_id: NodeId,
+) -> usize {
+    peers
         .iter()
-        .filter(|p| {
-            let matches_session = p.peer_state.session_id() == session_id;
-            let is_not_self = p.peer_state.ident() != self_node_id;
-            debug!(
-                "  filtering peer {}: matches_session={}, is_not_self={}",
-                p.peer_state.ident(),
-                matches_session,
-                is_not_self
-            );
-            matches_session && is_not_self
+        .filter(|peer| {
+            peer.peer_state.session_id() == session_id && peer.peer_state.ident() != self_node_id
         })
-        .cloned()
-        .collect::<Vec<_>>();
+        .map(|peer| peer.peer_state.ident())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
 
-    debug!(
-        "unique_session_peer_count: before dedup, filtered peers count: {}",
-        peers.len()
-    );
-    peers.dedup_by(|a, b| {
-        let is_duplicate = a.peer_state.ident() == b.peer_state.ident();
-        if is_duplicate {
-            debug!("  removing duplicate peer: {}", a.peer_state.ident());
-        }
-        is_duplicate
-    });
-
-    debug!(
-        "unique_session_peer_count: after dedup, final peers count: {}",
-        peers.len()
-    );
-    peers.len()
+/// Count without parking an async executor while a public registry guard is held.
+pub async fn unique_session_peer_count_async(
+    session_id: SessionId,
+    peers: Arc<Mutex<Vec<ControllerPeer>>>,
+    self_node_id: NodeId,
+) -> usize {
+    retry_state(|| {
+        Some(count_session_peers(
+            session_id,
+            &try_state(&peers)?,
+            self_node_id,
+        ))
+    })
+    .await
 }
 
 #[derive(Clone)]
@@ -320,6 +294,15 @@ pub enum PeerStateChange {
     /// change — mirroring upstream, which does not invoke the callback from
     /// `peerLeftGateway`.
     AudioEndpoint(NodeId, Option<SocketAddrV4>),
+}
+
+fn retain_live_sessions(
+    current: &Session,
+    others: &mut Vec<Session>,
+    live: impl Iterator<Item = SessionId> + Clone,
+) {
+    let live = live.collect::<std::collections::HashSet<_>>();
+    others.retain(|session| session.key().matches(current) || live.contains(&session.session_id));
 }
 
 fn with_observer_state<R>(
@@ -350,14 +333,52 @@ fn with_observer_state<R>(
     if let (Some(current), Some(others)) = (current, others.as_mut()) {
         // Current-session retry ownership survives temporary absence. A candidate
         // must not survive its last peer, even if its measurement is still running.
-        others.retain(|session| {
-            session.key().matches(&current)
-                || peers
-                    .iter()
-                    .any(|peer| peer.peer_state.session_id() == session.session_id)
-        });
+        retain_live_sessions(
+            &current,
+            others,
+            peers.iter().map(|peer| peer.peer_state.session_id()),
+        );
     }
     result
+}
+
+fn try_with_observer_state<R>(
+    peers: &Mutex<Vec<ControllerPeer>>,
+    self_state: Option<&Mutex<PeerState>>,
+    sessions: Option<&Sessions>,
+    #[cfg(test)] state_ready: Option<&std::sync::atomic::AtomicUsize>,
+    action: impl FnOnce(Option<&PeerState>, &mut Vec<ControllerPeer>) -> R,
+) -> Option<R> {
+    let current = match sessions {
+        Some(sessions) => Some(try_state(&sessions.current)?),
+        None => None,
+    };
+    let mut others = match sessions {
+        Some(sessions) => Some(try_state(&sessions.other_sessions)?),
+        None => None,
+    };
+    // The receive path holds ingress while reading this identity. Release its
+    // guard before waiting for peers/ingress; session guards still cover resets.
+    let self_state = match self_state {
+        Some(state) => Some(try_state(state)?.clone()),
+        None => None,
+    };
+    #[cfg(test)]
+    if let Some(ready) = state_ready {
+        ready.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+    let mut peers = try_state(peers)?;
+    let result = action(self_state.as_ref(), &mut peers);
+    if let (Some(current), Some(others)) = (current, others.as_mut()) {
+        // Current-session retry ownership survives temporary absence. A candidate
+        // must not survive its last peer, even if its measurement is still running.
+        retain_live_sessions(
+            &current,
+            others,
+            peers.iter().map(|peer| peer.peer_state.session_id()),
+        );
+    }
+    Some(result)
 }
 
 async fn observed_peer(
@@ -378,45 +399,56 @@ async fn observed_peer(
         result = tx.reserve() => match result { Ok(slot) => slot, Err(_) => return },
     };
     let observation = message.observation.clone();
-    with_observer_state(
-        &peers,
-        Some(&self_peer_state),
-        sessions,
-        #[cfg(test)]
-        state_ready,
-        |self_state, peers| {
-            if message.ttl > 0 && deadline <= tokio::time::Instant::now() {
-                return;
-            }
-            let commit = || {
+    let mut slot = Some(slot);
+    let commit = retry_state(|| {
+        try_with_observer_state(
+            &peers,
+            Some(&self_peer_state),
+            sessions,
+            #[cfg(test)]
+            state_ready,
+            |self_state, peers| {
                 if message.ttl > 0 && deadline <= tokio::time::Instant::now() {
-                    return;
+                    return Some(());
                 }
-                let changes = if message.ttl == 0 {
-                    remove_peer(message.node_state.ident(), peers)
-                } else {
-                    apply_peer(
-                        PeerState {
-                            node_state: message.node_state,
-                            measurement_endpoint: message.measurement_endpoint,
-                            audio_endpoint: message.audio_endpoint,
-                        },
-                        peers,
-                        self_state.unwrap(),
-                        Some(deadline),
-                    )
+                let mut publish = || {
+                    if message.ttl > 0 && deadline <= tokio::time::Instant::now() {
+                        return;
+                    }
+                    let changes = if message.ttl == 0 {
+                        remove_peer(message.node_state.ident(), peers)
+                    } else {
+                        apply_peer(
+                            PeerState {
+                                node_state: message.node_state.clone(),
+                                measurement_endpoint: message.measurement_endpoint,
+                                audio_endpoint: message.audio_endpoint,
+                            },
+                            peers,
+                            self_state.unwrap(),
+                            Some(deadline),
+                        )
+                    };
+                    if !changes.is_empty() {
+                        slot.take().unwrap().send(changes);
+                    }
                 };
-                if !changes.is_empty() {
-                    slot.send(changes);
+                if let Some(observation) = &observation {
+                    observation.try_while_current(publish).map(|_| ())
+                } else {
+                    publish();
+                    Some(())
                 }
-            };
-            if let Some(observation) = observation {
-                observation.while_current(commit);
-            } else {
-                commit();
-            }
-        },
-    );
+            },
+        )
+        .flatten()
+    });
+    tokio::select! {
+        biased;
+        _ = super::messenger::PeerObservation::invalidated(message.observation.as_deref()) => {},
+        _ = tokio::time::sleep_until(deadline), if message.ttl > 0 => {},
+        _ = commit => {},
+    }
 }
 
 async fn saw_peer(
@@ -430,19 +462,23 @@ async fn saw_peer(
     let Ok(slot) = tx.reserve().await else {
         return;
     };
-    with_observer_state(
-        &peers,
-        Some(&self_peer_state),
-        sessions,
-        #[cfg(test)]
-        None,
-        |self_state, peers| {
-            let changes = apply_peer(state, peers, self_state.unwrap(), None);
-            if !changes.is_empty() {
-                slot.send(changes);
-            }
-        },
-    );
+    let mut slot = Some(slot);
+    retry_state(|| {
+        try_with_observer_state(
+            &peers,
+            Some(&self_peer_state),
+            sessions,
+            #[cfg(test)]
+            None,
+            |self_state, peers| {
+                let changes = apply_peer(state.clone(), peers, self_state.unwrap(), None);
+                if !changes.is_empty() {
+                    slot.take().unwrap().send(changes);
+                }
+            },
+        )
+    })
+    .await;
 }
 
 fn apply_peer(
@@ -524,19 +560,23 @@ async fn peer_left(
     let Ok(slot) = tx.reserve().await else {
         return;
     };
-    with_observer_state(
-        &peers,
-        None,
-        sessions,
-        #[cfg(test)]
-        None,
-        |_, peers| {
-            let changes = remove_peer(node_id, peers);
-            if !changes.is_empty() {
-                slot.send(changes);
-            }
-        },
-    );
+    let mut slot = Some(slot);
+    retry_state(|| {
+        try_with_observer_state(
+            &peers,
+            None,
+            sessions,
+            #[cfg(test)]
+            None,
+            |_, peers| {
+                let changes = remove_peer(node_id, peers);
+                if !changes.is_empty() {
+                    slot.take().unwrap().send(changes);
+                }
+            },
+        )
+    })
+    .await;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -546,6 +586,258 @@ pub struct ControllerPeer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_io_retirement_visits_each_live_peer_once() {
+        use crate::link::sessions::SessionMeasurement;
+        let current = Session::new(
+            SessionId(NodeId::from_array(u64::MAX.to_be_bytes())),
+            Timeline::default(),
+            SessionMeasurement::default(),
+        );
+        let ids = (0u64..1024)
+            .map(|id| SessionId(NodeId::from_array(id.to_be_bytes())))
+            .collect::<Vec<_>>();
+        let mut others = ids
+            .iter()
+            .map(|id| Session::new(*id, Timeline::default(), SessionMeasurement::default()))
+            .collect::<Vec<_>>();
+        others.push(Session::new(
+            SessionId(NodeId::from_array(2048u64.to_be_bytes())),
+            Timeline::default(),
+            SessionMeasurement::default(),
+        ));
+        let visits = std::cell::Cell::new(0usize);
+        retain_live_sessions(
+            &current,
+            &mut others,
+            ids.iter().map(|id| {
+                visits.set(visits.get() + 1);
+                *id
+            }),
+        );
+        assert_eq!(others.len(), 1024);
+        assert_eq!(
+            visits.get(),
+            1024,
+            "retirement must not rescan peers per candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_io_observer_contention_keeps_packets_deadlines_and_shutdown_live() {
+        use crate::{
+            discovery::messenger::MeasurementRoute,
+            link::{
+                node::NodeState, payload::Payload, pingresponder, sessions::SessionMeasurement,
+            },
+            platform::io_context::IoContext,
+        };
+        use std::{net::Ipv4Addr, sync::atomic::Ordering, time::Duration};
+        let io = IoContext::new().unwrap();
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let held = peers.clone();
+        let (ready, ready_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            ready.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let shared = peers.clone();
+        let (observer, events, capacity, mut changes, gate, route, session_task) = io
+            .spawn(async move {
+                let (events, rx) = mpsc::channel(1);
+                let (changes, rx_changes) = mpsc::channel(1);
+                let (requests, _rx_requests) = mpsc::channel(1);
+                let (_results, rx_results) = mpsc::channel(1);
+                let (joins, _rx_joins) = mpsc::channel(1);
+                let gate = Arc::new(DispatchGate::new_open());
+                let (sessions, task) = Sessions::with_dispatch_gate(
+                    Session::new(
+                        SessionId::default(),
+                        Timeline::default(),
+                        SessionMeasurement::default(),
+                    ),
+                    requests,
+                    shared.clone(),
+                    crate::link::clock::Clock::new(),
+                    joins,
+                    rx_results,
+                    gate.clone(),
+                );
+                let observer = GatewayObserver::with_dispatch_gate(
+                    rx,
+                    Arc::new(Mutex::new(PeerState::default())),
+                    Arc::new(Mutex::new(SessionPeerCounter::default())),
+                    changes.clone(),
+                    shared,
+                    gate.clone(),
+                    Some(sessions),
+                )
+                .await;
+                let (route, _retire) = MeasurementRoute::test_fixture();
+                (observer, events, changes, rx_changes, gate, route, task)
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+        events
+            .send(PeerEvent::Observed(PeerStateMessageType {
+                node_state: NodeState {
+                    node_id: NodeId::from_array([90; 8]),
+                    ..Default::default()
+                },
+                ttl: 30,
+                expires_at: Some(deadline),
+                observation: None,
+                measurement_endpoint: None,
+                audio_endpoint: None,
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observer.state_ready.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let remote = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let std::net::SocketAddr::V4(endpoint) = remote.local_addr().unwrap() else {
+            panic!("IPv4")
+        };
+        let responder = tokio::spawn(async move {
+            let mut bytes = [0; 512];
+            let (n, from) = remote.recv_from(&mut bytes).await.unwrap();
+            assert_eq!(
+                &bytes[..n],
+                pingresponder::encode_message(pingresponder::PING, &Payload::default())
+                    .unwrap()
+                    .as_slice()
+            );
+            remote
+                .send_to(
+                    &pingresponder::encode_message(pingresponder::PONG, &Payload::default())
+                        .unwrap(),
+                    from,
+                )
+                .await
+                .unwrap();
+        });
+        let mut network = io.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            route
+                .send(
+                    &pingresponder::encode_message(pingresponder::PING, &Payload::default())
+                        .unwrap(),
+                    endpoint,
+                )
+                .await
+                .unwrap();
+            let mut bytes = [0; 512];
+            let (n, _) = route.socket().recv_from(&mut bytes).await.unwrap();
+            assert_eq!(
+                &bytes[..n],
+                pingresponder::encode_message(pingresponder::PONG, &Payload::default())
+                    .unwrap()
+                    .as_slice()
+            );
+        });
+        let network_live = matches!(
+            tokio::time::timeout(Duration::from_millis(150), &mut network).await,
+            Ok(Ok(()))
+        );
+        let expiry_live = tokio::time::timeout(Duration::from_millis(650), async {
+            while capacity.capacity() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let stop_live = tokio::time::timeout(Duration::from_millis(150), gate.stop())
+            .await
+            .is_ok();
+        let (stopped, mut stopped_rx) = tokio::sync::oneshot::channel();
+        let shutdown = std::thread::spawn(move || {
+            let mut io = io;
+            io.shutdown();
+            let _ = stopped.send(());
+        });
+        let shutdown_live = tokio::time::timeout(Duration::from_millis(150), &mut stopped_rx)
+            .await
+            .is_ok();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        shutdown.join().unwrap();
+        responder.abort();
+        let _ = responder.await;
+        let _ = session_task.await;
+        assert!(
+            network_live,
+            "peer contention must not park the actual owned IO runtime's PING/PONG or timer"
+        );
+        assert!(
+            expiry_live,
+            "expired input must release reserved capacity while peers remain locked"
+        );
+        assert!(
+            stop_live && shutdown_live,
+            "gate stop and owned executor shutdown must finish before the peer guard is released"
+        );
+        assert!(peers.lock().unwrap().is_empty());
+        assert!(changes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn owned_io_count_waits_instead_of_reporting_contention_as_empty() {
+        use std::time::Duration;
+        let id = SessionId(NodeId::from_array([4; 8]));
+        let peer = ControllerPeer {
+            peer_state: PeerState {
+                node_state: crate::link::node::NodeState::new(id),
+                ..Default::default()
+            },
+        };
+        let peers = Arc::new(Mutex::new(vec![peer]));
+        let held = peers.clone();
+        let (ready, ready_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            ready.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let count_peers = peers.clone();
+        let (counted, mut count_rx) = tokio::sync::oneshot::channel();
+        let count_thread = std::thread::spawn(move || {
+            let _ = counted.send(unique_session_peer_count(
+                id,
+                count_peers,
+                NodeId::default(),
+            ));
+        });
+        let async_peers = peers.clone();
+        let mut work = tokio::spawn(async move {
+            unique_session_peer_count_async(id, async_peers, NodeId::default()).await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let premature_sync = count_rx.try_recv().ok();
+        let premature_async = work.is_finished();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        count_thread.join().unwrap();
+        assert!(
+            premature_sync.is_none() && !premature_async,
+            "contention is not an empty peer registry"
+        );
+        assert_eq!(count_rx.await.unwrap(), 1);
+        assert_eq!((&mut work).await.unwrap(), 1);
+    }
+
     #[tokio::test]
     async fn origin_finality_last_departure_retires_candidate_before_result_or_reappearance() {
         use crate::link::{

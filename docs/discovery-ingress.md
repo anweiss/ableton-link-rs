@@ -373,3 +373,26 @@ may rearm it after each result; they no longer accumulate permanently recurring 
 Managed retry workers remain lifecycle-owned and deduplicated per incarnation.
 A peer without an advertised measurement endpoint reports a failed transform, not
 retryable route retirement; public measurement constructors start no workers for it.
+
+### Cooperative registry contention and eligible measurement ownership
+
+Observer commits and managed session/count operations retry contended mutex acquisition
+as one cancellable async operation, releasing every acquired guard before waiting.
+They do not park the owned single-thread IO executor or create blocking-pool jobs.
+Ingress/revision checks in observer publication are also nonblocking; original deadlines,
+receive ordering, and irrevocable gateway departure cleanup remain in force. A controller
+membership batch stays ordered while waiting and is cancelled with its lifecycle epoch.
+The synchronous `unique_session_peer_count` waits for a correct snapshot; async callers
+can use `unique_session_peer_count_async`. Candidate retirement builds one live-session
+set rather than rescanning peers for each candidate.
+
+Measurement selection prefers endpoint-advertising members, with leader preference
+within that group; no-endpoint sessions still receive terminal failed measurements.
+Failed-origin retirement removes every matching incarnation entry, without deleting a
+distinct incarnation or its peers. Join consumption validates live peers under the same
+session/registry guards, resetting a peerless remote promotion even if both counts were zero.
+
+`schedule_remeasurement` now returns a `JoinHandle<()>`: retain it and abort it when an
+independent caller's ownership ends. It waits for a peer and channel capacity, sends at
+most one request, and exits when the request receiver closes. Public session-result
+handlers also stop their waiting request when its originating current incarnation changes.
