@@ -2881,7 +2881,7 @@ mod dispatch_gate_tests {
             }) - i128::from(origin);
             let expected_nanos = beat_difference * 500 - 100_000_000_000;
             assert_eq!(
-                crate::duration_nanos(received_host_time),
+                crate::link::duration_nanos(received_host_time),
                 expected_nanos,
                 "received start/stop must retain the full beat difference before subtracting the 100-second intercept"
             );
