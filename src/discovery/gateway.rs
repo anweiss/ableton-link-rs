@@ -867,7 +867,7 @@ mod tests {
                 assert!(current[0].0 <= Instant::now() + std::time::Duration::from_secs(3));
                 assert_eq!(current[1].1, other);
             }
-            assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
+            assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(state)) if state.node_state.ident() == id && state.ttl == 30 && state.expires_at.is_some() && state.observation.is_none()));
             on_byebye(id, timeouts.clone(), tx, cancel).await;
             assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(peer)) if peer == id));
             assert!(!find_peer(&id, timeouts).await);
