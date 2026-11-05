@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::encoding::{self, Decode, Encode};
+#[cfg(test)]
 use crate::sync::lock;
 
 use tokio::net::UdpSocket;
@@ -171,7 +172,9 @@ impl PingResponder {
             (*id, form.host_to_ghost(self.clock.micros()))
         };
         let id = SessionMembership { session_id };
-        let current_gt = GhostTime { time };
+        let current_gt = GhostTime {
+            time: chrono::Duration::microseconds(super::micros(time)),
+        };
 
         payload_entries.push(PayloadEntry::SessionMembership(id));
         payload_entries.push(PayloadEntry::GhostTime(current_gt));
@@ -215,6 +218,7 @@ impl PingResponder {
         .await;
     }
 
+    #[cfg(test)]
     pub(crate) fn update_node_state_now(&self, session_id: SessionId, x_form: GhostXForm) {
         let mut current_id = lock(&self.session_id);
         let mut current_form = lock(&self.ghost_x_form);
@@ -270,6 +274,105 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn wide_boundary_shared_reader_survives_extreme_pong_and_ghost_time() {
+        use crate::{
+            discovery::peers::PeerState,
+            link::{measurement::MeasurementService, state::SessionState},
+        };
+        let io = crate::platform::io_context::IoContext::new().unwrap();
+        let service = io
+            .spawn(async {
+                let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                let (results, _result_rx) = tokio::sync::mpsc::channel(1);
+                let (_requests, request_rx) = tokio::sync::mpsc::channel(1);
+                let notifier = Arc::new(tokio::sync::Notify::new());
+                let service = MeasurementService::new(
+                    socket,
+                    Arc::new(Mutex::new(PeerState::default())),
+                    Arc::new(Mutex::new(SessionState::default())),
+                    Clock::new(),
+                    results,
+                    notifier.clone(),
+                    request_rx,
+                )
+                .await;
+                service.listen(notifier).await;
+                service
+            })
+            .await
+            .unwrap();
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = service.shared_socket.local_addr().unwrap();
+        let extreme_pong = encode_message(
+            PONG,
+            &Payload {
+                entries: vec![
+                    PayloadEntry::HostTime(HostTime::new(chrono::Duration::microseconds(i64::MIN))),
+                    PayloadEntry::GhostTime(GhostTime::new(chrono::Duration::microseconds(
+                        i64::MAX,
+                    ))),
+                ],
+            },
+        )
+        .unwrap();
+        remote.send_to(&extreme_pong, destination).await.unwrap();
+        remote
+            .send_to(&extreme_pong[..extreme_pong.len() - 1], destination)
+            .await
+            .unwrap();
+        let ping = encode_message(
+            PING,
+            &Payload {
+                entries: vec![PayloadEntry::HostTime(HostTime::default())],
+            },
+        )
+        .unwrap();
+        for (intercept, expected) in [
+            (chrono::Duration::microseconds(i64::MAX), i64::MAX),
+            (chrono::Duration::MIN, i64::MIN),
+            (chrono::Duration::microseconds(42), 42),
+        ] {
+            service
+                .ping_responder
+                .update_node_state(
+                    SessionId::default(),
+                    GhostXForm {
+                        slope: if expected == 42 { 0.0 } else { 1.0 },
+                        intercept,
+                    },
+                )
+                .await;
+            remote.send_to(&ping, destination).await.unwrap();
+            let mut bytes = [0; MAX_MESSAGE_SIZE];
+            let (n, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                remote.recv_from(&mut bytes),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let (header, offset) = parse_message_header(&bytes[..n]).unwrap();
+            assert_eq!(header.message_type, PONG);
+            let payload = parse_payload(&bytes[offset..n]).unwrap();
+            let ghost = payload
+                .entries
+                .iter()
+                .find_map(|entry| {
+                    if let PayloadEntry::GhostTime(time) = entry {
+                        Some(time.time)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert_eq!(ghost, chrono::Duration::microseconds(expected));
+        }
+        service.stop().await;
+        drop(service);
+        drop(io);
+    }
+
     #[tokio::test]
     async fn admission_owned_reader_skips_contended_ping_and_recovers() {
         use crate::{

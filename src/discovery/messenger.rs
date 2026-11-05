@@ -311,6 +311,28 @@ impl MeasurementRoute {
     pub(crate) async fn invalidated(&self) {
         self.entry.invalidated().await;
     }
+    pub(crate) fn try_while_current<T>(&self, publish: impl FnOnce() -> T) -> Option<Option<T>> {
+        let sockets = crate::platform::io_context::try_state(&self.sockets)?;
+        let registered = sockets.get(&self.entry.identity.addr).is_some_and(|group| {
+            group
+                .registrations()
+                .any(|entry| Arc::ptr_eq(&entry.socket, &self.entry.socket))
+        });
+        if registered && self.entry.is_current().unwrap_or(false) {
+            Some(Some(publish()))
+        } else {
+            Some(None)
+        }
+    }
+    pub(crate) async fn while_current_async<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
+        let mut publish = Some(publish);
+        select! {
+            biased;
+            _ = self.invalidated() => None,
+            result = crate::platform::io_context::retry_state(|| self.try_while_current(|| publish.take().unwrap()())) => result,
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn while_current<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
         let sockets = self.sockets.lock().ok()?;
         let registered = sockets.get(&self.entry.identity.addr).is_some_and(|group| {
@@ -551,6 +573,7 @@ impl PeerObservation {
         Some((!self.revision.cancel.is_cancelled()).then(commit))
     }
 
+    #[cfg(test)]
     pub(crate) fn while_current<T>(&self, commit: impl FnOnce() -> T) -> Option<T> {
         self.ingress
             .while_current(|| {
@@ -1404,7 +1427,14 @@ fn receive_loop(
                     continue;
                 };
                 let observation = state.observation.clone().expect("managed observation");
-                observation.while_current(|| {
+                let expires = state.expires_at.expect("managed announcement deadline");
+                let mut slot = Some(slot);
+                select! {
+                    biased;
+                    _ = delivery_open.closed() => {},
+                    _ = PeerObservation::invalidated(Some(&observation)) => {},
+                    _ = tokio::time::sleep_until(expires), if state.ttl > 0 => {},
+                    _ = crate::platform::io_context::retry_state(|| observation.try_while_current(|| {
                     let expires = state.expires_at.expect("managed announcement deadline");
                     if state.ttl > 0 && expires <= Instant::now() {
                         return;
@@ -1421,8 +1451,9 @@ fn receive_loop(
                             false,
                         );
                     }
-                    slot.send(OnEvent::PeerState(state));
-                });
+                    slot.take().unwrap().send(OnEvent::PeerState(state.clone()));
+                })) => {},
+                }
             }
         });
         loop {
@@ -2529,6 +2560,316 @@ mod tests {
             );
         }
         children.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn wide_boundary_received_forwarder_waits_without_parking_deadlines_or_epoch_stop() {
+        for hold_revision in [false, true] {
+            for mode in 0..3 {
+                let io = crate::platform::io_context::IoContext::new().unwrap();
+                let (outbound, mut events) = tokio::sync::mpsc::channel(1);
+                outbound
+                    .send(OnEvent::Byebye(NodeId::default()))
+                    .await
+                    .unwrap();
+                let (listener, context, worker) = io
+                    .spawn(async move {
+                        let listener = Arc::new(
+                            PacketSocket::new(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0), None)
+                                .unwrap(),
+                        );
+                        let context = receive_context(outbound);
+                        let worker =
+                            tokio::spawn(receive_loop(listener.clone(), None, context.clone()));
+                        (listener, context, worker)
+                    })
+                    .await
+                    .unwrap();
+                let remote = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                let peer = PeerState {
+                    node_state: NodeState {
+                        node_id: NodeId::from_array([185; 8]),
+                        timeline: crate::link::timeline::Timeline {
+                            tempo: crate::link::tempo::Tempo::new(120.0),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    measurement_endpoint: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20809)),
+                    ..Default::default()
+                };
+                let bytes =
+                    encode_message(peer.ident(), 1, RESPONSE, &Payload::from(peer.clone()), 0)
+                        .unwrap();
+                remote
+                    .send_to(
+                        &bytes,
+                        (
+                            Ipv4Addr::LOCALHOST,
+                            listener.socket.local_addr().unwrap().port(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while context.pending_delivery.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let map = context.interface_sockets.clone();
+                let revision = context.measurement_routes.1.clone();
+                let (ready, ready_rx) = std::sync::mpsc::channel();
+                let (release, release_rx) = std::sync::mpsc::channel();
+                fn hold<T>(
+                    state: Arc<Mutex<T>>,
+                    ready: std::sync::mpsc::Sender<()>,
+                    release: std::sync::mpsc::Receiver<()>,
+                ) {
+                    let _guard = state.lock().unwrap();
+                    ready.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
+                let holder = std::thread::spawn(move || {
+                    if hold_revision {
+                        hold(revision, ready, release_rx)
+                    } else {
+                        hold(map, ready, release_rx)
+                    }
+                });
+                ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert!(matches!(events.recv().await, Some(OnEvent::Byebye(_))));
+                let heartbeat = io.spawn(async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                });
+                let live = matches!(
+                    tokio::time::timeout(Duration::from_millis(100), heartbeat).await,
+                    Ok(Ok(()))
+                );
+                let no_partial = events.try_recv().is_err();
+                if mode == 1 {
+                    tokio::time::sleep(Duration::from_millis(1100)).await;
+                }
+                let stopped = if mode == 2 {
+                    tokio::time::timeout(Duration::from_millis(200), context.gate.stop())
+                        .await
+                        .is_ok()
+                } else {
+                    true
+                };
+                release.send(()).unwrap();
+                holder.join().unwrap();
+                let delivered = if mode == 0 {
+                    matches!(tokio::time::timeout(Duration::from_secs(1),events.recv()).await,Ok(Some(OnEvent::PeerState(state))) if state.node_state.ident()==peer.ident())
+                } else {
+                    tokio::time::timeout(Duration::from_millis(30), events.recv())
+                        .await
+                        .is_err()
+                };
+                worker.abort();
+                let _ = worker.await;
+                context.gate.stop().await;
+                drop(io);
+                assert!(live&&no_partial&&stopped&&delivered,"received forwarder must retry guards within original wire TTL and epoch: revision={hold_revision}, mode={mode}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wide_boundary_measurement_route_commit_is_cooperative_and_lease_cancellable() {
+        for cancel in [false, true] {
+            let io = crate::platform::io_context::IoContext::new().unwrap();
+            let (route, retire) = MeasurementRoute::test_fixture();
+            let map = route.sockets.clone();
+            let (ready, ready_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let _guard = map.lock().unwrap();
+                ready.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let committed = Arc::new(AtomicUsize::new(0));
+            let marker = committed.clone();
+            let mut work = io.spawn(async move {
+                route
+                    .while_current_async(|| {
+                        marker.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .await
+            });
+            let heartbeat = io.spawn(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            });
+            let live = matches!(
+                tokio::time::timeout(Duration::from_millis(100), heartbeat).await,
+                Ok(Ok(()))
+            );
+            let pending = !work.is_finished() && committed.load(Ordering::SeqCst) == 0;
+            if cancel {
+                retire();
+            }
+            let cancelled = if cancel {
+                matches!(
+                    tokio::time::timeout(Duration::from_millis(100), &mut work).await,
+                    Ok(Ok(None))
+                )
+            } else {
+                true
+            };
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            if !cancel {
+                assert_eq!(work.await.unwrap(), Some(()));
+            } else if !work.is_finished() {
+                work.abort();
+                let _ = work.await;
+            }
+            assert!(live && pending && cancelled);
+            assert_eq!(committed.load(Ordering::SeqCst), usize::from(!cancel));
+            drop(io);
+        }
+    }
+
+    #[tokio::test]
+    async fn wide_boundary_gateway_checked_commit_releases_guards_for_expiry_and_stop() {
+        use super::super::{gateway, peers::PeerEvent};
+        for held_kind in 0..3 {
+            for mode in 0..4 {
+                let io = crate::platform::io_context::IoContext::new().unwrap();
+                let (route, retire) = MeasurementRoute::test_fixture();
+                let routes = MeasurementRoutes::default();
+                let (input, mut pending) = tokio::sync::mpsc::channel(1);
+                let peer = PeerState {
+                    node_state: NodeState {
+                        node_id: NodeId::from_array([178; 8]),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                queued_state(&input, &routes, &route, &peer, 1);
+                let OnEvent::PeerState(mut message) = pending.recv().await.unwrap().event else {
+                    panic!("peer")
+                };
+                if mode == 1 {
+                    message.expires_at = Some(Instant::now() + Duration::from_millis(60));
+                }
+                let previous = NodeId::from_array([179; 8]);
+                let timeouts = Arc::new(Mutex::new(vec![(
+                    Instant::now() + Duration::from_millis(20),
+                    previous,
+                )]));
+                let cancel = Arc::new(Notify::new());
+                let (events, mut received) = tokio::sync::mpsc::channel(4);
+                let (t, tx, c) = (timeouts.clone(), events.clone(), cancel.clone());
+                io.spawn(async move {
+                    gateway::schedule_next_pruning(t, Instant::now(), tx, c).await;
+                })
+                .await
+                .unwrap();
+                let map = route.sockets.clone();
+                let revision = routes.1.clone();
+                let state = timeouts.clone();
+                let (ready, ready_rx) = std::sync::mpsc::channel();
+                let (release, release_rx) = std::sync::mpsc::channel();
+                fn hold<T>(
+                    state: Arc<Mutex<T>>,
+                    ready: std::sync::mpsc::Sender<()>,
+                    release: std::sync::mpsc::Receiver<()>,
+                ) {
+                    let _guard = state.lock().unwrap();
+                    ready.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
+                let holder = std::thread::spawn(move || match held_kind {
+                    0 => hold(map, ready, release_rx),
+                    1 => hold(revision, ready, release_rx),
+                    _ => hold(state, ready, release_rx),
+                });
+                ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let gate = Arc::new(crate::link::controller::DispatchGate::new_open());
+                let owner = gate.clone();
+                let (t, tx, c) = (timeouts.clone(), events.clone(), cancel.clone());
+                let mut work = io.spawn(async move {
+                    owner
+                        .run_in_epoch(
+                            owner.epoch(),
+                            gateway::on_peer_state(
+                                message,
+                                t,
+                                tx,
+                                Instant::now(),
+                                c,
+                                NodeId::default(),
+                            ),
+                        )
+                        .await;
+                });
+                let heartbeat = io.spawn(async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                });
+                let live = matches!(
+                    tokio::time::timeout(Duration::from_millis(100), heartbeat).await,
+                    Ok(Ok(()))
+                );
+                let pending_before = mode == 1 || !work.is_finished();
+                if mode == 2 {
+                    retire();
+                }
+                let stopped = if mode == 3 {
+                    tokio::time::timeout(Duration::from_millis(150), gate.stop())
+                        .await
+                        .is_ok()
+                } else {
+                    true
+                };
+                let expired = if held_kind < 2 {
+                    matches!(tokio::time::timeout(Duration::from_millis(250),received.recv()).await,Ok(Some(PeerEvent::PeerTimedOut(id))) if id==previous)
+                } else {
+                    true
+                };
+                let cancelled = if mode > 0 {
+                    tokio::time::timeout(Duration::from_millis(150), &mut work)
+                        .await
+                        .is_ok()
+                } else {
+                    true
+                };
+                release.send(()).unwrap();
+                holder.join().unwrap();
+                if mode == 0 {
+                    tokio::time::timeout(Duration::from_secs(1), &mut work)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                } else if !work.is_finished() {
+                    work.abort();
+                    let _ = work.await;
+                }
+                assert!(live && pending_before && stopped && expired && cancelled,"checked gateway commit parked IO or held timeout state: guard={held_kind}, mode={mode}");
+                if mode == 0 {
+                    loop {
+                        if let Some(PeerEvent::Observed(observed)) = received.recv().await {
+                            assert_eq!(observed.node_state.ident(), peer.ident());
+                            break;
+                        }
+                    }
+                } else {
+                    assert!(!timeouts
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(_, id)| *id == peer.ident()));
+                    while let Ok(event) = received.try_recv() {
+                        assert!(!matches!(event, PeerEvent::Observed(_)));
+                    }
+                }
+                cancel.notify_waiters();
+                gate.stop().await;
+                drop(io);
+            }
+        }
     }
 
     fn queued_state(

@@ -25,7 +25,7 @@ impl Display for Tempo {
 impl From<Duration> for Tempo {
     fn from(value: Duration) -> Self {
         Tempo {
-            value: 60.0 * 1e6 / super::micros(value) as f64,
+            value: 60.0 * 1e9 / super::duration_nanos(value) as f64,
         }
     }
 }
@@ -44,12 +44,30 @@ impl Tempo {
     }
 
     pub fn micros_to_beats(&self, micros: Duration) -> Beats {
-        Beats::new(super::micros(micros) as f64 / super::micros(self.micros_per_beat()) as f64)
+        Beats::from_microbeats(
+            self.microbeats_from_nanos(super::duration_nanos(micros))
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+        )
     }
 
     pub fn beats_to_micros(&self, beats: Beats) -> Duration {
-        Duration::microseconds(
-            (beats.floating() * super::micros(self.micros_per_beat()) as f64).round() as i64,
+        super::duration_from_nanos(
+            self.micros_from_microbeats(i128::from(beats.value))
+                .saturating_mul(1_000),
+        )
+    }
+
+    pub(crate) fn microbeats_from_nanos(&self, nanos: i128) -> i128 {
+        super::round_ratio(
+            nanos * 1_000,
+            i128::from(super::micros(self.micros_per_beat())),
+        )
+    }
+
+    pub(crate) fn micros_from_microbeats(&self, beats: i128) -> i128 {
+        super::round_ratio(
+            beats * i128::from(super::micros(self.micros_per_beat())),
+            1_000_000,
         )
     }
 }
@@ -79,6 +97,30 @@ impl crate::encoding::Decode for Tempo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_boundary_tempo_preserves_large_elapsed_values() {
+        let tempo = Tempo::new(20.0);
+        let elapsed = Duration::microseconds(i64::MAX) - Duration::microseconds(i64::MIN);
+        assert_eq!(
+            tempo.micros_to_beats(elapsed).value,
+            6_148_914_691_236_517_205
+        );
+        assert_eq!(
+            tempo.micros_to_beats(-elapsed).value,
+            -6_148_914_691_236_517_205
+        );
+        assert_eq!(
+            tempo.beats_to_micros(Beats::from_microbeats(i64::MAX)),
+            Duration::microseconds(i64::MAX) * 3
+        );
+        assert_eq!(
+            tempo.beats_to_micros(Beats::from_microbeats(i64::MIN)),
+            Duration::microseconds(i64::MIN) * 3
+        );
+        assert_eq!(tempo.micros_to_beats(Duration::MAX).value, i64::MAX);
+        assert_eq!(tempo.micros_to_beats(Duration::MIN).value, i64::MIN);
+    }
 
     #[test]
     fn construct_from_bpm() {

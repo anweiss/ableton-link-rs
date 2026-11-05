@@ -19,24 +19,25 @@ impl Default for GhostXForm {
 
 impl GhostXForm {
     pub fn host_to_ghost(&self, host_time: Duration) -> Duration {
+        if self.slope == 1.0 {
+            return super::duration_from_nanos(
+                super::round_ratio(super::duration_nanos(host_time), 1_000) * 1_000
+                    + super::duration_nanos(self.intercept),
+            );
+        }
         let offset =
-            Duration::microseconds((self.slope * super::micros(host_time) as f64).round() as i64);
-        offset
-            .checked_add(&self.intercept)
-            .unwrap_or(if offset < Duration::zero() {
-                Duration::MIN
-            } else {
-                Duration::MAX
-            })
+            (self.slope * (super::duration_nanos(host_time) as f64 / 1_000.0)).round() as i128;
+        super::duration_from_nanos(
+            offset
+                .saturating_mul(1_000)
+                .saturating_add(super::duration_nanos(self.intercept)),
+        )
     }
 
     pub fn ghost_to_host(&self, ghost_time: Duration) -> Duration {
         // Preserve a wide (and potentially cancelling) difference through the
         // division. Only the final host microseconds are saturated by the cast.
-        let nanos = |time: Duration| {
-            i128::from(time.num_seconds()) * 1_000_000_000 + i128::from(time.subsec_nanos())
-        };
-        let difference = nanos(ghost_time) - nanos(self.intercept);
+        let difference = super::duration_nanos(ghost_time) - super::duration_nanos(self.intercept);
         Duration::microseconds((difference as f64 / 1_000.0 / self.slope).round() as i64)
     }
 }
@@ -80,24 +81,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wide_boundary_forward_scaling_and_intercept_cancellation() {
+        let identity = GhostXForm {
+            slope: 1.0,
+            intercept: Duration::zero(),
+        };
+        for input in [
+            Duration::MIN,
+            Duration::MAX,
+            Duration::microseconds(i64::MAX) + Duration::microseconds(1),
+            Duration::microseconds(i64::MIN) - Duration::microseconds(1),
+        ] {
+            assert_eq!(identity.host_to_ghost(input), input);
+        }
+        for (input, expected) in [(1_499, 1), (1_500, 2), (-1_499, -1), (-1_500, -2)] {
+            assert_eq!(
+                identity.host_to_ghost(Duration::nanoseconds(input)),
+                Duration::microseconds(expected)
+            );
+        }
+        for sign in [-1, 1] {
+            let input = Duration::microseconds(sign * i64::MAX) * 2;
+            let form = GhostXForm {
+                slope: 0.25,
+                intercept: Duration::zero(),
+            };
+            let expected = Duration::microseconds(sign * (i64::MAX / 2));
+            assert!(
+                (form.host_to_ghost(input) - expected)
+                    .num_microseconds()
+                    .unwrap()
+                    .abs()
+                    <= 2
+            );
+            let form = GhostXForm {
+                slope: 2.0,
+                intercept: -Duration::microseconds(sign * i64::MAX),
+            };
+            let output = form.host_to_ghost(Duration::microseconds(sign * i64::MAX));
+            assert!(
+                (output - Duration::microseconds(sign * i64::MAX))
+                    .num_microseconds()
+                    .unwrap()
+                    .abs()
+                    <= 2
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
-    fn transforms_saturate_out_of_range_microsecond_inputs_in_both_directions() {
+    fn transforms_preserve_wide_forward_values_and_bound_final_host_microseconds() {
         let identity = GhostXForm {
             slope: 1.0,
             intercept: Duration::zero(),
         };
         for (limit, delta) in [(i64::MIN, -1), (i64::MIN, 0), (i64::MAX, 0), (i64::MAX, 1)] {
             let input = Duration::microseconds(limit) + Duration::microseconds(delta);
-            assert_eq!(identity.host_to_ghost(input), Duration::microseconds(limit));
+            assert_eq!(identity.host_to_ghost(input), input);
             assert_eq!(identity.ghost_to_host(input), Duration::microseconds(limit));
         }
         for (input, expected) in [(Duration::MIN, i64::MIN), (Duration::MAX, i64::MAX)] {
-            assert_eq!(
-                identity.host_to_ghost(input),
-                Duration::microseconds(expected)
-            );
+            assert_eq!(identity.host_to_ghost(input), input);
             assert_eq!(
                 identity.ghost_to_host(input),
                 Duration::microseconds(expected)

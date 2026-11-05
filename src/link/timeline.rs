@@ -39,11 +39,20 @@ impl Default for Timeline {
 
 impl Timeline {
     pub fn to_beats(&self, time: Duration) -> Beats {
-        self.beat_origin + self.tempo.micros_to_beats(time - self.time_origin)
+        let elapsed = super::duration_nanos(time) - super::duration_nanos(self.time_origin);
+        let beats = self
+            .tempo
+            .microbeats_from_nanos(elapsed)
+            .saturating_add(i128::from(self.beat_origin.value));
+        Beats::from_microbeats(beats.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
     }
 
     pub fn from_beats(&self, beats: Beats) -> Duration {
-        self.time_origin + self.tempo.beats_to_micros(beats - self.beat_origin)
+        let difference = i128::from(beats.value) - i128::from(self.beat_origin.value);
+        let elapsed = self.tempo.micros_from_microbeats(difference);
+        super::duration_from_nanos(
+            super::duration_nanos(self.time_origin).saturating_add(elapsed.saturating_mul(1_000)),
+        )
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -161,6 +170,57 @@ pub fn shift_client_timeline(client: Timeline, shift: Beats) -> Timeline {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wide_boundary_timeline_converts_before_narrowing() {
+        let timeline = Timeline {
+            tempo: Tempo::new(20.0),
+            beat_origin: Beats::default(),
+            time_origin: Duration::microseconds(i64::MIN),
+        };
+        assert_eq!(
+            timeline.to_beats(Duration::microseconds(i64::MAX)).value,
+            6_148_914_691_236_517_205
+        );
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::from_microbeats(i64::MIN),
+            time_origin: Duration::zero(),
+        };
+        assert_eq!(
+            timeline.from_beats(Beats::from_microbeats(i64::MAX)),
+            Duration::microseconds(i64::MAX) + Duration::microseconds(1)
+        );
+        let timeline = Timeline {
+            time_origin: Duration::microseconds(-i64::MAX),
+            ..timeline
+        };
+        assert_eq!(
+            timeline.from_beats(Beats::from_microbeats(i64::MAX)),
+            Duration::microseconds(1)
+        );
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::from_microbeats(i64::MIN),
+            time_origin: Duration::zero(),
+        };
+        assert_eq!(
+            timeline.to_beats(Duration::microseconds(i64::MAX)).value,
+            i64::MAX - 1
+        );
+        let reversed = Timeline {
+            beat_origin: Beats::from_microbeats(i64::MAX),
+            ..timeline
+        };
+        assert_eq!(
+            reversed.from_beats(Beats::from_microbeats(i64::MIN)),
+            -Duration::microseconds(i64::MAX) - Duration::microseconds(1)
+        );
+        assert_eq!(
+            timeline.from_beats(Beats::from_microbeats(i64::MIN + 1)),
+            Duration::microseconds(1)
+        );
+    }
+
     use super::*;
 
     #[test]

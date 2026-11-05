@@ -68,6 +68,42 @@ pub(crate) fn micros(d: chrono::Duration) -> i64 {
         })
 }
 
+// Keep arithmetic wide until the enclosing semantic value is complete.
+pub(crate) fn duration_nanos(d: chrono::Duration) -> i128 {
+    i128::from(d.num_seconds()) * 1_000_000_000 + i128::from(d.subsec_nanos())
+}
+
+pub(crate) fn duration_from_nanos(nanos: i128) -> chrono::Duration {
+    let nanos = nanos.clamp(
+        duration_nanos(chrono::Duration::MIN),
+        duration_nanos(chrono::Duration::MAX),
+    );
+    chrono::Duration::seconds((nanos / 1_000_000_000) as i64)
+        + chrono::Duration::nanoseconds((nanos % 1_000_000_000) as i64)
+}
+
+pub(crate) fn round_ratio(numerator: i128, denominator: i128) -> i128 {
+    if denominator == 0 {
+        return match numerator.cmp(&0) {
+            core::cmp::Ordering::Less => i128::MIN,
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Greater => i128::MAX,
+        };
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder.unsigned_abs() >= denominator.unsigned_abs().div_ceil(2) {
+        quotient
+            + if (numerator < 0) == (denominator < 0) {
+                1
+            } else {
+                -1
+            }
+    } else {
+        quotient
+    }
+}
+
 #[cfg(feature = "std")]
 pub type PeerCountCallback = Arc<Mutex<Box<dyn Fn(usize) + Send>>>;
 #[cfg(feature = "std")]

@@ -370,6 +370,44 @@ mod tests {
     };
 
     #[test]
+    fn wide_boundary_all_clock_fields_preserve_direct_encoding_validation() {
+        for time in [Duration::MIN, Duration::MAX] {
+            for entry in [
+                PayloadEntry::HostTime(HostTime::new(time)),
+                PayloadEntry::GhostTime(GhostTime::new(time)),
+                PayloadEntry::PrevGhostTime(PrevGhostTime::new(time)),
+            ] {
+                assert!(Payload {
+                    entries: vec![entry]
+                }
+                .encode()
+                .is_err());
+            }
+        }
+        for expected in [i64::MIN, i64::MAX] {
+            let time = Duration::microseconds(expected);
+            let payload = Payload {
+                entries: vec![
+                    PayloadEntry::HostTime(HostTime::new(time)),
+                    PayloadEntry::GhostTime(GhostTime::new(time)),
+                    PayloadEntry::PrevGhostTime(PrevGhostTime::new(time)),
+                ],
+            };
+            let bytes = payload.encode().unwrap();
+            let decoded = crate::discovery::messages::parse_payload(&bytes).unwrap();
+            for entry in decoded.entries {
+                let actual = match entry {
+                    PayloadEntry::HostTime(v) => v.time,
+                    PayloadEntry::GhostTime(v) => v.time,
+                    PayloadEntry::PrevGhostTime(v) => v.time,
+                    _ => panic!("clock"),
+                };
+                assert_eq!(actual, time);
+            }
+        }
+    }
+
+    #[test]
     fn peer_state_without_an_endpoint_announces_none() {
         let without = Payload::from(PeerState::default());
         assert!(!without

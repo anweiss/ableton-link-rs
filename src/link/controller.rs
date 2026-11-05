@@ -2084,6 +2084,116 @@ mod dispatch_gate_tests {
     }
 
     #[tokio::test]
+    async fn wide_boundary_gateway_update_waits_atomically_and_cancels_on_owned_io() {
+        for held_kind in 0..3 {
+            for cancel in [false, true] {
+                let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+                    .await
+                    .unwrap();
+                let gateway = controller.discovery.clone();
+                let responder = &gateway.measurement_service.ping_responder;
+                let old_peer = gateway.peer_state.lock().unwrap().clone();
+                let old_id = *responder.session_id.lock().unwrap();
+                let old_form = *responder.ghost_x_form.lock().unwrap();
+                let target = NodeState {
+                    session_id: SessionId(NodeId::from_array([171; 8])),
+                    ..old_peer.node_state.clone()
+                };
+                let target_form = GhostXForm {
+                    slope: 1.0,
+                    intercept: chrono::Duration::seconds(73),
+                };
+                let peer = gateway.peer_state.clone();
+                let id = responder.session_id.clone();
+                let form = responder.ghost_x_form.clone();
+                let (ready, ready_rx) = std::sync::mpsc::channel();
+                let (release, release_rx) = std::sync::mpsc::channel();
+                fn hold<T>(
+                    state: Arc<Mutex<T>>,
+                    ready: std::sync::mpsc::Sender<()>,
+                    release: std::sync::mpsc::Receiver<()>,
+                ) {
+                    let _guard = state.lock().unwrap();
+                    ready.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
+                let holder = std::thread::spawn(move || match held_kind {
+                    0 => hold(peer, ready, release_rx),
+                    1 => hold(id, ready, release_rx),
+                    _ => hold(form, ready, release_rx),
+                });
+                ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let writer = gateway.clone();
+                let update = target.clone();
+                let io = controller.io.as_ref().unwrap();
+                let work = io.spawn(async move {
+                    writer.update_node_state(update, None, target_form).await;
+                });
+                let heartbeat = io.spawn(async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                });
+                let live = matches!(
+                    tokio::time::timeout(Duration::from_millis(100), heartbeat).await,
+                    Ok(Ok(()))
+                );
+                let pending = !work.is_finished();
+                let untouched = (held_kind == 0
+                    || gateway
+                        .peer_state
+                        .try_lock()
+                        .is_ok_and(|p| p.node_state == old_peer.node_state))
+                    && (held_kind == 1
+                        || responder
+                            .session_id
+                            .try_lock()
+                            .is_ok_and(|id| *id == old_id))
+                    && (held_kind == 2
+                        || responder
+                            .ghost_x_form
+                            .try_lock()
+                            .is_ok_and(|form| *form == old_form));
+                if cancel {
+                    work.abort();
+                }
+                let cancelled_before_release = if cancel {
+                    tokio::time::timeout(Duration::from_millis(100), async {
+                        while !work.is_finished() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .is_ok()
+                } else {
+                    true
+                };
+                release.send(()).unwrap();
+                holder.join().unwrap();
+                let outcome = tokio::time::timeout(Duration::from_secs(1), work)
+                    .await
+                    .unwrap();
+                assert!(live && pending && untouched && cancelled_before_release,"gateway must acquire all guards before mutation without parking IO: {held_kind}, cancel={cancel}");
+                if cancel {
+                    assert!(outcome.unwrap_err().is_cancelled());
+                    assert_eq!(
+                        gateway.peer_state.lock().unwrap().node_state,
+                        old_peer.node_state
+                    );
+                    assert_eq!(*responder.session_id.lock().unwrap(), old_id);
+                    assert_eq!(*responder.ghost_x_form.lock().unwrap(), old_form);
+                    gateway
+                        .update_node_state(target.clone(), None, target_form)
+                        .await;
+                } else {
+                    outcome.unwrap();
+                }
+                assert_eq!(gateway.peer_state.lock().unwrap().node_state, target);
+                assert_eq!(*responder.session_id.lock().unwrap(), target.session_id);
+                assert_eq!(*responder.ghost_x_form.lock().unwrap(), target_form);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn admission_disable_waits_for_public_guards_without_parking_owned_io() {
         for held_kind in 0..3 {
             let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
@@ -2468,6 +2578,19 @@ mod dispatch_gate_tests {
                 controller.client_state.lock().unwrap().timeline_session_id,
                 id
             );
+            let received_host_time = controller
+                .client_state
+                .lock()
+                .unwrap()
+                .start_stop_state
+                .time;
+            if origin == i64::MIN {
+                let expected = chrono::Duration::microseconds(i64::MAX - 99_999_999);
+                assert!((received_host_time - expected).num_microseconds().unwrap().abs() <= 2048,
+                    "received start/stop must convert the full wide beat difference before narrowing: {received_host_time:?}");
+            } else {
+                assert_eq!(received_host_time, chrono::Duration::microseconds(i64::MIN));
+            }
             let edit = Timeline {
                 tempo: tempo::Tempo::new(150.0),
                 ..controller.client_state.lock().unwrap().timeline

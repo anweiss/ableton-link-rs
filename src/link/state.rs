@@ -123,6 +123,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wide_boundary_start_stop_timestamp_saturates_at_wire_encoding() {
+        for (timestamp, expected) in [(Duration::MAX, i64::MAX), (Duration::MIN, i64::MIN)] {
+            let state = StartStopState {
+                timestamp,
+                ..Default::default()
+            };
+            let bytes = crate::encoding::encode_to_vec(&state).unwrap();
+            let (decoded, _) =
+                crate::encoding::decode_from_slice::<StartStopState>(&bytes).unwrap();
+            assert_eq!(decoded.timestamp, Duration::microseconds(expected));
+        }
+    }
+
+    #[test]
     fn start_stop_encoding_saturates_both_wire_time_boundaries() {
         for limit in [i64::MIN, i64::MAX] {
             for delta in [-1, 0, 1] {
