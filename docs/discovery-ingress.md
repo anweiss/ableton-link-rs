@@ -70,7 +70,9 @@ wildcard socket remains available for standalone measurement/responder usage.
 Managed outbound PINGs use the captured discovery registration too. Hints are
 keyed by peer identity and advertised endpoint, expire with the announcement TTL,
 and are cleared on restart. Expired and invalidated leases are pruned on lookup,
-recording, and reconciliation. The cache holds at most 1,024 hints overall and 16
+recording, and reconciliation. Each sweep drains a shared topology monitor once
+and compares all its leases against that snapshot and their cancellation flags.
+The cache holds at most 1,024 hints overall and 16
 endpoints per node; insertion at a limit evicts the earliest-expiring hint. Refresh
 of an existing key does not evict another hint. A missing or stale hint fails closed. Each interface
 registration owns a separate PONG dispatch table, so identical remote endpoints
@@ -96,9 +98,12 @@ both announcements and PONG sources for the new registration as well.
 ## Registration, queues and lifecycle
 
 Each socket reader owns one delivery task and a 64-event discovery handoff queue.
-It reserves capacity before decoding ALIVE/RESPONSE state or recording a route;
-overflow updates are discarded rather than blocking measurement datagrams or
-accumulating routing hints. The delivery task uses the lifecycle gate's receive
+ALIVE/RESPONSE decoding is bounded by the datagram size. Valid received traffic
+refreshes only an already published route identity before attempting handoff;
+overflow updates cannot add new hints or block measurement datagrams. Each item
+retains its receive-time expiry, which also bounds the gateway's downstream wait.
+Expired work is discarded, fractional remaining life uses the absolute deadline,
+and older queued updates cannot overwrite a newer route refresh. The delivery task uses the lifecycle gate's receive
 permit and preparation drain. Every queued item retains its captured ingress
 lease; closure or lease invalidation interrupts its event-capacity wait. With
 capacity reserved, the worker verifies the exact socket remains registered and
@@ -304,3 +309,13 @@ shim dependency or replaced by an unsupported-platform success path.
 * Windows notifications and cancellation:
   <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-notifyipinterfacechange>
   and <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-cancelmibchangenotify2>
+
+## Source migration
+
+`PeerStateMessageType` adds `expires_at: Option<tokio::time::Instant>`. Existing
+standalone struct literals use None to retain call-time TTL semantics; managed
+forwarders preserve Some(original_receive_deadline). This is a source-breaking
+metadata change, not a wire-format change. Same-adapter alias selection uses
+verified subnet masks and link-local scope only after the ingress index is fixed.
+Local-delivery identity is refreshed on subsequent scans, including for leases
+captured before an enumeration failure recovered. This does not close #154.

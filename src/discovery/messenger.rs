@@ -136,32 +136,64 @@ impl Cancel {
     }
 }
 
-#[derive(Default)]
-struct LocalDelivery {
+#[derive(Clone, Default)]
+struct LocalIdentity {
     loopback_indices: HashSet<u32>,
     addresses: HashSet<IpAddr>,
+    subnets: HashMap<(u32, Ipv4Addr), Ipv4Addr>,
 }
 
+#[derive(Default)]
+struct LocalDelivery(Mutex<LocalIdentity>);
+
 impl LocalDelivery {
-    fn snapshot() -> Self {
+    fn identity() -> LocalIdentity {
         let Ok(interfaces) = if_addrs::get_if_addrs() else {
-            return Self::default();
+            return LocalIdentity::default();
         };
-        Self {
+        LocalIdentity {
             loopback_indices: interfaces
                 .iter()
-                .filter(|interface| interface.is_loopback())
-                .filter_map(|interface| interface.index)
+                .filter(|i| i.is_loopback())
+                .filter_map(|i| i.index)
                 .collect(),
-            addresses: interfaces.iter().map(|interface| interface.ip()).collect(),
+            addresses: interfaces.iter().map(|i| i.ip()).collect(),
+            subnets: interfaces
+                .iter()
+                .filter_map(|interface| match &interface.addr {
+                    if_addrs::IfAddr::V4(address) => {
+                        Some(((interface.index?, address.ip), address.netmask))
+                    }
+                    _ => None,
+                })
+                .collect(),
         }
     }
-
+    fn snapshot() -> Self {
+        Self(Mutex::new(Self::identity()))
+    }
+    fn refresh(&self, identity: &LocalIdentity) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = identity.clone();
+    }
+    fn same_subnet(&self, index: u32, address: Ipv4Addr, source: IpAddr) -> bool {
+        let IpAddr::V4(source) = source else {
+            return false;
+        };
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .subnets
+            .get(&(index, address))
+            .is_some_and(|mask| {
+                u32::from(address) & u32::from(*mask) == u32::from(source) & u32::from(*mask)
+            })
+    }
     fn accepts(&self, index: u64, source: IpAddr) -> bool {
+        let identity = self.0.lock().unwrap_or_else(|e| e.into_inner());
         u32::try_from(index)
             .ok()
-            .is_some_and(|index| self.loopback_indices.contains(&index))
-            && self.addresses.contains(&source)
+            .is_some_and(|i| identity.loopback_indices.contains(&i))
+            && identity.addresses.contains(&source)
     }
 }
 
@@ -244,11 +276,39 @@ impl std::fmt::Debug for MeasurementRoute {
 }
 
 impl MeasurementRoute {
+    #[cfg(test)]
+    pub(crate) fn test_fixture() -> (Self, impl FnOnce()) {
+        let entry = tests::interface_socket();
+        let route = Self {
+            entry: entry.lease(),
+            sockets: Arc::new(Mutex::new(HashMap::from([(
+                entry.identity.addr,
+                entry.lease(),
+            )]))),
+        };
+        (route, move || entry.cancel.cancel())
+    }
     pub(crate) fn socket(&self) -> Arc<UdpSocket> {
         self.entry.socket.clone()
     }
     pub(crate) fn dispatch(&self) -> crate::link::measurement::PongDispatch {
         self.entry.measurement_dispatch.clone()
+    }
+    pub(crate) async fn invalidated(&self) {
+        self.entry.invalidated().await;
+    }
+    pub(crate) fn while_current<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
+        let sockets = self.sockets.lock().ok()?;
+        let registered = sockets.get(&self.entry.identity.addr).is_some_and(|group| {
+            group
+                .registrations()
+                .any(|entry| Arc::ptr_eq(&entry.socket, &self.entry.socket))
+        });
+        if registered && self.entry.is_current().unwrap_or(false) {
+            Some(publish())
+        } else {
+            None
+        }
     }
     pub(crate) async fn send(&self, bytes: &[u8], to: SocketAddrV4) -> std::io::Result<usize> {
         send_registered(&self.entry, &self.sockets, bytes, to).await?;
@@ -259,22 +319,41 @@ impl MeasurementRoute {
 const MAX_MEASUREMENT_ROUTES: usize = 1024;
 const MAX_ROUTES_PER_PEER: usize = 16;
 
-type MeasurementRouteMap = HashMap<(NodeId, SocketAddrV4), (Instant, MeasurementRoute)>;
+struct RouteHint {
+    expires: Instant,
+    observed: Instant,
+    route: MeasurementRoute,
+}
+type MeasurementRouteMap = HashMap<(NodeId, SocketAddrV4), RouteHint>;
+type TopologySnapshot = HashMap<usize, Option<u64>>;
+
+fn current_in_snapshot(entry: &InterfaceSocket, generations: &mut TopologySnapshot) -> bool {
+    !entry.cancel.is_cancelled()
+        && entry.topology.as_ref().is_none_or(|topology| {
+            *generations
+                .entry(Arc::as_ptr(topology) as usize)
+                .or_insert_with(|| topology.check().ok())
+                == Some(entry.generation)
+        })
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct MeasurementRoutes(Arc<Mutex<MeasurementRouteMap>>);
 
 impl MeasurementRoutes {
-    fn prune(&self) {
-        let now = Instant::now();
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|_, (expires, route)| {
-                *expires > now && route.entry.is_current().unwrap_or(false)
-            });
+    fn sweep(routes: &mut MeasurementRouteMap, now: Instant) -> TopologySnapshot {
+        let mut generations = HashMap::new();
+        routes.retain(|_, hint| {
+            hint.expires > now && current_in_snapshot(&hint.route.entry, &mut generations)
+        });
+        generations
     }
-
+    fn prune(&self) {
+        Self::sweep(
+            &mut self.0.lock().unwrap_or_else(|e| e.into_inner()),
+            Instant::now(),
+        );
+    }
     fn record(
         &self,
         peer: NodeId,
@@ -283,17 +362,43 @@ impl MeasurementRoutes {
         route: MeasurementRoute,
     ) {
         let now = Instant::now();
-        let mut routes = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        routes.retain(|_, (expires, route)| {
-            *expires > now && route.entry.is_current().unwrap_or(false)
-        });
-        if !route.entry.is_current().unwrap_or(false) {
+        self.record_received(
+            peer,
+            endpoint,
+            now,
+            now + Duration::from_secs(u64::from(ttl)),
+            route,
+            false,
+        );
+    }
+    fn record_received(
+        &self,
+        peer: NodeId,
+        endpoint: Option<SocketAddrV4>,
+        observed: Instant,
+        expires: Instant,
+        route: MeasurementRoute,
+        existing_only: bool,
+    ) {
+        let now = Instant::now();
+        let mut routes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut generations = Self::sweep(&mut routes, now);
+        if !current_in_snapshot(&route.entry, &mut generations) {
             return;
         }
         if let Some(endpoint) = endpoint {
             let key = (peer, endpoint);
-            if ttl == 0 {
+            if routes
+                .get(&key)
+                .is_some_and(|hint| hint.observed > observed)
+            {
+                return;
+            }
+            if expires <= now {
                 routes.remove(&key);
+                return;
+            }
+            if existing_only && !routes.contains_key(&key) {
                 return;
             }
             if !routes.contains_key(&key) {
@@ -301,7 +406,7 @@ impl MeasurementRoutes {
                     if let Some(old) = routes
                         .iter()
                         .filter(|((node, _), _)| *node == peer)
-                        .min_by_key(|(_, (expires, _))| *expires)
+                        .min_by_key(|(_, hint)| hint.expires)
                         .map(|(key, _)| *key)
                     {
                         routes.remove(&old);
@@ -310,7 +415,7 @@ impl MeasurementRoutes {
                 if routes.len() >= MAX_MEASUREMENT_ROUTES {
                     if let Some(old) = routes
                         .iter()
-                        .min_by_key(|(_, (expires, _))| *expires)
+                        .min_by_key(|(_, hint)| hint.expires)
                         .map(|(key, _)| *key)
                     {
                         routes.remove(&old);
@@ -318,36 +423,29 @@ impl MeasurementRoutes {
                 }
             }
             routes.insert(
-                (peer, endpoint),
-                (now + Duration::from_secs(u64::from(ttl)), route),
+                key,
+                RouteHint {
+                    expires,
+                    observed,
+                    route,
+                },
             );
-        } else {
-            routes.retain(|(node, _), _| *node != peer);
+        } else if !existing_only {
+            routes.retain(|(node, _), hint| *node != peer || hint.observed > observed);
         }
     }
-
     pub(crate) fn resolve(&self, peer: &PeerState) -> Option<MeasurementRoute> {
         let endpoint = peer.measurement_endpoint?;
-        let route = {
-            let now = Instant::now();
-            let mut routes = self.0.lock().unwrap_or_else(|error| error.into_inner());
-            routes.retain(|_, (expires, route)| {
-                *expires > now && route.entry.is_current().unwrap_or(false)
-            });
-            routes.get(&(peer.ident(), endpoint))?.1.clone()
-        };
-        route
-            .entry
-            .is_current()
-            .ok()
-            .filter(|current| *current)
-            .map(|_| route)
+        let mut routes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Self::sweep(&mut routes, Instant::now());
+        routes
+            .get(&(peer.ident(), endpoint))
+            .map(|hint| hint.route.clone())
     }
-
     fn remove_peer(&self, node: NodeId) {
         self.0
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|(peer, _), _| *peer != node);
     }
 }
@@ -946,6 +1044,11 @@ fn reconcile_interfaces_at(
     failures: &mut SetupFailures,
 ) {
     failures.forget_except(current);
+    let local_identity = LocalDelivery::identity();
+    for entry in interface_socket_entries(&context.interface_sockets) {
+        entry.local_delivery.refresh(&local_identity);
+    }
+
     let entries = interface_socket_entries(&context.interface_sockets);
     let known: Vec<_> = entries.iter().map(|entry| entry.identity.clone()).collect();
 
@@ -1002,16 +1105,25 @@ fn socket_for_ingress(
     sockets: &HashMap<Ipv4Addr, InterfaceSocket>,
     index: u64,
     destination: IpAddr,
+    source: IpAddr,
 ) -> Option<InterfaceSocket> {
     sockets
         .values()
         .flat_map(InterfaceSocket::registrations)
         .filter(|entry| u64::from(entry.identity.index) == index && !entry.cancel.is_cancelled())
         // With multiple addresses on one adapter, prefer the exact unicast
-        // destination, otherwise a stable local address; never use the source.
+        // destination. Within the verified ingress adapter only, prefer the
+        // same link-local scope as the peer; source IP never selects the adapter.
         .min_by_key(|entry| {
             (
                 IpAddr::V4(entry.identity.addr) != destination,
+                matches!(source, IpAddr::V4(ip) if ip.is_link_local())
+                    != entry.identity.addr.is_link_local(),
+                !entry.local_delivery.same_subnet(
+                    entry.identity.index,
+                    entry.identity.addr,
+                    source,
+                ),
                 entry.identity.addr,
             )
         })
@@ -1057,7 +1169,7 @@ async fn receive_datagram(
                         })
                         .map(InterfaceSocket::lease)
                 } else {
-                    socket_for_ingress(&sockets, info.if_index, info.addr_dst)
+                    socket_for_ingress(&sockets, info.if_index, info.addr_dst, info.addr_src.ip())
                 };
                 let route = match route {
                     Some(entry) if entry.is_current()? => Some(entry),
@@ -1092,6 +1204,16 @@ const DISCOVERY_HANDOFF_CAPACITY: usize = 64;
 struct DiscoveryEvent {
     event: OnEvent,
     ingress: MeasurementRoute,
+    received: Instant,
+}
+
+async fn event_expired(event: &OnEvent) {
+    match event {
+        OnEvent::PeerState(state) if state.expires_at.is_some() => {
+            tokio::time::sleep_until(state.expires_at.unwrap()).await
+        }
+        _ => std::future::pending().await,
+    }
 }
 
 fn receive_loop(
@@ -1111,7 +1233,7 @@ fn receive_loop(
         let pending_delivery = context.pending_delivery.clone();
         let mut delivery_task = tokio::task::JoinSet::new();
         delivery_task.spawn(async move {
-            while let Some((_permit, _, event)) = crate::link::controller::gated_recv(
+            while let Some((_permit, _, mut event)) = crate::link::controller::gated_recv(
                 &delivery_gate,
                 &mut delivery_open,
                 &mut pending,
@@ -1124,6 +1246,7 @@ fn receive_loop(
                     biased;
                     _ = delivery_open.closed() => continue,
                     _ = event.ingress.entry.invalidated() => continue,
+                    _ = event_expired(&event.event) => continue,
                     result = events.reserve() => match result { Ok(slot) => slot, Err(_) => break },
                 };
                 // No await from the registration check through event publication.
@@ -1140,13 +1263,26 @@ fn receive_loop(
                 if !registered || !entry.is_current().unwrap_or(false) {
                     continue;
                 }
-                match &event.event {
-                    OnEvent::PeerState(state) => routes.record(
-                        state.node_state.ident(),
-                        state.measurement_endpoint,
-                        state.ttl,
-                        event.ingress.clone(),
-                    ),
+                match &mut event.event {
+                    OnEvent::PeerState(state) => {
+                        let expires = state.expires_at.expect("managed announcement deadline");
+                        let now = Instant::now();
+                        if expires <= now {
+                            continue;
+                        }
+                        state.ttl = expires
+                            .duration_since(now)
+                            .as_secs()
+                            .min(u64::from(u8::MAX)) as u8;
+                        routes.record_received(
+                            state.node_state.ident(),
+                            state.measurement_endpoint,
+                            event.received,
+                            expires,
+                            event.ingress.clone(),
+                            false,
+                        );
+                    }
                     OnEvent::Byebye(node) => routes.remove_peer(*node),
                 }
                 if entry.is_current().unwrap_or(false) {
@@ -1200,6 +1336,7 @@ fn receive_loop(
                     continue;
                 }
             };
+            let received_at = Instant::now();
             if ingress.is_none() {
                 debug!(
                     "discarding discovery datagram without a registered ingress from {}",
@@ -1304,6 +1441,7 @@ fn receive_loop(
 
                             queue_peer_state(
                                 &handoff,
+                                received_at,
                                 header,
                                 &buf[header_len..amt],
                                 ingress.as_ref().map(|entry| {
@@ -1328,6 +1466,7 @@ fn receive_loop(
 
                             queue_peer_state(
                                 &handoff,
+                                received_at,
                                 header,
                                 &buf[header_len..amt],
                                 ingress.as_ref().map(|entry| {
@@ -1346,6 +1485,7 @@ fn receive_loop(
                             if let Some(entry) = &ingress {
                                 let _ = handoff.try_send(DiscoveryEvent {
                                     event: OnEvent::Byebye(header.ident),
+                                    received: received_at,
                                     ingress: MeasurementRoute {
                                         entry: entry.lease(),
                                         sockets: context.interface_sockets.clone(),
@@ -1742,20 +1882,38 @@ async fn receive_peer_state_with_route(
 
 fn queue_peer_state(
     tx: &Sender<DiscoveryEvent>,
+    received: Instant,
     header: MessageHeader,
     buf: &[u8],
     route: Option<(&MeasurementRoutes, MeasurementRoute)>,
 ) {
-    // Reserve before decoding/recording a route so dropped events cannot grow
-    // the routing table while the consumer is backpressured.
-    match tx.try_reserve() {
-        Ok(permit) => {
-            let Some((_, ingress)) = route else { return };
-            if let Some(event) = peer_state_event(header, buf, None) {
-                permit.send(DiscoveryEvent { event, ingress });
-            }
-        }
-        Err(error) => debug!("dropping discovery event from bounded handoff: {}", error),
+    let Some((routes, ingress)) = route else {
+        return;
+    };
+    let expires = received + Duration::from_secs(u64::from(header.ttl));
+    let Some(mut event) = peer_state_event(header, buf, None) else {
+        return;
+    };
+    if let OnEvent::PeerState(state) = &mut event {
+        state.expires_at = Some(expires);
+        // Refresh only an already published identity, even when handoff is full.
+        ingress.while_current(|| {
+            routes.record_received(
+                state.node_state.ident(),
+                state.measurement_endpoint,
+                received,
+                expires,
+                ingress.clone(),
+                true,
+            )
+        });
+    }
+    if let Ok(slot) = tx.try_reserve() {
+        slot.send(DiscoveryEvent {
+            event,
+            ingress,
+            received,
+        });
     }
 }
 
@@ -1796,6 +1954,7 @@ fn peer_state_event(
     Some(OnEvent::PeerState(PeerStateMessageType {
         node_state,
         ttl: header.ttl,
+        expires_at: Some(Instant::now() + Duration::from_secs(u64::from(header.ttl))),
         measurement_endpoint,
         audio_endpoint,
     }))
@@ -2405,6 +2564,10 @@ mod tests {
                 assert!(payload.entries.iter().any(|entry| matches!(entry,
                     PayloadEntry::MeasurementEndpointV4(measurement) if measurement.endpoint.map(SocketAddr::V4) == Some(endpoint))));
                 let ping = pingresponder::encode_message(pingresponder::PING, &Payload::default()).unwrap();
+                let mut malformed = ping.clone();
+                malformed.extend_from_slice(&crate::link::payload::HOST_TIME_HEADER_KEY.to_be_bytes());
+                malformed.extend_from_slice(&crate::link::payload::HOST_TIME_SIZE.to_be_bytes());
+                peer.send_to(&malformed, endpoint).await.unwrap();
                 peer.send_to(&ping, endpoint).await.unwrap();
                 let (size, source) = peer.recv_from(&mut buffer).await.unwrap();
                 assert_eq!(source, endpoint);
@@ -2608,6 +2771,253 @@ mod tests {
         })
         .await
         .expect("stale wildcard handoff must be cancelled while event capacity is unavailable");
+    }
+
+    #[tokio::test]
+    async fn cache_sweeps_check_a_shared_topology_only_once() {
+        let topology = Arc::new(Topology::new().unwrap());
+        let mut entry = interface_socket();
+        entry.generation = topology.check().unwrap();
+        entry.topology = Some(topology.clone());
+        let route = MeasurementRoute {
+            entry: entry.lease(),
+            sockets: Arc::new(Mutex::new(HashMap::from([(
+                entry.identity.addr,
+                entry.lease(),
+            )]))),
+        };
+        let routes = MeasurementRoutes::default();
+        let peer = PeerState {
+            node_state: NodeState {
+                node_id: NodeId::from_array([99; 8]),
+                ..NodeState::default()
+            },
+            measurement_endpoint: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20)),
+            ..PeerState::default()
+        };
+        for n in 0..MAX_MEASUREMENT_ROUTES - 1 {
+            routes.record(
+                NodeId::from_array((n as u64).to_be_bytes()),
+                peer.measurement_endpoint,
+                255,
+                route.clone(),
+            );
+        }
+        let before = topology.check_count();
+        routes.record(peer.ident(), peer.measurement_endpoint, 255, route);
+        assert_eq!(topology.check_count() - before, 1);
+        let before = topology.check_count();
+        assert!(routes.resolve(&peer).is_some());
+        assert_eq!(topology.check_count() - before, 1);
+        let before = topology.check_count();
+        routes.prune();
+        assert_eq!(topology.check_count() - before, 1);
+        topology.invalidate();
+        routes.prune();
+        assert!(routes.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unchanged_registration_refreshes_a_failed_local_identity_snapshot() {
+        let mut entry = interface_socket();
+        entry.local_delivery = Arc::new(LocalDelivery::default());
+        let identity = LocalDelivery::identity();
+        let index = *identity
+            .loopback_indices
+            .iter()
+            .next()
+            .expect("loopback identity");
+        let retained = entry.lease();
+        assert!(!retained
+            .local_delivery
+            .accepts(u64::from(index), IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let context = receive_context(tx);
+        context
+            .interface_sockets
+            .lock()
+            .unwrap()
+            .insert(entry.identity.addr, entry.lease());
+        let listener = Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap());
+        let mut children = tokio::task::JoinSet::new();
+        reconcile_interfaces(
+            &listener,
+            &context,
+            &mut children,
+            std::slice::from_ref(&entry.identity),
+        );
+        assert!(retained
+            .local_delivery
+            .accepts(u64::from(index), IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!retained
+            .local_delivery
+            .accepts(u64::from(index), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 19))));
+        assert!(Arc::ptr_eq(
+            &context
+                .interface_sockets
+                .lock()
+                .unwrap()
+                .get(&entry.identity.addr)
+                .unwrap()
+                .socket,
+            &entry.socket
+        ));
+        children.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn same_ingress_adapter_selects_link_local_scope_without_crossing_adapters() {
+        let mut routed = interface_socket();
+        routed.identity.addr = Ipv4Addr::new(10, 0, 0, 10);
+        routed.identity.index = 77;
+        let mut local = interface_socket();
+        local.identity.addr = Ipv4Addr::new(169, 254, 0, 2);
+        local.identity.index = 77;
+        let mut foreign = interface_socket();
+        foreign.identity.addr = Ipv4Addr::new(169, 254, 0, 1);
+        foreign.identity.index = 88;
+        let map = HashMap::from([
+            (routed.identity.addr, routed.clone()),
+            (local.identity.addr, local.clone()),
+            (foreign.identity.addr, foreign),
+        ]);
+        let source = IpAddr::V4(Ipv4Addr::new(169, 254, 4, 8));
+        let selected = socket_for_ingress(&map, 77, IpAddr::V4(MULTICAST_ADDR), source).unwrap();
+        assert!(Arc::ptr_eq(&selected.socket, &local.socket));
+        let unicast =
+            socket_for_ingress(&map, 77, IpAddr::V4(routed.identity.addr), source).unwrap();
+        assert!(Arc::ptr_eq(&unicast.socket, &routed.socket));
+        assert!(socket_for_ingress(&map, 99, IpAddr::V4(MULTICAST_ADDR), source).is_none());
+        let mut subnet = interface_socket();
+        subnet.identity.addr = Ipv4Addr::new(192, 168, 4, 10);
+        subnet.identity.index = 77;
+        let identity = LocalIdentity {
+            subnets: HashMap::from([
+                ((77, routed.identity.addr), Ipv4Addr::new(255, 255, 255, 0)),
+                ((77, subnet.identity.addr), Ipv4Addr::new(255, 255, 255, 0)),
+            ]),
+            ..LocalIdentity::default()
+        };
+        routed.local_delivery.refresh(&identity);
+        subnet.local_delivery.refresh(&identity);
+        let map = HashMap::from([
+            (routed.identity.addr, routed.clone()),
+            (subnet.identity.addr, subnet.clone()),
+        ]);
+        let selected = socket_for_ingress(
+            &map,
+            77,
+            IpAddr::V4(MULTICAST_ADDR),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 4, 2)),
+        )
+        .unwrap();
+        assert!(
+            Arc::ptr_eq(&selected.socket, &subnet.socket),
+            "a verified subnet match outranks numerical alias order"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_handoff_refreshes_only_published_routes_past_the_original_ttl() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (route, _cancel) = MeasurementRoute::test_fixture(); let routes = MeasurementRoutes::default();
+            let peer = PeerState { measurement_endpoint: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808)), ..PeerState::default() };
+            let other = PeerState { node_state: NodeState { node_id: NodeId::from_array([99;8]), ..NodeState::default() }, ..peer.clone() };
+            let first = Instant::now(); routes.record(peer.ident(),peer.measurement_endpoint,1,route.clone());
+            let (tx,_rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(DiscoveryEvent { event: OnEvent::Byebye(NodeId::default()), ingress: route.clone(), received: first }).ok().unwrap();
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                for state in [&peer,&other] {
+                    let packet=encode_message(state.ident(),1,RESPONSE,&Payload::from(state.clone()),0).unwrap();
+                    let (header,len)=parse_message_header(&packet).unwrap();
+                    queue_peer_state(&tx,Instant::now(),header,&packet[len..],Some((&routes,route.clone())));
+                }
+            }
+            assert!(Instant::now()>first+Duration::from_secs(1));
+            assert!(routes.resolve(&peer).is_some(), "an admitted peer's existing route must survive fresh traffic while discovery is blocked");
+            assert!(routes.resolve(&other).is_none(), "unpublished identity must not add a hint");
+            routes.record_received(peer.ident(),peer.measurement_endpoint,first,first+Duration::from_secs(1),route,false);
+            assert!(routes.resolve(&peer).is_some(), "older queued publication must not regress a refreshed hint");
+            let refreshed=routes.resolve(&peer).unwrap();
+            routes.record_received(peer.ident(),None,first,first+Duration::from_secs(1),refreshed,false);
+            assert!(routes.resolve(&peer).is_some(), "older endpoint withdrawal must not remove newer hint");
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wildcard_handoff_drops_expired_announcements_instead_of_renewing_ttl() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let entry = interface_socket();
+            let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let listener = Arc::new(
+                PacketSocket::new(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0), None).unwrap(),
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(OnEvent::Byebye(NodeId::default())).await.unwrap();
+            let context = receive_context(tx);
+            context
+                .interface_sockets
+                .lock()
+                .unwrap()
+                .insert(entry.identity.addr, entry.lease());
+            let pending = context.pending_delivery.clone();
+            let routes = context.measurement_routes.clone();
+            let worker = tokio::spawn(receive_loop(listener.clone(), None, context));
+            let expired = PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::from_array([90; 8]),
+                    ..NodeState::default()
+                },
+                measurement_endpoint: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 20808)),
+                ..PeerState::default()
+            };
+            let fresh = PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::from_array([91; 8]),
+                    ..NodeState::default()
+                },
+                ..expired.clone()
+            };
+            let address =
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port());
+            peer.send_to(
+                &encode_message(
+                    expired.ident(),
+                    1,
+                    RESPONSE,
+                    &Payload::from(expired.clone()),
+                    0,
+                )
+                .unwrap(),
+                address,
+            )
+            .await
+            .unwrap();
+            while pending.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            rx.recv().await.unwrap();
+            peer.send_to(
+                &encode_message(fresh.ident(), 2, RESPONSE, &Payload::from(fresh.clone()), 0)
+                    .unwrap(),
+                address,
+            )
+            .await
+            .unwrap();
+            let Some(OnEvent::PeerState(state)) = rx.recv().await else {
+                panic!("fresh announcement")
+            };
+            assert_eq!(state.node_state.ident(), fresh.ident());
+            assert!(state.expires_at.unwrap() > Instant::now());
+            assert!(routes.resolve(&expired).is_none());
+            assert!(routes.resolve(&fresh).is_some());
+            worker.abort();
+            let _ = worker.await;
+        })
+        .await
+        .expect("expired queued state must be dropped without needing downstream capacity");
     }
 
     #[tokio::test]
@@ -2884,7 +3294,7 @@ mod tests {
         assert!(worker.await.unwrap_err().is_cancelled());
     }
 
-    fn interface_socket() -> InterfaceSocket {
+    pub(super) fn interface_socket() -> InterfaceSocket {
         use network_interface::NetworkInterfaceConfig;
         let interface = network_interface::NetworkInterface::show()
             .unwrap()
@@ -3073,12 +3483,36 @@ mod tests {
             })
             .unwrap();
         assert!(Arc::ptr_eq(&old.socket, &ethernet.socket));
-        let selected = socket_for_ingress(&sockets, 11, IpAddr::V4(MULTICAST_ADDR)).unwrap();
+        let selected = socket_for_ingress(
+            &sockets,
+            11,
+            IpAddr::V4(MULTICAST_ADDR),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(&selected.socket, &wifi.socket));
-        let selected = socket_for_ingress(&sockets, 12, IpAddr::V4(MULTICAST_ADDR)).unwrap();
+        let selected = socket_for_ingress(
+            &sockets,
+            12,
+            IpAddr::V4(MULTICAST_ADDR),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(&selected.socket, &ethernet.socket));
-        assert!(socket_for_ingress(&sockets, 0, IpAddr::V4(sender)).is_none());
-        assert!(socket_for_ingress(&sockets, 13, IpAddr::V4(sender)).is_none());
+        assert!(socket_for_ingress(
+            &sockets,
+            0,
+            IpAddr::V4(sender),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        )
+        .is_none());
+        assert!(socket_for_ingress(
+            &sockets,
+            13,
+            IpAddr::V4(sender),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        )
+        .is_none());
     }
 
     #[tokio::test]
@@ -3561,8 +3995,20 @@ mod tests {
         let b_socket = b.socket.clone();
         a.siblings.push(b);
         let map = HashMap::from([(Ipv4Addr::LOCALHOST, a)]);
-        let first = socket_for_ingress(&map, 101, IpAddr::V4(MULTICAST_ADDR)).unwrap();
-        let second = socket_for_ingress(&map, 102, IpAddr::V4(MULTICAST_ADDR)).unwrap();
+        let first = socket_for_ingress(
+            &map,
+            101,
+            IpAddr::V4(MULTICAST_ADDR),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+        .unwrap();
+        let second = socket_for_ingress(
+            &map,
+            102,
+            IpAddr::V4(MULTICAST_ADDR),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+        .unwrap();
         assert!(first.siblings.is_empty() && second.siblings.is_empty());
         assert!(Arc::ptr_eq(&second.socket, &b_socket));
         let map = Arc::new(Mutex::new(map));

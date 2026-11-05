@@ -2337,6 +2337,7 @@ mod dispatch_gate_tests {
                 .event_sender()
                 .send(OnEvent::PeerState(
                     crate::discovery::peers::PeerStateMessageType {
+                        expires_at: None,
                         node_state: NodeState {
                             node_id: NodeId::from_array([99; 8]),
                             session_id: SessionId(NodeId::from_array([99; 8])),

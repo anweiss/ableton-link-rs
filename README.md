@@ -116,6 +116,36 @@ current/other-session lock order, and PONGs snapshot session identity and clock
 transform together. Callers directly accessing public mutex fields must preserve
 that lock order; these guarantees do not make arbitrary external mutations atomic.
 
+Received announcements retain an absolute deadline through discovery and gateway
+capacity waits. Expired work is discarded rather than renewing TTL. Fresh ingress
+traffic can refresh an existing published route even when the handoff is full;
+it cannot add a route for an unpublished identity. Cache sweeps drain each shared
+topology monitor once. Same-adapter address selection prefers the peer's link-local
+scope and verified subnet; source addresses never select a different adapter.
+A later scan refreshes failed local-identity snapshots without replacing the socket.
+Managed measurement cancellation follows the captured lease through queued PONGs
+and final result publication. PONG samples are appended only after every applicable
+time sum validates, and standalone early failure reporting observes cancellation.
+
+### Breaking session construction change
+
+Construct session values with `Session::new(session_id, timeline, measurement)`
+instead of a `Session` struct literal. Each new value carries a private incarnation
+identity. `clone()` preserves that identity; `Sessions::reset_session()` always
+creates a fresh incarnation, including same-ID resets. A join waiting for capacity
+rejects a reset current session or removed/reinserted candidate incarnation rather
+than publishing its old clock mapping. Public mutex mutation outside these methods
+is not an atomic lifecycle API.
+
+### Breaking discovery metadata change
+
+`PeerStateMessageType` struct literals must now include `expires_at`. Use
+`expires_at: None` for standalone callers that want TTL to start when the gateway
+accepts the call, or `Some(tokio::time::Instant)` for an original receive deadline.
+Managed socket readers always supply the deadline; intermediate code must preserve
+it rather than replace it with a new TTL. Wire bytes and method signatures do not
+change. Both replacement PR merge commits must carry a breaking-change marker.
+
 Interface scanning retains IPv4 link-local addresses for networks without DHCP,
 while excluding adapters the OS reports as operationally down. This applies to
 managed discovery and both public scanners, including their `if-addrs` fallback;

@@ -330,39 +330,35 @@ async fn on_peer_state_in_epoch(
 ) {
     debug!("received peer state from messenger");
 
+    let deadline = msg
+        .expires_at
+        .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(u64::from(msg.ttl)));
+    let slot = select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => return,
+        result = tx_peer_event.reserve() => match result { Ok(slot) => slot, Err(_) => return },
+    };
+    if deadline <= Instant::now() {
+        return;
+    }
     let peer_id = msg.node_state.ident();
-
     let new_to = (
-        Instant::now() + std::time::Duration::from_secs(u64::from(msg.ttl.min(3))), // Cap timeout at 3 seconds max
+        deadline.min(Instant::now() + std::time::Duration::from_secs(3)),
         peer_id,
     );
-
-    debug!(
-        "updating peer timeout status for peer {} with TTL {} seconds (capped at 3)",
-        peer_id, msg.ttl
-    );
-
     {
-        let mut timeouts = lock(&peer_timeouts);
+        let mut timeouts = peer_timeouts.lock().unwrap_or_else(|e| e.into_inner());
         timeouts.retain(|(_, id)| id != &peer_id);
-        let i = timeouts
+        let position = timeouts
             .iter()
-            .position(|(timeout, _)| timeout >= &new_to.0)
+            .position(|(time, _)| *time >= new_to.0)
             .unwrap_or(timeouts.len());
-        timeouts.insert(i, new_to);
-    }
-
-    debug!("sending peer state to observer");
-    if let Err(e) = tx_peer_event
-        .send(PeerEvent::SawPeer(PeerState {
+        timeouts.insert(position, new_to);
+        slot.send(PeerEvent::SawPeer(PeerState {
             node_state: msg.node_state,
             measurement_endpoint: msg.measurement_endpoint,
             audio_endpoint: msg.audio_endpoint,
-        }))
-        .await
-    {
-        debug!("Failed to send SawPeer event: {:?}", e);
-        return;
+        }));
     }
 
     cancel.notify_waiters();
@@ -506,6 +502,47 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn gateway_preserves_receive_deadlines_and_rejects_expired_state() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for expired in [true, false] {
+                let (tx, mut rx) = mpsc::channel(2);
+                let timeouts = Arc::new(Mutex::new(Vec::new()));
+                let deadline = if expired {
+                    Instant::now() - std::time::Duration::from_secs(1)
+                } else {
+                    Instant::now() + std::time::Duration::from_millis(300)
+                };
+                let state = PeerStateMessageType {
+                    node_state: NodeState::default(),
+                    ttl: if expired { 2 } else { 0 },
+                    expires_at: Some(deadline),
+                    measurement_endpoint: None,
+                    audio_endpoint: None,
+                };
+                on_peer_state(
+                    state,
+                    timeouts.clone(),
+                    tx,
+                    Instant::now(),
+                    Arc::new(Notify::new()),
+                    NodeId::default(),
+                )
+                .await;
+                if expired {
+                    assert!(rx.try_recv().is_err());
+                    assert!(timeouts.lock().unwrap().is_empty());
+                } else {
+                    assert_eq!(timeouts.lock().unwrap()[0].0, deadline);
+                    assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
+                    assert!(matches!(rx.recv().await, Some(PeerEvent::PeerTimedOut(_))));
+                }
+            }
+        })
+        .await
+        .expect("gateway must honor original deadlines, including subsecond remaining life");
+    }
+
     fn init_tracing() {
         let _ = tracing_subscriber::fmt::try_init();
     }
@@ -531,8 +568,9 @@ mod tests {
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
             tx.send(PeerEvent::PeerLeft(other)).await.unwrap();
             let cancel = Arc::new(Notify::new());
-            let work = tokio::spawn(on_peer_state(
+            let mut work = Box::pin(on_peer_state(
                 PeerStateMessageType {
+                    expires_at: None,
                     node_state: crate::link::node::NodeState {
                         node_id: id,
                         ..Default::default()
@@ -547,15 +585,19 @@ mod tests {
                 cancel.clone(),
                 other,
             ));
-            loop {
-                if lock(&timeouts)
-                    .iter()
-                    .any(|(deadline, node)| *node == id && *deadline > epoch)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(work.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                lock(&timeouts).len(),
+                3,
+                "waiting for capacity must not prematurely renew a timeout"
+            );
+            assert!(find_peer(&id, timeouts.clone()).await);
+            rx.recv().await.unwrap();
+            work.await;
             {
                 let current = lock(&timeouts);
                 assert_eq!(current.len(), 2);
@@ -563,13 +605,6 @@ mod tests {
                 assert!(current[0].0 <= Instant::now() + std::time::Duration::from_secs(3));
                 assert_eq!(current[1].1, other);
             }
-            assert!(
-                !work.is_finished(),
-                "full event channel must still apply backpressure"
-            );
-            assert!(find_peer(&id, timeouts.clone()).await);
-            rx.recv().await.unwrap();
-            work.await.unwrap();
             assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
             on_byebye(id, timeouts.clone(), tx, cancel).await;
             assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(peer)) if peer == id));
