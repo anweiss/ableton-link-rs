@@ -168,9 +168,95 @@ pub fn force_beat_at_time_impl(
                     }
                 }
             }
+            if precise {
+                if let Some(anchored) = exact_fast_anchor(*timeline, beat, time, quantum) {
+                    *timeline = anchored;
+                    return;
+                }
+            }
         }
     }
     *timeline = adjusted;
+}
+
+fn exact_fast_anchor(
+    timeline: Timeline,
+    beat: Beats,
+    time: Duration,
+    quantum: Beats,
+) -> Option<Timeline> {
+    let period = timeline.tempo.period_micros();
+    let magnitude = period.unsigned_abs();
+    let quantum_magnitude = i128::from(quantum.value).abs();
+    if !(1..1_000).contains(&magnitude) || quantum_magnitude == 0 {
+        return None;
+    }
+    let magnitude = magnitude as i128;
+    let target = i128::from(beat.value);
+    let first_boundary = closest_phase_match_wide(i64::MIN.into(), 0, quantum_magnitude);
+    let last_boundary = closest_phase_match_wide(i64::MAX.into(), 0, quantum_magnitude);
+    let (mut divisor, mut remainder) = (1_000, quantum_magnitude);
+    let (mut inverse, mut coefficient) = (1, 0);
+    while remainder != 0 {
+        let quotient = divisor / remainder;
+        (divisor, remainder) = (remainder, divisor - quotient * remainder);
+        (inverse, coefficient) = (coefficient, inverse - quotient * coefficient);
+    }
+    let modulus = quantum_magnitude / divisor;
+    let inverse = inverse.rem_euclid(modulus);
+    let time_nanos = super::duration_nanos(time);
+    // At fast raw tempos, nanosecond samples skip microbeats. Enumerate their
+    // residues, then solve the quantum congruence instead of scanning boundaries.
+    for direction in [1, -1] {
+        let sign = direction * period.signum();
+        let (minimum, maximum) = if sign > 0 {
+            (target - last_boundary, target - first_boundary)
+        } else {
+            (first_boundary - target, last_boundary - target)
+        };
+        let minimum = minimum.max(0);
+        if maximum < minimum {
+            continue;
+        }
+        let span = if direction > 0 {
+            time_nanos - super::duration_nanos(Duration::MIN)
+        } else {
+            super::duration_nanos(Duration::MAX) - time_nanos
+        };
+        for residue in 0..magnitude {
+            if residue > span {
+                break;
+            }
+            let rounded = super::round_ratio(1_000 * residue, magnitude);
+            let rhs = sign * target - rounded;
+            if rhs.rem_euclid(divisor) != 0 {
+                continue;
+            }
+            let first = ((rhs / divisor).rem_euclid(modulus) * inverse).rem_euclid(modulus);
+            let lower = ((minimum - rounded + 999).div_euclid(1_000)).max(0);
+            let upper = ((maximum - rounded).div_euclid(1_000)).min((span - residue) / magnitude);
+            let cycles = lower + (first - lower).rem_euclid(modulus);
+            if cycles > upper {
+                continue;
+            }
+            let boundary = target - sign * (1_000 * cycles + rounded);
+            let origin = narrow(boundary);
+            if closest_phase_match_wide(origin.value.into(), 0, quantum_magnitude) != boundary {
+                continue;
+            }
+            let anchored = Timeline {
+                beat_origin: origin,
+                time_origin: super::duration_from_nanos(
+                    time_nanos - direction * (cycles * magnitude + residue),
+                ),
+                ..timeline
+            };
+            if to_phase_encoded_microbeats(&anchored, time, quantum) == target {
+                return Some(anchored);
+            }
+        }
+    }
+    None
 }
 
 /// Shift client timeline by the given beat offset
@@ -200,6 +286,105 @@ fn shifted_time_origin_nanos(timeline: Timeline, shift: i128) -> i128 {
 mod tests {
     use super::*;
     use crate::link::tempo::Tempo;
+
+    #[test]
+    fn force_microbeats_searches_beyond_nearest_quantum_boundaries() {
+        for (period, quantum, target, origin, elapsed) in
+            [(500, 3, 1, -3, 2), (3, 2, 1, -332, 1), (3, 5, 2, -665, 2)]
+        {
+            for period_sign in [-1, 1] {
+                for quantum_sign in [-1, 1] {
+                    for (time, direction) in [(Duration::MAX, 1), (Duration::MIN, -1)] {
+                        let sign = period_sign * direction;
+                        let target = Beats::from_microbeats(target * sign);
+                        let quantum = Beats::from_microbeats(quantum * quantum_sign);
+                        let mut timeline = Timeline {
+                            tempo: Tempo::new(60_000_000.0 / (period * period_sign) as f64),
+                            beat_origin: Beats::default(),
+                            time_origin: time,
+                        };
+                        let alternative = Timeline {
+                            beat_origin: Beats::from_microbeats(origin * sign),
+                            time_origin: time - Duration::nanoseconds(elapsed * direction),
+                            ..timeline
+                        };
+                        assert_eq!(to_phase_encoded_beats(&alternative, time, quantum), target);
+                        force_beat_at_time_impl(&mut timeline, target, time, quantum);
+                        assert_eq!(to_phase_encoded_beats(&timeline, time, quantum), target);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_anchor_rejects_an_unsatisfiable_quantum_congruence() {
+        let timeline = Timeline {
+            tempo: Tempo::new(120_000.0),
+            ..Timeline::default()
+        };
+        assert_eq!(
+            exact_fast_anchor(
+                timeline,
+                Beats::from_microbeats(1),
+                Duration::MAX,
+                Beats::from_microbeats(2),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn force_microbeats_recovers_independently_constructed_endpoint_anchors() {
+        for period in [
+            1_i128, 2, 3, 7, 499, 500, 501, 997, 999, 1_000, 1_001, 1_999,
+        ] {
+            for period in [period, -period] {
+                for quantum in [1_i64, 2, 3, 7, 37, i64::MIN, i64::MAX] {
+                    let magnitude = i128::from(quantum).abs();
+                    for origin in [0_i64, -5, 5, i64::MIN, i64::MAX] {
+                        let boundary = magnitude
+                            * (2 * i128::from(origin) + magnitude - 1).div_euclid(2 * magnitude);
+                        for (time, direction) in [(Duration::MAX, 1), (Duration::MIN, -1)] {
+                            for elapsed in 0..=3_i64 {
+                                let elapsed = elapsed * direction;
+                                let numerator = i128::from(elapsed) * 1_000;
+                                let rounded = (2 * numerator.abs() + period.abs())
+                                    / (2 * period.abs())
+                                    * numerator.signum()
+                                    * period.signum();
+                                let Ok(target) = i64::try_from(boundary + rounded) else {
+                                    continue;
+                                };
+                                let quantum = Beats::from_microbeats(quantum);
+                                let target = Beats::from_microbeats(target);
+                                let mut timeline = Timeline {
+                                    tempo: Tempo::new(60_000_000.0 / period as f64),
+                                    beat_origin: Beats::default(),
+                                    time_origin: time,
+                                };
+                                let alternative = Timeline {
+                                    beat_origin: Beats::from_microbeats(origin),
+                                    time_origin: time - Duration::nanoseconds(elapsed),
+                                    ..timeline
+                                };
+                                assert_eq!(
+                                    to_phase_encoded_beats(&alternative, time, quantum),
+                                    target
+                                );
+                                force_beat_at_time_impl(&mut timeline, target, time, quantum);
+                                assert_eq!(
+                                    to_phase_encoded_beats(&timeline, time, quantum),
+                                    target,
+                                    "{period} {quantum:?} {origin} {elapsed}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn force_microbeats_accepts_exact_clamped_nanosecond_anchors() {
