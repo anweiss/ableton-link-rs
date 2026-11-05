@@ -698,8 +698,15 @@ impl Measurement {
                 cancelled: true,
                 job: Arc::new(()),
             };
-            if let Err(error) = tx_measurement.send(Vec::new()).await {
-                debug!("measurement result consumer closed: {}", error);
+            let cancelled = notifier.notified();
+            tokio::pin!(cancelled);
+            cancelled.as_mut().enable();
+            select! {
+                biased;
+                _ = &mut cancelled => {}
+                result = tx_measurement.send(Vec::new()) => {
+                    if let Err(error) = result { debug!("measurement result consumer closed: {}", error); }
+                }
             }
             return Ok(measurement);
         }
@@ -779,8 +786,12 @@ impl Measurement {
         // Public constructors must complete the result protocol even when no
         // worker starts; another sender may keep the consumer's channel open.
         let Some(endpoint) = state.measurement_endpoint else {
-            if let Err(error) = tx_measurement.send(Vec::new()).await {
-                debug!("measurement result consumer closed: {}", error);
+            select! {
+                biased;
+                _ = &mut cancelled => {}
+                result = tx_measurement.send(Vec::new()) => {
+                    if let Err(error) = result { debug!("measurement result consumer closed: {}", error); }
+                }
             }
             measurement.cancelled = true;
             return measurement;
@@ -807,16 +818,24 @@ impl Measurement {
 
         info!("sending initial host time ping {:?}", ht);
 
-        let init_bytes_sent = match send_ping_via(
+        let initial_payload = Payload {
+            entries: vec![PayloadEntry::HostTime(ht)],
+        };
+        let initial_send = send_ping_via(
             unicast_socket.clone(),
             route.clone(),
             endpoint,
-            &Payload {
-                entries: vec![PayloadEntry::HostTime(ht)],
-            },
-        )
-        .await
-        {
+            &initial_payload,
+        );
+        let init_bytes_sent = match select! {
+            biased;
+            _ = &mut cancelled => {
+                measurement.cancelled = true;
+                measurement.tasks.abort();
+                return measurement;
+            }
+            result = initial_send => result,
+        } {
             Ok(bytes_sent) => bytes_sent,
             Err(e) => {
                 debug!("failed to send initial ping to {}: {}", endpoint, e);
@@ -1143,6 +1162,37 @@ mod tests {
             cancelled: false,
             job,
         }
+    }
+
+    #[tokio::test]
+    async fn missing_endpoint_constructors_cancel_while_public_result_channel_is_full() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for supplied_socket in [false, true] {
+                let (tx, mut rx) = mpsc::channel(1);
+                tx.send(vec![(1.0, 2.0)]).await.unwrap();
+                let cancel = Arc::new(Notify::new());
+                let notifier = cancel.clone();
+                let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+                let (_tx_pong, rx_pong) = mpsc::channel(1);
+                let mut constructor = Box::pin(async {
+                    if supplied_socket {
+                        Measurement::with_socket(PeerState::default(), Clock::new(), tx.clone(), notifier, socket, rx_pong).await
+                    } else {
+                        Measurement::new(PeerState::default(), Clock::new(), tx.clone(), notifier).await.unwrap()
+                    }
+                });
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(constructor.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                }).await;
+                cancel.notify_waiters();
+                let measurement = constructor.await;
+                assert!(measurement.cancelled);
+                assert!(measurement.tasks.0.is_empty());
+                assert_eq!(rx.recv().await.unwrap(), vec![(1.0, 2.0)]);
+                assert!(rx.try_recv().is_err());
+            }
+        }).await.expect("missing-endpoint completion must honor cancellation without waiting for public capacity");
     }
 
     #[tokio::test]

@@ -151,11 +151,17 @@ impl PingResponder {
             }
         }
 
-        let id = SessionMembership {
-            session_id: *lock(&self.session_id),
-        };
-        let current_gt = GhostTime {
-            time: lock(&self.ghost_x_form).host_to_ghost(self.clock.micros()),
+        let (id, current_gt) = {
+            let session_id = lock(&self.session_id);
+            let x_form = lock(&self.ghost_x_form);
+            (
+                SessionMembership {
+                    session_id: *session_id,
+                },
+                GhostTime {
+                    time: x_form.host_to_ghost(self.clock.micros()),
+                },
+            )
         };
 
         payload_entries.push(PayloadEntry::SessionMembership(id));
@@ -180,8 +186,10 @@ impl PingResponder {
     }
 
     pub async fn update_node_state(&self, session_id: SessionId, x_form: GhostXForm) {
-        *lock(&self.session_id) = session_id;
-        *lock(&self.ghost_x_form) = x_form;
+        let mut current_id = lock(&self.session_id);
+        let mut current_form = lock(&self.ghost_x_form);
+        *current_id = session_id;
+        *current_form = x_form;
     }
 }
 
@@ -241,6 +249,68 @@ mod tests {
 
     fn init_tracing() {
         let _ = tracing_subscriber::fmt::try_init();
+    }
+
+    #[test]
+    fn pong_snapshot_keeps_session_and_transform_together_during_update() {
+        use crate::link::node::NodeId;
+        let old_id = SessionId(NodeId::from_array([1; 8]));
+        let new_id = SessionId(NodeId::from_array([2; 8]));
+        let responder = PingResponder {
+            session_id: Arc::new(Mutex::new(old_id)),
+            ghost_x_form: Arc::new(Mutex::new(GhostXForm {
+                slope: 0.0,
+                intercept: chrono::Duration::microseconds(100),
+            })),
+            clock: Clock::new(),
+            unicast_socket: None,
+            ping_message_received: Arc::new(AtomicBool::new(false)),
+        };
+        let ping = encode_message(PING, &Payload::default()).unwrap();
+        let src = "127.0.0.1:12345".parse().unwrap();
+        let held_transform = lock(&responder.ghost_x_form);
+        let reader = responder.clone();
+        let request = ping.clone();
+        let task = std::thread::spawn(move || reader.pong_message(&request, src).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut snapshot_holds_id = false;
+        while std::time::Instant::now() < deadline {
+            if matches!(
+                responder.session_id.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ) {
+                snapshot_holds_id = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let writer = responder.clone();
+        let update = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(writer.update_node_state(
+                    new_id,
+                    GhostXForm {
+                        slope: 0.0,
+                        intercept: chrono::Duration::microseconds(200),
+                    },
+                ))
+        });
+        drop(held_transform);
+        let first = task.join().unwrap();
+        update.join().unwrap();
+        assert!(
+            snapshot_holds_id,
+            "a PONG must retain its session snapshot until it reads the matching transform"
+        );
+        let second = responder.pong_message(&ping, src).unwrap();
+        for (message, expected_id, expected_time) in [(first, old_id, 100), (second, new_id, 200)] {
+            let (_, header) = parse_message_header(&message).unwrap();
+            let payload = parse_payload(&message[header..]).unwrap();
+            assert!(payload.entries.iter().any(|entry| matches!(entry, PayloadEntry::SessionMembership(id) if id.session_id == expected_id)));
+            assert!(payload.entries.iter().any(|entry| matches!(entry, PayloadEntry::GhostTime(time) if time.time == chrono::Duration::microseconds(expected_time))));
+        }
     }
 
     #[test]

@@ -100,9 +100,21 @@ use caller-supplied sockets or OS routing; exact peer endpoint matching is uncha
 Discovery forwarding uses a bounded queue and a lifecycle-owned delivery worker,
 so a slow event consumer does not stop that socket from handling PINGs/PONGs.
 Overflow discovery updates are dropped; periodic announcements can refresh them.
+Each queued event retains its ingress lease: invalidation cancels a capacity wait,
+and publication rechecks that exact registration. Route hints prune expired and
+retired leases and are capped at 1,024 entries overall and 16 endpoints per peer;
+new hints evict the earliest-expiring entry at a limit, so an evicted hint fails
+closed until a later accepted announcement refreshes it.
 Each measurement keeps competing terminal results on its own private channel,
 then forwards the winning result with caller backpressure. Public measurements
 sharing a full result channel therefore do not discard each other's completions.
+Missing-endpoint constructors also honor cancellation while the caller's result
+channel is full. Session transitions reserve join-notification capacity before
+committing, then recheck current state; cancellation while waiting does not leave
+a half-published switch. Library-managed session operations use a consistent
+current/other-session lock order, and PONGs snapshot session identity and clock
+transform together. Callers directly accessing public mutex fields must preserve
+that lock order; these guarantees do not make arbitrary external mutations atomic.
 
 Interface scanning retains IPv4 link-local addresses for networks without DHCP,
 while excluding adapters the OS reports as operationally down. This applies to

@@ -223,8 +223,9 @@ impl Sessions {
                             let gate = gate.clone();
                             let peers = peers_loop.clone();
                             let sender = tx_measure_peer_state_loop.clone();
+                            let current = current_loop.clone();
                             remeasurements.spawn(async move {
-                                gate.run_in_epoch(epoch, remeasurement_loop(peers, sender, session)).await;
+                                gate.run_in_epoch(epoch, remeasurement_loop(peers, sender, session, Some(current))).await;
                             });
                         }
                     }
@@ -248,14 +249,17 @@ impl Sessions {
     }
 
     pub fn reset_session(&mut self, session: Session) {
-        *lock(&self.current) = session;
-        lock(&self.other_sessions).clear();
+        let mut current = lock(&self.current);
+        let mut others = lock(&self.other_sessions);
+        *current = session;
+        others.clear();
     }
 
     pub fn reset_timeline(&self, timeline: Timeline) {
-        // Read the current id first: holding `other_sessions` while locking
-        // `current` inside the search is what crashed a host on contention.
-        let current_id = lock(&self.current).session_id;
+        // Every compound session operation takes current before other_sessions.
+        let mut current = lock(&self.current);
+        current.timeline = timeline;
+        let current_id = current.session_id;
         if let Some(session) = lock(&self.other_sessions)
             .iter_mut()
             .find(|s| s.session_id == current_id)
@@ -274,59 +278,33 @@ impl Sessions {
             timeline, session_id,
         );
 
-        let current = lock(&self.current).clone();
-        if current.session_id == session_id {
-            let session = self.update_timeline(current, timeline);
-            lock(&self.current).timeline = session.timeline;
-            let mut has_joined = lock(&self.has_joined);
-            if !*has_joined {
-                debug!(
-                    "updating current session {} with timeline {:?}",
-                    session_id, session.timeline
-                );
-
-                *has_joined = true;
-            }
-        } else {
-            let session = Session {
-                session_id,
-                timeline,
-                measurement: SessionMeasurement {
-                    x_form: GhostXForm::default(),
-                    timestamp: Duration::zero(),
-                },
-            };
-
-            let seen = lock(&self.other_sessions)
-                .iter()
-                .find(|s| s.session_id == session_id)
-                .cloned();
-
-            if let Some(s) = seen {
-                let session = self.update_timeline(s, timeline);
-                info!(
-                    "updating already seen session {} with timeline {:?}",
-                    session_id, session.timeline
-                );
-                // Look it up again rather than reuse an index: the list may
-                // have changed since it was read.
-                if let Some(slot) = lock(&self.other_sessions)
-                    .iter_mut()
-                    .find(|s| s.session_id == session_id)
-                {
-                    slot.timeline = session.timeline;
-                }
+        let launch = {
+            let mut current = lock(&self.current);
+            let mut others = lock(&self.other_sessions);
+            if current.session_id == session_id {
+                current.timeline = self.update_timeline(current.clone(), timeline).timeline;
+                *lock(&self.has_joined) = true;
+                None
+            } else if let Some(session) = others.iter_mut().find(|s| s.session_id == session_id) {
+                session.timeline = self.update_timeline(session.clone(), timeline).timeline;
+                None
             } else {
-                info!("adding session {} to other sessions", session_id);
-                lock(&self.other_sessions).push(session.clone());
-
-                launch_session_measurement(
-                    self.peers.clone(),
-                    self.tx_measure_peer_state.clone(),
-                    session,
-                )
-                .await;
+                let session = Session {
+                    session_id,
+                    timeline,
+                    measurement: SessionMeasurement::default(),
+                };
+                others.push(session.clone());
+                Some(session)
             }
+        };
+        if let Some(session) = launch {
+            launch_session_measurement(
+                self.peers.clone(),
+                self.tx_measure_peer_state.clone(),
+                session,
+            )
+            .await;
         }
 
         lock(&self.current).timeline
@@ -438,95 +416,53 @@ async fn handle_successful_measurement_inner(
         timestamp: clock.micros(),
     };
 
-    let current_session = lock(&current).clone();
-    debug!(
-        "Current session: {}, measured session: {}",
-        current_session.session_id, session_id
-    );
-
-    if current_session.session_id == session_id {
-        let session = {
-            let mut current = lock(&current);
-            current.measurement = measurement;
-            current.clone()
-        };
-        if let Err(e) = tx_join_session.send(session).await {
-            debug!("Failed to send session join event: {}", e);
-        }
-    } else {
-        let seen = lock(&other_sessions)
-            .iter()
-            .find(|s| s.session_id == session_id)
-            .cloned();
-
-        if let Some(mut s) = seen {
-            const SESSION_EPS: Duration = Duration::microseconds(500000);
-
-            let host_time = clock.micros();
-            let cur_ghost = current_session.measurement.x_form.host_to_ghost(host_time);
-            let new_ghost = measurement.x_form.host_to_ghost(host_time);
-
-            s.measurement = measurement;
-            if let Some(slot) = lock(&other_sessions)
-                .iter_mut()
-                .find(|o| o.session_id == session_id)
-            {
-                *slot = s.clone();
-            }
-
-            let ghost_diff = new_ghost - cur_ghost;
-            debug!(
-                "Ghost time comparison: current={} us, new={} us, diff={} us, eps={} us",
-                micros(cur_ghost),
-                micros(new_ghost),
-                micros(ghost_diff),
-                micros(SESSION_EPS)
-            );
-
-            // Session switching logic, matching upstream `Sessions::
-            // handleSuccessfulMeasurement`:
-            // 1. Join if the other session's ghost time is significantly ahead
-            //    of ours, which is what makes a freshly started peer adopt an
-            //    established session (and its tempo) rather than impose its own.
-            // 2. If the two are within an epsilon, fall back to session id order
-            //    so that both sides break the tie the same way.
-            let current_session_id = lock(&current).session_id;
-
-            let should_switch = ghost_diff > SESSION_EPS
-                || (micros(ghost_diff).saturating_abs() < micros(SESSION_EPS)
-                    && session_id < current_session_id);
-
-            if should_switch {
-                info!(
-                    "Session {} wins over current session (ghost_diff={} us, tempo={}), switching!",
-                    session_id,
-                    micros(ghost_diff),
-                    s.timeline.tempo.bpm()
-                );
-                // Swap the two, one lock at a time: the old current session
-                // takes the winner's place among the others.
-                let previous = std::mem::replace(&mut *lock(&current), s.clone());
-                {
-                    let mut others = lock(&other_sessions);
-                    match others.iter_mut().find(|o| o.session_id == session_id) {
-                        Some(slot) => *slot = previous,
-                        None => others.push(previous),
-                    }
-                }
-
-                if let Err(e) = tx_join_session.send(s.clone()).await {
-                    debug!("Failed to send session join event: {}", e);
-                }
-
-                return Some(s);
-            } else {
-                debug!("Session {} does not win over current session (ghost_diff={} us), staying with current",
-                       session_id,
-                       micros(ghost_diff));
+    // Decide under a consistent snapshot; do not mutate a session that requires
+    // a join notification until capacity is reserved. Cancellation while waiting
+    // must not commit an undelivered session transition.
+    {
+        let current = lock(&current);
+        let mut others = lock(&other_sessions);
+        if current.session_id != session_id {
+            let candidate = others.iter_mut().find(|s| s.session_id == session_id)?;
+            if !measurement_wins(&current, session_id, measurement, clock.micros()) {
+                candidate.measurement = measurement;
+                return None;
             }
         }
     }
+    let Ok(slot) = tx_join_session.reserve().await else {
+        return None;
+    };
+    let mut current = lock(&current);
+    let mut others = lock(&other_sessions);
+    // Capacity may have been unavailable across a reset or another transition.
+    if current.session_id == session_id {
+        current.measurement = measurement;
+        slot.send(current.clone());
+    } else if let Some(candidate) = others.iter_mut().find(|s| s.session_id == session_id) {
+        candidate.measurement = measurement;
+        if measurement_wins(&current, session_id, measurement, clock.micros()) {
+            let winner = candidate.clone();
+            *candidate = std::mem::replace(&mut *current, winner.clone());
+            slot.send(winner.clone());
+            return Some(winner);
+        }
+    }
+
     None
+}
+
+fn measurement_wins(
+    current: &Session,
+    candidate: SessionId,
+    measurement: SessionMeasurement,
+    host_time: Duration,
+) -> bool {
+    const SESSION_EPS: Duration = Duration::microseconds(500_000);
+    let diff = measurement.x_form.host_to_ghost(host_time)
+        - current.measurement.x_form.host_to_ghost(host_time);
+    diff > SESSION_EPS
+        || (micros(diff).saturating_abs() < micros(SESSION_EPS) && candidate < current.session_id)
 }
 
 pub async fn handle_failed_measurement(
@@ -551,9 +487,9 @@ async fn handle_failed_measurement_inner(
 ) -> Option<Session> {
     info!("session {} measurement failed", session_id);
 
-    let current = lock(&current).clone();
+    let current = lock(&current);
     if current.session_id == session_id {
-        return Some(current);
+        return Some(current.clone());
     } else {
         lock(&other_sessions).retain(|session| session.session_id != session_id);
         lock(&peers).retain(|peer| peer.peer_state.session_id() != session_id);
@@ -566,19 +502,28 @@ pub async fn schedule_remeasurement(
     tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     session: Session,
 ) {
-    tokio::spawn(remeasurement_loop(peers, tx_measure_peer, session));
+    tokio::spawn(remeasurement_loop(peers, tx_measure_peer, session, None));
 }
 
 async fn remeasurement_loop(
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     session: Session,
+    current: Option<Arc<Mutex<Session>>>,
 ) {
     let repeat = async {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            launch_session_measurement(peers.clone(), tx_measure_peer.clone(), session.clone())
-                .await;
+            let session = if let Some(current) = &current {
+                let current = lock(current);
+                if current.session_id != session.session_id {
+                    break;
+                }
+                current.clone()
+            } else {
+                session.clone()
+            };
+            launch_session_measurement(peers.clone(), tx_measure_peer.clone(), session).await;
         }
     };
     tokio::select! {
@@ -605,6 +550,109 @@ pub fn session_peers(
 mod tests {
     use super::*;
     use crate::link::node::NodeId;
+
+    #[tokio::test]
+    async fn blocked_join_is_cancel_safe_and_rechecks_state_before_commit() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for outcome in 0..3 {
+                let a = Session {
+                    session_id: SessionId(NodeId::from_array([10; 8])),
+                    timeline: Timeline::default(),
+                    measurement: SessionMeasurement::default(),
+                };
+                let b = Session {
+                    session_id: SessionId(NodeId::from_array([20; 8])),
+                    ..a.clone()
+                };
+                let current = Arc::new(Mutex::new(a.clone()));
+                let others = Arc::new(Mutex::new(vec![b.clone()]));
+                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                tx.send(a.clone()).await.unwrap();
+                let mut pending = tokio::spawn(handle_successful_measurement_inner(
+                    b.session_id,
+                    GhostXForm {
+                        slope: 1.0,
+                        intercept: Duration::seconds(60),
+                    },
+                    others.clone(),
+                    current.clone(),
+                    Clock::new(),
+                    tx.clone(),
+                ));
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(30), &mut pending)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    lock(&current).session_id,
+                    a.session_id,
+                    "blocked notification must not partially commit a switch"
+                );
+                assert_eq!(lock(&others)[0].session_id, b.session_id);
+                if outcome == 0 {
+                    pending.abort();
+                    let _ = pending.await;
+                    assert_eq!(lock(&current).session_id, a.session_id);
+                    rx.recv().await.unwrap();
+                    assert!(rx.try_recv().is_err());
+                } else if outcome == 1 {
+                    {
+                        let mut guard = lock(&current);
+                        let mut candidates = lock(&others);
+                        guard.session_id = SessionId(NodeId::from_array([30; 8]));
+                        candidates.clear();
+                    }
+                    rx.recv().await.unwrap();
+                    assert!(pending.await.unwrap().is_none());
+                    assert!(
+                        rx.try_recv().is_err(),
+                        "pre-reset session must not be published after capacity returns"
+                    );
+                } else {
+                    lock(&others)[0].timeline.tempo = crate::link::tempo::Tempo::new(150.0);
+                    rx.recv().await.unwrap();
+                    let winner = pending.await.unwrap().unwrap();
+                    assert_eq!(winner.timeline.tempo.bpm(), 150.0);
+                    assert_eq!(rx.recv().await.unwrap().session_id, b.session_id);
+                    let guard = lock(&current);
+                    let candidates = lock(&others);
+                    assert_eq!(guard.session_id, b.session_id);
+                    assert_eq!(guard.timeline.tempo.bpm(), 150.0);
+                    assert_eq!(candidates.len(), 1);
+                    assert_eq!(candidates[0].session_id, a.session_id);
+                }
+            }
+        })
+        .await
+        .expect("blocked joins must be cancel-safe and use state current at publication");
+    }
+
+    #[test]
+    fn resetting_timeline_updates_the_current_snapshot_without_an_other_copy() {
+        let current = Session {
+            session_id: SessionId(NodeId::from_array([1; 8])),
+            timeline: Timeline::default(),
+            measurement: SessionMeasurement::default(),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let sessions = Sessions {
+            current: Arc::new(Mutex::new(current)),
+            other_sessions: Arc::new(Mutex::new(Vec::new())),
+            is_founding: Arc::new(Mutex::new(false)),
+            has_joined: Arc::new(Mutex::new(false)),
+            peers: Arc::new(Mutex::new(Vec::new())),
+            tx_measure_peer_state: tx,
+            clock: Clock::new(),
+        };
+        let timeline = Timeline {
+            tempo: crate::link::tempo::Tempo::new(150.0),
+            ..Timeline::default()
+        };
+        sessions.reset_timeline(timeline);
+        assert_eq!(lock(&sessions.current).timeline.tempo, timeline.tempo);
+        assert!(lock(&sessions.other_sessions).is_empty());
+    }
 
     #[tokio::test]
     async fn failed_other_session_removes_only_its_session_and_peers() {
