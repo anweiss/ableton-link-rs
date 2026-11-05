@@ -264,6 +264,8 @@ pub type InterfaceSockets = Arc<Mutex<HashMap<Ipv4Addr, InterfaceSocket>>>;
 
 #[derive(Clone)]
 pub(crate) struct MeasurementRoute {
+    #[cfg(test)]
+    retire_before_samples: Arc<AtomicBool>,
     entry: InterfaceSocket,
     sockets: InterfaceSockets,
 }
@@ -281,6 +283,7 @@ impl MeasurementRoute {
     pub(crate) fn test_fixture() -> (Self, impl FnOnce()) {
         let entry = tests::interface_socket();
         let route = Self {
+            retire_before_samples: Default::default(),
             entry: entry.lease(),
             sockets: Arc::new(Mutex::new(HashMap::from([(
                 entry.identity.addr,
@@ -288,6 +291,16 @@ impl MeasurementRoute {
             )]))),
         };
         (route, move || entry.cancel.cancel())
+    }
+    #[cfg(test)]
+    pub(crate) fn retire_at_sample_publication(&self) {
+        self.retire_before_samples.store(true, Ordering::SeqCst);
+    }
+    #[cfg(test)]
+    pub(crate) fn before_sample_publication(&self) {
+        if self.retire_before_samples.swap(false, Ordering::SeqCst) {
+            self.entry.cancel.cancel();
+        }
     }
     pub(crate) fn socket(&self) -> Arc<UdpSocket> {
         self.entry.socket.clone()
@@ -611,6 +624,8 @@ impl Messenger {
             Some((
                 &self.measurement_routes,
                 MeasurementRoute {
+                    #[cfg(test)]
+                    retire_before_samples: Default::default(),
                     entry,
                     sockets: self.interface_sockets.clone(),
                 },
@@ -1979,6 +1994,8 @@ fn observe_discovery(
         payload,
         &context.measurement_routes,
         MeasurementRoute {
+            #[cfg(test)]
+            retire_before_samples: Default::default(),
             entry: entry.lease(),
             sockets: context.interface_sockets.clone(),
         },
@@ -2136,6 +2153,98 @@ pub fn send_byebye(node_state: NodeId) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn origin_finality_state_contention_does_not_block_registered_ping_pong() {
+        use super::super::peers::{GatewayObserver, PeerEvent};
+        use crate::link::{controller::SessionPeerCounter, pingresponder};
+        for hold_self in [false, true] {
+            let (route, _retire) = MeasurementRoute::test_fixture();
+            let routes = MeasurementRoutes::default();
+            let (handoff, mut pending) = tokio::sync::mpsc::channel(1);
+            let peer = PeerState {
+                node_state: NodeState {
+                    node_id: NodeId::from_array([86; 8]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let peers = Arc::new(Mutex::new(Vec::new()));
+            let self_state = Arc::new(Mutex::new(PeerState::default()));
+            let held_peers = peers.clone();
+            let held_self = self_state.clone();
+            let (ready, ready_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let peers = (!hold_self).then(|| held_peers.lock().unwrap());
+                let state = hold_self.then(|| held_self.lock().unwrap());
+                ready.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                drop((peers, state));
+            });
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let (events, rx_events) = tokio::sync::mpsc::channel(1);
+            let (changes, mut changed) = tokio::sync::mpsc::channel(1);
+            let capacity = changes.clone();
+            let _observer = GatewayObserver::new(
+                rx_events,
+                self_state,
+                Arc::new(Mutex::new(SessionPeerCounter::default())),
+                changes,
+                peers.clone(),
+                Arc::new(Notify::new()),
+                None,
+            )
+            .await;
+            queued_state(&handoff, &routes, &route, &peer, 30);
+            let OnEvent::PeerState(state) = pending.recv().await.unwrap().event else {
+                panic!("state")
+            };
+            events.send(PeerEvent::Observed(state)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while capacity.capacity() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let remote = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let SocketAddr::V4(endpoint) = remote.local_addr().unwrap() else {
+                panic!("IPv4")
+            };
+            let socket = route.socket();
+            let mut network = tokio::spawn(async move {
+                let ping = pingresponder::encode_message(pingresponder::PING, &Payload::default())
+                    .unwrap();
+                route.send(&ping, endpoint).await.unwrap();
+                let mut buf = [0; MAX_MESSAGE_SIZE];
+                let (n, src) = remote.recv_from(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], ping.as_slice());
+                let pong = pingresponder::encode_message(pingresponder::PONG, &Payload::default())
+                    .unwrap();
+                remote.send_to(&pong, src).await.unwrap();
+                let (n, source) = socket.recv_from(&mut buf).await.unwrap();
+                assert_eq!(source, SocketAddr::V4(endpoint));
+                assert_eq!(&buf[..n], pong.as_slice());
+            });
+            let result = tokio::time::timeout(Duration::from_millis(200), &mut network).await;
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            if result.is_err() {
+                let _ = tokio::time::timeout(Duration::from_secs(1), network).await;
+            }
+            assert!(
+                result.is_ok(),
+                "state contention must not retain ingress locks needed for PING/PONG"
+            );
+            result.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(1), changed.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(peers.lock().unwrap().len(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn gateway_capacity_wait_is_cancelled_by_newer_ttl_zero() {
         use super::super::{gateway::on_peer_state, peers::PeerEvent};
@@ -2388,6 +2497,7 @@ mod tests {
                 changes,
                 peers.clone(),
                 Arc::new(Notify::new()),
+                None,
             )
             .await;
             queued_state(&handoff, &routes, &route, &peer, 0);
@@ -2494,6 +2604,7 @@ mod tests {
                 changes,
                 peers.clone(),
                 Arc::new(Notify::new()),
+                None,
             )
             .await;
             queued_state(&handoff, &routes, &route, &peer, 30);
@@ -3011,6 +3122,8 @@ mod tests {
             Some(endpoint),
             30,
             MeasurementRoute {
+                #[cfg(test)]
+                retire_before_samples: Default::default(),
                 entry: first.lease(),
                 sockets: sockets.clone(),
             },
@@ -3020,6 +3133,8 @@ mod tests {
             Some(endpoint),
             30,
             MeasurementRoute {
+                #[cfg(test)]
+                retire_before_samples: Default::default(),
                 entry: second.lease(),
                 sockets: sockets.clone(),
             },
@@ -3071,6 +3186,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             let entry = interface_socket();
             let route = MeasurementRoute {
+                #[cfg(test)]
+                retire_before_samples: Default::default(),
                 entry: entry.lease(),
                 sockets: Arc::new(Mutex::new(HashMap::from([(
                     entry.identity.addr,
@@ -3449,6 +3566,8 @@ mod tests {
                 remote.measurement_endpoint,
                 30,
                 MeasurementRoute {
+                    #[cfg(test)]
+                    retire_before_samples: Default::default(),
                     entry: entry.lease(),
                     sockets: context.interface_sockets.clone(),
                 },
@@ -3601,6 +3720,8 @@ mod tests {
         entry.generation = topology.check().unwrap();
         entry.topology = Some(topology.clone());
         let route = MeasurementRoute {
+            #[cfg(test)]
+            retire_before_samples: Default::default(),
             entry: entry.lease(),
             sockets: Arc::new(Mutex::new(HashMap::from([(
                 entry.identity.addr,
@@ -3849,6 +3970,8 @@ mod tests {
             entry.lease(),
         )])));
         let route = MeasurementRoute {
+            #[cfg(test)]
+            retire_before_samples: Default::default(),
             entry: entry.lease(),
             sockets,
         };

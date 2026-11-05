@@ -126,6 +126,8 @@ pub struct SessionKey {
 
 impl SessionKey {
     /// A standalone incarnation. Managed requests use Session::key instead.
+    /// Fresh identity for independently consumed results only. Session handlers
+    /// require the key captured from `Session::key()` at request origin instead.
     pub fn new(session_id: SessionId) -> Self {
         Self {
             session_id,
@@ -290,11 +292,16 @@ impl Sessions {
                             retries.insert(identity, remeasurements.spawn(async move {
                                 gate.run_in_epoch(epoch, async move {
                                     tokio::time::sleep(delay).await;
-                                    let request = owned_measurement_request(&session.key(), &current, &others, &peers);
-                                    if let Some(request) = request {
-                                        if let Err(error) = sender.send(request).await {
-                                            debug!("measurement request receiver closed: {}", error);
+                                    loop {
+                                        let request = owned_measurement_request(&session.key(), &current, &others, &peers);
+                                        if let Some(request) = request {
+                                            if let Err(error) = sender.send(request).await {
+                                                debug!("measurement request receiver closed: {}", error);
+                                            }
+                                            break;
                                         }
+                                        if !session.key().matches(&lock(&current)) { break; }
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                     }
                                 }).await;
                             }));
@@ -635,40 +642,44 @@ async fn handle_failed_measurement_inner(
     None
 }
 
+/// Schedule one standalone request after 30 seconds; its result handler may rearm it.
 pub async fn schedule_remeasurement(
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     session: Session,
 ) {
-    tokio::spawn(remeasurement_loop(peers, tx_measure_peer, session, None));
+    tokio::spawn(remeasurement_once(
+        peers,
+        tx_measure_peer,
+        session,
+        None,
+        std::time::Duration::from_secs(30),
+    ));
 }
 
-async fn remeasurement_loop(
+async fn remeasurement_once(
     peers: Arc<Mutex<Vec<ControllerPeer>>>,
     tx_measure_peer: tokio::sync::mpsc::Sender<MeasurePeerEvent>,
     session: Session,
     current: Option<Arc<Mutex<Session>>>,
+    delay: std::time::Duration,
 ) {
-    let repeat = async {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let session = if let Some(current) = &current {
-                let current = lock(current);
-                if current.session_id != session.session_id
-                    || !Arc::ptr_eq(&current.incarnation, &session.incarnation)
-                {
-                    break;
-                }
-                current.clone()
-            } else {
-                session.clone()
-            };
-            launch_session_measurement(peers.clone(), tx_measure_peer.clone(), session).await;
-        }
+    let once = async {
+        tokio::time::sleep(delay).await;
+        let session = if let Some(current) = &current {
+            let current = lock(current);
+            if !session.key().matches(&current) {
+                return;
+            }
+            current.clone()
+        } else {
+            session
+        };
+        launch_session_measurement(peers, tx_measure_peer.clone(), session).await;
     };
     tokio::select! {
         _ = tx_measure_peer.closed() => {}
-        _ = repeat => {}
+        _ = once => {}
     }
 }
 
@@ -688,6 +699,102 @@ pub fn session_peers(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn origin_finality_standalone_scheduler_is_one_shot() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let id = SessionId(NodeId::from_array([1; 8]));
+            let session = Session::new(id, Timeline::default(), SessionMeasurement::default());
+            let peers = Arc::new(Mutex::new(vec![ControllerPeer {
+                peer_state: crate::discovery::peers::PeerState {
+                    node_state: crate::link::node::NodeState::new(id),
+                    ..Default::default()
+                },
+            }]));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let mut work = tokio::spawn(remeasurement_once(
+                peers,
+                tx,
+                session.clone(),
+                None,
+                std::time::Duration::from_millis(5),
+            ));
+            let MeasurePeerEvent::PeerState(key, _) = rx.recv().await.unwrap() else {
+                panic!("request")
+            };
+            assert!(key.matches(&session));
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut work)
+                .await
+                .expect("public remeasurement must finish after one request")
+                .unwrap();
+            assert!(
+                rx.recv().await.is_none(),
+                "no recurring producer survives the result"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn origin_finality_current_retry_survives_absence_and_remains_unique() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let id = SessionId(NodeId::from_array([1; 8]));
+            let init = Session::new(id, Timeline::default(), SessionMeasurement::default());
+            let peer = ControllerPeer {
+                peer_state: crate::discovery::peers::PeerState {
+                    node_state: crate::link::node::NodeState::new(id),
+                    ..Default::default()
+                },
+            };
+            let peers = Arc::new(Mutex::new(Vec::new()));
+            let gate = Arc::new(DispatchGate::new_open());
+            let (tx_request, mut requests) = tokio::sync::mpsc::channel(8);
+            let (tx_result, results) = tokio::sync::mpsc::channel(8);
+            let (tx_join, _joins) = tokio::sync::mpsc::channel(1);
+            let (sessions, task) = Sessions::with_dispatch_gate(
+                init.clone(),
+                tx_request,
+                peers.clone(),
+                Clock::new(),
+                tx_join,
+                results,
+                gate.clone(),
+            );
+            for _ in 0..4 {
+                tx_result
+                    .send(MeasurePeerEvent::Cancelled(init.key()))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            assert!(requests.try_recv().is_err());
+            peers.lock().unwrap().push(peer);
+            sessions.saw_session_timeline(id, Timeline::default()).await;
+            let request =
+                tokio::time::timeout(std::time::Duration::from_millis(500), requests.recv())
+                    .await
+                    .expect("current ownership must survive temporary peer absence")
+                    .unwrap();
+            assert!(matches!(request, MeasurePeerEvent::PeerState(key, _) if key.matches(&init)));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), requests.recv())
+                    .await
+                    .is_err(),
+                "one owned retry, not one per cancellation result"
+            );
+            tx_result
+                .send(MeasurePeerEvent::Cancelled(init.key()))
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            gate.stop().await;
+            assert!(requests.try_recv().is_err());
+            task.abort();
+            let _ = task.await;
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn originating_incarnation_rejects_old_success_and_failure_after_replacement() {

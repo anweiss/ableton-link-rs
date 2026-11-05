@@ -98,6 +98,7 @@ impl PeerGateway {
         rx_measure_peer_state: Receiver<MeasurePeerEvent>,
         ping_responder_unicast_socket: Arc<UdpSocket>,
         enabled: Arc<Mutex<bool>>,
+        sessions: Option<crate::link::sessions::Sessions>,
     ) -> Result<Self, std::io::Error> {
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
@@ -144,6 +145,7 @@ impl PeerGateway {
                 tx_peer_state_change,
                 peers,
                 gate,
+                sessions,
             )
             .await,
             messenger,
@@ -930,6 +932,7 @@ mod tests {
             rx_measure_peer_state,
             ping_responder_unicast_socket,
             Arc::new(Mutex::new(true)), // enabled for test
+            None,
         )
         .await
         .unwrap();
