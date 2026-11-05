@@ -1,7 +1,5 @@
-use chrono::Duration;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use triple_buffer::{Input, Output, TripleBuffer};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, RwLock, TryLockError};
 
 use super::error::CommitError;
 use super::{
@@ -37,12 +35,9 @@ struct PendingUpdate {
 pub struct RtClientState {
     pub timeline: Timeline,
     /// The session `timeline` was captured from; mirrored from
-    /// [`ClientState::timeline_session_id`] so grace-period handling can
-    /// detect a session change even when the timeline value is unchanged.
+    /// [`ClientState::timeline_session_id`].
     pub timeline_session_id: SessionId,
     pub start_stop_state: ClientStartStopState,
-    pub timeline_timestamp: Duration,
-    pub start_stop_state_timestamp: Duration,
 }
 
 impl From<ClientState> for RtClientState {
@@ -51,8 +46,6 @@ impl From<ClientState> for RtClientState {
             timeline: client_state.timeline,
             timeline_session_id: client_state.timeline_session_id,
             start_stop_state: client_state.start_stop_state,
-            timeline_timestamp: Duration::zero(),
-            start_stop_state_timestamp: Duration::zero(),
         }
     }
 }
@@ -67,107 +60,93 @@ impl From<RtClientState> for ClientState {
     }
 }
 
-/// Real-time safe session state handler using only safe Rust
-/// This provides non-blocking access to session state for real-time audio threads
-/// while allowing safe updates from other threads.
-///
-/// Uses RwLock for cached state (readers won't block each other) and
-/// triple_buffer crate for lock-free producer-consumer communication.
-pub struct SafeRtSessionStateHandler {
-    /// Triple buffer for sharing client state between RT and non-RT threads
-    /// This is split into separate input/output handles that are thread-safe
-    client_state_input: Arc<Mutex<Input<ClientState>>>,
-    client_state_output: Arc<Mutex<Output<ClientState>>>,
-
-    /// Cached RT client state for immediate access
-    /// RwLock allows multiple concurrent readers (RT threads) but exclusive writer access
-    cached_rt_state: Arc<RwLock<RtClientState>>,
-
-    /// Atomic timestamps for grace period management (in microseconds)
-    timeline_timestamp: AtomicU64,
-    start_stop_timestamp: AtomicU64,
-
-    /// Flag indicating pending updates
-    has_pending_updates: AtomicBool,
-    pending: Mutex<PendingUpdate>,
-
-    /// Grace period for local modifications (in microseconds)
-    local_mod_grace_period_micros: AtomicU64,
+struct AcceptedState {
+    slots: [RwLock<ClientState>; 2],
+    published: AtomicUsize,
+    readers: AtomicUsize,
+    pending: Mutex<Option<ClientState>>,
 }
 
-impl SafeRtSessionStateHandler {
-    pub fn new(initial_state: ClientState, grace_period: Duration) -> Self {
-        let grace_period_micros = grace_period.num_microseconds().unwrap_or(1000000) as u64; // Default 1 second
+struct AcceptedRead<'a>(&'a AcceptedState);
 
-        // Create triple buffer for client state
-        let (input, output) = TripleBuffer::new(&initial_state).split();
+impl Drop for AcceptedRead<'_> {
+    fn drop(&mut self) {
+        self.0.readers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
+impl AcceptedState {
+    fn new(initial: ClientState) -> Self {
         Self {
-            client_state_input: Arc::new(Mutex::new(input)),
-            client_state_output: Arc::new(Mutex::new(output)),
-            cached_rt_state: Arc::new(RwLock::new(initial_state.into())),
-            timeline_timestamp: AtomicU64::new(0),
-            start_stop_timestamp: AtomicU64::new(0),
-            has_pending_updates: AtomicBool::new(false),
-            pending: Mutex::new(PendingUpdate::default()),
-            local_mod_grace_period_micros: AtomicU64::new(grace_period_micros),
+            slots: [RwLock::new(initial), RwLock::new(initial)],
+            published: AtomicUsize::new(0),
+            readers: AtomicUsize::new(0),
+            pending: Mutex::new(None),
         }
     }
 
-    /// Get the current real-time client state
-    /// This is optimized for real-time threads - uses try_read to avoid blocking
-    pub fn get_rt_client_state(&self, current_time: Duration) -> ClientState {
-        let current_time_micros = current_time.num_microseconds().unwrap_or(0) as u64;
-        let grace_period = self.local_mod_grace_period_micros.load(Ordering::Acquire);
-
-        // Check if grace period has expired for timeline
-        let timeline_grace_expired = current_time_micros
-            .saturating_sub(self.timeline_timestamp.load(Ordering::Acquire))
-            > grace_period;
-
-        // Check if grace period has expired for start/stop state
-        let start_stop_grace_expired = current_time_micros
-            .saturating_sub(self.start_stop_timestamp.load(Ordering::Acquire))
-            > grace_period;
-
-        // Try to get new state if grace periods have expired and there are updates
-        if timeline_grace_expired || start_stop_grace_expired {
-            // Try to check for new data from the triple buffer (non-blocking)
-            if let Ok(mut output) = self.client_state_output.try_lock() {
-                // Check if there's new data available
-                if output.updated() {
-                    let new_state = *output.read();
-
-                    // Try to update the cached state (non-blocking)
-                    if let Ok(mut cached_state) = self.cached_rt_state.try_write() {
-                        // Update unconditionally once the grace period has
-                        // expired: comparing only the timeline value would
-                        // miss a session change whose timeline happens to be
-                        // numerically identical to the previous session's.
-                        if timeline_grace_expired {
-                            cached_state.timeline = new_state.timeline;
-                            cached_state.timeline_session_id = new_state.timeline_session_id;
-                        }
-
-                        if start_stop_grace_expired {
-                            cached_state.start_stop_state = new_state.start_stop_state;
-                        }
-                    }
-
-                    return new_state;
-                }
-            }
+    fn flush(&self, pending: &mut Option<ClientState>) {
+        let Some(state) = *pending else { return };
+        if self.readers.load(Ordering::SeqCst) != 0 {
+            return;
         }
+        let next = 1 - self.published.load(Ordering::SeqCst);
+        let mut slot = match self.slots[next].try_write() {
+            Ok(slot) => slot,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        *slot = state;
+        *pending = None;
+        drop(slot);
+        self.published.store(next, Ordering::SeqCst);
+    }
 
-        // Return current cached state (non-blocking read)
-        // If we can't get the lock, we use the last known state stored atomically
-        if let Ok(cached_state) = self.cached_rt_state.try_read() {
-            cached_state.clone().into()
-        } else {
-            // Fallback: create a default state if we can't read the cache
-            // This should rarely happen in practice
-            ClientState::default()
+    fn read(&self) -> ClientState {
+        if let Ok(mut pending) = self.pending.try_lock() {
+            self.flush(&mut pending);
         }
+        // Pin before loading the index. An in-flight writer uses the other
+        // slot; another writer cannot start while this reader remains pinned.
+        self.readers
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+            .expect("too many simultaneous accepted-state readers");
+        let reader = AcceptedRead(self);
+        let slot = self.published.load(Ordering::SeqCst);
+        let state = match self.slots[slot].try_read() {
+            Ok(state) => *state,
+            Err(TryLockError::Poisoned(error)) => *error.into_inner(),
+            Err(TryLockError::WouldBlock) => unreachable!("published accepted slot is pinned"),
+        };
+        drop(reader);
+        state
+    }
+
+    fn publish(&self, state: ClientState) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        *pending = Some(state);
+        self.flush(&mut pending);
+    }
+}
+
+/// Non-blocking accepted snapshots and a bounded acknowledged proposal queue.
+pub struct SafeRtSessionStateHandler {
+    accepted: AcceptedState,
+    has_pending_updates: AtomicBool,
+    pending: Mutex<PendingUpdate>,
+}
+
+impl SafeRtSessionStateHandler {
+    pub fn new(initial_state: ClientState) -> Self {
+        Self {
+            accepted: AcceptedState::new(initial_state),
+            has_pending_updates: AtomicBool::new(false),
+            pending: Mutex::new(PendingUpdate::default()),
+        }
+    }
+
+    pub fn get_rt_client_state(&self) -> ClientState {
+        self.accepted.read()
     }
 
     /// Queue a proposal without changing accepted state. One outstanding request
@@ -176,8 +155,6 @@ impl SafeRtSessionStateHandler {
     pub fn update_rt_client_state(
         &self,
         incoming_state: IncomingClientState,
-        _current_time: Duration,
-        _is_enabled: bool,
     ) -> Result<AudioCommitTicket, AudioQueueError> {
         self.update_rt_client_state_from_origin(incoming_state, None)
     }
@@ -228,21 +205,14 @@ impl SafeRtSessionStateHandler {
             (
                 AudioCommitTicket(pending.sequence),
                 incoming,
-                pending.origin.clone(),
+                pending.origin,
             )
         })
     }
 
     /// Publish only a controller-accepted snapshot, never an unvalidated proposal.
     pub fn publish_client_state(&self, accepted: ClientState) {
-        self.client_state_input
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .write(accepted);
-        *self
-            .cached_rt_state
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = accepted.into();
+        self.accepted.publish(accepted);
     }
 
     pub fn complete_pending_update(
@@ -284,18 +254,6 @@ impl SafeRtSessionStateHandler {
     pub fn has_pending_updates(&self) -> bool {
         self.has_pending_updates.load(Ordering::Acquire)
     }
-
-    /// Get the current grace period
-    pub fn grace_period(&self) -> Duration {
-        Duration::microseconds(self.local_mod_grace_period_micros.load(Ordering::Acquire) as i64)
-    }
-
-    /// Set a new grace period for local modifications
-    pub fn set_grace_period(&self, grace_period: Duration) {
-        let grace_period_micros = grace_period.num_microseconds().unwrap_or(1000000) as u64;
-        self.local_mod_grace_period_micros
-            .store(grace_period_micros, Ordering::Release);
-    }
 }
 
 // Safe implementations - no unsafe code needed
@@ -305,6 +263,7 @@ impl SafeRtSessionStateHandler {
 mod tests {
     use super::*;
     use crate::link::{beats::Beats, tempo::Tempo};
+    use chrono::Duration;
 
     fn create_test_client_state() -> ClientState {
         ClientState {
@@ -325,19 +284,17 @@ mod tests {
     #[test]
     fn test_safe_rt_session_state_handler_creation() {
         let client_state = create_test_client_state();
-        let handler = SafeRtSessionStateHandler::new(client_state, Duration::milliseconds(1000));
+        let handler = SafeRtSessionStateHandler::new(client_state);
 
-        assert_eq!(handler.grace_period(), Duration::milliseconds(1000));
         assert!(!handler.has_pending_updates());
     }
 
     #[test]
     fn test_safe_rt_session_state_handler_get_state() {
         let client_state = create_test_client_state();
-        let handler = SafeRtSessionStateHandler::new(client_state, Duration::milliseconds(1000));
+        let handler = SafeRtSessionStateHandler::new(client_state);
 
-        let current_time = Duration::milliseconds(500);
-        let retrieved_state = handler.get_rt_client_state(current_time);
+        let retrieved_state = handler.get_rt_client_state();
 
         assert_eq!(
             retrieved_state.timeline.tempo.bpm(),
@@ -352,7 +309,7 @@ mod tests {
     #[test]
     fn test_safe_rt_session_state_handler_updates() {
         let client_state = create_test_client_state();
-        let handler = SafeRtSessionStateHandler::new(client_state, Duration::milliseconds(1000));
+        let handler = SafeRtSessionStateHandler::new(client_state);
 
         // Create an incoming state update
         let new_timeline = Timeline {
@@ -368,13 +325,8 @@ mod tests {
         };
 
         // Update the real-time state
-        let ticket = handler
-            .update_rt_client_state(incoming_state, Duration::milliseconds(3000), true)
-            .unwrap();
-        assert_eq!(
-            handler.get_rt_client_state(Duration::seconds(10)),
-            client_state
-        );
+        let ticket = handler.update_rt_client_state(incoming_state).unwrap();
+        assert_eq!(handler.get_rt_client_state(), client_state);
 
         // Should have pending updates
         assert!(handler.has_pending_updates());
@@ -389,16 +341,13 @@ mod tests {
         assert_eq!(processed_state, incoming_state);
         assert_eq!(handler.process_pending_updates(), Some(incoming_state));
         assert_eq!(
-            handler.update_rt_client_state(incoming_state, Duration::zero(), true),
+            handler.update_rt_client_state(incoming_state),
             Err(AudioQueueError::Busy)
         );
         assert!(handler.complete_pending_update(ticket, Err(CommitError::TimelineOriginExhausted)));
+        assert_eq!(handler.get_rt_client_state(), client_state);
         assert_eq!(
-            handler.get_rt_client_state(Duration::seconds(10)),
-            client_state
-        );
-        assert_eq!(
-            handler.update_rt_client_state(incoming_state, Duration::zero(), true),
+            handler.update_rt_client_state(incoming_state),
             Err(AudioQueueError::Busy)
         );
         assert_eq!(
@@ -409,29 +358,36 @@ mod tests {
             handler.take_commit_result(ticket),
             Err(AudioQueueError::UnknownTicket)
         );
-        let ticket = handler
-            .update_rt_client_state(incoming_state, Duration::zero(), true)
-            .unwrap();
+        let ticket = handler.update_rt_client_state(incoming_state).unwrap();
         handler.publish_client_state(ClientState {
             timeline: new_timeline,
             ..client_state
         });
         assert!(handler.complete_pending_update(ticket, Ok(())));
         assert_eq!(handler.take_commit_result(ticket), Ok(Some(Ok(()))));
-        assert_eq!(
-            handler.get_rt_client_state(Duration::seconds(10)).timeline,
-            new_timeline
-        );
+        assert_eq!(handler.get_rt_client_state().timeline, new_timeline);
     }
 
     #[test]
-    fn test_safe_rt_session_state_handler_grace_period() {
+    fn ordering_accepted_snapshot_survives_preempted_publication() {
         let client_state = create_test_client_state();
-        let handler = SafeRtSessionStateHandler::new(client_state, Duration::milliseconds(1000));
-
-        // Change grace period
-        handler.set_grace_period(Duration::milliseconds(2000));
-        assert_eq!(handler.grace_period(), Duration::milliseconds(2000));
+        let handler = SafeRtSessionStateHandler::new(client_state);
+        let mut accepted = client_state;
+        accepted.timeline.tempo = Tempo::new(150.0);
+        handler.publish_client_state(accepted);
+        assert_eq!(handler.get_rt_client_state(), accepted);
+        let mut pending = handler.accepted.pending.lock().unwrap();
+        let next = 1 - handler.accepted.published.load(Ordering::SeqCst);
+        let slot = handler.accepted.slots[next].write().unwrap();
+        let mut newer = accepted;
+        newer.timeline.tempo = Tempo::new(180.0);
+        *pending = Some(newer);
+        for _ in 0..3 {
+            assert_eq!(handler.get_rt_client_state(), accepted);
+        }
+        drop(slot);
+        drop(pending);
+        assert_eq!(handler.get_rt_client_state(), newer);
     }
 
     #[test]
@@ -461,18 +417,14 @@ mod tests {
         use std::time::Duration as StdDuration;
 
         let client_state = create_test_client_state();
-        let handler = Arc::new(SafeRtSessionStateHandler::new(
-            client_state,
-            Duration::milliseconds(1000),
-        ));
+        let handler = Arc::new(SafeRtSessionStateHandler::new(client_state));
 
         let handler_clone = handler.clone();
 
         // Spawn a thread that simulates RT thread behavior
         let rt_thread = thread::spawn(move || {
-            for i in 0..100 {
-                let current_time = Duration::milliseconds(i * 10);
-                let _state = handler_clone.get_rt_client_state(current_time);
+            for _ in 0..100 {
+                let _state = handler_clone.get_rt_client_state();
 
                 // Simulate some RT work
                 thread::sleep(StdDuration::from_micros(10));
@@ -493,9 +445,7 @@ mod tests {
                 timeline_timestamp: Duration::milliseconds(i * 20),
             };
 
-            let ticket = handler
-                .update_rt_client_state(incoming_state, Duration::milliseconds(i * 20), true)
-                .unwrap();
+            let ticket = handler.update_rt_client_state(incoming_state).unwrap();
             assert_eq!(handler.process_pending_updates(), Some(incoming_state));
             handler.publish_client_state(ClientState {
                 timeline: new_timeline,
@@ -510,7 +460,7 @@ mod tests {
         rt_thread.join().unwrap();
 
         // Verify we can still read state
-        let final_state = handler.get_rt_client_state(Duration::milliseconds(1000));
+        let final_state = handler.get_rt_client_state();
         assert_eq!(final_state.timeline.tempo.bpm(), 169.0);
     }
 }

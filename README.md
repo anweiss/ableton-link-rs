@@ -290,14 +290,19 @@ Local commit ordering is checked before any authoritative state changes.
 rejected, including a combined tempo/start-stop edit, and success callbacks do not
 run. Exhaustion does not automatically create a new session or restore synchronization.
 `StaleClientState` also rejects a proposal captured from a replaced incarnation or
-overtaken timeline revision, before either field of a combined edit is installed.
+overtaken client-edit revision, before either field of a combined edit is installed.
 Capture-time provenance is retained across queueing/retries, not refreshed when
-draining. Same-ID resets and timeline value A->B->A changes invalidate old captures.
+draining. Same-ID cloned resets, client-only alignment, accepted playback observations,
+mapping changes and value A->B->A changes invalidate old captures. Provenance contains
+only copyable values, not reference-counted allocations that could be freed on an
+audio thread. Process-local edit identifiers never wrap; exhaustion prevents new
+captures from authorizing commits rather than reusing an old identifier.
 `SessionState` is now `Clone`, not `Copy`; use `.clone()` if retaining a submitted
 snapshot. Commit states captured by the same `BasicLink`, rather than constructing
 an untracked `SessionState::new` or default value for submission. A contended or
 not-yet-published capture has no commit provenance and returns `StaleClientState`
-on submission processing; recapture after publication settles.
+on submission processing; recapture after publication settles. Read-only captures
+still return accepted client values, not a fabricated zero-tempo/stopped state.
 Custom deferred controller callers use `capture_client_state()` and
 `set_state_checked(state, &origin)`. The untracked `set_state`/`handle_client_state`
 entry points are immediate requests; callers must not use them to bypass deferred
@@ -316,14 +321,40 @@ handle `Busy` (including lock contention) without assuming submission, and
 Call `process_audio_session_state_updates().await` periodically from a non-RT
 application thread, including to refresh remote accepted state. It drains at most
 one request through the checked controller path; `LinkAudio` forwards this method.
+Both drains take `&self`, so a non-RT consumer can share `Arc<BasicLink>` with an
+audio callback. A concurrent or reentrant drain returns `None` without consuming
+the request. Audio capture/submission never acquires the non-RT consumer claim.
 Read `take_audio_commit_result(ticket)` until it returns `Some(result)`, then handle
 that commit result. A completed ticket occupies the slot until acknowledged.
-An interrupted drain leaves the original request queued, with its changed-field
-mask intact; capture cannot consume it. The lower-level `AtomicSessionState` and
+Cancellation before acceptance leaves the original request queued, with its
+changed-field mask intact; capture cannot consume it. After controller acceptance,
+the ticket's terminal result is recorded before any cancellable refresh. A later
+drain resumes accepted-state refresh and pending playback notification, not the
+proposal. Playback dispatch has its own nonblocking claim and records delivered
+state only after invoking the callback. A busy dispatcher retains the latest
+pending playback value; intermediate undelivered values may coalesce. No
+controller/cache guard is held while user callbacks run.
+Tempo notification remains in the controller and is not dispatched again
+by the drain. The lower-level `AtomicSessionState` and
 `SafeRtSessionStateHandler` follow the same proposal/completion contract:
 `process_pending_updates` peeks, `pending_update` also supplies the ticket,
 `publish_client_state` installs only a controller-accepted snapshot, and
 `complete_pending_update` records the validation result before acknowledgment.
+
+Accepted RT snapshots use pinned, preallocated value slots. A preempted publisher
+does not lock out readers or cause default values to replace an accepted snapshot.
+Publication can remain pending while concurrent readers overlap continuously;
+there is no bounded freshness guarantee under that scheduling pattern.
+The obsolete local grace period is removed: `AtomicSessionState::new` and
+`SafeRtSessionStateHandler::new` take only the initial state, capture/get methods
+take no time argument, and low-level commit/update methods take only the incoming
+proposal. Remove `grace_period`, `set_grace_period`, `LOCAL_MOD_GRACE_PERIOD`, and
+the two obsolete `RtClientState` grace timestamps from downstream code.
+
+Runtime tempo normalization uses 120 BPM for NaN and bounds other values to
+20..999 BPM, including construction, local edits and accepted remote timelines.
+Canonical storage and publication use the same normalized tempo; raw `Tempo` and
+`Timeline` arithmetic remain separate from this runtime policy.
 
 `controller::update_discovery` now accepts `&Controller`, replacing three independent
 state arguments. It reads and publishes through the owner's full guarded boundary;

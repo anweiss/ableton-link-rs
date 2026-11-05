@@ -2,7 +2,11 @@ use crate::platform::io_context::{retry_state, try_state};
 use std::{
     fmt::{self, Display},
     mem,
-    sync::{Arc, Mutex},
+    num::NonZeroU64,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use chrono::Duration;
@@ -21,7 +25,7 @@ use super::{
     ghostxform::GhostXForm,
     measurement::MeasurePeerEvent,
     node::NodeId,
-    timeline::Timeline,
+    timeline::{clamp_tempo, Timeline},
     Result,
 };
 
@@ -162,27 +166,31 @@ impl Display for SessionKey {
 #[derive(Clone, Debug)]
 pub struct Session {
     pub(crate) incarnation: Arc<()>,
-    pub(crate) timeline_revision: Arc<()>,
+    pub(crate) edit_revision: Option<NonZeroU64>,
     pub session_id: SessionId,
     pub timeline: Timeline,
     pub measurement: SessionMeasurement,
 }
 
 impl Session {
+    pub(crate) fn invalidate_edit_origin(&mut self) {
+        self.edit_revision = new_edit_revision();
+    }
+
     pub(crate) fn set_timeline(&mut self, timeline: Timeline) {
         if self.timeline != timeline {
-            self.timeline_revision = Arc::new(());
+            self.invalidate_edit_origin();
             self.timeline = timeline;
         }
     }
 
-    pub(crate) fn edit_origin(&self) -> SessionEditOrigin {
-        SessionEditOrigin {
-            key: self.key(),
-            revision: self.timeline_revision.clone(),
+    pub(crate) fn edit_origin(&self) -> Option<SessionEditOrigin> {
+        Some(SessionEditOrigin {
+            session_id: self.session_id,
+            revision: self.edit_revision?,
             timeline: self.timeline,
             mapping: self.measurement.x_form,
-        }
+        })
     }
 
     pub fn key(&self) -> SessionKey {
@@ -199,37 +207,60 @@ impl Session {
             timeline,
             measurement,
             incarnation: Arc::new(()),
-            timeline_revision: Arc::new(()),
+            edit_revision: new_edit_revision(),
         }
     }
 }
 
 /// Opaque capture-time provenance for a deferred client edit.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SessionEditOrigin {
-    key: SessionKey,
-    revision: Arc<()>,
+    session_id: SessionId,
+    revision: NonZeroU64,
     timeline: Timeline,
     mapping: GhostXForm,
 }
 
 impl SessionEditOrigin {
     pub(crate) fn matches(&self, session: &Session) -> bool {
-        self.key.matches(session)
-            && Arc::ptr_eq(&self.revision, &session.timeline_revision)
+        self.session_id == session.session_id
+            && Some(self.revision) == session.edit_revision
             && self.timeline == session.timeline
             && self.mapping == session.measurement.x_form
     }
 }
 
-impl PartialEq for SessionEditOrigin {
-    fn eq(&self, other: &Self) -> bool {
-        self.key.session_id == other.key.session_id
-            && Arc::ptr_eq(&self.key.incarnation, &other.key.incarnation)
-            && Arc::ptr_eq(&self.revision, &other.revision)
-            && self.timeline == other.timeline
-            && self.mapping == other.mapping
-    }
+fn allocate_edit_revision(counter: &AtomicU64) -> Option<NonZeroU64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .ok()
+        .and_then(NonZeroU64::new)
+}
+
+#[cfg(test)]
+#[test]
+fn ordering_revision_exhaustion_fails_closed_without_reusing_a_token() {
+    let counter = AtomicU64::new(u64::MAX - 1);
+    let mut session = Session::new(
+        SessionId::default(),
+        Timeline::default(),
+        SessionMeasurement::default(),
+    );
+    session.edit_revision = allocate_edit_revision(&counter);
+    let origin = session.edit_origin().unwrap();
+    assert_eq!(origin.revision.get(), u64::MAX - 1);
+    session.edit_revision = allocate_edit_revision(&counter);
+    assert!(!origin.matches(&session));
+    assert!(session.edit_origin().is_none());
+    assert!(allocate_edit_revision(&counter).is_none());
+    assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+}
+
+pub(crate) fn new_edit_revision() -> Option<NonZeroU64> {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    allocate_edit_revision(&NEXT)
 }
 
 #[derive(Clone)]
@@ -393,6 +424,8 @@ impl Sessions {
 
     pub fn reset_session(&mut self, mut session: Session) {
         session.incarnation = Arc::new(());
+        session.set_timeline(clamp_tempo(session.timeline));
+        session.invalidate_edit_origin();
         let mut current = lock(&self.current);
         let mut others = lock(&self.other_sessions);
         *current = session;
@@ -406,6 +439,7 @@ impl Sessions {
         mapping: GhostXForm,
         timeline: Timeline,
     ) -> bool {
+        let timeline = clamp_tempo(timeline);
         let mut current = lock(&self.current);
         let mut others = lock(&self.other_sessions);
         if !origin.matches(&current) || current.measurement.x_form != mapping {
@@ -452,6 +486,7 @@ impl Sessions {
         timeline: Timeline,
         slot: &mut Option<tokio::sync::mpsc::Permit<'_, MeasurePeerEvent>>,
     ) -> Option<Sighting> {
+        let timeline = clamp_tempo(timeline);
         let mut current = try_state(&self.current)?;
         let mut others = try_state(&self.other_sessions)?;
         let mut joined = try_state(&self.has_joined)?;
@@ -478,6 +513,7 @@ impl Sessions {
     }
 
     pub fn update_timeline(&self, mut session: Session, timeline: Timeline) -> Session {
+        let timeline = clamp_tempo(timeline);
         if timeline.beat_origin > session.timeline.beat_origin {
             info!(
                 "[adopting] updating peer timeline for session {} (bpm: {}, beat origin: {}, time: origin: {})",
@@ -758,6 +794,9 @@ async fn handle_successful_measurement_inner(
                 if current.measurement.timestamp > measurement.timestamp {
                     return None;
                 }
+                if current.measurement.x_form != measurement.x_form {
+                    current.invalidate_edit_origin();
+                }
                 current.measurement = measurement;
                 slot.take().unwrap().send(current.clone());
                 return Some(current.clone());
@@ -768,7 +807,8 @@ async fn handle_successful_measurement_inner(
             }
             candidate.measurement = measurement;
             if measurement_wins(&current, session_id, measurement, clock.micros()) {
-                let winner = candidate.clone();
+                let mut winner = candidate.clone();
+                winner.invalidate_edit_origin();
                 *candidate = std::mem::replace(&mut *current, winner.clone());
                 slot.take().unwrap().send(winner.clone());
                 return Some(winner);
@@ -2009,7 +2049,7 @@ mod tests {
     async fn failed_other_session_removes_only_its_session_and_peers() {
         let current = Session {
             incarnation: Arc::new(()),
-            timeline_revision: Arc::new(()),
+            edit_revision: crate::link::sessions::new_edit_revision(),
             session_id: SessionId(NodeId::from_array([1; 8])),
             timeline: Timeline::default(),
             measurement: SessionMeasurement::default(),
@@ -2063,7 +2103,7 @@ mod tests {
         let (tx_join, mut rx_join) = tokio::sync::mpsc::channel(1);
         let session = Session {
             incarnation: Arc::new(()),
-            timeline_revision: Arc::new(()),
+            edit_revision: crate::link::sessions::new_edit_revision(),
             session_id: SessionId::default(),
             timeline: Timeline::default(),
             measurement: SessionMeasurement::default(),

@@ -30,8 +30,6 @@ use super::{
     AudioEndpointCallback, IncomingClientState, TempoCallback,
 };
 
-pub const LOCAL_MOD_GRACE_PERIOD: Duration = Duration::milliseconds(1000);
-
 /// Start/stop gate for the background dispatch loops (measurement results,
 /// join-session and peer-state-change) spawned in [`Controller::new`]. Rust analogue of
 /// upstream's `RtClientStateSetter::start()`/`stop()` (see upstream commits
@@ -563,7 +561,7 @@ impl Controller {
         let (sessions, session_task) = Sessions::with_dispatch_gate(
             Session {
                 incarnation: Arc::new(()),
-                timeline_revision: Arc::new(()),
+                edit_revision: crate::link::sessions::new_edit_revision(),
                 session_id,
                 timeline,
                 measurement: SessionMeasurement {
@@ -939,11 +937,15 @@ impl Controller {
         let published = try_state(&self.sessions.published)?;
         let session = try_state(&self.session_state)?;
         let client = try_state(&self.client_state)?;
-        (published.matches(&current)
+        if published.matches(&current)
             && current.session_id == client.timeline_session_id
             && current.timeline == session.timeline
-            && current.measurement.x_form == session.ghost_x_form)
-            .then(|| (*client, current.edit_origin()))
+            && current.measurement.x_form == session.ghost_x_form
+        {
+            Some((*client, current.edit_origin()?))
+        } else {
+            None
+        }
     }
 
     /// Reject a deferred proposal if its capture was overtaken or replaced.
@@ -1202,6 +1204,14 @@ impl SessionCommit<'_> {
         changed
     }
 
+    fn invalidate_client_captures(&mut self) {
+        self.current.invalidate_edit_origin();
+        let key = self.current.key();
+        for other in self.others.iter_mut().filter(|other| key.matches(other)) {
+            other.edit_revision = self.current.edit_revision;
+        }
+    }
+
     fn refresh_timing(&mut self, clock: Clock) -> Option<tempo::Tempo> {
         // A promotion's pending join owns publication of its identity. A timeline
         // announcement may refresh only the session already published locally.
@@ -1211,6 +1221,7 @@ impl SessionCommit<'_> {
             return None;
         }
         let session = self.current.clone();
+        let before = *self.client;
         let changed = update_timing_guarded(
             self.session,
             self.client,
@@ -1220,6 +1231,9 @@ impl SessionCommit<'_> {
             self.sync_enabled,
             session.session_id,
         );
+        if *self.client != before {
+            self.invalidate_client_captures();
+        }
         self.publish_discovery();
         changed
     }
@@ -1288,6 +1302,9 @@ impl SessionCommit<'_> {
             None => None,
         };
         let mut changed = None;
+        if incoming.timeline.is_some() || incoming.start_stop_state.is_some() {
+            self.current.invalidate_edit_origin();
+        }
         if let Some(timeline) = incoming.timeline {
             let timeline = clamp_tempo(timeline);
             let mapping = self.session.ghost_x_form;
@@ -1295,7 +1312,7 @@ impl SessionCommit<'_> {
             self.current.set_timeline(target);
             for other in self.others.iter_mut().filter(|other| key.matches(other)) {
                 other.timeline = target;
-                other.timeline_revision = self.current.timeline_revision.clone();
+                other.edit_revision = self.current.edit_revision;
             }
             for peer in self
                 .peers
@@ -1317,6 +1334,9 @@ impl SessionCommit<'_> {
         }
         if let Some(state) = incoming.start_stop_state {
             self.client.start_stop_state = state;
+            for other in self.others.iter_mut().filter(|other| key.matches(other)) {
+                other.edit_revision = self.current.edit_revision;
+            }
             if let Some(mapped) = proposed_start_stop {
                 self.session.start_stop_state = mapped;
             }
@@ -1342,6 +1362,11 @@ impl SessionCommit<'_> {
         }
         if incoming.timestamp <= self.session.start_stop_state.timestamp {
             return ClientCommit::Complete(None);
+        }
+        self.current.invalidate_edit_origin();
+        let key = self.current.key();
+        for other in self.others.iter_mut().filter(|other| key.matches(other)) {
+            other.edit_revision = self.current.edit_revision;
         }
         self.session.start_stop_state = incoming;
         let changed = update_timing_guarded(
@@ -1380,6 +1405,7 @@ impl SessionCommit<'_> {
         if self.peer.session_id() != session.session_id {
             self.session.start_stop_state = StartStopState::default();
         }
+        let before = *self.client;
         self.peer.node_state.session_id = session.session_id;
         let changed = update_timing_guarded(
             self.session,
@@ -1390,6 +1416,9 @@ impl SessionCommit<'_> {
             self.sync_enabled,
             session.session_id,
         );
+        if *self.client != before {
+            self.invalidate_client_captures();
+        }
         self.publish_discovery();
         self.counter.session_peer_count = count;
         changed
@@ -1782,6 +1811,66 @@ pub struct SessionPeerCounter {
 #[cfg(test)]
 mod dispatch_gate_tests {
     #[tokio::test]
+    async fn ordering_value_only_captures_survive_unused_and_busy_drop_after_cloned_reset() {
+        use crate::link::{AudioQueueError, BasicLink, CommitError};
+        assert!(!std::mem::needs_drop::<crate::link::SessionState>());
+        let link = BasicLink::new(120.0).await.unwrap();
+        let old = link.capture_audio_session_state();
+        let origin = old.origin.unwrap();
+        let ticket = link.commit_audio_session_state(old.clone()).unwrap();
+        let mut sessions = link.controller.sessions.clone();
+        let prior = sessions.current.lock().unwrap().clone();
+        sessions.reset_session(prior);
+        assert!(!origin.matches(&sessions.current.lock().unwrap()));
+        assert_eq!(
+            link.commit_audio_session_state(old),
+            Err(AudioQueueError::Busy)
+        );
+        assert_eq!(
+            link.process_audio_session_state_updates().await,
+            Some((ticket, Err(CommitError::StaleClientState)))
+        );
+    }
+
+    #[tokio::test]
+    async fn ordering_normalized_tempo_and_pending_publication_keep_captures_usable() {
+        use crate::link::{BasicLink, CommitError};
+        let mut link = BasicLink::new(f64::NAN).await.unwrap();
+        assert_eq!(link.capture_app_session_state().tempo(), 120.0);
+        for (bpm, expected) in [
+            (f64::INFINITY, 999.0),
+            (f64::NEG_INFINITY, 20.0),
+            (f64::NAN, 120.0),
+        ] {
+            let prior = *link.controller.client_state.lock().unwrap();
+            let current = link.controller.sessions.current.lock().unwrap().clone();
+            let timeline = Timeline {
+                tempo: tempo::Tempo::new(bpm),
+                beat_origin: Beats::from_microbeats(current.timeline.beat_origin.value + 1),
+                ..current.timeline
+            };
+            link.controller
+                .sessions
+                .saw_session_timeline(current.session_id, timeline)
+                .await;
+            let untracked = link.capture_app_session_state();
+            assert_eq!(untracked.timeline(), prior.timeline);
+            assert!(untracked.origin.is_none());
+            assert_eq!(
+                link.commit_app_session_state(untracked).await,
+                Err(CommitError::StaleClientState)
+            );
+            super::update_discovery(&link.controller).await;
+            let mut captured = link.capture_app_session_state();
+            assert_eq!(captured.tempo(), expected);
+            assert!(captured.origin.is_some());
+            captured.set_tempo(f64::NAN, link.clock.micros());
+            link.commit_app_session_state(captured).await.unwrap();
+            assert_eq!(link.capture_app_session_state().tempo(), 120.0);
+        }
+    }
+
+    #[tokio::test]
     async fn ordering_queued_audio_cannot_cross_join_or_same_id_reset() {
         use crate::link::{BasicLink, CommitError};
         for different_id in [false, true] {
@@ -1914,9 +2003,85 @@ mod dispatch_gate_tests {
     }
 
     #[test]
+    fn ordering_playback_revision_rejects_equal_observation_aba() {
+        ordering_fixture(|state| {
+            state.client.start_stop_state.timestamp = chrono::Duration::seconds(100);
+            let before = *state.client;
+            let origin = state.current.edit_origin().unwrap();
+            for (is_playing, timestamp) in [(true, 1), (false, 2)] {
+                assert!(matches!(
+                    state.received_start_stop(
+                        state.current.session_id,
+                        StartStopState {
+                            is_playing,
+                            timestamp: chrono::Duration::microseconds(timestamp),
+                            ..Default::default()
+                        },
+                        Clock::new()
+                    ),
+                    ClientCommit::Complete(_)
+                ));
+            }
+            assert_eq!(*state.client, before);
+            let incoming = IncomingClientState {
+                timeline: None,
+                timeline_timestamp: chrono::Duration::seconds(101),
+                start_stop_state: Some(ClientStartStopState {
+                    is_playing: true,
+                    timestamp: chrono::Duration::seconds(101),
+                    ..before.start_stop_state
+                }),
+            };
+            assert!(matches!(
+                state.client_edit_from_origin(&incoming, Clock::new(), Some(&origin)),
+                ClientCommit::Rejected(super::super::CommitError::StaleClientState)
+            ));
+            assert_eq!(*state.client, before);
+        });
+    }
+
+    #[test]
+    fn ordering_client_alignment_revision_rejects_aba_without_wire_change() {
+        ordering_fixture(|state| {
+            let origin = state.current.edit_origin().unwrap();
+            let before = *state.client;
+            let session = state.current.timeline;
+            for beat_origin in [Beats::new(4.0), before.timeline.beat_origin] {
+                let incoming = IncomingClientState {
+                    timeline: Some(Timeline {
+                        beat_origin,
+                        ..before.timeline
+                    }),
+                    timeline_timestamp: chrono::Duration::zero(),
+                    start_stop_state: None,
+                };
+                assert!(matches!(
+                    state.client_edit(&incoming, Clock::new()),
+                    ClientCommit::Complete(_)
+                ));
+                assert_eq!(state.current.timeline, session);
+            }
+            assert_eq!(*state.client, before);
+            let incoming = IncomingClientState {
+                timeline: Some(Timeline {
+                    tempo: tempo::Tempo::new(150.0),
+                    ..before.timeline
+                }),
+                timeline_timestamp: chrono::Duration::zero(),
+                start_stop_state: None,
+            };
+            assert!(matches!(
+                state.client_edit_from_origin(&incoming, Clock::new(), Some(&origin)),
+                ClientCommit::Rejected(super::super::CommitError::StaleClientState)
+            ));
+            assert_eq!(*state.client, before);
+        });
+    }
+
+    #[test]
     fn ordering_timeline_revision_does_not_reuse_an_old_capture_after_aba() {
         ordering_fixture(|state| {
-            let origin = state.current.edit_origin();
+            let origin = state.current.edit_origin().unwrap();
             let initial = state.current.timeline;
             state.current.set_timeline(Timeline {
                 tempo: tempo::Tempo::new(180.0),
@@ -4291,7 +4456,7 @@ mod dispatch_gate_tests {
         let (sessions, task) = Sessions::with_dispatch_gate(
             Session {
                 incarnation: Arc::new(()),
-                timeline_revision: Arc::new(()),
+                edit_revision: crate::link::sessions::new_edit_revision(),
                 session_id: SessionId::default(),
                 timeline: Timeline::default(),
                 measurement: SessionMeasurement::default(),

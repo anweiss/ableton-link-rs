@@ -35,7 +35,10 @@ pub mod timeline;
 use core::result;
 
 #[cfg(feature = "std")]
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 #[cfg(feature = "std")]
 use chrono::Duration;
@@ -150,7 +153,10 @@ pub struct BasicLink {
     controller: Controller,
     clock: Clock,
     atomic_session_state: AtomicSessionState,
-    last_is_playing_for_callback: bool,
+    last_is_playing_for_callback: AtomicBool,
+    non_rt_commit: tokio::sync::Mutex<()>,
+    pending_playback_notification: Mutex<Option<bool>>,
+    notification_dispatch: tokio::sync::Mutex<()>,
 }
 
 #[cfg(feature = "std")]
@@ -162,29 +168,11 @@ impl BasicLink {
         let clock = Clock::default();
         let controller = Controller::new(tempo::Tempo::new(bpm), clock).await?;
 
-        // Create initial client state for atomic session state
+        use crate::platform::io_context::{retry_state, try_state};
         let initial_client_state =
-            if let Ok(client_state_guard) = controller.client_state.try_lock() {
-                *client_state_guard
-            } else {
-                // Fallback to default state if we can't get the lock
-                ClientState {
-                    timeline: Timeline {
-                        tempo: Tempo::new(bpm),
-                        beat_origin: Beats::new(0.0),
-                        time_origin: Duration::zero(),
-                    },
-                    timeline_session_id: SessionId::default(),
-                    start_stop_state: ClientStartStopState {
-                        is_playing: false,
-                        time: Duration::zero(),
-                        timestamp: Duration::zero(),
-                    },
-                }
-            };
+            retry_state(|| Some(*try_state(&controller.client_state)?)).await;
 
-        let atomic_session_state =
-            AtomicSessionState::new(initial_client_state, controller::LOCAL_MOD_GRACE_PERIOD);
+        let atomic_session_state = AtomicSessionState::new(initial_client_state);
 
         Ok(Self {
             peer_count_callback: None,
@@ -193,7 +181,10 @@ impl BasicLink {
             controller,
             clock,
             atomic_session_state,
-            last_is_playing_for_callback: false,
+            last_is_playing_for_callback: AtomicBool::new(false),
+            non_rt_commit: tokio::sync::Mutex::new(()),
+            pending_playback_notification: Mutex::new(None),
+            notification_dispatch: tokio::sync::Mutex::new(()),
         })
     }
 }
@@ -268,11 +259,16 @@ impl BasicLink {
             *guard = Some(cb);
         }
 
-        // Trigger initial callback with current tempo
-        if let Ok(client_state) = self.controller.client_state.try_lock() {
+        let bpm = self
+            .controller
+            .client_state
+            .try_lock()
+            .ok()
+            .map(|state| state.timeline.tempo.bpm());
+        if let Some(bpm) = bpm {
             if let Some(ref callback) = self.tempo_callback {
                 if let Ok(callback) = callback.try_lock() {
-                    callback(client_state.timeline.tempo.bpm());
+                    callback(bpm);
                 }
             }
         }
@@ -284,12 +280,18 @@ impl BasicLink {
     {
         self.start_stop_callback = Some(Arc::new(Mutex::new(Box::new(callback))));
 
-        // Update our cached playing state and trigger initial callback
-        if let Ok(client_state) = self.controller.client_state.try_lock() {
-            self.last_is_playing_for_callback = client_state.start_stop_state.is_playing;
+        let playing = self
+            .controller
+            .client_state
+            .try_lock()
+            .ok()
+            .map(|state| state.start_stop_state.is_playing);
+        if let Some(playing) = playing {
             if let Some(ref callback) = self.start_stop_callback {
                 if let Ok(callback) = callback.try_lock() {
-                    callback(self.last_is_playing_for_callback);
+                    callback(playing);
+                    self.last_is_playing_for_callback
+                        .store(playing, Ordering::Release);
                 }
             }
         }
@@ -326,10 +328,7 @@ impl BasicLink {
 
     pub fn capture_audio_session_state(&self) -> SessionState {
         // Real-time safe capture using atomic session state
-        let current_time = self.clock.micros();
-        let client_state = self
-            .atomic_session_state
-            .capture_audio_session_state(current_time);
+        let client_state = self.atomic_session_state.capture_audio_session_state();
         let mut captured = to_session_state(&client_state, self.num_peers() > 0);
         if let Some((accepted, origin)) = self.controller.capture_client_state() {
             if accepted == client_state {
@@ -357,9 +356,13 @@ impl BasicLink {
     /// Process at most one queued audio request and refresh the accepted RT view.
     /// Cancellation leaves an unprocessed request queued. Call periodically from
     /// the application thread, including when there are no audio requests.
+    /// Concurrent or reentrant consumers return None without consuming a request.
     pub async fn process_audio_session_state_updates(
-        &mut self,
+        &self,
     ) -> Option<(AudioCommitTicket, result::Result<(), CommitError>)> {
+        let Ok(consumer) = self.non_rt_commit.try_lock() else {
+            return None;
+        };
         let pending = self.atomic_session_state.pending_update_from_origin();
         let completed = if let Some((ticket, incoming, origin)) = pending {
             let result = self
@@ -371,12 +374,10 @@ impl BasicLink {
         } else {
             None
         };
-        let accepted = *self
-            .controller
-            .client_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        self.atomic_session_state.publish_client_state(accepted);
+        let accepted = self.refresh_accepted_client_state().await;
+        self.queue_playback_notification(accepted);
+        drop(consumer);
+        self.dispatch_playback_notification();
         completed
     }
 
@@ -393,8 +394,11 @@ impl BasicLink {
             captured.origin = Some(origin);
             captured
         } else {
-            // Return a default state if we can't get the lock
-            SessionState::default()
+            use crate::platform::io_context::try_state;
+            let accepted = try_state(&self.controller.client_state)
+                .map(|state| *state)
+                .unwrap_or_else(|| self.atomic_session_state.capture_app_session_state());
+            to_session_state(&accepted, self.num_peers() > 0)
         }
     }
 
@@ -404,12 +408,18 @@ impl BasicLink {
     ) -> result::Result<(), CommitError> {
         let incoming_state =
             to_incoming_client_state(&state.state, &state.original_state, self.clock.micros());
+        let consumer = self.non_rt_commit.lock().await;
         self.commit_incoming_client_state(incoming_state, state.origin.as_ref())
-            .await
+            .await?;
+        let accepted = self.refresh_accepted_client_state().await;
+        self.queue_playback_notification(accepted);
+        drop(consumer);
+        self.dispatch_playback_notification();
+        Ok(())
     }
 
     async fn commit_incoming_client_state(
-        &mut self,
+        &self,
         incoming_state: IncomingClientState,
         origin: Option<&sessions::SessionEditOrigin>,
     ) -> result::Result<(), CommitError> {
@@ -420,34 +430,49 @@ impl BasicLink {
         } else {
             return Err(CommitError::StaleClientState);
         }
-        let accepted = *self
-            .controller
-            .client_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        self.atomic_session_state.publish_client_state(accepted);
-        let should_invoke_callback =
-            self.last_is_playing_for_callback != accepted.start_stop_state.is_playing;
-        self.last_is_playing_for_callback = accepted.start_stop_state.is_playing;
-
-        // Invoke start/stop callback if needed
-        if should_invoke_callback {
-            if let Some(ref callback) = self.start_stop_callback {
-                if let Ok(callback) = callback.try_lock() {
-                    callback(self.last_is_playing_for_callback);
-                }
-            }
-        }
-
-        // Check for tempo changes and invoke callback
-        if let Some(ref callback) = self.tempo_callback {
-            if let Ok(client_state) = self.controller.client_state.try_lock() {
-                if let Ok(callback) = callback.try_lock() {
-                    callback(client_state.timeline.tempo.bpm());
-                }
-            }
-        }
         Ok(())
+    }
+
+    async fn refresh_accepted_client_state(&self) -> ClientState {
+        use crate::platform::io_context::{retry_state, try_state};
+        let accepted = retry_state(|| Some(*try_state(&self.controller.client_state)?)).await;
+        self.atomic_session_state.publish_client_state(accepted);
+        accepted
+    }
+
+    fn queue_playback_notification(&self, accepted: ClientState) {
+        *self
+            .pending_playback_notification
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(accepted.start_stop_state.is_playing);
+    }
+
+    fn dispatch_playback_notification(&self) {
+        use crate::platform::io_context::try_state;
+        let Ok(_dispatch) = self.notification_dispatch.try_lock() else {
+            return;
+        };
+        let playing = self
+            .pending_playback_notification
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(playing) = playing else { return };
+        if self.last_is_playing_for_callback.load(Ordering::Acquire) == playing {
+            return;
+        }
+        if let Some(callback) = &self.start_stop_callback {
+            let Some(callback) = try_state(callback) else {
+                self.pending_playback_notification
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert(playing);
+                return;
+            };
+            callback(playing);
+        }
+        self.last_is_playing_for_callback
+            .store(playing, Ordering::Release);
     }
 }
 
@@ -670,6 +695,284 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn ordering_callback_registration_releases_client_guard() {
+        use std::sync::atomic::AtomicUsize;
+        let mut link = BasicLink::new(120.0).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = link.controller.client_state.clone();
+        let count = calls.clone();
+        link.set_tempo_callback(move |_| {
+            assert!(client.try_lock().is_ok());
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let client = link.controller.client_state.clone();
+        let count = calls.clone();
+        link.set_start_stop_callback(move |_| {
+            assert!(client.try_lock().is_ok());
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn ordering_stale_playback_capture_rejects_app_and_audio_submission() {
+        for audio in [false, true] {
+            let mut link = BasicLink::new(120.0).await.unwrap();
+            let mut old = link.capture_app_session_state();
+            for playing in [true, false] {
+                let mut newer = link.capture_app_session_state();
+                newer.set_is_playing(playing, link.clock.micros());
+                link.commit_app_session_state(newer).await.unwrap();
+            }
+            old.set_is_playing(true, link.clock.micros());
+            old.set_tempo(150.0, link.clock.micros());
+            let before = *link.controller.client_state.lock().unwrap();
+            if audio {
+                let ticket = link.commit_audio_session_state(old).unwrap();
+                assert_eq!(
+                    link.process_audio_session_state_updates().await,
+                    Some((ticket, Err(CommitError::StaleClientState)))
+                );
+                assert_eq!(
+                    link.take_audio_commit_result(ticket),
+                    Ok(Some(Err(CommitError::StaleClientState)))
+                );
+            } else {
+                assert_eq!(
+                    link.commit_app_session_state(old).await,
+                    Err(CommitError::StaleClientState)
+                );
+            }
+            assert_eq!(*link.controller.client_state.lock().unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordering_idle_drain_notifies_accepted_controller_playback() {
+        let mut link = BasicLink::new(120.0).await.unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        link.set_start_stop_callback(move |playing| observed.lock().unwrap().push(playing));
+        let mut state = link.capture_app_session_state();
+        state.set_is_playing(true, link.clock.micros());
+        let incoming =
+            to_incoming_client_state(&state.state, &state.original_state, link.clock.micros());
+        link.controller.set_state(incoming).await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![false]);
+        assert_eq!(link.process_audio_session_state_updates().await, None);
+        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn ordering_callback_dispatch_selects_latest_state_after_claim() {
+        let mut link = BasicLink::new(120.0).await.unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        link.set_start_stop_callback(move |playing| observed.lock().unwrap().push(playing));
+        let link = Arc::new(link);
+        let dispatch = link.notification_dispatch.try_lock().unwrap();
+        for playing in [true, false] {
+            let mut state = link.capture_audio_session_state();
+            state.set_is_playing(playing, link.clock.micros());
+            let ticket = link.commit_audio_session_state(state).unwrap();
+            assert_eq!(
+                link.process_audio_session_state_updates().await,
+                Some((ticket, Ok(())))
+            );
+            assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
+        }
+        assert_eq!(*calls.lock().unwrap(), vec![false]);
+        assert_eq!(
+            *link.pending_playback_notification.lock().unwrap(),
+            Some(false)
+        );
+        drop(dispatch);
+        assert_eq!(link.process_audio_session_state_updates().await, None);
+        assert_eq!(*calls.lock().unwrap(), vec![false]);
+        assert!(link.pending_playback_notification.lock().unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordering_callback_dispatch_retains_stop_while_start_callback_is_busy() {
+        let mut link = BasicLink::new(120.0).await.unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        link.set_start_stop_callback(move |playing| {
+            observed.lock().unwrap().push(playing);
+            if playing {
+                entered.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+            }
+        });
+        let link = Arc::new(link);
+        let mut start = link.capture_audio_session_state();
+        start.set_is_playing(true, link.clock.micros());
+        let first = link.commit_audio_session_state(start).unwrap();
+        let worker = link.clone();
+        let running =
+            tokio::spawn(async move { worker.process_audio_session_state_updates().await });
+        tokio::task::yield_now().await;
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(link.take_audio_commit_result(first), Ok(Some(Ok(()))));
+        let mut stop = link.capture_audio_session_state();
+        stop.set_is_playing(false, link.clock.micros());
+        let second = link.commit_audio_session_state(stop).unwrap();
+        assert_eq!(
+            link.process_audio_session_state_updates().await,
+            Some((second, Ok(())))
+        );
+        assert_eq!(link.take_audio_commit_result(second), Ok(Some(Ok(()))));
+        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+        assert_eq!(
+            *link.pending_playback_notification.lock().unwrap(),
+            Some(false)
+        );
+        release.send(()).unwrap();
+        assert_eq!(running.await.unwrap(), Some((first, Ok(()))));
+        assert_eq!(link.process_audio_session_state_updates().await, None);
+        assert_eq!(*calls.lock().unwrap(), vec![false, true, false]);
+        assert!(!link.last_is_playing_for_callback.load(Ordering::Acquire));
+        assert!(!link.capture_app_session_state().is_playing());
+    }
+
+    #[tokio::test]
+    async fn ordering_shared_drain_serializes_consumers_and_notifies_tempo_once() {
+        use std::sync::atomic::AtomicUsize;
+        let mut link = BasicLink::new(120.0).await.unwrap();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let count = callbacks.clone();
+        link.set_tempo_callback(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        let link = Arc::new(link);
+        let mut proposed = link.capture_audio_session_state();
+        proposed.set_tempo(150.0, link.clock.micros());
+        let ticket = link.commit_audio_session_state(proposed).unwrap();
+        let consumer = link.non_rt_commit.lock().await;
+        let audio = link.clone();
+        std::thread::spawn(move || {
+            let capture = audio.capture_audio_session_state();
+            assert_eq!(capture.tempo(), 120.0);
+            assert_eq!(
+                audio.commit_audio_session_state(capture),
+                Err(AudioQueueError::Busy)
+            );
+            assert_eq!(audio.take_audio_commit_result(ticket), Ok(None));
+        })
+        .join()
+        .unwrap();
+        assert_eq!(link.process_audio_session_state_updates().await, None);
+        drop(consumer);
+        let worker = link.clone();
+        assert_eq!(
+            tokio::spawn(async move { worker.process_audio_session_state_updates().await })
+                .await
+                .unwrap(),
+            Some((ticket, Ok(())))
+        );
+        assert_eq!(link.process_audio_session_state_updates().await, None);
+        assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
+        assert_eq!(link.capture_audio_session_state().tempo(), 150.0);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordering_idle_refresh_yields_to_the_holder_release_timer() {
+        let link = BasicLink::new(120.0).await.unwrap();
+        let client = link.controller.client_state.clone();
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let expired = timed_out.clone();
+        let (ready, ready_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = client.lock().unwrap();
+            ready.send(()).unwrap();
+            expired.store(
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_err(),
+                Ordering::SeqCst,
+            );
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let _ = release.send(());
+        });
+        assert_eq!(link.process_audio_session_state_updates().await, None);
+        holder.join().unwrap();
+        timer.await.unwrap();
+        assert!(!timed_out.load(Ordering::SeqCst));
+        assert_eq!(link.capture_audio_session_state().tempo(), 120.0);
+    }
+
+    #[tokio::test]
+    async fn ordering_cancellation_after_acceptance_keeps_success_and_refresh_work() {
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+        let mut link = BasicLink::new(120.0).await.unwrap();
+        let client = link.controller.client_state.clone();
+        let (trigger, trigger_rx) = std::sync::mpsc::channel();
+        let (ready, ready_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            trigger_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            let _guard = client.lock().unwrap();
+            ready.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+        });
+        link.set_tempo_callback(move |bpm| {
+            if bpm == 150.0 {
+                trigger.send(()).unwrap();
+                ready_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+            }
+        });
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        link.set_start_stop_callback(move |playing| observed.lock().unwrap().push(playing));
+        let mut proposed = link.capture_audio_session_state();
+        proposed.set_tempo(150.0, link.clock.micros());
+        proposed.set_is_playing(true, link.clock.micros());
+        let ticket = link.commit_audio_session_state(proposed).unwrap();
+        let mut drain = Box::pin(link.process_audio_session_state_updates());
+        assert!(drain
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
+        assert_eq!(link.process_audio_session_state_updates().await, None);
+        assert_eq!(link.capture_audio_session_state().tempo(), 120.0);
+        drop(drain);
+        assert_eq!(*calls.lock().unwrap(), vec![false]);
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(link.process_audio_session_state_updates().await, None);
+        assert_eq!(link.capture_audio_session_state().tempo(), 150.0);
+        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+        assert_eq!(
+            link.take_audio_commit_result(ticket),
+            Err(AudioQueueError::UnknownTicket)
+        );
+    }
+
+    #[tokio::test]
     async fn ordering_overtaken_audio_timeline_cannot_overwrite_app_commit() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         for combined in [false, true] {
@@ -720,7 +1023,7 @@ mod tests {
             future::Future,
             task::{Context, Waker},
         };
-        let mut link = BasicLink::new(120.0).await.unwrap();
+        let link = BasicLink::new(120.0).await.unwrap();
         let mut proposed = link.capture_audio_session_state();
         proposed.set_tempo(150.0, link.clock.micros());
         let ticket = link.commit_audio_session_state(proposed).unwrap();
@@ -786,7 +1089,7 @@ mod tests {
             link.commit_app_session_state(proposed.clone()).await,
             Err(CommitError::StartStopTimestampExhausted)
         );
-        assert!(!link.last_is_playing_for_callback);
+        assert!(!link.last_is_playing_for_callback.load(Ordering::Acquire));
         let ticket = link.commit_audio_session_state(proposed).unwrap();
         for _ in 0..3 {
             assert_eq!(link.capture_audio_session_state().tempo(), 120.0);
@@ -807,7 +1110,7 @@ mod tests {
             before_session
         );
         assert_eq!(calls.load(Ordering::SeqCst), before_calls);
-        assert!(!link.last_is_playing_for_callback);
+        assert!(!link.last_is_playing_for_callback.load(Ordering::Acquire));
     }
 
     #[test]

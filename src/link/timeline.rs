@@ -106,10 +106,15 @@ impl Decode for Timeline {
 pub fn clamp_tempo(timeline: Timeline) -> Timeline {
     const MIN_BPM: f64 = 20.0;
     const MAX_BPM: f64 = 999.0;
+    let bpm = timeline.tempo.bpm();
 
     Timeline {
         tempo: Tempo {
-            value: timeline.tempo.bpm().clamp(MIN_BPM, MAX_BPM),
+            value: if bpm.is_nan() {
+                120.0
+            } else {
+                bpm.clamp(MIN_BPM, MAX_BPM)
+            },
         },
         beat_origin: timeline.beat_origin,
         time_origin: timeline.time_origin,
