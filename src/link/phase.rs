@@ -3,65 +3,101 @@ use chrono::Duration;
 use super::beats::Beats;
 use super::timeline::Timeline;
 
-/// Returns a value in the range [0,quantum) corresponding to beats %
-/// quantum except that negative beat values are handled correctly.
-/// If the given quantum is zero, returns zero.
-pub fn phase(beats: Beats, quantum: Beats) -> Beats {
-    let quantum = i128::from(quantum.value).abs();
-    Beats::from_microbeats(if quantum == 0 {
-        0
-    } else {
-        i128::from(beats.value).rem_euclid(quantum) as i64
-    })
+fn narrow(beats: i128) -> Beats {
+    Beats::from_microbeats(beats.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
 }
 
-/// Return the least value greater than x that matches the phase of
-/// target with respect to the given quantum. If the given quantum
-/// is 0, x is returned.
-pub fn next_phase_match(x: Beats, target: Beats, quantum: Beats) -> Beats {
-    let quantum = i128::from(quantum.value).abs();
+fn phase_wide(beats: i128, quantum: i128) -> i128 {
+    if quantum == 0 {
+        0
+    } else {
+        beats.rem_euclid(quantum.abs())
+    }
+}
+
+/// Return the nonnegative remainder modulo the quantum magnitude, or zero
+/// for a zero quantum.
+pub fn phase(beats: Beats, quantum: Beats) -> Beats {
+    narrow(phase_wide(
+        i128::from(beats.value),
+        i128::from(quantum.value),
+    ))
+}
+
+fn next_phase_match_wide(x: i128, target: i128, quantum: i128) -> i128 {
+    let offset = phase_wide(
+        phase_wide(target, quantum) - phase_wide(x, quantum),
+        quantum,
+    );
+    x.saturating_add(offset)
+}
+
+fn closest_phase_match_wide(x: i128, target: i128, quantum: i128) -> i128 {
+    let quantum = quantum.abs();
     if quantum == 0 {
         return x;
     }
-    let offset = (i128::from(target.value) - i128::from(x.value)).rem_euclid(quantum);
-    Beats::from_microbeats(
-        (i128::from(x.value) + offset).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+    let offset = phase_wide(
+        phase_wide(target, quantum) - phase_wide(x, quantum),
+        quantum,
+    );
+    x.saturating_add(if offset * 2 >= quantum {
+        offset - quantum
+    } else {
+        offset
+    })
+}
+
+/// Return the least value at or above x matching the target phase.
+/// A zero quantum returns x; an unrepresentable result saturates.
+pub fn next_phase_match(x: Beats, target: Beats, quantum: Beats) -> Beats {
+    narrow(next_phase_match_wide(
+        x.value.into(),
+        target.value.into(),
+        quantum.value.into(),
+    ))
+}
+
+/// Return the closest phase match, choosing the lower match at a tie.
+pub fn closest_phase_match(x: Beats, target: Beats, quantum: Beats) -> Beats {
+    narrow(closest_phase_match_wide(
+        x.value.into(),
+        target.value.into(),
+        quantum.value.into(),
+    ))
+}
+
+fn to_phase_encoded_microbeats(tl: &Timeline, time: Duration, quantum: Beats) -> i128 {
+    let beat = tl.microbeats_at(time);
+    closest_phase_match_wide(
+        beat,
+        phase_wide(beat, quantum.value.into())
+            - phase_wide(tl.beat_origin.value.into(), quantum.value.into()),
+        quantum.value.into(),
     )
 }
 
-/// Return the closest value to x that matches the phase of the target
-/// with respect to the given quantum. The result deviates from x by at
-/// most quantum/2, but may be less than x.
-pub fn closest_phase_match(x: Beats, target: Beats, quantum: Beats) -> Beats {
-    next_phase_match(x - Beats::new(0.5 * quantum.floating()), target, quantum)
-}
-
-/// Interprets the given timeline as encoding a quantum boundary at its
-/// origin. Given such a timeline, returns a phase-encoded beat value
-/// relative to the given quantum that corresponds to the given
-/// time. The phase of the resulting beat value can be calculated with
-/// phase(beats, quantum). The result will deviate by up to +-
-/// (quantum/2) beats compared to the result of tl.to_beats(time).
+/// Interpret the timeline origin as a quantum boundary and return the
+/// corresponding phase-encoded beat value, saturating only the final result.
 pub fn to_phase_encoded_beats(tl: &Timeline, time: Duration, quantum: Beats) -> Beats {
-    let beat = tl.to_beats(time);
-    closest_phase_match(beat, beat - tl.beat_origin, quantum)
+    narrow(to_phase_encoded_microbeats(tl, time, quantum))
 }
 
-/// The inverse of to_phase_encoded_beats. Given a phase encoded beat
-/// value from the given timeline and quantum, find the time value that
-/// it maps to.
+/// Invert phase encoding, rounding up at a phase midpoint to undo the
+/// forward conversion's downward tie break.
 pub fn from_phase_encoded_beats(tl: &Timeline, beat: Beats, quantum: Beats) -> Duration {
-    let from_origin = beat - tl.beat_origin;
-    let origin_offset = from_origin - phase(from_origin, quantum);
-    // invert the phase calculation so that it always rounds up in the
-    // middle instead of down like closest_phase_match. Otherwise we'll
-    // end up rounding down twice when a value is at phase quantum/2.
-    let inverse_phase_offset = closest_phase_match(
-        quantum - phase(from_origin, quantum),
-        quantum - phase(beat, quantum),
+    let beat = i128::from(beat.value);
+    let origin = i128::from(tl.beat_origin.value);
+    let quantum = i128::from(quantum.value).abs();
+    let from_origin = beat - origin;
+    let remainder = phase_wide(from_origin, quantum);
+    let origin_offset = from_origin - remainder;
+    let inverse_phase_offset = closest_phase_match_wide(
+        quantum - remainder,
+        quantum - phase_wide(beat, quantum),
         quantum,
     );
-    tl.from_beats(tl.beat_origin + origin_offset + quantum - inverse_phase_offset)
+    tl.time_at_microbeats(origin + origin_offset + quantum - inverse_phase_offset)
 }
 
 /// Force beat at time implementation for timeline modification
@@ -73,17 +109,28 @@ pub fn force_beat_at_time_impl(
 ) {
     // There are two components to the beat adjustment: a phase shift
     // and a beat magnitude adjustment.
-    let cur_beat_at_time = to_phase_encoded_beats(timeline, time, quantum);
-    let closest_in_phase = closest_phase_match(cur_beat_at_time, beat, quantum);
-    *timeline = shift_client_timeline(*timeline, closest_in_phase - cur_beat_at_time);
-    // Now adjust the magnitude
-    timeline.beat_origin = timeline.beat_origin + beat - closest_in_phase;
+    let cur_beat_at_time = to_phase_encoded_microbeats(timeline, time, quantum);
+    let closest_in_phase =
+        closest_phase_match_wide(cur_beat_at_time, beat.value.into(), quantum.value.into());
+    *timeline = shift_client_timeline_wide(*timeline, closest_in_phase - cur_beat_at_time);
+    // Narrow only after both magnitude adjustments have cancelled.
+    timeline.beat_origin =
+        narrow(i128::from(timeline.beat_origin.value) + i128::from(beat.value) - closest_in_phase);
 }
 
 /// Shift client timeline by the given beat offset
-pub fn shift_client_timeline(mut timeline: Timeline, shift: Beats) -> Timeline {
-    let time_delta = timeline.from_beats(shift) - timeline.from_beats(Beats { value: 0 });
-    timeline.time_origin -= time_delta;
+pub fn shift_client_timeline(timeline: Timeline, shift: Beats) -> Timeline {
+    shift_client_timeline_wide(timeline, shift.value.into())
+}
+
+fn shift_client_timeline_wide(mut timeline: Timeline, shift: i128) -> Timeline {
+    let origin = i128::from(timeline.beat_origin.value);
+    // Round each beat-to-time conversion as before, but do not clamp either
+    // intermediate Duration before their difference and the final origin.
+    let delta = timeline.tempo.micros_from_microbeats(shift - origin)
+        - timeline.tempo.micros_from_microbeats(-origin);
+    timeline.time_origin =
+        super::duration_from_nanos(super::duration_nanos(timeline.time_origin) - delta * 1_000);
     timeline
 }
 
@@ -91,6 +138,176 @@ pub fn shift_client_timeline(mut timeline: Timeline, shift: Beats) -> Timeline {
 mod tests {
     use super::*;
     use crate::link::tempo::Tempo;
+
+    #[test]
+    fn numeric_cleanup_phase_preserves_extreme_origin_roundtrips() {
+        for (origin, time) in [
+            (
+                Duration::zero(),
+                Duration::microseconds((1_i64 << 62) + 1_000_000),
+            ),
+            (
+                Duration::microseconds(-(1_i64 << 62)),
+                Duration::microseconds(500_000),
+            ),
+        ] {
+            let timeline = Timeline {
+                tempo: Tempo::new(120.0),
+                beat_origin: Beats::from_microbeats(i64::MIN),
+                time_origin: origin,
+            };
+            let encoded = to_phase_encoded_beats(&timeline, time, Beats::new(4.0));
+            assert_eq!(
+                from_phase_encoded_beats(&timeline, encoded, Beats::new(4.0)),
+                time
+            );
+        }
+        // A wide relative difference must be reduced before composing a small result.
+        assert_eq!(
+            closest_phase_match(
+                Beats::from_microbeats(i64::MIN),
+                Beats::default(),
+                Beats::new(4.0)
+            )
+            .value,
+            i64::MIN
+        );
+        assert_eq!(
+            closest_phase_match(
+                Beats::from_microbeats(i64::MAX),
+                Beats::default(),
+                Beats::new(4.0)
+            )
+            .value,
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn numeric_cleanup_phase_composes_before_final_time_conversion() {
+        for sign in [-1, 1] {
+            let timeline = Timeline {
+                tempo: Tempo::new(120.0),
+                beat_origin: Beats::new(sign as f64),
+                time_origin: Duration::zero(),
+            };
+            let time = Duration::microseconds(sign * ((1_i64 << 62) - 250_000));
+            let encoded = to_phase_encoded_beats(&timeline, time, Beats::new(4.0));
+            assert_ne!(encoded.value, if sign < 0 { i64::MIN } else { i64::MAX });
+            assert_eq!(
+                from_phase_encoded_beats(&timeline, encoded, Beats::new(4.0)),
+                time
+            );
+        }
+        for (origin, beat, expected) in [
+            (i64::MIN, i64::MAX, Duration::MAX),
+            (i64::MAX, i64::MIN, Duration::MIN),
+        ] {
+            let timeline = Timeline {
+                tempo: Tempo::new(1e-20),
+                beat_origin: Beats::from_microbeats(origin),
+                time_origin: Duration::zero(),
+            };
+            assert_eq!(
+                from_phase_encoded_beats(&timeline, Beats::from_microbeats(beat), Beats::new(4.0)),
+                expected
+            );
+        }
+        for origin in [i64::MIN, -3, 0, 3, i64::MAX] {
+            let timeline = Timeline {
+                tempo: Tempo::new(60.0),
+                beat_origin: Beats::from_microbeats(origin),
+                time_origin: Duration::microseconds(origin),
+            };
+            for quantum in [0, 1, 3, -3, 4_000_000, -4_000_000, i64::MIN] {
+                let quantum = Beats::from_microbeats(quantum);
+                let time = Duration::microseconds(500_000);
+                let encoded = to_phase_encoded_beats(&timeline, time, quantum);
+                assert_eq!(
+                    from_phase_encoded_beats(&timeline, encoded, quantum),
+                    time,
+                    "origin={origin},quantum={quantum:?}"
+                );
+            }
+        }
+        assert_eq!(
+            closest_phase_match(
+                Beats::default(),
+                Beats::from_microbeats(1),
+                Beats::from_microbeats(3)
+            )
+            .value,
+            1
+        );
+    }
+
+    #[test]
+    fn numeric_cleanup_shift_retains_whole_difference_and_origin() {
+        let timeline = Timeline {
+            tempo: Tempo::new(0.001),
+            beat_origin: Beats::from_microbeats(-1),
+            time_origin: Duration::zero(),
+        };
+        assert_eq!(
+            shift_client_timeline(timeline, Beats::from_microbeats(i64::MIN)).time_origin,
+            Duration::MAX
+        );
+        assert_eq!(
+            shift_client_timeline(timeline, Beats::from_microbeats(i64::MAX)).time_origin,
+            Duration::MIN
+        );
+        let timeline = Timeline {
+            time_origin: Duration::MAX,
+            ..timeline
+        };
+        let shift = 200_000_000_000_000_000_i64;
+        assert_eq!(
+            shift_client_timeline(timeline, Beats::from_microbeats(shift)).time_origin,
+            super::super::duration_from_nanos(
+                super::super::duration_nanos(Duration::MAX) - i128::from(shift) * 60_000 * 1_000
+            )
+        );
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            time_origin: Duration::zero(),
+            ..timeline
+        };
+        assert_eq!(
+            shift_client_timeline(timeline, Beats::from_microbeats(1)).time_origin,
+            Duration::zero(),
+            "preserve rounding of each beat-origin conversion"
+        );
+    }
+
+    #[test]
+    fn numeric_cleanup_force_beat_keeps_cancelling_magnitude_wide() {
+        let mut high = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::from_microbeats(i64::MAX),
+            time_origin: Duration::zero(),
+        };
+        force_beat_at_time_impl(
+            &mut high,
+            Beats::new(1.0),
+            Duration::zero(),
+            Beats::new(4.0),
+        );
+        assert_eq!(
+            to_phase_encoded_beats(&high, Duration::zero(), Beats::new(4.0)),
+            Beats::new(1.0)
+        );
+        let mut timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::from_microbeats(i64::MIN),
+            time_origin: Duration::zero(),
+        };
+        let time = Duration::microseconds((1_i64 << 62) + 1_000_000);
+        force_beat_at_time_impl(&mut timeline, Beats::new(1.0), time, Beats::new(4.0));
+        assert_eq!(
+            to_phase_encoded_beats(&timeline, time, Beats::new(4.0)),
+            Beats::new(1.0)
+        );
+    }
 
     #[test]
     fn test_phase_positive() {

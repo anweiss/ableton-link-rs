@@ -4223,6 +4223,99 @@ mod dispatch_gate_tests {
     }
 
     #[tokio::test]
+    async fn numeric_cleanup_signal_retries_identity_and_sends_unlocked_byebye() {
+        use crate::discovery::{
+            messages::{parse_message_header, BYEBYE, MAX_MESSAGE_SIZE},
+            messenger::send_byebye_to,
+        };
+        let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let io = controller.io.take().unwrap();
+        let gateway = controller.discovery.clone();
+        let state = gateway.peer_state.clone();
+        let check_unlocked = state.clone();
+        let notifier = controller.notifier.clone();
+        let open = gateway.gate.subscribe();
+        let events = controller.rx_event.take().unwrap();
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(destination) = receiver.local_addr().unwrap() else {
+            panic!("IPv4")
+        };
+        let (signal, signalled) = tokio::sync::oneshot::channel();
+        let (seen, observed) = tokio::sync::oneshot::channel();
+        let work = io.spawn(async move {
+            gateway
+                .listen_with_signal_and_departure(
+                    events,
+                    notifier,
+                    open,
+                    async {
+                        signalled.await.unwrap();
+                        seen.send(()).unwrap();
+                        Ok(())
+                    },
+                    move |id| {
+                        assert!(
+                            check_unlocked.try_lock().is_ok(),
+                            "release identity before network cleanup"
+                        );
+                        send_byebye_to(id, destination);
+                    },
+                )
+                .await;
+        });
+        let id = NodeId::from_array([94; 8]);
+        let (held, held_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let mut guard = state.lock().unwrap();
+            held.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            guard.node_state.node_id = id;
+        });
+        held_rx.await.unwrap();
+        signal.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), observed)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            io.spawn(async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let pending_while_locked = !work.is_finished();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), work)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = [0; MAX_MESSAGE_SIZE];
+        let wire =
+            tokio::time::timeout(Duration::from_millis(300), receiver.recv_from(&mut bytes)).await;
+        assert!(
+            pending_while_locked && wire.is_ok(),
+            "Ctrl-C must wait cooperatively and deliver BYEBYE"
+        );
+        let (size, _) = wire.unwrap().unwrap();
+        let (header, _) = parse_message_header(&bytes[..size]).unwrap();
+        assert_eq!(header.message_type, BYEBYE);
+        assert_eq!(header.ttl, 0);
+        assert_eq!(
+            header.ident, id,
+            "sample the current identity only after acquiring its guard"
+        );
+        drop(controller);
+        drop(io);
+    }
+
+    #[tokio::test]
     async fn signal_setup_error_does_not_terminate_the_discovery_listener() {
         let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
             .await

@@ -739,11 +739,10 @@ fn measurement_wins(
     measurement: SessionMeasurement,
     host_time: Duration,
 ) -> bool {
-    const SESSION_EPS: Duration = Duration::microseconds(500_000);
-    let diff = measurement.x_form.host_to_ghost(host_time)
-        - current.measurement.x_form.host_to_ghost(host_time);
-    diff > SESSION_EPS
-        || (micros(diff).saturating_abs() < micros(SESSION_EPS) && candidate < current.session_id)
+    const SESSION_EPS_NANOS: i128 = 500_000_000;
+    let diff = super::duration_nanos(measurement.x_form.host_to_ghost(host_time))
+        - super::duration_nanos(current.measurement.x_form.host_to_ghost(host_time));
+    diff > SESSION_EPS_NANOS || (diff.abs() < SESSION_EPS_NANOS && candidate < current.session_id)
 }
 
 pub async fn handle_failed_measurement(
@@ -887,6 +886,72 @@ pub fn session_peers(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn numeric_cleanup_successful_measurement_handles_extreme_clock_difference() {
+        let io = crate::platform::io_context::IoContext::new().unwrap();
+        io.spawn(async {
+            let clock = Clock::new();
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            let extreme = GhostXForm {
+                slope: -1e30,
+                intercept: Duration::zero(),
+            };
+            assert_eq!(extreme.host_to_ghost(clock.micros()), Duration::MIN);
+            for extreme_current in [false, true] {
+                let mut initial = admission_session(1, 0);
+                if extreme_current {
+                    initial.measurement.x_form = extreme;
+                }
+                let origin = initial.key();
+                let candidate = admission_session(2, 0);
+                let candidate_key = candidate.key();
+                let current = Arc::new(Mutex::new(initial));
+                let others = Arc::new(Mutex::new(vec![candidate]));
+                let peers = Arc::new(Mutex::new(vec![]));
+                let (joins, mut joined) = tokio::sync::mpsc::channel(1);
+                let (requests, _requested) = tokio::sync::mpsc::channel(1);
+                assert!(handle_successful_measurement(
+                    candidate_key.clone(),
+                    extreme,
+                    others.clone(),
+                    current.clone(),
+                    clock,
+                    joins.clone(),
+                    peers.clone(),
+                    requests.clone()
+                )
+                .await
+                .is_none());
+                assert!(origin.matches(&current.lock().unwrap()));
+                assert_eq!(others.lock().unwrap()[0].measurement.x_form, extreme);
+                assert!(joined.try_recv().is_err());
+                let ordinary = GhostXForm {
+                    slope: 1.0,
+                    intercept: Duration::seconds(10),
+                };
+                let retry = handle_successful_measurement(
+                    candidate_key.clone(),
+                    ordinary,
+                    others,
+                    current.clone(),
+                    clock,
+                    joins,
+                    peers,
+                    requests,
+                )
+                .await
+                .unwrap();
+                let winner = joined.recv().await.unwrap();
+                assert!(candidate_key.matches(&winner));
+                assert!(candidate_key.matches(&current.lock().unwrap()));
+                assert_eq!(winner.measurement.x_form, ordinary);
+                drop(retry);
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn admission_standalone_absence_and_capacity_do_not_spin_as_mutex_contention() {
         use std::{

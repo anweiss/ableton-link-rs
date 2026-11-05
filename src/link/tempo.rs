@@ -65,10 +65,12 @@ impl Tempo {
     }
 
     pub(crate) fn micros_from_microbeats(&self, beats: i128) -> i128 {
-        super::round_ratio(
-            beats * i128::from(super::micros(self.micros_per_beat())),
-            1_000_000,
-        )
+        let period = i128::from(super::micros(self.micros_per_beat()));
+        // Split before multiplying: phase composition can exceed the public
+        // microbeat range even when its final time remains representable.
+        (beats / 1_000_000)
+            .saturating_mul(period)
+            .saturating_add(super::round_ratio((beats % 1_000_000) * period, 1_000_000))
     }
 }
 

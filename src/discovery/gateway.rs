@@ -31,6 +31,11 @@ use super::{
     },
 };
 
+#[cfg(test)]
+std::thread_local! {
+    static PRUNING_HANDOFF: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub struct PeerGateway {
     pub(crate) gate: Arc<DispatchGate>,
     pub observer: GatewayObserver,
@@ -231,10 +236,22 @@ impl PeerGateway {
 
     pub(crate) async fn listen_with_signal(
         &self,
+        rx_event: Receiver<OnEvent>,
+        notifier: Arc<Notify>,
+        open: DispatchReceiver,
+        signal: impl std::future::Future<Output = std::io::Result<()>>,
+    ) {
+        self.listen_with_signal_and_departure(rx_event, notifier, open, signal, send_byebye)
+            .await;
+    }
+
+    pub(crate) async fn listen_with_signal_and_departure(
+        &self,
         mut rx_event: Receiver<OnEvent>,
         notifier: Arc<Notify>,
         mut open: DispatchReceiver,
         signal: impl std::future::Future<Output = std::io::Result<()>>,
+        departure: impl Fn(NodeId),
     ) {
         let node_id = self
             .peer_state
@@ -320,7 +337,10 @@ impl PeerGateway {
                 result = &mut signal, if signal_available => {
                     match result {
                         Ok(()) => {
-                            if let Some(state) = crate::platform::io_context::try_state(&peer_state) { send_byebye(state.ident()); }
+                            let id = crate::platform::io_context::retry_state(|| {
+                                Some(crate::platform::io_context::try_state(&peer_state)?.ident())
+                            }).await;
+                            departure(id);
                             notifier.notify_waiters();
                             break;
                         }
@@ -439,6 +459,12 @@ async fn on_peer_state_in_epoch(
         return;
     }
 
+    #[cfg(test)]
+    PRUNING_HANDOFF.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     cancel.notify_waiters();
     schedule_next_pruning_in_epoch(
         peer_timeouts.clone(),
@@ -446,8 +472,7 @@ async fn on_peer_state_in_epoch(
         tx_peer_event.clone(),
         cancel,
         lifecycle,
-    )
-    .await;
+    );
 }
 
 fn try_timeouts(
@@ -505,21 +530,16 @@ pub async fn schedule_next_pruning(
     tx_peer_event: Sender<PeerEvent>,
     cancel: Arc<Notify>,
 ) {
-    schedule_next_pruning_in_epoch(peer_timeouts, epoch, tx_peer_event, cancel, None).await;
+    schedule_next_pruning_in_epoch(peer_timeouts, epoch, tx_peer_event, cancel, None);
 }
 
-async fn schedule_next_pruning_in_epoch(
+fn schedule_next_pruning_in_epoch(
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
     epoch: Instant,
     tx_peer_event: Sender<PeerEvent>,
     cancel: Arc<Notify>,
     lifecycle: Option<(Arc<DispatchGate>, u64)>,
 ) {
-    if crate::platform::io_context::retry_state(|| Some(try_timeouts(&peer_timeouts)?.is_empty()))
-        .await
-    {
-        return;
-    }
     // Register before spawning so a renewal cannot be missed before the worker polls.
     let mut cancelled = Box::pin(cancel.notified_owned());
     cancelled.as_mut().enable();
@@ -581,6 +601,79 @@ impl Drop for PeerGateway {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn numeric_cleanup_cancelled_announcement_retains_timeout_worker() {
+        let io = crate::platform::io_context::IoContext::new().unwrap();
+        let id = NodeId::from_array([93; 8]);
+        let epoch = Instant::now();
+        let timeouts = Arc::new(Mutex::new(vec![(
+            epoch + std::time::Duration::from_secs(2),
+            id,
+        )]));
+        let held = timeouts.clone();
+        let (committed, committed_rx) = std::sync::mpsc::channel();
+        let (locked, locked_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            committed_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            let _guard = held.lock().unwrap();
+            locked.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(3));
+        });
+        let (events, mut rx) = mpsc::channel(4);
+        let cancel = Arc::new(Notify::new());
+        let state = timeouts.clone();
+        let work = io.spawn(async move {
+            schedule_next_pruning(state.clone(), epoch, events.clone(), cancel.clone()).await;
+            PRUNING_HANDOFF.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    committed.send(()).unwrap();
+                    locked_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap();
+                }))
+            });
+            let mut msg = announcement(id, 1);
+            msg.expires_at = Some(Instant::now() + std::time::Duration::from_millis(120));
+            let mut announce = Box::pin(on_peer_state(
+                msg,
+                state,
+                events,
+                epoch,
+                cancel,
+                NodeId::default(),
+            ));
+            let _ = std::future::Future::poll(
+                announce.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            );
+            // Cancel at the first possible suspension after the observable commit.
+            drop(announce);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), work)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(PeerEvent::Observed(_))));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            io.spawn(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            matches!(tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await.unwrap(), Some(PeerEvent::PeerTimedOut(peer)) if peer == id)
+        );
+        assert!(timeouts.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn byebye_does_not_cancel_pruning_of_other_peers() {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {

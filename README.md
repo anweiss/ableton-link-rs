@@ -1223,3 +1223,13 @@ uses the new epoch. The shared notifier remains a wakeup, not an inferred stop.
 Wire regressions pause after snapshot/encoding, complete actual controller disable
 with an unchanged registration, and distinguish a fresh150BPM announcement from
 the captured120BPM payload during rapid re-enable.
+
+Phase-origin differences, modulo reduction, forced-beat composition and timeline
+shifts now retain wide intermediates through the final result. Session comparison
+also subtracts mapped clock times in wide nanoseconds, not bounded Chrono
+durations. The public saturating `Beats` operators are unchanged.
+
+An announcement commits its timeout and registers the replacement pruning worker
+without an intervening suspension, so cancelling a standalone announcement future
+cannot strand the committed peer. Ctrl-C cleanup retries a contended peer identity
+cooperatively and releases its guard before sending BYEBYE.

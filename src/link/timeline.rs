@@ -39,16 +39,25 @@ impl Default for Timeline {
 
 impl Timeline {
     pub fn to_beats(&self, time: Duration) -> Beats {
+        Beats::from_microbeats(
+            self.microbeats_at(time)
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+        )
+    }
+
+    pub(crate) fn microbeats_at(&self, time: Duration) -> i128 {
         let elapsed = super::duration_nanos(time) - super::duration_nanos(self.time_origin);
-        let beats = self
-            .tempo
+        self.tempo
             .microbeats_from_nanos(elapsed)
-            .saturating_add(i128::from(self.beat_origin.value));
-        Beats::from_microbeats(beats.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+            .saturating_add(i128::from(self.beat_origin.value))
     }
 
     pub fn from_beats(&self, beats: Beats) -> Duration {
-        let difference = i128::from(beats.value) - i128::from(self.beat_origin.value);
+        self.time_at_microbeats(beats.value.into())
+    }
+
+    pub(crate) fn time_at_microbeats(&self, beats: i128) -> Duration {
+        let difference = beats - i128::from(self.beat_origin.value);
         let elapsed = self.tempo.micros_from_microbeats(difference);
         super::duration_from_nanos(
             super::duration_nanos(self.time_origin).saturating_add(elapsed.saturating_mul(1_000)),
