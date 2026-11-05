@@ -22,6 +22,8 @@ use crate::link::{
 pub struct PeerStateMessageType {
     pub node_state: NodeState,
     pub ttl: u8,
+    /// Original receive deadline. None preserves standalone caller TTL semantics.
+    pub expires_at: Option<tokio::time::Instant>,
     pub measurement_endpoint: Option<SocketAddrV4>,
     pub audio_endpoint: Option<SocketAddrV4>,
 }

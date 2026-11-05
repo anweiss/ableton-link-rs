@@ -109,6 +109,26 @@ Each measurement keeps competing terminal results on its own private channel,
 then forwards the winning result with caller backpressure. Public measurements
 sharing a full result channel therefore do not discard each other's completions.
 
+Received announcements retain an absolute deadline through discovery and gateway
+capacity waits. Expired work is discarded rather than renewing TTL. Fresh ingress
+traffic can refresh an existing published route even when the handoff is full;
+it cannot add a route for an unpublished identity. Cache sweeps drain each shared
+topology monitor once. Same-adapter address selection prefers the peer's link-local
+scope and verified subnet; source addresses never select a different adapter.
+A later scan refreshes failed local-identity snapshots without replacing the socket.
+Managed measurement cancellation follows the captured lease through queued PONGs
+and final result publication. PONG samples are appended only after every applicable
+time sum validates, and standalone early failure reporting observes cancellation.
+
+### Breaking discovery metadata change
+
+`PeerStateMessageType` struct literals must now include `expires_at`. Use
+`expires_at: None` for standalone callers that want TTL to start when the gateway
+accepts the call, or `Some(tokio::time::Instant)` for an original receive deadline.
+Managed socket readers always supply the deadline; intermediate code must preserve
+it rather than replace it with a new TTL. Wire bytes and method signatures do not
+change. Both replacement PR merge commits must carry a breaking-change marker.
+
 Interface scanning retains IPv4 link-local addresses for networks without DHCP,
 while excluding adapters the OS reports as operationally down. This applies to
 managed discovery and both public scanners, including their `if-addrs` fallback;

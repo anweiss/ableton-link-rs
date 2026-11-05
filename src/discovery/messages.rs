@@ -150,7 +150,7 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
 
 pub fn parse_payload(data: &[u8]) -> Result<Payload> {
     let mut payload = Payload::default();
-    payload::decode(&mut payload, data).unwrap();
+    payload::decode(&mut payload, data)?;
 
     Ok(payload)
 }

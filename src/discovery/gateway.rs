@@ -332,52 +332,35 @@ async fn on_peer_state_in_epoch(
 ) {
     debug!("received peer state from messenger");
 
+    let deadline = msg
+        .expires_at
+        .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(u64::from(msg.ttl)));
+    let slot = select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => return,
+        result = tx_peer_event.reserve() => match result { Ok(slot) => slot, Err(_) => return },
+    };
+    if deadline <= Instant::now() {
+        return;
+    }
     let peer_id = msg.node_state.ident();
-    peer_timeouts
-        .try_lock()
-        .unwrap()
-        .retain(|(_, id)| id != &peer_id);
-
     let new_to = (
-        Instant::now()
-            + Duration::seconds(std::cmp::min(msg.ttl as i64, 3))
-                .to_std()
-                .unwrap(), // Cap timeout at 3 seconds max
+        deadline.min(Instant::now() + std::time::Duration::from_secs(3)),
         peer_id,
     );
-
-    debug!(
-        "updating peer timeout status for peer {} with TTL {} seconds (capped at 3)",
-        peer_id, msg.ttl
-    );
-
-    if let Ok(mut timeouts) = peer_timeouts.try_lock() {
-        let i = timeouts
+    {
+        let mut timeouts = peer_timeouts.lock().unwrap_or_else(|e| e.into_inner());
+        timeouts.retain(|(_, id)| id != &peer_id);
+        let position = timeouts
             .iter()
-            .position(|(timeout, _)| timeout >= &new_to.0);
-        if let Some(i) = i {
-            timeouts.insert(i, new_to);
-        } else {
-            timeouts.push(new_to);
-        }
-    } else {
-        debug!(
-            "Could not acquire peer_timeouts lock to update timeout for peer {}",
-            peer_id
-        );
-    }
-
-    debug!("sending peer state to observer");
-    if let Err(e) = tx_peer_event
-        .send(PeerEvent::SawPeer(PeerState {
+            .position(|(time, _)| *time >= new_to.0)
+            .unwrap_or(timeouts.len());
+        timeouts.insert(position, new_to);
+        slot.send(PeerEvent::SawPeer(PeerState {
             node_state: msg.node_state,
             measurement_endpoint: msg.measurement_endpoint,
             audio_endpoint: msg.audio_endpoint,
-        }))
-        .await
-    {
-        debug!("Failed to send SawPeer event: {:?}", e);
-        return;
+        }));
     }
 
     cancel.notify_waiters();
@@ -580,6 +563,47 @@ mod tests {
     use crate::{discovery::messenger::new_udp_reuseport, link::sessions::SessionId};
 
     use super::*;
+
+    #[tokio::test]
+    async fn gateway_preserves_receive_deadlines_and_rejects_expired_state() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for expired in [true, false] {
+                let (tx, mut rx) = mpsc::channel(2);
+                let timeouts = Arc::new(Mutex::new(Vec::new()));
+                let deadline = if expired {
+                    Instant::now() - std::time::Duration::from_secs(1)
+                } else {
+                    Instant::now() + std::time::Duration::from_millis(300)
+                };
+                let state = PeerStateMessageType {
+                    node_state: NodeState::default(),
+                    ttl: if expired { 2 } else { 0 },
+                    expires_at: Some(deadline),
+                    measurement_endpoint: None,
+                    audio_endpoint: None,
+                };
+                on_peer_state(
+                    state,
+                    timeouts.clone(),
+                    tx,
+                    Instant::now(),
+                    Arc::new(Notify::new()),
+                    NodeId::default(),
+                )
+                .await;
+                if expired {
+                    assert!(rx.try_recv().is_err());
+                    assert!(timeouts.lock().unwrap().is_empty());
+                } else {
+                    assert_eq!(timeouts.lock().unwrap()[0].0, deadline);
+                    assert!(matches!(rx.recv().await, Some(PeerEvent::SawPeer(_))));
+                    assert!(matches!(rx.recv().await, Some(PeerEvent::PeerTimedOut(_))));
+                }
+            }
+        })
+        .await
+        .expect("gateway must honor original deadlines, including subsecond remaining life");
+    }
 
     fn init_tracing() {
         let _ = tracing_subscriber::fmt::try_init();

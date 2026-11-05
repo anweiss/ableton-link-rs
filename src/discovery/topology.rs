@@ -25,16 +25,25 @@ impl Events {
 pub(super) struct Topology {
     events: Arc<Events>,
     source: platform::Source,
+    #[cfg(test)]
+    checks: AtomicU64,
 }
 
 impl Topology {
     pub fn new() -> io::Result<Self> {
         let events = Arc::new(Events::default());
         let source = platform::Source::new(events.clone())?;
-        Ok(Self { events, source })
+        Ok(Self {
+            events,
+            source,
+            #[cfg(test)]
+            checks: AtomicU64::new(0),
+        })
     }
 
     pub fn check(&self) -> io::Result<u64> {
+        #[cfg(test)]
+        self.checks.fetch_add(1, Ordering::SeqCst);
         self.source.drain(&self.events)?;
         Ok(self.events.epoch.load(Ordering::SeqCst))
     }
@@ -52,6 +61,11 @@ impl Topology {
                 result = self.source.ready() => result?,
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn check_count(&self) -> u64 {
+        self.checks.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]

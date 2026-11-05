@@ -227,11 +227,11 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
     let min_message_size = PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE;
 
     if data.len() < min_message_size {
-        panic!("invalid message size");
+        return Err(encoding::DecodeError::UnexpectedEnd.into());
     }
 
     if !data.starts_with(&PROTOCOL_HEADER) {
-        panic!("invalid protocol header");
+        return Err(encoding::DecodeError::UnexpectedEnd.into());
     }
 
     let (header, consumed) = encoding::decode_from_slice::<MessageHeader>(
