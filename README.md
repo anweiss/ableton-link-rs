@@ -139,6 +139,8 @@ Managed retry selection holds current-session, candidate and peer guards in that
 When no peer remains for a candidate, it retires only that incarnation; an unchanged
 same-ID sighting rearms measurement with a fresh incarnation rather than stranding it.
 
+## Source migration and managed lifecycle
+
 ### Breaking managed-event and measurement identity changes
 
 - `PeerStateMessageType` literals add `expires_at` and `observation`. Standalone
@@ -170,6 +172,178 @@ lock as resets; user callbacks run after that lock is released. Lease cancellati
 still observes lifecycle shutdown while reporting its retryable terminal result.
 Pruning and departure reserve notification capacity before changing timeout state,
 then recheck/remove/publish under one poison-recovering guard.
+
+### Session-aware observers and retry ownership
+
+`PeerGateway::new` and `GatewayObserver::new` now take a final `Option<Sessions>`.
+Construct `Sessions` first and pass `Some(sessions.clone())` when results feed its
+session handlers; the observer and coordinator must share the same peer registry.
+Use `None` only for an independent peer observer whose consumer owns session state.
+The coordinated observer holds current-session and candidate guards across peer
+mutation and retirement: removing the last candidate peer immediately invalidates
+its incarnation, before a queued controller notification or late result can reuse it.
+Current-session retry ownership survives temporary peer absence until reset/disable.
+
+Observers copy the local identity and release its mutex before waiting for peer-list
+or ingress guards. This avoids inversion with the receive path, which reads that
+identity under ingress serialization; coordinated session guards still cover resets.
+Discovery admission and receive timestamps remain serialized, including withdrawals:
+state contention does not discard them or restart their TTL.
+Observers acquire peer/session guards before checked ingress publication, so contention on
+those guards does not retain the interface-map/revision locks needed by PING/PONG.
+Measurement sample append likewise acquires its data guard before its ingress check.
+All receive deadlines are still rechecked after blocking state acquisition. A rejected
+final sample publication reports originating-key cancellation and releases workers.
+Queued controller joins use the latest guarded snapshot of the matching incarnation,
+not the older timeline/transform carried in the notification.
+
+Public `schedule_remeasurement` is one-shot. The standalone success/failure handlers
+may rearm it after each result; they no longer accumulate permanently recurring loops.
+Managed retry workers remain lifecycle-owned and deduplicated per incarnation.
+A peer without an advertised measurement endpoint reports a failed transform, not
+retryable route retirement; public measurement constructors start no workers for it.
+
+### Cooperative registry contention and eligible measurement ownership
+
+Observer commits and managed session/count operations retry contended mutex acquisition
+as one cancellable async operation, releasing every acquired guard before waiting.
+They do not park the owned single-thread IO executor or create blocking-pool jobs.
+Ingress/revision checks in observer publication are also nonblocking; original deadlines,
+receive ordering, and irrevocable gateway departure cleanup remain in force. A controller
+membership batch stays ordered while waiting and is cancelled with its lifecycle epoch.
+The synchronous `unique_session_peer_count` waits for a correct snapshot; async callers
+can use `unique_session_peer_count_async`. Candidate retirement builds one live-session
+set rather than rescanning peers for each candidate.
+
+Measurement selection prefers endpoint-advertising members, with leader preference
+within that group; no-endpoint sessions still receive terminal failed measurements.
+Failed-origin retirement removes every matching incarnation entry, without deleting a
+distinct incarnation or its peers. Join consumption validates live peers under the same
+session/registry guards, resetting a peerless remote promotion even if both counts were zero.
+
+`schedule_remeasurement` returns `RemeasurementTask`, replacing `JoinHandle<()>`.
+Public `handle_successful_measurement` and `handle_failed_measurement` return
+`Option<RemeasurementTask>`. Retain each returned owner while a retry is wanted;
+dropping it aborts pending work instead of detaching it. `abort`, `is_finished`, and
+awaiting completion remain available. Each owner sends at most one request, cancels
+on receiver closure or replacement of its originating current incarnation, and uses
+an async channel-capacity wait plus bounded-rate peer-absence checks rather than
+5ms polling for either condition. Already committed requests are not retracted.
+
+Join/reset commits acquire identity, session/client timing, sync policy, peer count,
+and responder publication guards in the same cooperative attempt as session and peer
+ownership. A busy guard means retry, not completed/no-change. No state is mutated until
+all required guards are held; callbacks run after release. This includes peerless resets
+and equal-timing joins whose client session identity still needs to change.
+Timeline announcements publish the accepted current identity, timeline and clock mapping
+from one guarded snapshot, never a candidate's wire ID paired with the current timeline.
+A pending promotion leaves local publication to its owned join, including equal-timing joins.
+
+
+### Atomic admission and clock publication
+
+Initial sightings reserve measurement capacity before installing a candidate. Managed
+retries reserve capacity, then validate the originating key, select the latest peer,
+and publish synchronously under current/candidate/peer guards. Cancellation before
+admission leaves no candidate or queued stale request. Standalone launch also selects
+a peer only after capacity is available. `Cancelled(key, attempted_peer)` identifies
+the failed `NodeId`; managed retries rotate through endpoint-advertising peers instead
+of repeatedly choosing a leader with an unavailable route. Candidate result commits
+match the full key in every lookup and compare against the latest current session;
+results originating from a replaced current session are rejected.
+
+Construct `Sessions` with `Sessions::new`, not field literals: publication identity is
+now private coordinator state. `Sessions::reset_timeline` takes
+`(&SessionKey, GhostXForm, Timeline)` and returns `bool`; capture the key and mapping
+with the source timeline, and handle `false` if that source changed. This low-level
+synchronous helper is not a controller client-state publication API. Use async
+`Controller::set_state` for client edits: calculation and installation share the full
+publication commit, including incarnation and clock mapping. Pending promotions wait
+for their owned join; even a same-wire-ID replacement cannot receive an old-clock edit.
+`disable` cooperatively awaits peer reset and publishes a fresh local incarnation, so
+cancelling a queued promotion does not strand later edits while disabled.
+
+PING replies snapshot membership and clock together in writer lock order using
+nonblocking acquisition. A contended PING is skipped, leaving retry ownership with the
+remote measurement; no deferred reply tasks accumulate or park the sole IO executor.
+Async responder publication also waits cooperatively for both guards.
+
+Beat arithmetic saturates at the signed microbeat limits; remainder with a zero
+quantum or MIN/-1 returns zero. Phase arithmetic uses wide intermediates. Received
+extreme beat origins and start/stop values therefore do not overflow during joining
+or client conversion. Inverse ghost-clock conversion retains the wide difference
+through division and saturates only the final host-microsecond conversion.
+
+Client edits use the accepted current timeline under the matching published identity
+and mapping, even when a same-incarnation announcement is ahead of local publication.
+Received start/stop updates use that same cooperative commit boundary: no timing or
+client state changes before every publication guard is acquired, and the ordered
+receive batch remains epoch-cancellable while waiting. An intervening join cannot
+cause a responder to publish a new identity with an old session's clock snapshot.
+
+`controller::update_discovery` now accepts `&Controller`, replacing three independent
+state arguments. It reads and publishes through the owner's full guarded boundary;
+callers no longer provide separately captured session, peer and gateway state.
+
+The minimum Chrono version is now **0.4.39**, including for `no_std` consumers.
+Elapsed time, timeline beat differences and clock scaling retain wide intermediates
+through conversion and origin/intercept addition. Public `Beats` operators still
+saturate; timeline composition does not use their narrowed intermediate results.
+PONG ghost timestamps saturate at the final signed-microsecond wire boundary.
+Gateway node publication acquires peer and both responder guards cooperatively
+before any mutation. Checked announcement commits release timeout state while
+waiting on interface/revision guards and remain lease/deadline/epoch cancellable.
+
+Clock payload fields and start/stop timestamps clamp only when encoded as signed
+wire microseconds. PONG sample sums and differences remain wide through averaging;
+individual received fields must still be representable in the wire format.
+`Tempo::beats_to_micros`, timeline conversion and forward ghost scaling can return
+Chrono durations beyond the signed-microsecond range. Callers must handle
+`num_microseconds() == None` instead of unwrapping an arbitrary derived duration.
+Managed discovery forwarding and measurement publication use the same cooperative
+interface-lease checks; timeout lookup, pruning and shutdown also release guards
+before waiting. Ignoring an `Option<RemeasurementTask>` returned by a public result
+handler drops the owner and aborts that pending retry immediately.
+
+The receive path acquires the interface map, peer/enabled policy, observation
+revision index and route cache before its nonblocking receive syscall. Receipt
+sampling, observation and bounded admission remain one synchronous region; a
+contended guard cannot consume and silently drop a withdrawal. Final forwarding
+acquires its route-cache guard before checking the original receive deadline.
+Registered sends likewise acquire their map cooperatively, then check the exact
+registration and perform the syscall without an intervening await. Lease and
+epoch cancellation remain active while these attempts wait.
+
+Owned startup snapshots, scanning/reconciliation, route pruning/resolution and
+broadcast snapshots also yield on contention. Reconciliation revalidates topology
+after acquiring the map; membership changes, queue draining and registration
+publication stay serialized with receive and send. Enable acquires every final
+drain/policy guard before clearing hints and opening its gate; asynchronous
+lifecycle checks never block on the enabled flag. Synchronous setup helpers remain
+synchronous. The owned-runtime regression overlaps raw withdrawals, encoded PING
+traffic, scanning/reconciliation and broadcasting under five contended guards,
+and checks original-deadline expiry, registered-source delivery and cancellation.
+
+An owned ALIVE broadcast holds its originating discovery-epoch permit through
+snapshot acquisition and the registered send. Closing that epoch cancels a send
+waiting on the interface map before disable completes, even though the interface
+lease remains live. Re-enabling cannot revive the old announcement; fresh work
+uses the new epoch. The shared notifier remains a wakeup, not an inferred stop.
+Wire regressions pause after snapshot/encoding, complete actual controller disable
+with an unchanged registration, and distinguish a fresh150BPM announcement from
+the captured120BPM payload during rapid re-enable.
+
+Phase-origin differences, modulo reduction, forced-beat composition and timeline
+shifts now retain wide intermediates through the final result. Session comparison
+also subtracts mapped clock times in wide nanoseconds, not bounded Chrono
+durations. The public saturating `Beats` operators are unchanged.
+
+An announcement commits its timeout and registers the replacement pruning worker
+without an intervening suspension, so cancelling a standalone announcement future
+cannot strand the committed peer. Ctrl-C cleanup retries a contended peer identity
+cooperatively and releases its guard before sending BYEBYE.
+
+### Interface scanning and controller lifecycle
 
 Interface scanning retains IPv4 link-local addresses for networks without DHCP,
 while excluding adapters the OS reports as operationally down. This applies to
@@ -1063,173 +1237,3 @@ This implementation aims for full compatibility with the official Ableton Link s
 ## Support
 
 For questions about this Rust implementation, please [open an issue](https://github.com/anweiss/ableton-link-rs/issues). For general Ableton Link questions, contact <link-devs@ableton.com>.
-
-### Session-aware observers and retry ownership
-
-`PeerGateway::new` and `GatewayObserver::new` now take a final `Option<Sessions>`.
-Construct `Sessions` first and pass `Some(sessions.clone())` when results feed its
-session handlers; the observer and coordinator must share the same peer registry.
-Use `None` only for an independent peer observer whose consumer owns session state.
-The coordinated observer holds current-session and candidate guards across peer
-mutation and retirement: removing the last candidate peer immediately invalidates
-its incarnation, before a queued controller notification or late result can reuse it.
-Current-session retry ownership survives temporary peer absence until reset/disable.
-
-Observers copy the local identity and release its mutex before waiting for peer-list
-or ingress guards. This avoids inversion with the receive path, which reads that
-identity under ingress serialization; coordinated session guards still cover resets.
-Discovery admission and receive timestamps remain serialized, including withdrawals:
-state contention does not discard them or restart their TTL.
-Observers acquire peer/session guards before checked ingress publication, so contention on
-those guards does not retain the interface-map/revision locks needed by PING/PONG.
-Measurement sample append likewise acquires its data guard before its ingress check.
-All receive deadlines are still rechecked after blocking state acquisition. A rejected
-final sample publication reports originating-key cancellation and releases workers.
-Queued controller joins use the latest guarded snapshot of the matching incarnation,
-not the older timeline/transform carried in the notification.
-
-Public `schedule_remeasurement` is one-shot. The standalone success/failure handlers
-may rearm it after each result; they no longer accumulate permanently recurring loops.
-Managed retry workers remain lifecycle-owned and deduplicated per incarnation.
-A peer without an advertised measurement endpoint reports a failed transform, not
-retryable route retirement; public measurement constructors start no workers for it.
-
-### Cooperative registry contention and eligible measurement ownership
-
-Observer commits and managed session/count operations retry contended mutex acquisition
-as one cancellable async operation, releasing every acquired guard before waiting.
-They do not park the owned single-thread IO executor or create blocking-pool jobs.
-Ingress/revision checks in observer publication are also nonblocking; original deadlines,
-receive ordering, and irrevocable gateway departure cleanup remain in force. A controller
-membership batch stays ordered while waiting and is cancelled with its lifecycle epoch.
-The synchronous `unique_session_peer_count` waits for a correct snapshot; async callers
-can use `unique_session_peer_count_async`. Candidate retirement builds one live-session
-set rather than rescanning peers for each candidate.
-
-Measurement selection prefers endpoint-advertising members, with leader preference
-within that group; no-endpoint sessions still receive terminal failed measurements.
-Failed-origin retirement removes every matching incarnation entry, without deleting a
-distinct incarnation or its peers. Join consumption validates live peers under the same
-session/registry guards, resetting a peerless remote promotion even if both counts were zero.
-
-`schedule_remeasurement` returns `RemeasurementTask`, replacing `JoinHandle<()>`.
-Public `handle_successful_measurement` and `handle_failed_measurement` return
-`Option<RemeasurementTask>`. Retain each returned owner while a retry is wanted;
-dropping it aborts pending work instead of detaching it. `abort`, `is_finished`, and
-awaiting completion remain available. Each owner sends at most one request, cancels
-on receiver closure or replacement of its originating current incarnation, and uses
-an async channel-capacity wait plus bounded-rate peer-absence checks rather than
-5ms polling for either condition. Already committed requests are not retracted.
-
-Join/reset commits acquire identity, session/client timing, sync policy, peer count,
-and responder publication guards in the same cooperative attempt as session and peer
-ownership. A busy guard means retry, not completed/no-change. No state is mutated until
-all required guards are held; callbacks run after release. This includes peerless resets
-and equal-timing joins whose client session identity still needs to change.
-Timeline announcements publish the accepted current identity, timeline and clock mapping
-from one guarded snapshot, never a candidate's wire ID paired with the current timeline.
-A pending promotion leaves local publication to its owned join, including equal-timing joins.
-
-
-### Atomic admission and clock publication
-
-Initial sightings reserve measurement capacity before installing a candidate. Managed
-retries reserve capacity, then validate the originating key, select the latest peer,
-and publish synchronously under current/candidate/peer guards. Cancellation before
-admission leaves no candidate or queued stale request. Standalone launch also selects
-a peer only after capacity is available. `Cancelled(key, attempted_peer)` identifies
-the failed `NodeId`; managed retries rotate through endpoint-advertising peers instead
-of repeatedly choosing a leader with an unavailable route. Candidate result commits
-match the full key in every lookup and compare against the latest current session;
-results originating from a replaced current session are rejected.
-
-Construct `Sessions` with `Sessions::new`, not field literals: publication identity is
-now private coordinator state. `Sessions::reset_timeline` takes
-`(&SessionKey, GhostXForm, Timeline)` and returns `bool`; capture the key and mapping
-with the source timeline, and handle `false` if that source changed. This low-level
-synchronous helper is not a controller client-state publication API. Use async
-`Controller::set_state` for client edits: calculation and installation share the full
-publication commit, including incarnation and clock mapping. Pending promotions wait
-for their owned join; even a same-wire-ID replacement cannot receive an old-clock edit.
-`disable` cooperatively awaits peer reset and publishes a fresh local incarnation, so
-cancelling a queued promotion does not strand later edits while disabled.
-
-PING replies snapshot membership and clock together in writer lock order using
-nonblocking acquisition. A contended PING is skipped, leaving retry ownership with the
-remote measurement; no deferred reply tasks accumulate or park the sole IO executor.
-Async responder publication also waits cooperatively for both guards.
-
-Beat arithmetic saturates at the signed microbeat limits; remainder with a zero
-quantum or MIN/-1 returns zero. Phase arithmetic uses wide intermediates. Received
-extreme beat origins and start/stop values therefore do not overflow during joining
-or client conversion. Inverse ghost-clock conversion retains the wide difference
-through division and saturates only the final host-microsecond conversion.
-
-Client edits use the accepted current timeline under the matching published identity
-and mapping, even when a same-incarnation announcement is ahead of local publication.
-Received start/stop updates use that same cooperative commit boundary: no timing or
-client state changes before every publication guard is acquired, and the ordered
-receive batch remains epoch-cancellable while waiting. An intervening join cannot
-cause a responder to publish a new identity with an old session's clock snapshot.
-
-`controller::update_discovery` now accepts `&Controller`, replacing three independent
-state arguments. It reads and publishes through the owner's full guarded boundary;
-callers no longer provide separately captured session, peer and gateway state.
-
-The minimum Chrono version is now **0.4.39**, including for `no_std` consumers.
-Elapsed time, timeline beat differences and clock scaling retain wide intermediates
-through conversion and origin/intercept addition. Public `Beats` operators still
-saturate; timeline composition does not use their narrowed intermediate results.
-PONG ghost timestamps saturate at the final signed-microsecond wire boundary.
-Gateway node publication acquires peer and both responder guards cooperatively
-before any mutation. Checked announcement commits release timeout state while
-waiting on interface/revision guards and remain lease/deadline/epoch cancellable.
-
-Clock payload fields and start/stop timestamps clamp only when encoded as signed
-wire microseconds. PONG sample sums and differences remain wide through averaging;
-individual received fields must still be representable in the wire format.
-`Tempo::beats_to_micros`, timeline conversion and forward ghost scaling can return
-Chrono durations beyond the signed-microsecond range. Callers must handle
-`num_microseconds() == None` instead of unwrapping an arbitrary derived duration.
-Managed discovery forwarding and measurement publication use the same cooperative
-interface-lease checks; timeout lookup, pruning and shutdown also release guards
-before waiting. Ignoring an `Option<RemeasurementTask>` returned by a public result
-handler drops the owner and aborts that pending retry immediately.
-
-The receive path acquires the interface map, peer/enabled policy, observation
-revision index and route cache before its nonblocking receive syscall. Receipt
-sampling, observation and bounded admission remain one synchronous region; a
-contended guard cannot consume and silently drop a withdrawal. Final forwarding
-acquires its route-cache guard before checking the original receive deadline.
-Registered sends likewise acquire their map cooperatively, then check the exact
-registration and perform the syscall without an intervening await. Lease and
-epoch cancellation remain active while these attempts wait.
-
-Owned startup snapshots, scanning/reconciliation, route pruning/resolution and
-broadcast snapshots also yield on contention. Reconciliation revalidates topology
-after acquiring the map; membership changes, queue draining and registration
-publication stay serialized with receive and send. Enable acquires every final
-drain/policy guard before clearing hints and opening its gate; asynchronous
-lifecycle checks never block on the enabled flag. Synchronous setup helpers remain
-synchronous. The owned-runtime regression overlaps raw withdrawals, encoded PING
-traffic, scanning/reconciliation and broadcasting under five contended guards,
-and checks original-deadline expiry, registered-source delivery and cancellation.
-
-An owned ALIVE broadcast holds its originating discovery-epoch permit through
-snapshot acquisition and the registered send. Closing that epoch cancels a send
-waiting on the interface map before disable completes, even though the interface
-lease remains live. Re-enabling cannot revive the old announcement; fresh work
-uses the new epoch. The shared notifier remains a wakeup, not an inferred stop.
-Wire regressions pause after snapshot/encoding, complete actual controller disable
-with an unchanged registration, and distinguish a fresh150BPM announcement from
-the captured120BPM payload during rapid re-enable.
-
-Phase-origin differences, modulo reduction, forced-beat composition and timeline
-shifts now retain wide intermediates through the final result. Session comparison
-also subtracts mapped clock times in wide nanoseconds, not bounded Chrono
-durations. The public saturating `Beats` operators are unchanged.
-
-An announcement commits its timeout and registers the replacement pruning worker
-without an intervening suspension, so cancelling a standalone announcement future
-cannot strand the committed peer. Ctrl-C cleanup retries a contended peer identity
-cooperatively and releases its guard before sending BYEBYE.

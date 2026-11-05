@@ -19,14 +19,51 @@ impl Default for GhostXForm {
 
 impl GhostXForm {
     pub fn host_to_ghost(&self, host_time: Duration) -> Duration {
-        if self.slope == 1.0 {
-            return super::duration_from_nanos(
-                super::round_ratio(super::duration_nanos(host_time), 1_000) * 1_000
-                    + super::duration_nanos(self.intercept),
-            );
+        let nanos = super::duration_nanos(host_time);
+        if nanos == 0 {
+            return self.intercept;
         }
-        let offset =
-            (self.slope * (super::duration_nanos(host_time) as f64 / 1_000.0)).round() as i128;
+        let offset = if self.slope.is_finite() {
+            let (mantissa, exponent, sign) =
+                num_traits::float::FloatCore::integer_decode(self.slope);
+            let magnitude = nanos.unsigned_abs();
+            let mantissa = u128::from(mantissa);
+            // Divide before multiplying so the exact binary product fits, while
+            // retaining the fractional microsecond until the single rounding.
+            let fraction = (magnitude % 1_000) * mantissa;
+            let whole = (magnitude / 1_000) * mantissa + fraction / 1_000;
+            let magnitude = if exponent < 0 {
+                let shift = u32::from(exponent.unsigned_abs());
+                if shift >= 128 {
+                    0
+                } else {
+                    (whole >> shift)
+                        + u128::from(whole & ((1_u128 << shift) - 1) >= (1_u128 << (shift - 1)))
+                }
+            } else {
+                let shift = exponent as u32;
+                let limit = i128::MAX as u128;
+                if shift >= 127 || whole > (limit >> shift) {
+                    limit
+                } else {
+                    (whole << shift)
+                        .saturating_add(
+                            (fraction % 1_000)
+                                .saturating_mul(1_u128 << shift)
+                                .saturating_add(500)
+                                / 1_000,
+                        )
+                        .min(limit)
+                }
+            } as i128;
+            if (nanos < 0) != (sign < 0) {
+                -magnitude
+            } else {
+                magnitude
+            }
+        } else {
+            (self.slope * (nanos as f64 / 1_000.0)).round() as i128
+        };
         super::duration_from_nanos(
             offset
                 .saturating_mul(1_000)
@@ -35,15 +72,170 @@ impl GhostXForm {
     }
 
     pub fn ghost_to_host(&self, ghost_time: Duration) -> Duration {
-        // Preserve a wide (and potentially cancelling) difference through the
-        // division. Only the final host microseconds are saturated by the cast.
         let difference = super::duration_nanos(ghost_time) - super::duration_nanos(self.intercept);
-        Duration::microseconds((difference as f64 / 1_000.0 / self.slope).round() as i64)
+        if self.slope == 0.0 || !self.slope.is_finite() {
+            return Duration::microseconds(
+                (difference as f64 / 1_000.0 / self.slope).round() as i64
+            );
+        }
+        let (mantissa, exponent, sign) = num_traits::float::FloatCore::integer_decode(self.slope);
+        let difference = if sign < 0 { -difference } else { difference };
+        let denominator = i128::from(mantissa) * 1_000;
+        let micros = if exponent >= 0 {
+            let shift = exponent as u32;
+            if shift >= 127 || denominator > (i128::MAX >> shift) {
+                0
+            } else {
+                super::round_ratio(difference, denominator << shift)
+            }
+        } else {
+            let shift = u32::from(exponent.unsigned_abs());
+            if difference == 0 {
+                0
+            } else if shift >= 127 || difference.unsigned_abs() > ((i128::MAX as u128) >> shift) {
+                // The denominator is below 2^63, so an overflowing numerator
+                // necessarily produces host microseconds outside i64.
+                if difference < 0 {
+                    i128::MIN
+                } else {
+                    i128::MAX
+                }
+            } else {
+                super::round_ratio(difference << shift, denominator)
+            }
+        };
+        Duration::microseconds(micros.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clock_precision_forward_preserves_cancelling_integer_and_fractional_parts() {
+        let micros = (1_i64 << 62) + 511;
+        for sign in [-1, 1] {
+            for slope in [2.0, -2.0] {
+                let direction = sign * if slope < 0.0 { -1 } else { 1 };
+                let form = GhostXForm {
+                    slope,
+                    intercept: Duration::microseconds(-direction * i64::MAX),
+                };
+                assert_eq!(
+                    form.host_to_ghost(Duration::microseconds(sign * micros)),
+                    Duration::microseconds(direction * 1_023)
+                );
+            }
+            let form = GhostXForm {
+                slope: sign as f64 * f64::from_bits(1.0_f64.to_bits() + 1),
+                intercept: Duration::microseconds(-sign * micros),
+            };
+            assert_eq!(
+                form.host_to_ghost(Duration::microseconds(micros)),
+                Duration::microseconds(sign * 1_024)
+            );
+        }
+        for input in [Duration::MIN, Duration::MAX] {
+            let form = GhostXForm {
+                slope: 0.5,
+                intercept: -(input / 2),
+            };
+            let expected = crate::link::duration_from_nanos(
+                crate::link::round_ratio(crate::link::duration_nanos(input), 2_000) * 1_000
+                    + crate::link::duration_nanos(form.intercept),
+            );
+            assert_eq!(form.host_to_ghost(input), expected);
+        }
+        for slope in [f64::MIN_POSITIVE, f64::from_bits(1)] {
+            let form = GhostXForm {
+                slope,
+                intercept: Duration::nanoseconds(37),
+            };
+            for input in [Duration::MIN, Duration::MAX] {
+                assert_eq!(form.host_to_ghost(input), form.intercept);
+            }
+        }
+        for slope in [f64::MAX, -f64::MAX] {
+            let form = GhostXForm {
+                slope,
+                intercept: Duration::nanoseconds(37),
+            };
+            assert_eq!(form.host_to_ghost(Duration::zero()), form.intercept);
+            for nanos in [-1, 1] {
+                assert_eq!(
+                    form.host_to_ghost(Duration::nanoseconds(nanos)),
+                    if (slope < 0.0) == (nanos < 0) {
+                        Duration::MAX
+                    } else {
+                        Duration::MIN
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clock_precision_inverse_preserves_identity_and_binary_ratios() {
+        let micros = (1_i64 << 53) - 21;
+        for sign in [-1, 1] {
+            let identity = GhostXForm {
+                slope: 1.0,
+                intercept: Duration::zero(),
+            };
+            let time = Duration::microseconds(sign * micros);
+            assert_eq!(identity.ghost_to_host(time), time);
+            for (numerator, denominator) in [
+                (1, 1),
+                (-1, 1),
+                (2, 1),
+                (-2, 1),
+                (1, 2),
+                (-1, 2),
+                (3, 2),
+                (-3, 2),
+            ] {
+                let host = sign * 2 * micros;
+                let form = GhostXForm {
+                    slope: numerator as f64 / denominator as f64,
+                    intercept: Duration::nanoseconds(37),
+                };
+                let ghost = Duration::microseconds(host * numerator / denominator) + form.intercept;
+                assert_eq!(form.ghost_to_host(ghost), Duration::microseconds(host));
+            }
+        }
+        let identity = GhostXForm {
+            slope: 1.0,
+            intercept: Duration::zero(),
+        };
+        for (nanos, micros) in [(1_499, 1), (1_500, 2), (-1_499, -1), (-1_500, -2)] {
+            assert_eq!(
+                identity.ghost_to_host(Duration::nanoseconds(nanos)),
+                Duration::microseconds(micros)
+            );
+        }
+        for slope in [f64::MIN_POSITIVE, f64::from_bits(1)] {
+            for sign in [-1, 1] {
+                let form = GhostXForm {
+                    slope: sign as f64 * slope,
+                    intercept: Duration::nanoseconds(37),
+                };
+                assert_eq!(form.ghost_to_host(form.intercept), Duration::zero());
+                assert_eq!(
+                    form.ghost_to_host(form.intercept + Duration::nanoseconds(1)),
+                    Duration::microseconds(if sign < 0 { i64::MIN } else { i64::MAX })
+                );
+            }
+        }
+        for slope in [f64::MAX, -f64::MAX] {
+            let form = GhostXForm {
+                slope,
+                intercept: Duration::nanoseconds(37),
+            };
+            for input in [Duration::MIN, Duration::MAX] {
+                assert_eq!(form.ghost_to_host(input), Duration::zero());
+            }
+        }
+    }
+
     #[test]
     fn admission_inverse_divides_wide_difference_before_saturating() {
         let form = super::GhostXForm {
@@ -60,7 +252,7 @@ mod tests {
         };
         assert_eq!(
             form.ghost_to_host(chrono::Duration::microseconds(-i64::MAX)),
-            chrono::Duration::microseconds(i64::MIN)
+            chrono::Duration::microseconds(-i64::MAX)
         );
         let large = chrono::Duration::MAX - chrono::Duration::seconds(1);
         let form = super::GhostXForm {
