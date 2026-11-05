@@ -124,14 +124,20 @@ time sum validates, and standalone early failure reporting observes cancellation
 Queued announcements own node-scoped supersession tokens independently of endpoint-keyed
 route hints. Socket receipt, timestamp capture, decoding and revision admission share
 one interface-map critical section, so an earlier reader cannot admit behind a newer
-withdrawal. Tokens and captured leases survive the bounded handoff, gateway queue and
-observer wait. Each stage reserves downstream capacity before a synchronous checked
+withdrawal. Positive announcements retain tokens, leases and their original deadlines
+through the bounded handoff, gateway queue and observer wait, including state-lock contention. Each stage reserves downstream capacity before a synchronous checked
 commit; the observer commits peer changes and its notification together. The weak
 index owns no tombstones or leases: live keys are bounded by owned handoff/delivery
 items plus the bounded gateway/observer queues and handlers (not arbitrary copies
 retained by external consumers). Dead keys are reclaimed on the next observation.
 TTL-zero and managed BYEBYE are explicit existing-peer withdrawals; expired positive
 announcements are discarded. Wire TTL is preserved and expires_at carries exact life.
+Once the gateway removes a timeout, it queues an irrevocable FIFO `PeerLeft` cleanup
+obligation. Newer dropped traffic cannot cancel that removal and orphan observer state;
+a later admitted positive announcement follows it and may recreate the peer.
+Managed retry selection holds current-session, candidate and peer guards in that order.
+When no peer remains for a candidate, it retires only that incarnation; an unchanged
+same-ID sighting rearms measurement with a fresh incarnation rather than stranding it.
 
 ### Breaking managed-event and measurement identity changes
 
@@ -140,7 +146,8 @@ announcements are discarded. Wire TTL is preserved and expires_at carries exact 
   opaque `Arc<PeerObservation>` and advertised `ttl`; never regenerate any of them.
   A true zero TTL withdraws existing state. Managed BYEBYE is normalized to this
   zero-TTL peer-state event; standalone `receive_bye_bye` still emits `OnEvent::Byebye`.
-- `PeerEvent::Observed(PeerStateMessageType)` carries managed state to `GatewayObserver`.
+- `PeerEvent::Observed(PeerStateMessageType)` carries positive gateway announcements
+  (including standalone calls) with the original deadline to `GatewayObserver`.
   Exhaustive matches need the new variant. Forward it intact to the stock observer;
   converting it to unguarded `SawPeer` discards ordering and lease protection.
 - Construct sessions with `Session::new(id, timeline, measurement)` rather than struct

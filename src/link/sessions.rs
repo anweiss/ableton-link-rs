@@ -302,12 +302,12 @@ impl Sessions {
                             retries.insert(identity, remeasurements.spawn(async move {
                                 gate.run_in_epoch(epoch, async move {
                                     tokio::time::sleep(delay).await;
-                                    let live = {
-                                        let current = lock(&current);
-                                        if session.key().matches(&current) { Some(current.clone()) }
-                                        else { lock(&others).iter().find(|other| session.key().matches(other)).cloned() }
-                                    };
-                                    if let Some(live) = live { launch_session_measurement(peers, sender, live).await; }
+                                    let request = owned_measurement_request(&session.key(), &current, &others, &peers);
+                                    if let Some(request) = request {
+                                        if let Err(error) = sender.send(request).await {
+                                            debug!("measurement request receiver closed: {}", error);
+                                        }
+                                    }
                                 }).await;
                             }));
                         }
@@ -384,12 +384,17 @@ impl Sessions {
             }
         };
         if let Some(session) = launch {
-            launch_session_measurement(
-                self.peers.clone(),
-                self.tx_measure_peer_state.clone(),
-                session,
-            )
-            .await;
+            let request = owned_measurement_request(
+                &session.key(),
+                &self.current,
+                &self.other_sessions,
+                &self.peers,
+            );
+            if let Some(request) = request {
+                if let Err(error) = self.tx_measure_peer_state.send(request).await {
+                    debug!("measurement request receiver closed: {}", error);
+                }
+            }
         }
 
         lock(&self.current).timeline
@@ -414,6 +419,41 @@ impl Sessions {
         }
 
         session
+    }
+}
+
+fn owned_measurement_request(
+    key: &SessionKey,
+    current: &Mutex<Session>,
+    others: &Mutex<Vec<Session>>,
+    peers: &Mutex<Vec<ControllerPeer>>,
+) -> Option<MeasurePeerEvent> {
+    let current = lock(current);
+    let mut others = lock(others);
+    let is_current = key.matches(&current);
+    if !is_current && !others.iter().any(|session| key.matches(session)) {
+        return None;
+    }
+    let peers = lock(peers);
+    let mut candidates = peers
+        .iter()
+        .filter(|peer| peer.peer_state.session_id() == key.session_id);
+    let peer = candidates
+        .clone()
+        .find(|peer| peer.peer_state.ident() == key.session_id.0)
+        .or_else(|| candidates.next());
+    if let Some(peer) = peer {
+        Some(MeasurePeerEvent::PeerState(
+            key.clone(),
+            peer.peer_state.clone(),
+        ))
+    } else {
+        // No detached retry or dormant candidate survives peer absence. A later
+        // sighting creates a fresh incarnation; old terminal results cannot own it.
+        if !is_current {
+            others.retain(|session| !key.matches(session));
+        }
+        None
     }
 }
 
@@ -737,6 +777,98 @@ mod tests {
             assert_eq!(peers.lock().unwrap().len(), 1);
             assert!(rx.try_recv().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn three_gaps_candidate_rearms_after_absent_peer_and_rejects_retired_origin() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let id = SessionId(NodeId::from_array([1; 8]));
+            let peer = ControllerPeer {
+                peer_state: crate::discovery::peers::PeerState {
+                    node_state: crate::link::node::NodeState::new(id),
+                    ..Default::default()
+                },
+            };
+            let peers = Arc::new(Mutex::new(vec![peer.clone()]));
+            let (tx_requests, mut requests) = tokio::sync::mpsc::channel(1);
+            let (tx_results, results) = tokio::sync::mpsc::channel(1);
+            let (tx_joins, mut joins) = tokio::sync::mpsc::channel(1);
+            let (sessions, task) = Sessions::with_dispatch_gate(
+                Session::new(
+                    SessionId(NodeId::from_array([2; 8])),
+                    Timeline::default(),
+                    SessionMeasurement::default(),
+                ),
+                tx_requests,
+                peers.clone(),
+                Clock::new(),
+                tx_joins,
+                results,
+                Arc::new(DispatchGate::new_open()),
+            );
+            sessions.saw_session_timeline(id, Timeline::default()).await;
+            let MeasurePeerEvent::PeerState(old, _) = requests.recv().await.unwrap() else {
+                panic!("initial request")
+            };
+            peers.lock().unwrap().clear();
+            tx_results
+                .send(MeasurePeerEvent::Cancelled(old.clone()))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while sessions
+                    .other_sessions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|session| old.matches(session))
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("retry must retire an absent candidate rather than strand it");
+            assert!(requests.try_recv().is_err());
+            assert!(joins.try_recv().is_err());
+            peers.lock().unwrap().push(peer);
+            sessions.saw_session_timeline(id, Timeline::default()).await;
+            let MeasurePeerEvent::PeerState(fresh, _) = requests.recv().await.unwrap() else {
+                panic!("rearmed request")
+            };
+            assert!(!Arc::ptr_eq(&old.incarnation, &fresh.incarnation));
+            tx_results
+                .send(MeasurePeerEvent::XForm(
+                    old.clone(),
+                    GhostXForm {
+                        slope: 1.0,
+                        intercept: Duration::seconds(2),
+                    },
+                ))
+                .await
+                .unwrap();
+            tx_results
+                .send(MeasurePeerEvent::XForm(old, GhostXForm::default()))
+                .await
+                .unwrap();
+            tx_results
+                .send(MeasurePeerEvent::XForm(
+                    fresh.clone(),
+                    GhostXForm {
+                        slope: 1.0,
+                        intercept: Duration::seconds(1),
+                    },
+                ))
+                .await
+                .unwrap();
+            let joined = joins.recv().await.unwrap();
+            assert!(fresh.matches(&joined));
+            assert_eq!(peers.lock().unwrap().len(), 1);
+            assert!(joins.try_recv().is_err());
+            task.abort();
+            let _ = task.await;
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
