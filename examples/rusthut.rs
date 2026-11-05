@@ -307,10 +307,14 @@ async fn handle_input(state: Arc<tokio::sync::Mutex<State>>) {
                     state_guard.last_tempo_change = Some((new_tempo, std::time::Instant::now()));
 
                     // Commit the change to Link in background
-                    state_guard
+                    if let Err(error) = state_guard
                         .link
                         .commit_app_session_state(session_state)
-                        .await;
+                        .await
+                    {
+                        state_guard.last_tempo_change = None;
+                        eprintln!("Link edit rejected: {error}");
+                    }
                 }
                 'e' => {
                     let new_tempo = (session_state.tempo() + 1.0).min(999.0); // Max tempo like C++
@@ -321,10 +325,14 @@ async fn handle_input(state: Arc<tokio::sync::Mutex<State>>) {
                     state_guard.last_tempo_change = Some((new_tempo, std::time::Instant::now()));
 
                     // Commit the change to Link in background
-                    state_guard
+                    if let Err(error) = state_guard
                         .link
                         .commit_app_session_state(session_state)
-                        .await;
+                        .await
+                    {
+                        state_guard.last_tempo_change = None;
+                        eprintln!("Link edit rejected: {error}");
+                    }
                 }
                 'r' => {
                     state_guard.quantum = (state_guard.quantum - 1.0).max(1.0);
@@ -346,10 +354,13 @@ async fn handle_input(state: Arc<tokio::sync::Mutex<State>>) {
                         let current_time = state_guard.link.clock().micros();
                         session_state.set_is_playing(true, current_time);
                     }
-                    state_guard
+                    if let Err(error) = state_guard
                         .link
                         .commit_app_session_state(session_state)
-                        .await;
+                        .await
+                    {
+                        eprintln!("Link edit rejected: {error}");
+                    }
                 }
                 _ => {}
             }
@@ -523,7 +534,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Capture all state in a single lock acquisition to ensure consistency
         let (
             time,
-            session_state,
+            mut session_state,
             link_enabled,
             num_peers,
             quantum,
@@ -606,10 +617,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Commit any timeline modifications outside the lock
         if should_commit {
             let mut state_guard = state.lock().await;
-            state_guard
+            if let Err(error) = state_guard
                 .link
-                .commit_app_session_state(session_state)
-                .await;
+                .commit_app_session_state(session_state.clone())
+                .await
+            {
+                session_state = state_guard.link.capture_app_session_state();
+                eprintln!("Link edit rejected: {error}");
+            }
         }
 
         let is_playing = session_state.is_playing();

@@ -205,6 +205,38 @@ impl GhostXForm {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn clock_precision_public_rounding_retains_fractional_input() {
+        let identity = GhostXForm {
+            slope: 1.0,
+            intercept: Duration::zero(),
+        };
+        for sign in [-1, 1] {
+            for (nanos, micros) in [(500, 1), (1_500, 2)] {
+                let input = Duration::nanoseconds(sign * nanos);
+                let expected = Duration::microseconds(sign * micros);
+                assert_eq!(identity.host_to_ghost(input), expected);
+                assert_eq!(identity.ghost_to_host(input), expected);
+            }
+            let scaled = GhostXForm {
+                slope: 2.0,
+                intercept: Duration::zero(),
+            };
+            assert_eq!(
+                scaled.host_to_ghost(Duration::nanoseconds(sign * 750)),
+                Duration::microseconds(sign * 2)
+            );
+            let divided = GhostXForm {
+                slope: 0.5,
+                intercept: Duration::zero(),
+            };
+            assert_eq!(
+                divided.ghost_to_host(Duration::nanoseconds(sign * 750)),
+                Duration::microseconds(sign * 2)
+            );
+        }
+    }
+
+    #[test]
     fn nanosecond_alignment_clock_mapping_preserves_fractional_origins() {
         let identity = GhostXForm {
             slope: 1.0,

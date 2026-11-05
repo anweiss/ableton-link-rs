@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use triple_buffer::{Input, Output, TripleBuffer};
 
+use super::error::CommitError;
 use super::{
     sessions::SessionId,
     state::{ClientStartStopState, ClientState},
@@ -10,7 +11,28 @@ use super::{
 };
 use crate::link::IncomingClientState;
 
-/// Real-time client state for lock-free access from audio threads
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioCommitTicket(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AudioQueueError {
+    #[error("audio commit queue is busy; drain and acknowledge the outstanding request")]
+    Busy,
+    #[error("audio commit ticket counter exhausted")]
+    TicketExhausted,
+    #[error("audio commit ticket is unknown or already acknowledged")]
+    UnknownTicket,
+}
+
+#[derive(Default)]
+struct PendingUpdate {
+    sequence: u64,
+    incoming: Option<IncomingClientState>,
+    result: Option<Result<(), CommitError>>,
+    origin: Option<super::sessions::SessionEditOrigin>,
+}
+
+/// Accepted client state for non-blocking access from audio threads.
 #[derive(Clone, Debug, Default)]
 pub struct RtClientState {
     pub timeline: Timeline,
@@ -46,7 +68,7 @@ impl From<RtClientState> for ClientState {
 }
 
 /// Real-time safe session state handler using only safe Rust
-/// This provides lock-free access to session state for real-time audio threads
+/// This provides non-blocking access to session state for real-time audio threads
 /// while allowing safe updates from other threads.
 ///
 /// Uses RwLock for cached state (readers won't block each other) and
@@ -67,6 +89,7 @@ pub struct SafeRtSessionStateHandler {
 
     /// Flag indicating pending updates
     has_pending_updates: AtomicBool,
+    pending: Mutex<PendingUpdate>,
 
     /// Grace period for local modifications (in microseconds)
     local_mod_grace_period_micros: AtomicU64,
@@ -86,6 +109,7 @@ impl SafeRtSessionStateHandler {
             timeline_timestamp: AtomicU64::new(0),
             start_stop_timestamp: AtomicU64::new(0),
             has_pending_updates: AtomicBool::new(false),
+            pending: Mutex::new(PendingUpdate::default()),
             local_mod_grace_period_micros: AtomicU64::new(grace_period_micros),
         }
     }
@@ -146,78 +170,114 @@ impl SafeRtSessionStateHandler {
         }
     }
 
-    /// Update the real-time client state with new data
-    /// This should only be called from the real-time thread
-    /// Uses try_lock operations to avoid blocking
+    /// Queue a proposal without changing accepted state. One outstanding request
+    /// is retained until a non-RT consumer completes it and its ticket is read.
+    /// Uses try_lock and performs no allocation.
     pub fn update_rt_client_state(
         &self,
         incoming_state: IncomingClientState,
-        current_time: Duration,
-        is_enabled: bool,
-    ) {
-        if incoming_state.timeline.is_none() && incoming_state.start_stop_state.is_none() {
-            return;
-        }
-
-        let current_time_micros = current_time.num_microseconds().unwrap_or(0) as u64;
-        let timestamp_to_store = if is_enabled { current_time_micros } else { 0 };
-
-        // Try to update cached state (non-blocking)
-        if let Ok(mut cached_state) = self.cached_rt_state.try_write() {
-            // Update timeline if provided
-            if let Some(timeline) = incoming_state.timeline {
-                cached_state.timeline = timeline;
-                cached_state.timeline_timestamp = current_time;
-                self.timeline_timestamp
-                    .store(timestamp_to_store, Ordering::Release);
-            }
-
-            // Update start/stop state if provided
-            if let Some(start_stop_state) = incoming_state.start_stop_state {
-                cached_state.start_stop_state = start_stop_state;
-                cached_state.start_stop_state_timestamp = current_time;
-                self.start_stop_timestamp
-                    .store(timestamp_to_store, Ordering::Release);
-            }
-
-            // Try to send updated state to non-RT thread via triple buffer (non-blocking)
-            if let Ok(mut input) = self.client_state_input.try_lock() {
-                input.write(cached_state.clone().into());
-
-                // Mark that we have pending updates
-                self.has_pending_updates.store(true, Ordering::Release);
-            }
-        }
+        _current_time: Duration,
+        _is_enabled: bool,
+    ) -> Result<AudioCommitTicket, AudioQueueError> {
+        self.update_rt_client_state_from_origin(incoming_state, None)
     }
 
-    /// Process any pending updates from the triple buffers
-    /// This should be called periodically from a non-realtime thread
-    /// This method can block briefly since it's not called from RT thread
+    pub(crate) fn update_rt_client_state_from_origin(
+        &self,
+        incoming_state: IncomingClientState,
+        origin: Option<super::sessions::SessionEditOrigin>,
+    ) -> Result<AudioCommitTicket, AudioQueueError> {
+        let mut pending = self.pending.try_lock().map_err(|_| AudioQueueError::Busy)?;
+        if pending.incoming.is_some() || pending.result.is_some() {
+            return Err(AudioQueueError::Busy);
+        }
+        pending.sequence = pending
+            .sequence
+            .checked_add(1)
+            .ok_or(AudioQueueError::TicketExhausted)?;
+        pending.incoming = Some(incoming_state);
+        pending.origin = origin;
+        self.has_pending_updates.store(true, Ordering::Release);
+        Ok(AudioCommitTicket(pending.sequence))
+    }
+
+    /// Peek at the pending request, preserving its changed-field mask.
+    /// The non-RT consumer must validate, publish accepted state, and complete
+    /// its ticket. Repeated reads do not consume or acknowledge the request.
     pub fn process_pending_updates(&self) -> Option<IncomingClientState> {
-        if !self.has_pending_updates.load(Ordering::Acquire) {
-            return None;
+        self.pending_update().map(|(_, incoming)| incoming)
+    }
+
+    /// Peek without consuming: cancellation of a non-RT drain leaves the request queued.
+    pub fn pending_update(&self) -> Option<(AudioCommitTicket, IncomingClientState)> {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending
+            .incoming
+            .map(|incoming| (AudioCommitTicket(pending.sequence), incoming))
+    }
+
+    pub(crate) fn pending_update_from_origin(
+        &self,
+    ) -> Option<(
+        AudioCommitTicket,
+        IncomingClientState,
+        Option<super::sessions::SessionEditOrigin>,
+    )> {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.incoming.map(|incoming| {
+            (
+                AudioCommitTicket(pending.sequence),
+                incoming,
+                pending.origin.clone(),
+            )
+        })
+    }
+
+    /// Publish only a controller-accepted snapshot, never an unvalidated proposal.
+    pub fn publish_client_state(&self, accepted: ClientState) {
+        self.client_state_input
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write(accepted);
+        *self
+            .cached_rt_state
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = accepted.into();
+    }
+
+    pub fn complete_pending_update(
+        &self,
+        ticket: AudioCommitTicket,
+        result: Result<(), CommitError>,
+    ) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if ticket.0 != pending.sequence || pending.incoming.is_none() {
+            return false;
         }
+        pending.incoming = None;
+        pending.origin = None;
+        pending.result = Some(result);
+        self.has_pending_updates.store(false, Ordering::Release);
+        true
+    }
 
-        // Check for new state data from triple buffer (can block for non-RT thread)
-        if let Ok(mut output) = self.client_state_output.lock() {
-            if output.updated() {
-                let new_state = *output.read();
-
-                let result = IncomingClientState {
-                    timeline: Some(new_state.timeline),
-                    start_stop_state: Some(new_state.start_stop_state),
-                    timeline_timestamp: Duration::microseconds(
-                        self.timeline_timestamp.load(Ordering::Acquire) as i64,
-                    ),
-                };
-
-                // Clear the pending flag
-                self.has_pending_updates.store(false, Ordering::Release);
-                return Some(result);
-            }
+    /// Non-blocking acknowledgment; a completed result occupies the slot until read.
+    pub fn take_commit_result(
+        &self,
+        ticket: AudioCommitTicket,
+    ) -> Result<Option<Result<(), CommitError>>, AudioQueueError> {
+        let mut pending = self.pending.try_lock().map_err(|_| AudioQueueError::Busy)?;
+        if ticket.0 != pending.sequence {
+            return Err(AudioQueueError::UnknownTicket);
         }
-
-        None
+        if pending.incoming.is_some() {
+            return Ok(None);
+        }
+        pending
+            .result
+            .take()
+            .map(Some)
+            .ok_or(AudioQueueError::UnknownTicket)
     }
 
     /// Check if there are pending updates waiting to be processed
@@ -308,7 +368,13 @@ mod tests {
         };
 
         // Update the real-time state
-        handler.update_rt_client_state(incoming_state, Duration::milliseconds(3000), true);
+        let ticket = handler
+            .update_rt_client_state(incoming_state, Duration::milliseconds(3000), true)
+            .unwrap();
+        assert_eq!(
+            handler.get_rt_client_state(Duration::seconds(10)),
+            client_state
+        );
 
         // Should have pending updates
         assert!(handler.has_pending_updates());
@@ -320,6 +386,42 @@ mod tests {
         let processed_state = processed.unwrap();
         assert!(processed_state.timeline.is_some());
         assert_eq!(processed_state.timeline.unwrap().tempo.bpm(), 140.0);
+        assert_eq!(processed_state, incoming_state);
+        assert_eq!(handler.process_pending_updates(), Some(incoming_state));
+        assert_eq!(
+            handler.update_rt_client_state(incoming_state, Duration::zero(), true),
+            Err(AudioQueueError::Busy)
+        );
+        assert!(handler.complete_pending_update(ticket, Err(CommitError::TimelineOriginExhausted)));
+        assert_eq!(
+            handler.get_rt_client_state(Duration::seconds(10)),
+            client_state
+        );
+        assert_eq!(
+            handler.update_rt_client_state(incoming_state, Duration::zero(), true),
+            Err(AudioQueueError::Busy)
+        );
+        assert_eq!(
+            handler.take_commit_result(ticket),
+            Ok(Some(Err(CommitError::TimelineOriginExhausted)))
+        );
+        assert_eq!(
+            handler.take_commit_result(ticket),
+            Err(AudioQueueError::UnknownTicket)
+        );
+        let ticket = handler
+            .update_rt_client_state(incoming_state, Duration::zero(), true)
+            .unwrap();
+        handler.publish_client_state(ClientState {
+            timeline: new_timeline,
+            ..client_state
+        });
+        assert!(handler.complete_pending_update(ticket, Ok(())));
+        assert_eq!(handler.take_commit_result(ticket), Ok(Some(Ok(()))));
+        assert_eq!(
+            handler.get_rt_client_state(Duration::seconds(10)).timeline,
+            new_timeline
+        );
     }
 
     #[test]
@@ -391,12 +493,16 @@ mod tests {
                 timeline_timestamp: Duration::milliseconds(i * 20),
             };
 
-            handler.update_rt_client_state(incoming_state, Duration::milliseconds(i * 20), true);
-
-            // Process updates occasionally
-            if i % 10 == 0 {
-                handler.process_pending_updates();
-            }
+            let ticket = handler
+                .update_rt_client_state(incoming_state, Duration::milliseconds(i * 20), true)
+                .unwrap();
+            assert_eq!(handler.process_pending_updates(), Some(incoming_state));
+            handler.publish_client_state(ClientState {
+                timeline: new_timeline,
+                ..client_state
+            });
+            assert!(handler.complete_pending_update(ticket, Ok(())));
+            assert_eq!(handler.take_commit_result(ticket), Ok(Some(Ok(()))));
 
             thread::sleep(StdDuration::from_micros(20));
         }
@@ -405,6 +511,6 @@ mod tests {
 
         // Verify we can still read state
         let final_state = handler.get_rt_client_state(Duration::milliseconds(1000));
-        assert!(final_state.timeline.tempo.bpm() >= 120.0);
+        assert_eq!(final_state.timeline.tempo.bpm(), 169.0);
     }
 }

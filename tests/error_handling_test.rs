@@ -99,7 +99,7 @@ async fn test_rapid_tempo_changes() {
         let mut state = link.capture_app_session_state();
         let time = link.clock().micros();
         state.set_tempo(bpm as f64, time);
-        link.commit_app_session_state(state).await;
+        link.commit_app_session_state(state).await.unwrap();
 
         let captured = link.capture_app_session_state();
         assert_eq!(
@@ -126,7 +126,7 @@ async fn test_start_stop_transitions() {
     let mut state = link.capture_app_session_state();
     let time = link.clock().micros();
     state.set_is_playing(true, time);
-    link.commit_app_session_state(state).await;
+    link.commit_app_session_state(state).await.unwrap();
 
     let captured = link.capture_app_session_state();
     assert!(captured.is_playing(), "should be playing after start");
@@ -135,7 +135,7 @@ async fn test_start_stop_transitions() {
     let mut state = link.capture_app_session_state();
     let time = link.clock().micros();
     state.set_is_playing(false, time);
-    link.commit_app_session_state(state).await;
+    link.commit_app_session_state(state).await.unwrap();
 
     let captured = link.capture_app_session_state();
     assert!(!captured.is_playing(), "should be stopped after stop");

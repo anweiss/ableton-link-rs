@@ -563,6 +563,7 @@ impl Controller {
         let (sessions, session_task) = Sessions::with_dispatch_gate(
             Session {
                 incarnation: Arc::new(()),
+                timeline_revision: Arc::new(()),
                 session_id,
                 timeline,
                 measurement: SessionMeasurement {
@@ -916,11 +917,49 @@ impl Controller {
         // notifier. Final drop cancels the owned long-lived tasks.
     }
 
-    pub async fn set_state(&self, new_client_state: IncomingClientState) {
-        self.handle_client_state(new_client_state).await;
+    pub async fn set_state(
+        &self,
+        new_client_state: IncomingClientState,
+    ) -> Result<(), super::error::CommitError> {
+        self.handle_client_state(new_client_state).await
     }
 
-    pub async fn handle_client_state(&self, client_state: IncomingClientState) {
+    pub async fn handle_client_state(
+        &self,
+        client_state: IncomingClientState,
+    ) -> Result<(), super::error::CommitError> {
+        self.commit_client_state(client_state, None).await
+    }
+
+    /// Capture coherent accepted state and opaque provenance using only try_lock.
+    pub fn capture_client_state(
+        &self,
+    ) -> Option<(ClientState, super::sessions::SessionEditOrigin)> {
+        let current = try_state(&self.sessions.current)?;
+        let published = try_state(&self.sessions.published)?;
+        let session = try_state(&self.session_state)?;
+        let client = try_state(&self.client_state)?;
+        (published.matches(&current)
+            && current.session_id == client.timeline_session_id
+            && current.timeline == session.timeline
+            && current.measurement.x_form == session.ghost_x_form)
+            .then(|| (*client, current.edit_origin()))
+    }
+
+    /// Reject a deferred proposal if its capture was overtaken or replaced.
+    pub async fn set_state_checked(
+        &self,
+        client_state: IncomingClientState,
+        origin: &super::sessions::SessionEditOrigin,
+    ) -> Result<(), super::error::CommitError> {
+        self.commit_client_state(client_state, Some(origin)).await
+    }
+
+    async fn commit_client_state(
+        &self,
+        client_state: IncomingClientState,
+        origin: Option<&super::sessions::SessionEditOrigin>,
+    ) -> Result<(), super::error::CommitError> {
         loop {
             let result = retry_state(|| {
                 try_session_commit(
@@ -932,7 +971,7 @@ impl Controller {
                     &self.session_peer_counter,
                     &self.start_stop_sync_enabled,
                     &self.discovery,
-                    |state| state.client_edit(&client_state, self.clock),
+                    |state| state.client_edit_from_origin(&client_state, self.clock, origin),
                 )
             })
             .await;
@@ -948,8 +987,9 @@ impl Controller {
                             tempo,
                         );
                     }
-                    return;
+                    return Ok(());
                 }
+                ClientCommit::Rejected(error) => return Err(error),
             }
         }
     }
@@ -1043,6 +1083,7 @@ async fn refresh_peer_count(
 enum ClientCommit {
     WaitingForPublication,
     Complete(Option<tempo::Tempo>),
+    Rejected(super::error::CommitError),
 }
 
 struct SessionCommit<'a> {
@@ -1183,7 +1224,20 @@ impl SessionCommit<'_> {
         changed
     }
 
+    #[cfg(test)]
     fn client_edit(&mut self, incoming: &IncomingClientState, clock: Clock) -> ClientCommit {
+        self.client_edit_from_origin(incoming, clock, None)
+    }
+
+    fn client_edit_from_origin(
+        &mut self,
+        incoming: &IncomingClientState,
+        clock: Clock,
+        origin: Option<&super::sessions::SessionEditOrigin>,
+    ) -> ClientCommit {
+        if origin.is_some_and(|origin| !origin.matches(self.current)) {
+            return ClientCommit::Rejected(super::error::CommitError::StaleClientState);
+        }
         if !self.published.matches(self.current)
             || self.current.session_id != self.peer.session_id()
             || self.current.measurement.x_form != self.session.ghost_x_form
@@ -1193,19 +1247,55 @@ impl SessionCommit<'_> {
         // Calculation and installation share the publication/ownership guards;
         // no A-domain edit can be installed into a pending B incarnation.
         let key = self.current.key();
+        let target = match incoming.timeline {
+            Some(timeline) => match update_session_timeline_from_client(
+                self.current.timeline,
+                clamp_tempo(timeline),
+                incoming.timeline_timestamp,
+                self.session.ghost_x_form,
+            ) {
+                Ok(target) => Some(target),
+                Err(error) => return ClientCommit::Rejected(error),
+            },
+            None => None,
+        };
+        let proposed_start_stop = match incoming.start_stop_state {
+            Some(state) => {
+                if state.timestamp <= self.client.start_stop_state.timestamp {
+                    return ClientCommit::Rejected(super::error::CommitError::StaleClientState);
+                }
+                if self.sync_enabled {
+                    let Some(successor) =
+                        super::micros(self.session.start_stop_state.timestamp).checked_add(1)
+                    else {
+                        return ClientCommit::Rejected(
+                            super::error::CommitError::StartStopTimestampExhausted,
+                        );
+                    };
+                    let mut mapped = map_start_stop_state_from_client_to_session(
+                        state,
+                        target.unwrap_or(self.session.timeline),
+                        self.session.ghost_x_form,
+                    );
+                    mapped.timestamp = chrono::Duration::microseconds(
+                        super::micros(mapped.timestamp).max(successor),
+                    );
+                    Some(mapped)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
         let mut changed = None;
         if let Some(timeline) = incoming.timeline {
             let timeline = clamp_tempo(timeline);
             let mapping = self.session.ghost_x_form;
-            let target = update_session_timeline_from_client(
-                self.current.timeline,
-                timeline,
-                incoming.timeline_timestamp,
-                mapping,
-            );
-            self.current.timeline = target;
+            let target = target.expect("timeline preflight succeeded");
+            self.current.set_timeline(target);
             for other in self.others.iter_mut().filter(|other| key.matches(other)) {
                 other.timeline = target;
+                other.timeline_revision = self.current.timeline_revision.clone();
             }
             for peer in self
                 .peers
@@ -1225,21 +1315,10 @@ impl SessionCommit<'_> {
                 key.session_id,
             );
         }
-        if let Some(incoming) = incoming.start_stop_state {
-            let state = select_preferred_start_stop_state(self.client.start_stop_state, incoming);
+        if let Some(state) = incoming.start_stop_state {
             self.client.start_stop_state = state;
-            if self.sync_enabled
-                && self
-                    .session
-                    .ghost_x_form
-                    .host_to_ghost_nanos(state.timestamp)
-                    > self.session.start_stop_state.timestamp
-            {
-                self.session.start_stop_state = map_start_stop_state_from_client_to_session(
-                    state,
-                    self.session.timeline,
-                    self.session.ghost_x_form,
-                );
+            if let Some(mapped) = proposed_start_stop {
+                self.session.start_stop_state = mapped;
             }
         }
         self.publish_discovery();
@@ -1275,11 +1354,13 @@ impl SessionCommit<'_> {
             source,
         );
         if self.sync_enabled {
+            let observation = clock.micros().max(self.client.start_stop_state.timestamp);
             self.client.start_stop_state = map_start_stop_state_from_session_to_client(
                 incoming,
                 self.session.timeline,
                 self.session.ghost_x_form,
             );
+            self.client.start_stop_state.timestamp = observation;
         }
         self.publish_discovery();
         ClientCommit::Complete(changed)
@@ -1381,6 +1462,7 @@ async fn apply_received_start_stop(
                 }
                 return;
             }
+            ClientCommit::Rejected(_) => return,
         }
     }
 }
@@ -1582,11 +1664,13 @@ fn update_timing_guarded(
             new_x_form,
         );
         if sync_enabled && session.start_stop_state != StartStopState::default() {
+            let observation = client.start_stop_state.timestamp;
             client.start_stop_state = map_start_stop_state_from_session_to_client(
                 session.start_stop_state,
                 timeline,
                 new_x_form,
             );
+            client.start_stop_state.timestamp = observation;
         }
     }
     client.timeline_session_id = session_id;
@@ -1659,17 +1743,6 @@ fn init_client_state(session_state: SessionState, session_id: SessionId) -> Clie
     }
 }
 
-fn select_preferred_start_stop_state(
-    current_start_stop_state: ClientStartStopState,
-    start_stop_state: ClientStartStopState,
-) -> ClientStartStopState {
-    if start_stop_state.timestamp > current_start_stop_state.timestamp {
-        return start_stop_state;
-    }
-
-    current_start_stop_state
-}
-
 fn map_start_stop_state_from_session_to_client(
     session_start_stop_state: StartStopState,
     session_timeline: Timeline,
@@ -1708,6 +1781,312 @@ pub struct SessionPeerCounter {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
+    #[tokio::test]
+    async fn ordering_queued_audio_cannot_cross_join_or_same_id_reset() {
+        use crate::link::{BasicLink, CommitError};
+        for different_id in [false, true] {
+            let mut link = BasicLink::new(120.0).await.unwrap();
+            let mut old = link.capture_audio_session_state();
+            old.set_tempo(150.0, link.clock.micros());
+            let ticket = link.commit_audio_session_state(old).unwrap();
+            let initial = link.controller.sessions.current.lock().unwrap().clone();
+            let id = if different_id {
+                SessionId(NodeId::from_array([172; 8]))
+            } else {
+                initial.session_id
+            };
+            let replacement = Session::new(
+                id,
+                Timeline {
+                    tempo: tempo::Tempo::new(180.0),
+                    ..initial.timeline
+                },
+                initial.measurement,
+            );
+            if different_id {
+                link.controller.peers.lock().unwrap().push(ControllerPeer {
+                    peer_state: PeerState {
+                        node_state: NodeState {
+                            node_id: id.0,
+                            session_id: id,
+                            timeline: replacement.timeline,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                });
+            }
+            link.controller.sessions.reset_session(replacement);
+            let queued = link.controller.sessions.current.lock().unwrap().clone();
+            join_session(
+                queued,
+                link.controller.peer_state.clone(),
+                link.controller.session_state.clone(),
+                link.controller.client_state.clone(),
+                link.clock,
+                link.controller.start_stop_sync_enabled.clone(),
+                link.controller.discovery.clone(),
+                link.controller.peers.clone(),
+                link.controller.session_peer_counter.clone(),
+                link.controller.sessions.clone(),
+                link.controller.tempo_callback.clone(),
+            )
+            .await;
+            let before = *link.controller.client_state.lock().unwrap();
+            let before_session = *link.controller.session_state.lock().unwrap();
+            assert_eq!(before.timeline.tempo.bpm(), 180.0);
+            assert_eq!(
+                link.process_audio_session_state_updates().await,
+                Some((ticket, Err(CommitError::StaleClientState)))
+            );
+            assert_eq!(
+                link.take_audio_commit_result(ticket),
+                Ok(Some(Err(CommitError::StaleClientState)))
+            );
+            assert_eq!(*link.controller.client_state.lock().unwrap(), before);
+            assert_eq!(
+                *link.controller.session_state.lock().unwrap(),
+                before_session
+            );
+            assert_eq!(link.controller.peer_state.lock().unwrap().session_id(), id);
+        }
+    }
+
+    fn ordering_fixture(run: impl FnOnce(&mut SessionCommit<'_>)) {
+        let id = SessionId(NodeId::from_array([140; 8]));
+        let timeline = Timeline {
+            tempo: tempo::Tempo::new(120.0),
+            ..Timeline::default()
+        };
+        let form = GhostXForm {
+            slope: 1.0,
+            intercept: chrono::Duration::zero(),
+        };
+        let mut current = Session::new(
+            id,
+            timeline,
+            SessionMeasurement {
+                x_form: form,
+                timestamp: chrono::Duration::zero(),
+            },
+        );
+        let mut published = current.key();
+        let mut others = vec![current.clone()];
+        let mut peer = PeerState {
+            node_state: NodeState {
+                node_id: id.0,
+                session_id: id,
+                timeline,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut peers = vec![ControllerPeer {
+            peer_state: peer.clone(),
+        }];
+        let mut session = SessionState {
+            timeline,
+            ghost_x_form: form,
+            ..Default::default()
+        };
+        let mut client = ClientState {
+            timeline,
+            timeline_session_id: id,
+            ..Default::default()
+        };
+        let mut counter = SessionPeerCounter::default();
+        let mut responder_id = id;
+        let mut responder_form = form;
+        run(&mut SessionCommit {
+            published: &mut published,
+            current: &mut current,
+            others: &mut others,
+            peers: &mut peers,
+            peer: &mut peer,
+            session: &mut session,
+            client: &mut client,
+            counter: &mut counter,
+            sync_enabled: true,
+            responder_id: &mut responder_id,
+            responder_form: &mut responder_form,
+            gateway_peer: None,
+        });
+    }
+
+    #[test]
+    fn ordering_timeline_revision_does_not_reuse_an_old_capture_after_aba() {
+        ordering_fixture(|state| {
+            let origin = state.current.edit_origin();
+            let initial = state.current.timeline;
+            state.current.set_timeline(Timeline {
+                tempo: tempo::Tempo::new(180.0),
+                ..initial
+            });
+            state.current.set_timeline(initial);
+            let before = (*state.session, *state.client, state.current.timeline);
+            let incoming = IncomingClientState {
+                timeline: Some(Timeline {
+                    tempo: tempo::Tempo::new(150.0),
+                    ..initial
+                }),
+                start_stop_state: Some(ClientStartStopState {
+                    is_playing: true,
+                    timestamp: chrono::Duration::nanoseconds(1),
+                    ..Default::default()
+                }),
+                timeline_timestamp: chrono::Duration::nanoseconds(1),
+            };
+            assert!(matches!(
+                state.client_edit_from_origin(&incoming, Clock::new(), Some(&origin)),
+                ClientCommit::Rejected(super::super::error::CommitError::StaleClientState)
+            ));
+            assert_eq!(
+                (*state.session, *state.client, state.current.timeline),
+                before
+            );
+        });
+    }
+
+    #[test]
+    fn ordering_exhaustion_rejects_combined_edit_without_partial_publication() {
+        use crate::link::error::CommitError;
+        for timeline_exhausted in [false, true] {
+            ordering_fixture(|state| {
+                if timeline_exhausted {
+                    state.current.timeline.beat_origin = Beats::from_microbeats(i64::MAX);
+                } else {
+                    state.session.start_stop_state.timestamp =
+                        chrono::Duration::microseconds(i64::MAX);
+                }
+                let before = (
+                    state.current.timeline,
+                    *state.session,
+                    *state.client,
+                    state.peer.timeline(),
+                    state.others[0].timeline,
+                    state.peers[0].peer_state.timeline(),
+                    *state.responder_id,
+                    *state.responder_form,
+                );
+                let incoming = IncomingClientState {
+                    timeline: Some(Timeline {
+                        tempo: tempo::Tempo::new(150.0),
+                        ..state.client.timeline
+                    }),
+                    timeline_timestamp: chrono::Duration::nanoseconds(1),
+                    start_stop_state: Some(ClientStartStopState {
+                        is_playing: true,
+                        timestamp: chrono::Duration::nanoseconds(1),
+                        ..ClientStartStopState::default()
+                    }),
+                };
+                let expected = if timeline_exhausted {
+                    CommitError::TimelineOriginExhausted
+                } else {
+                    CommitError::StartStopTimestampExhausted
+                };
+                assert!(
+                    matches!(state.client_edit(&incoming, Clock::new()), ClientCommit::Rejected(error) if error == expected)
+                );
+                assert_eq!(
+                    before,
+                    (
+                        state.current.timeline,
+                        *state.session,
+                        *state.client,
+                        state.peer.timeline(),
+                        state.others[0].timeline,
+                        state.peers[0].peer_state.timeline(),
+                        *state.responder_id,
+                        *state.responder_form,
+                    )
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn ordering_fractional_wire_ties_advance_without_poisoning_local_order() {
+        ordering_fixture(|state| {
+            for (timestamp, expected_wire) in [(750, 1), (1000, 2)] {
+                let incoming = IncomingClientState {
+                    timeline: None,
+                    timeline_timestamp: chrono::Duration::zero(),
+                    start_stop_state: Some(ClientStartStopState {
+                        is_playing: expected_wire == 1,
+                        time: chrono::Duration::zero(),
+                        timestamp: chrono::Duration::nanoseconds(timestamp),
+                    }),
+                };
+                assert!(matches!(
+                    state.client_edit(&incoming, Clock::new()),
+                    ClientCommit::Complete(_)
+                ));
+                assert_eq!(
+                    state.session.start_stop_state.timestamp,
+                    chrono::Duration::microseconds(expected_wire)
+                );
+                assert_eq!(
+                    state.client.start_stop_state.timestamp,
+                    chrono::Duration::nanoseconds(timestamp)
+                );
+                let bytes =
+                    crate::encoding::encode_to_vec(&state.session.start_stop_state).unwrap();
+                let (decoded, _) =
+                    crate::encoding::decode_from_slice::<StartStopState>(&bytes).unwrap();
+                assert_eq!(
+                    decoded.timestamp,
+                    chrono::Duration::microseconds(expected_wire)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn ordering_terminal_remote_timestamp_reports_exhaustion_not_false_success() {
+        for terminal in [
+            chrono::Duration::microseconds(i64::MAX),
+            chrono::Duration::MAX,
+        ] {
+            ordering_fixture(|state| {
+                let clock = Clock::new();
+                let remote = StartStopState {
+                    is_playing: true,
+                    timestamp: terminal,
+                    ..Default::default()
+                };
+                assert!(matches!(
+                    state.received_start_stop(state.current.session_id, remote, clock),
+                    ClientCommit::Complete(_)
+                ));
+                let observed = state.client.start_stop_state.timestamp;
+                assert!(observed < terminal);
+                for (offset, expected) in [
+                    (
+                        1,
+                        super::super::error::CommitError::StartStopTimestampExhausted,
+                    ),
+                    (-1, super::super::error::CommitError::StaleClientState),
+                ] {
+                    let before = (*state.client, *state.session);
+                    let incoming = IncomingClientState {
+                        timeline: None,
+                        timeline_timestamp: observed,
+                        start_stop_state: Some(ClientStartStopState {
+                            is_playing: false,
+                            timestamp: observed + chrono::Duration::nanoseconds(offset),
+                            ..state.client.start_stop_state
+                        }),
+                    };
+                    assert!(
+                        matches!(state.client_edit(&incoming, clock), ClientCommit::Rejected(error) if error == expected)
+                    );
+                    assert_eq!((*state.client, *state.session), before);
+                }
+            });
+        }
+    }
+
     #[test]
     fn nanosecond_alignment_survives_guarded_controller_publication() {
         use crate::link::phase::{force_beat_at_time_impl, to_phase_encoded_beats};
@@ -1734,7 +2113,8 @@ mod dispatch_gate_tests {
                     slope,
                     intercept: Delta::nanoseconds(intercept),
                 };
-                let target = update_session_timeline_from_client(initial, forced, at, form);
+                let target =
+                    update_session_timeline_from_client(initial, forced, at, form).unwrap();
                 let mut session = SessionState {
                     timeline: initial,
                     ghost_x_form: form,
@@ -1931,14 +2311,18 @@ mod dispatch_gate_tests {
                         controller.session_state.lock().unwrap().start_stop_state,
                         incoming
                     );
-                    assert_eq!(
-                        controller.client_state.lock().unwrap().start_stop_state,
-                        map_start_stop_state_from_session_to_client(
-                            incoming,
-                            current.timeline,
-                            current.measurement.x_form
-                        )
+                    let actual = controller.client_state.lock().unwrap().start_stop_state;
+                    let mapped = map_start_stop_state_from_session_to_client(
+                        incoming,
+                        current.timeline,
+                        current.measurement.x_form,
                     );
+                    assert_eq!(
+                        (actual.is_playing, actual.time),
+                        (mapped.is_playing, mapped.time)
+                    );
+                    assert!(actual.timestamp >= before_client.start_stop_state.timestamp);
+                    assert!(actual.timestamp <= controller.clock.micros());
                     assert_eq!(*responder.session_id.lock().unwrap(), current.session_id);
                     assert_eq!(
                         *responder.ghost_x_form.lock().unwrap(),
@@ -2148,7 +2532,8 @@ mod dispatch_gate_tests {
                     start_stop_state: None,
                     timeline_timestamp: at,
                 })
-                .await;
+                .await
+                .unwrap();
             let actual = controller.sessions.current.lock().unwrap().timeline;
             resume.send(()).unwrap();
             barrier.await.unwrap();
@@ -2157,7 +2542,8 @@ mod dispatch_gate_tests {
                 .unwrap()
                 .unwrap();
             let expected =
-                update_session_timeline_from_client(accepted, edit, at, published.ghost_x_form);
+                update_session_timeline_from_client(accepted, edit, at, published.ghost_x_form)
+                    .unwrap();
             assert_eq!(
                 actual, expected,
                 "client edit rolled back the already accepted wire timeline"
@@ -2342,7 +2728,8 @@ mod dispatch_gate_tests {
                 start_stop_state: None,
                 timeline_timestamp: controller.clock.micros(),
             })
-            .await;
+            .await
+            .unwrap();
         if rapid {
             controller.enable().await;
             assert!(controller.discovery.gate.epoch() > old_epoch);
@@ -2598,6 +2985,7 @@ mod dispatch_gate_tests {
             }),
         )
         .await
+        .unwrap()
         .unwrap();
         assert_eq!(
             controller.sessions.current.lock().unwrap().session_id,
@@ -2705,13 +3093,17 @@ mod dispatch_gate_tests {
                 controller.tempo_callback.clone(),
             )
             .await;
-            tokio::time::timeout(TEST_TIMEOUT, edit).await.unwrap();
+            tokio::time::timeout(TEST_TIMEOUT, edit)
+                .await
+                .unwrap()
+                .unwrap();
             let expected = update_session_timeline_from_client(
                 remote.timeline,
                 host_edit,
                 at,
                 remote.measurement.x_form,
-            );
+            )
+            .unwrap();
             assert_eq!(
                 controller.sessions.current.lock().unwrap().timeline,
                 expected
@@ -2889,17 +3281,29 @@ mod dispatch_gate_tests {
                 tempo: tempo::Tempo::new(150.0),
                 ..controller.client_state.lock().unwrap().timeline
             };
-            controller
+            let before = *controller.session_state.lock().unwrap();
+            let before_client = *controller.client_state.lock().unwrap();
+            let result = controller
                 .set_state(IncomingClientState {
                     timeline: Some(edit),
                     start_stop_state: None,
                     timeline_timestamp: controller.clock.micros(),
                 })
                 .await;
-            assert_eq!(
-                controller.session_state.lock().unwrap().timeline.tempo,
-                tempo::Tempo::new(150.0)
-            );
+            if origin == i64::MAX {
+                assert_eq!(
+                    result,
+                    Err(super::super::error::CommitError::TimelineOriginExhausted)
+                );
+                assert_eq!(*controller.session_state.lock().unwrap(), before);
+                assert_eq!(*controller.client_state.lock().unwrap(), before_client);
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    controller.session_state.lock().unwrap().timeline.tempo,
+                    tempo::Tempo::new(150.0)
+                );
+            }
             controller.disable().await;
         }
     }
@@ -3774,7 +4178,7 @@ mod dispatch_gate_tests {
 
         let mut state = link.capture_app_session_state();
         state.set_tempo(122.0, link.clock().micros());
-        link.commit_app_session_state(state).await;
+        link.commit_app_session_state(state).await.unwrap();
         let delivered = observed.lock().unwrap().clone();
         assert_eq!(delivered.last(), Some(&122.0));
         // Resume at the production wrapper after an earlier session check.
@@ -3887,6 +4291,7 @@ mod dispatch_gate_tests {
         let (sessions, task) = Sessions::with_dispatch_gate(
             Session {
                 incarnation: Arc::new(()),
+                timeline_revision: Arc::new(()),
                 session_id: SessionId::default(),
                 timeline: Timeline::default(),
                 measurement: SessionMeasurement::default(),

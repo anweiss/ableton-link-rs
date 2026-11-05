@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     session_state.set_tempo(140.0, current_time);
 
     // Commit changes back to Link
-    link.commit_app_session_state(session_state).await;
+    link.commit_app_session_state(session_state).await?;
 
     // Clean shutdown
     link.disable().await;
@@ -281,6 +281,50 @@ client state changes before every publication guard is acquired, and the ordered
 receive batch remains epoch-cancellable while waiting. An intervening join cannot
 cause a responder to publish a new identity with an old session's clock snapshot.
 
+Local commit ordering is checked before any authoritative state changes.
+`timeline::update_session_timeline_from_client` returns `Result<Timeline, CommitError>`;
+`Controller::{set_state, handle_client_state}` and
+`BasicLink::commit_app_session_state` return `Result<(), CommitError>`.
+`LinkAudio::commit_app_session_state` forwards that result. Handle
+`TimelineOriginExhausted` and `StartStopTimestampExhausted`: the entire edit is
+rejected, including a combined tempo/start-stop edit, and success callbacks do not
+run. Exhaustion does not automatically create a new session or restore synchronization.
+`StaleClientState` also rejects a proposal captured from a replaced incarnation or
+overtaken timeline revision, before either field of a combined edit is installed.
+Capture-time provenance is retained across queueing/retries, not refreshed when
+draining. Same-ID resets and timeline value A->B->A changes invalidate old captures.
+`SessionState` is now `Clone`, not `Copy`; use `.clone()` if retaining a submitted
+snapshot. Commit states captured by the same `BasicLink`, rather than constructing
+an untracked `SessionState::new` or default value for submission. A contended or
+not-yet-published capture has no commit provenance and returns `StaleClientState`
+on submission processing; recapture after publication settles.
+Custom deferred controller callers use `capture_client_state()` and
+`set_state_checked(state, &origin)`. The untracked `set_state`/`handle_client_state`
+entry points are immediate requests; callers must not use them to bypass deferred
+provenance checks. Start/stop proposals older than or equal to the last local
+capture/observation are also stale. Received start/stop changes use a local observation
+timestamp; their remote logical timestamp cannot permanently outrun the local clock.
+Accepted synchronized edits advance a checked signed-microsecond wire timestamp,
+even when successive fractional mapped timestamps would encode identically.
+
+Audio commits now explicitly mean **queued**, not accepted.
+`BasicLink::commit_audio_session_state` returns
+`Result<AudioCommitTicket, AudioQueueError>` without allocating or blocking.
+It never changes captured state optimistically. There is one outstanding slot:
+handle `Busy` (including lock contention) without assuming submission, and
+`TicketExhausted` rather than expecting identifiers to wrap.
+Call `process_audio_session_state_updates().await` periodically from a non-RT
+application thread, including to refresh remote accepted state. It drains at most
+one request through the checked controller path; `LinkAudio` forwards this method.
+Read `take_audio_commit_result(ticket)` until it returns `Some(result)`, then handle
+that commit result. A completed ticket occupies the slot until acknowledged.
+An interrupted drain leaves the original request queued, with its changed-field
+mask intact; capture cannot consume it. The lower-level `AtomicSessionState` and
+`SafeRtSessionStateHandler` follow the same proposal/completion contract:
+`process_pending_updates` peeks, `pending_update` also supplies the ticket,
+`publish_client_state` installs only a controller-accepted snapshot, and
+`complete_pending_update` records the validation result before acknowledgment.
+
 `controller::update_discovery` now accepts `&Controller`, replacing three independent
 state arguments. It reads and publishes through the owner's full guarded boundary;
 callers no longer provide separately captured session, peer and gateway state.
@@ -299,8 +343,14 @@ A clamped anchor is accepted only if it still encodes the requested microbeat.
 Timeline beat-to-time and phase-inverse conversions retain nanosecond offsets.
 Controller client/session and start/stop mappings use internal nanosecond clock
 conversions so publication does not discard an accepted alignment. The public
-`GhostXForm` methods retain their existing microsecond rounding; wire timestamps
-remain signed microseconds.
+`GhostXForm` methods now retain fractional-microsecond inputs through scaling or
+division instead of truncating those inputs first. They round the scaled forward
+offset or inverse host result to microseconds, with half-ties away from zero.
+With an identity mapping and zero intercept, both directions now map +/-1,500 ns
+to +/-2 microseconds rather than +/-1 microsecond; +/-500 ns maps to +/-1
+microsecond rather than zero. This is a compatibility change for callers relying
+on the former input truncation. Wire timestamps remain signed microseconds;
+their format is unchanged.
 The public rounding correction clamps at Chrono's duration limits.
 Link Classic and LinkAudio tempo encoders saturate signed wire periods without
 changing the sign of a negative out-of-range value.
@@ -309,8 +359,9 @@ Gateway node publication acquires peer and both responder guards cooperatively
 before any mutation. Checked announcement commits release timeout state while
 waiting on interface/revision guards and remain lease/deadline/epoch cancellable.
 
-Clock payload fields and start/stop timestamps clamp only when encoded as signed
-wire microseconds. PONG sample sums and differences remain wide through averaging;
+Raw clock payload fields and start/stop timestamps clamp when encoded as signed
+wire microseconds; checked local ordering commits use canonical wire microseconds.
+PONG sample sums and differences remain wide through averaging;
 individual received fields must still be representable in the wire format.
 `Tempo::micros_per_beat`, `Tempo::beats_to_micros`, timeline conversion and forward ghost scaling can return
 Chrono durations beyond the signed-microsecond range. Callers must handle
@@ -513,7 +564,7 @@ link.set_audio_endpoint_callback(|peer_id, endpoint| { /* ... */ });
 
 // Session state
 let state = link.capture_app_session_state();
-link.commit_app_session_state(state).await;
+link.commit_app_session_state(state).await?;
 ```
 
 ### SessionState

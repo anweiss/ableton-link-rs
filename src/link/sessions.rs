@@ -162,12 +162,29 @@ impl Display for SessionKey {
 #[derive(Clone, Debug)]
 pub struct Session {
     pub(crate) incarnation: Arc<()>,
+    pub(crate) timeline_revision: Arc<()>,
     pub session_id: SessionId,
     pub timeline: Timeline,
     pub measurement: SessionMeasurement,
 }
 
 impl Session {
+    pub(crate) fn set_timeline(&mut self, timeline: Timeline) {
+        if self.timeline != timeline {
+            self.timeline_revision = Arc::new(());
+            self.timeline = timeline;
+        }
+    }
+
+    pub(crate) fn edit_origin(&self) -> SessionEditOrigin {
+        SessionEditOrigin {
+            key: self.key(),
+            revision: self.timeline_revision.clone(),
+            timeline: self.timeline,
+            mapping: self.measurement.x_form,
+        }
+    }
+
     pub fn key(&self) -> SessionKey {
         SessionKey {
             session_id: self.session_id,
@@ -182,7 +199,36 @@ impl Session {
             timeline,
             measurement,
             incarnation: Arc::new(()),
+            timeline_revision: Arc::new(()),
         }
+    }
+}
+
+/// Opaque capture-time provenance for a deferred client edit.
+#[derive(Clone, Debug)]
+pub struct SessionEditOrigin {
+    key: SessionKey,
+    revision: Arc<()>,
+    timeline: Timeline,
+    mapping: GhostXForm,
+}
+
+impl SessionEditOrigin {
+    pub(crate) fn matches(&self, session: &Session) -> bool {
+        self.key.matches(session)
+            && Arc::ptr_eq(&self.revision, &session.timeline_revision)
+            && self.timeline == session.timeline
+            && self.mapping == session.measurement.x_form
+    }
+}
+
+impl PartialEq for SessionEditOrigin {
+    fn eq(&self, other: &Self) -> bool {
+        self.key.session_id == other.key.session_id
+            && Arc::ptr_eq(&self.key.incarnation, &other.key.incarnation)
+            && Arc::ptr_eq(&self.revision, &other.revision)
+            && self.timeline == other.timeline
+            && self.mapping == other.mapping
     }
 }
 
@@ -365,9 +411,9 @@ impl Sessions {
         if !origin.matches(&current) || current.measurement.x_form != mapping {
             return false;
         }
-        current.timeline = timeline;
+        current.set_timeline(timeline);
         for session in others.iter_mut().filter(|session| origin.matches(session)) {
-            session.timeline = timeline;
+            session.set_timeline(timeline);
         }
         true
     }
@@ -410,13 +456,13 @@ impl Sessions {
         let mut others = try_state(&self.other_sessions)?;
         let mut joined = try_state(&self.has_joined)?;
         if current.session_id == session_id {
-            current.timeline = self.update_timeline(current.clone(), timeline).timeline;
+            *current = self.update_timeline(current.clone(), timeline);
             *joined = true;
         } else if let Some(session) = others
             .iter_mut()
             .find(|session| session.session_id == session_id)
         {
-            session.timeline = self.update_timeline(session.clone(), timeline).timeline;
+            *session = self.update_timeline(session.clone(), timeline);
         } else if slot.is_none() {
             return Some(Sighting::NeedsCapacity);
         } else {
@@ -440,7 +486,7 @@ impl Sessions {
                 timeline.beat_origin.floating(),
                 timeline.time_origin,
             );
-            session.timeline = timeline;
+            session.set_timeline(timeline);
         } else {
             debug!(
                 "[rejecting] updating peer timeline with beat origin: {}. current timeline beat origin: {}",
@@ -1963,6 +2009,7 @@ mod tests {
     async fn failed_other_session_removes_only_its_session_and_peers() {
         let current = Session {
             incarnation: Arc::new(()),
+            timeline_revision: Arc::new(()),
             session_id: SessionId(NodeId::from_array([1; 8])),
             timeline: Timeline::default(),
             measurement: SessionMeasurement::default(),
@@ -2016,6 +2063,7 @@ mod tests {
         let (tx_join, mut rx_join) = tokio::sync::mpsc::channel(1);
         let session = Session {
             incarnation: Arc::new(()),
+            timeline_revision: Arc::new(()),
             session_id: SessionId::default(),
             timeline: Timeline::default(),
             measurement: SessionMeasurement::default(),
