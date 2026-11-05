@@ -564,6 +564,7 @@ impl Controller {
         let mut dispatch = DispatchTasks::new();
         let (sessions, session_task) = Sessions::with_dispatch_gate(
             Session {
+                incarnation: Arc::new(()),
                 session_id,
                 timeline,
                 measurement: SessionMeasurement {
@@ -1425,6 +1426,7 @@ pub async fn reset_state(
     update_discovery(session_state.clone(), peer_state.clone(), discovery.clone()).await;
 
     sessions.reset_session(Session {
+        incarnation: Arc::new(()),
         session_id: s_id,
         timeline: new_tl,
         measurement: SessionMeasurement {
@@ -1787,6 +1789,7 @@ mod dispatch_gate_tests {
         let (tx_join, rx_join) = tokio::sync::mpsc::channel(1);
         let (sessions, task) = Sessions::with_dispatch_gate(
             Session {
+                incarnation: Arc::new(()),
                 session_id: SessionId::default(),
                 timeline: Timeline::default(),
                 measurement: SessionMeasurement::default(),

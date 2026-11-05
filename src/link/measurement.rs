@@ -337,14 +337,14 @@ async fn measure_peer_with_socket_factory(
     socket_factory: impl FnOnce() -> io::Result<Arc<UdpSocket>>,
 ) {
     if state.measurement_endpoint.is_none() {
-        report_failed_measurement(&tx_measure_peer_result, session_id).await;
+        report_failed_measurement(&tx_measure_peer_result, session_id, &notifier).await;
         return;
     }
     let socket = match socket_factory() {
         Ok(socket) => socket,
         Err(error) => {
             debug!("can't open a measurement socket: {}", error);
-            report_failed_measurement(&tx_measure_peer_result, session_id).await;
+            report_failed_measurement(&tx_measure_peer_result, session_id, &notifier).await;
             return;
         }
     };
@@ -446,7 +446,7 @@ async fn measure_peer_in_epoch(
             "peer {} has no measurement endpoint; can't measure session {}",
             state.node_state.node_id, session_id
         );
-        report_failed_measurement(&tx_measure_peer_result, session_id).await;
+        report_failed_measurement(&tx_measure_peer_result, session_id, &notifier).await;
         return;
     };
     info!(
@@ -470,6 +470,9 @@ async fn measure_peer_in_epoch(
         dispatch: pong_dispatch,
     };
 
+    let mut forward_cancelled = Box::pin(notifier.clone().notified_owned());
+    forward_cancelled.as_mut().enable();
+    let forward_route = route.clone();
     let mut measurement = Measurement::with_route(
         state,
         clock,
@@ -519,11 +522,16 @@ async fn measure_peer_in_epoch(
                     intercept: Duration::microseconds(intercept.round() as i64),
                 }
             };
-            if let Err(error) = tx_measure_peer_result
-                .send(MeasurePeerEvent::XForm(session_id, x_form))
-                .await
-            {
-                debug!("measurement result consumer closed: {}", error);
+            let slot = select! {
+                biased;
+                _ = &mut forward_cancelled => return,
+                _ = route_invalidated(forward_route.as_ref()) => return,
+                result = tx_measure_peer_result.reserve() => match result { Ok(slot) => slot, Err(_) => return },
+            };
+            if let Some(route) = &forward_route {
+                route.while_current(|| slot.send(MeasurePeerEvent::XForm(session_id, x_form)));
+            } else {
+                slot.send(MeasurePeerEvent::XForm(session_id, x_form));
             }
         };
         if let Some((gate, epoch)) = lifecycle {
@@ -549,14 +557,19 @@ fn new_unicast_socket() -> io::Result<Arc<UdpSocket>> {
 /// Tell the session logic a measurement of `session_id` failed (an identity
 /// transform), as a measurement that got no answers does.
 async fn report_failed_measurement(
-    tx_measure_peer_result: &tokio::sync::mpsc::Sender<MeasurePeerEvent>,
+    tx: &Sender<MeasurePeerEvent>,
     session_id: SessionId,
+    notifier: &Arc<Notify>,
 ) {
-    if let Err(error) = tx_measure_peer_result
-        .send(MeasurePeerEvent::XForm(session_id, GhostXForm::default()))
-        .await
-    {
-        debug!("measurement result consumer closed: {}", error);
+    let cancelled = notifier.notified();
+    tokio::pin!(cancelled);
+    cancelled.as_mut().enable();
+    select! {
+        biased;
+        _ = &mut cancelled => {},
+        result = tx.send(MeasurePeerEvent::XForm(session_id, GhostXForm::default())) => {
+            if let Err(error) = result { debug!("measurement result consumer closed: {}", error); }
+        }
     }
 }
 
@@ -824,23 +837,14 @@ impl Measurement {
         let initial_send = send_ping_via(
             unicast_socket.clone(),
             route.clone(),
-            endpoint,
+            state.measurement_endpoint.unwrap(),
             &initial_payload,
         );
-        let init_bytes_sent = match select! {
+        let init_bytes_sent = select! {
             biased;
-            _ = &mut cancelled => {
-                measurement.cancelled = true;
-                measurement.tasks.abort();
-                return measurement;
-            }
-            result = initial_send => result,
-        } {
-            Ok(bytes_sent) => bytes_sent,
-            Err(e) => {
-                debug!("failed to send initial ping to {}: {}", endpoint, e);
-                0
-            }
+            _ = &mut cancelled => { measurement.cancelled = true; measurement.tasks.abort(); return measurement; },
+            _ = route_invalidated(route.as_ref()) => { measurement.cancelled = true; measurement.tasks.abort(); return measurement; },
+            result = initial_send => match result { Ok(bytes) => bytes, Err(error) => { debug!("initial PING failed: {}", error); publish_samples(&tx_terminal, Vec::new()); finished_notifier.notify_one(); 0 } },
         };
 
         measurement.init_bytes_sent = init_bytes_sent;
@@ -853,10 +857,14 @@ impl Measurement {
             data.clone(),
             tx_terminal,
             finished_notifier.clone(),
-            route,
+            route.clone(),
         );
         tokio::select! {
             biased;
+            _ = route_invalidated(route.as_ref()) => {
+                measurement.cancelled = true;
+                measurement.tasks.abort();
+            }
             _ = &mut cancelled => {
                 measurement.cancelled = true;
                 measurement.tasks.abort();
@@ -865,8 +873,9 @@ impl Measurement {
                 timer.await;
                 if let Some(samples) = rx_terminal.recv().await {
                     rx_terminal.close();
-                    if let Err(error) = tx_measurement.send(samples).await {
-                        debug!("measurement result consumer closed: {}", error);
+                    if let Ok(slot) = tx_measurement.reserve().await {
+                        if let Some(route) = &route { route.while_current(|| slot.send(samples)); }
+                        else { slot.send(samples); }
                     }
                 }
             } => {}
@@ -896,7 +905,8 @@ impl Measurement {
 
             // Pongs are dispatched to this measurement by the single receive
             // loop owned by `MeasurementService`.
-            while let Some((buf, src)) = rx_pong.recv().await {
+            loop {
+                let (buf, src) = select! { biased; _ = route_invalidated(route.as_ref()) => break, pong = rx_pong.recv() => match pong { Some(pong) => pong, None => break } };
                 let (header, header_len) = match parse_message_header(&buf) {
                     Ok(header) => header,
                     Err(e) => {
@@ -951,30 +961,13 @@ impl Measurement {
                             send_ping_via(socket.clone(), route.clone(), endpoint, &payload).await
                         {
                             debug!("failed to send ping to {}: {}", endpoint, e);
+                            break;
                         }
 
-                        // Times come from the peer; a value outside chrono's
-                        // microsecond range is a bad sample, so it's skipped.
-                        let us = |d: Duration| d.num_microseconds().map(|v| v as f64);
-                        if ghost_time != Duration::microseconds(0)
-                            && prev_host_time != Duration::microseconds(0)
-                        {
-                            if let (Some(sum_host), Some(ghost)) =
-                                (us(host_time + prev_host_time), us(ghost_time))
-                            {
-                                let avg_host = sum_host * 0.5;
-                                lock(&data).push((avg_host, ghost - avg_host));
-                            }
-
-                            if prev_ghost_time != Duration::microseconds(0) {
-                                if let (Some(sum_ghost), Some(prev_host)) =
-                                    (us(ghost_time + prev_ghost_time), us(prev_host_time))
-                                {
-                                    let avg_ghost = sum_ghost * 0.5;
-                                    lock(&data).push((prev_host, avg_ghost - prev_host));
-                                }
-                            }
-                        }
+                        let Some(samples) = pong_samples(host_time, prev_host_time, ghost_time, prev_ghost_time) else { continue; };
+                        let append = || data.lock().unwrap_or_else(|e| e.into_inner()).extend(samples);
+                        if let Some(route) = &route { if route.while_current(append).is_none() { break; } }
+                        else { append(); }
 
                         let enough = lock(&data).len() > NUMBER_DATA_POINTS;
                         if enough {
@@ -1126,6 +1119,36 @@ pub fn median(mut numbers: Vec<f64>) -> f64 {
     }
 }
 
+async fn route_invalidated(route: Option<&MeasurementRoute>) {
+    match route {
+        Some(route) => route.invalidated().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn pong_samples(
+    host: Duration,
+    previous_host: Duration,
+    ghost: Duration,
+    previous_ghost: Duration,
+) -> Option<Vec<(f64, f64)>> {
+    if ghost == Duration::zero() || previous_host == Duration::zero() {
+        return Some(Vec::new());
+    }
+    let sum_host = host.checked_add(&previous_host)?.num_microseconds()? as f64;
+    let ghost_us = ghost.num_microseconds()? as f64;
+    let previous_host_us = previous_host.num_microseconds()? as f64;
+    let second = if previous_ghost != Duration::zero() {
+        let sum_ghost = ghost.checked_add(&previous_ghost)?.num_microseconds()? as f64;
+        Some((previous_host_us, sum_ghost * 0.5 - previous_host_us))
+    } else {
+        None
+    };
+    let mut samples = vec![(sum_host * 0.5, ghost_us - sum_host * 0.5)];
+    samples.extend(second);
+    Some(samples)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
@@ -1162,6 +1185,119 @@ mod tests {
             cancelled: false,
             job,
         }
+    }
+
+    #[tokio::test]
+    async fn standalone_failure_reporting_cancels_without_draining_a_full_channel() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for mode in 0..4 {
+                let (tx, mut rx) = mpsc::channel(1);
+                let id = SessionId::default();
+                tx.send(MeasurePeerEvent::XForm(id, GhostXForm::default()))
+                    .await
+                    .unwrap();
+                let cancel = Arc::new(Notify::new());
+                let measurements = Arc::new(Mutex::new(HashMap::new()));
+                let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+                let mut work = Box::pin(async {
+                    match mode {
+                        0 => {
+                            measure_peer(
+                                Clock::new(),
+                                measurements.clone(),
+                                tx.clone(),
+                                id,
+                                PeerState::default(),
+                                cancel.clone(),
+                            )
+                            .await
+                        }
+                        1 => {
+                            measure_peer_with_socket(
+                                Clock::new(),
+                                measurements.clone(),
+                                tx.clone(),
+                                id,
+                                PeerState::default(),
+                                cancel.clone(),
+                                socket,
+                                Arc::new(Mutex::new(HashMap::new())),
+                            )
+                            .await
+                        }
+                        2 => {
+                            measure_peer_with_socket_factory(
+                                Clock::new(),
+                                measurements.clone(),
+                                tx.clone(),
+                                id,
+                                PeerState {
+                                    measurement_endpoint: Some(SocketAddrV4::new(
+                                        Ipv4Addr::LOCALHOST,
+                                        20808,
+                                    )),
+                                    ..PeerState::default()
+                                },
+                                cancel.clone(),
+                                || Err(io::Error::other("injected bind error")),
+                            )
+                            .await
+                        }
+                        _ => {
+                            measure_peer_with_socket_factory(
+                                Clock::new(),
+                                measurements.clone(),
+                                tx.clone(),
+                                id,
+                                PeerState::default(),
+                                cancel.clone(),
+                                || panic!("missing endpoint must not allocate"),
+                            )
+                            .await
+                        }
+                    }
+                });
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(work.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                cancel.notify_waiters();
+                work.await;
+                assert!(measurements.lock().unwrap().is_empty());
+                assert!(matches!(rx.try_recv(), Ok(MeasurePeerEvent::XForm(_, _))));
+                assert!(rx.try_recv().is_err());
+            }
+        })
+        .await
+        .expect("standalone early failure must observe cancellation without result capacity");
+    }
+
+    #[tokio::test]
+    async fn retired_routes_cannot_complete_queued_pongs_or_publish_blocked_transforms() {
+        use crate::link::payload::GhostTime;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for after_completion in [false,true] {
+                let (route,invalidate)=MeasurementRoute::test_fixture();
+                let peer=UdpSocket::bind((Ipv4Addr::LOCALHOST,0)).await.unwrap();
+                let SocketAddr::V4(endpoint)=peer.local_addr().unwrap() else { panic!("IPv4") };
+                let state=PeerState { measurement_endpoint:Some(endpoint), ..PeerState::default() };
+                let (tx,mut rx)=mpsc::channel(1); tx.send(MeasurePeerEvent::XForm(SessionId::default(),GhostXForm::default())).await.unwrap();
+                let measurements=Arc::new(Mutex::new(HashMap::new())); let dispatch=route.dispatch();
+                let job=tokio::spawn(measure_peer_in_epoch(Clock::new(),measurements.clone(),tx.clone(),state.session_id(),state,Arc::new(Notify::new()),route.socket(),dispatch.clone(),None,Some(route)));
+                let mut buffer=[0;512]; peer.recv_from(&mut buffer).await.unwrap();
+                let pong=encode_message(PONG,&Payload { entries:vec![PayloadEntry::HostTime(HostTime::new(Duration::microseconds(100))),PayloadEntry::GhostTime(GhostTime::new(Duration::microseconds(200))),PayloadEntry::PrevGhostTime(PrevGhostTime::new(Duration::microseconds(300)))] }).unwrap();
+                let sender=dispatch.lock().unwrap().get(&SocketAddr::V4(endpoint)).unwrap().clone();
+                for _ in 0..11 { sender.try_send((pong.clone(),endpoint.into())).unwrap(); }
+                if after_completion {
+                    job.await.unwrap(); // terminal success reached the separate, blocked result forwarder
+                    invalidate();
+                } else { invalidate(); job.await.unwrap(); }
+                while !dispatch.lock().unwrap().is_empty() || !measurements.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+                assert!(matches!(rx.try_recv(),Ok(MeasurePeerEvent::XForm(_,x)) if x==GhostXForm::default()));
+                assert!(rx.try_recv().is_err(),"retired registration must not publish a queued success");
+            }
+        }).await.expect("invalidated measurements and their blocked result forwarders must terminate");
     }
 
     #[tokio::test]
@@ -1385,7 +1521,7 @@ mod tests {
             while measurement.clock.micros() <= Duration::zero() {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            let (tx_pong, rx_pong) = mpsc::channel(8);
+            let (tx_pong, rx_pong) = mpsc::channel(10);
             measurement.listen(rx_pong).await;
             let packet = |host, ghost, previous| {
                 encode_message(
@@ -1407,6 +1543,8 @@ mod tests {
             for bytes in [
                 vec![0],
                 malformed,
+                packet(i64::MAX, 200, 300),
+                packet(100, i64::MAX, 300),
                 packet(i64::MAX, 1, 0),
                 packet(i64::MAX, i64::MAX, i64::MAX),
                 packet(i64::MAX, i64::MIN, i64::MIN),
