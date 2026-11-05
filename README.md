@@ -296,6 +296,9 @@ The minimum Chrono version is now **0.4.39**, including for `no_std` consumers.
 Elapsed time, timeline beat differences and clock scaling retain wide intermediates
 through conversion and origin/intercept addition. Public `Beats` operators still
 saturate; timeline composition does not use their narrowed intermediate results.
+Tempo periods stay wide in both beat conversion directions. Forced-beat requests
+re-anchor an unrepresentable origin when a bounded quantum-boundary anchor exists;
+the public rounding correction clamps at Chrono's duration limits.
 PONG ghost timestamps saturate at the final signed-microsecond wire boundary.
 Gateway node publication acquires peer and both responder guards cooperatively
 before any mutation. Checked announcement commits release timeout state while
@@ -305,9 +308,13 @@ Derived PONG timestamps and start/stop timestamps clamp at the signed wire-micro
 boundary. Direct clock payload encoders retain their fallible range validation;
 callers supplying an unrepresentable raw field still receive an error. PONG sample sums and differences remain wide through averaging;
 individual received fields must still be representable in the wire format.
-`Tempo::beats_to_micros`, timeline conversion and forward ghost scaling can return
+`Tempo::micros_per_beat`, `Tempo::beats_to_micros`, timeline conversion and forward ghost scaling can return
 Chrono durations beyond the signed-microsecond range. Callers must handle
 `num_microseconds() == None` instead of unwrapping an arbitrary derived duration.
+Measurement workers acquire public sample, success and retry-counter mutexes
+cooperatively with poison recovery. Sample append returns its count under the same
+guard; completion drains under one guard, and timer state waits remain cancellable
+by completion without parking the current-thread executor.
 Managed discovery forwarding and measurement publication use the same cooperative
 interface-lease checks; timeout lookup, pruning and shutdown also release guards
 before waiting. Ignoring an `Option<RemeasurementTask>` returned by a public result
@@ -677,8 +684,10 @@ panic recovery; this is not a blanket guarantee for every API or invalid state:
   This can be a local encoding failure from caller-supplied state, not just an
   error in received network data. Saturation tests cover the helper, timeline,
   start/stop, and ghost-time conversion paths independently of those encoders.
-- The hardened session, measurement, gateway, and controller paths use a blocking,
-  poison-tolerant helper (`sync::lock`) instead of `try_lock().unwrap()`.
+- Synchronous hardened state access uses the poison-tolerant `sync::lock` helper.
+  Async gateway and observer commits instead use `try_state`/`retry_state`: they
+  yield on contention without partial mutations, retaining lease, deadline and
+  epoch cancellation while waiting.
 - A peer that can't be measured (no measurement endpoint, or no socket to measure from) is
   reported as a failed measurement, like one that never answers. `measure_peer`
   rejects a missing endpoint before opening its per-call socket or starting a
