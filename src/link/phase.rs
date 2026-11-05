@@ -156,7 +156,7 @@ pub fn force_beat_at_time_impl(
                         .saturating_mul(1_000)
                 };
                 let anchored_time = super::duration_nanos(time).saturating_sub(elapsed);
-                if (min_time..=max_time).contains(&anchored_time) {
+                if precise || (min_time..=max_time).contains(&anchored_time) {
                     let anchored = Timeline {
                         beat_origin: origin,
                         time_origin: super::duration_from_nanos(anchored_time),
@@ -203,6 +203,51 @@ fn shifted_time_origin_nanos(timeline: Timeline, shift: i128) -> i128 {
 mod tests {
     use super::*;
     use crate::link::tempo::Tempo;
+
+    #[test]
+    fn force_microbeats_accepts_exact_clamped_nanosecond_anchors() {
+        for (bpm, beat, quantum, time, anchor) in [
+            (
+                60.0,
+                i64::MIN,
+                i64::MAX,
+                Duration::MAX - Duration::nanoseconds(999),
+                Duration::MAX,
+            ),
+            (
+                -60.0,
+                i64::MAX,
+                3,
+                Duration::MAX - Duration::nanoseconds(999),
+                Duration::MAX,
+            ),
+            (
+                60_000_000.0 / 1999.0,
+                i64::MAX,
+                3,
+                Duration::MIN + Duration::nanoseconds(1),
+                Duration::MIN,
+            ),
+            (
+                -60_000_000.0 / 1999.0,
+                i64::MAX,
+                3,
+                Duration::MAX - Duration::nanoseconds(1),
+                Duration::MAX,
+            ),
+        ] {
+            let mut timeline = Timeline {
+                tempo: Tempo::new(bpm),
+                beat_origin: Beats::default(),
+                time_origin: Duration::zero(),
+            };
+            let beat = Beats::from_microbeats(beat);
+            let quantum = Beats::from_microbeats(quantum);
+            force_beat_at_time_impl(&mut timeline, beat, time, quantum);
+            assert_eq!(to_phase_encoded_beats(&timeline, time, quantum), beat);
+            assert_eq!(timeline.time_origin, anchor);
+        }
+    }
 
     #[test]
     fn force_microbeats_preserves_nanosecond_anchors_at_duration_limits() {
