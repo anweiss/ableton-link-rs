@@ -2874,9 +2874,11 @@ mod dispatch_gate_tests {
                 .unwrap()
                 .start_stop_state
                 .time;
-            let beat_difference =
-                i128::from(if origin == i64::MIN { i64::MAX } else { i64::MIN })
-                    - i128::from(origin);
+            let beat_difference = i128::from(if origin == i64::MIN {
+                i64::MAX
+            } else {
+                i64::MIN
+            }) - i128::from(origin);
             let expected_nanos = beat_difference * 500 - 100_000_000_000;
             assert_eq!(
                 crate::duration_nanos(received_host_time),
