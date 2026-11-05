@@ -387,18 +387,45 @@ pub(crate) struct MeasurementRoutes(
 
 impl MeasurementRoutes {
     #[cfg(test)]
+    pub(crate) fn hold_hints_fixture(
+        &self,
+        ready: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let _guard = self.0.lock().unwrap();
+        ready.send(()).unwrap();
+        release.recv_timeout(Duration::from_secs(3)).unwrap();
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_record(&self, peer: &PeerState, route: MeasurementRoute) {
         self.record(peer.ident(), peer.measurement_endpoint, 30, route);
     }
 
+    #[cfg(test)]
     fn observe(
         &self,
+        peer: NodeId,
+        endpoint: Option<SocketAddrV4>,
+        received: Instant,
+        admitted: bool,
+    ) -> Option<Arc<EventRevision>> {
+        Self::observe_locked(
+            &mut self.1.lock().unwrap_or_else(|e| e.into_inner()),
+            peer,
+            endpoint,
+            received,
+            admitted,
+        )
+    }
+
+    fn observe_locked(
+        pending: &mut PendingRevisions,
         peer: NodeId,
         _endpoint: Option<SocketAddrV4>,
         received: Instant,
         admitted: bool,
     ) -> Option<Arc<EventRevision>> {
-        let mut pending = self.1.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|_, revision| revision.strong_count() > 0);
         if pending
             .get(&peer)
@@ -433,12 +460,14 @@ impl MeasurementRoutes {
         });
         generations
     }
+    #[cfg(test)]
     fn prune(&self) {
         Self::sweep(
             &mut self.0.lock().unwrap_or_else(|e| e.into_inner()),
             Instant::now(),
         );
     }
+    #[cfg(test)]
     fn record(
         &self,
         peer: NodeId,
@@ -456,6 +485,7 @@ impl MeasurementRoutes {
             false,
         );
     }
+    #[cfg(test)]
     fn record_received(
         &self,
         peer: NodeId,
@@ -465,9 +495,28 @@ impl MeasurementRoutes {
         route: MeasurementRoute,
         existing_only: bool,
     ) {
+        Self::record_received_locked(
+            &mut self.0.lock().unwrap_or_else(|e| e.into_inner()),
+            peer,
+            endpoint,
+            observed,
+            expires,
+            route,
+            existing_only,
+        )
+    }
+
+    fn record_received_locked(
+        routes: &mut MeasurementRouteMap,
+        peer: NodeId,
+        endpoint: Option<SocketAddrV4>,
+        observed: Instant,
+        expires: Instant,
+        route: MeasurementRoute,
+        existing_only: bool,
+    ) {
         let now = Instant::now();
-        let mut routes = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mut generations = Self::sweep(&mut routes, now);
+        let mut generations = Self::sweep(routes, now);
         if !current_in_snapshot(&route.entry, &mut generations) {
             return;
         }
@@ -519,6 +568,7 @@ impl MeasurementRoutes {
             routes.retain(|(node, _), hint| *node != peer || hint.observed > observed);
         }
     }
+    #[cfg(test)]
     pub(crate) fn resolve(&self, peer: &PeerState) -> Option<MeasurementRoute> {
         let endpoint = peer.measurement_endpoint?;
         let mut routes = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -527,11 +577,27 @@ impl MeasurementRoutes {
             .get(&(peer.ident(), endpoint))
             .map(|hint| hint.route.clone())
     }
-    fn remove_peer_before(&self, node: NodeId, received: Instant) {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(peer, _), hint| *peer != node || hint.observed > received);
+    async fn prune_async(&self) {
+        crate::platform::io_context::retry_state(|| {
+            let mut routes = crate::platform::io_context::try_state(&self.0)?;
+            Self::sweep(&mut routes, Instant::now());
+            Some(())
+        })
+        .await
+    }
+
+    pub(crate) async fn resolve_async(&self, peer: &PeerState) -> Option<MeasurementRoute> {
+        let endpoint = peer.measurement_endpoint?;
+        crate::platform::io_context::retry_state(|| {
+            let mut routes = crate::platform::io_context::try_state(&self.0)?;
+            Self::sweep(&mut routes, Instant::now());
+            Some(
+                routes
+                    .get(&(peer.ident(), endpoint))
+                    .map(|hint| hint.route.clone()),
+            )
+        })
+        .await
     }
 }
 
@@ -558,6 +624,10 @@ impl PeerObservation {
 
     // None means contention (retry); Some(None) means permanently stale.
     pub(crate) fn try_while_current<T>(&self, commit: impl FnOnce() -> T) -> Option<Option<T>> {
+        self.try_commit(|| Some(commit()))
+    }
+
+    fn try_commit<T>(&self, commit: impl FnOnce() -> Option<T>) -> Option<Option<T>> {
         let sockets = crate::platform::io_context::try_state(&self.ingress.sockets)?;
         let registered = sockets
             .get(&self.ingress.entry.identity.addr)
@@ -570,7 +640,10 @@ impl PeerObservation {
             return Some(None);
         }
         let _pending = crate::platform::io_context::try_state(&self.routes.1)?;
-        Some((!self.revision.cancel.is_cancelled()).then(commit))
+        if self.revision.cancel.is_cancelled() {
+            return Some(None);
+        }
+        Some(Some(commit()?))
     }
 
     #[cfg(test)]
@@ -632,18 +705,17 @@ impl Messenger {
         }
     }
 
-    pub(crate) fn discard_queued_datagrams(&self) {
-        self.measurement_routes
-            .0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
+    pub(crate) fn try_discard_queued_datagrams(&self) -> Option<()> {
+        let sockets = crate::platform::io_context::try_state(&self.interface_sockets)?;
+        let mut routes = crate::platform::io_context::try_state(&self.measurement_routes.0)?;
+        routes.clear();
         if let Some(socket) = &self.interface {
             drain_socket(socket);
         }
-        for entry in interface_socket_entries(&self.interface_sockets) {
+        for entry in sockets.values().flat_map(InterfaceSocket::registrations) {
             drain_socket(&entry.socket);
         }
+        Some(())
     }
 
     #[cfg(test)]
@@ -817,6 +889,8 @@ impl Messenger {
             #[cfg(test)]
             pending_delivery: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
+            scan_reconciliations: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
             drain_count: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -835,23 +909,16 @@ impl Messenger {
             context.clone(),
         ));
 
-        // Each per-interface socket receives the unicast responses triggered by the
-        // messages sent through it.
-        for entry in interface_socket_entries(&interface_sockets) {
-            children.spawn(receive_loop(
-                entry.receiver.clone(),
-                Some(entry.cancel.clone()),
-                context.clone(),
-            ));
-        }
-
-        children.spawn(interface_scan(multicast_socket.socket.clone(), context));
+        children.spawn(interface_scan(
+            multicast_socket.socket.clone(),
+            context.clone(),
+        ));
 
         let broadcast = broadcast_state_loop(
             self.ttl,
             self.ttl_ratio,
             self.last_broadcast_time.clone(),
-            interface_sockets,
+            interface_sockets.clone(),
             self.peer_state.clone(),
             SocketAddrV4::new(MULTICAST_ADDR, LINK_PORT),
             self.notifier.clone(),
@@ -860,6 +927,16 @@ impl Messenger {
             false,
         );
         async move {
+            // Each per-interface socket receives the unicast responses triggered by the
+            // messages sent through it.
+            for entry in interface_socket_entries_async(&interface_sockets).await {
+                children.spawn(receive_loop(
+                    entry.receiver.clone(),
+                    Some(entry.cancel.clone()),
+                    context.clone(),
+                ));
+            }
+
             tokio::pin!(broadcast);
             loop {
                 select! {
@@ -887,6 +964,8 @@ struct ReceiveContext {
     fail_receive_once: Arc<AtomicBool>,
     #[cfg(test)]
     pending_delivery: Arc<AtomicUsize>,
+    #[cfg(test)]
+    scan_reconciliations: Arc<AtomicUsize>,
     gate: Arc<crate::link::controller::DispatchGate>,
     interface_sockets: InterfaceSockets,
     peer_state: Arc<Mutex<PeerState>>,
@@ -908,6 +987,7 @@ fn lock_map<T>(
     }
 }
 
+#[cfg(test)]
 fn interface_socket_entries(sockets: &InterfaceSockets) -> Vec<InterfaceSocket> {
     lock_map(sockets, |sockets| {
         sockets
@@ -919,11 +999,49 @@ fn interface_socket_entries(sockets: &InterfaceSockets) -> Vec<InterfaceSocket> 
     .unwrap_or_default()
 }
 
+async fn interface_socket_entries_async(sockets: &InterfaceSockets) -> Vec<InterfaceSocket> {
+    crate::platform::io_context::retry_state(|| match sockets.try_lock() {
+        Ok(sockets) => Some(
+            sockets
+                .values()
+                .flat_map(InterfaceSocket::registrations)
+                .map(InterfaceSocket::lease)
+                .collect(),
+        ),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(_)) => Some(Vec::new()),
+    })
+    .await
+}
+
 /// Join the multicast group on `addr` and create the ephemeral socket used to send
 /// discovery messages through that interface.
 fn add_interface_with_identity(
     multicast_socket: &Arc<UdpSocket>,
     interface_sockets: &InterfaceSockets,
+    identity: Ipv4Interface,
+    topology: Option<Arc<Topology>>,
+    generation: u64,
+    measurement_responder: bool,
+    local_identity: &LocalIdentity,
+) -> Result<InterfaceSocket, std::io::Error> {
+    let mut sockets = interface_sockets
+        .lock()
+        .map_err(|_| std::io::Error::other("interface socket map is poisoned"))?;
+    add_interface_locked(
+        multicast_socket,
+        &mut sockets,
+        identity,
+        topology,
+        generation,
+        measurement_responder,
+        local_identity,
+    )
+}
+
+fn add_interface_locked(
+    multicast_socket: &Arc<UdpSocket>,
+    sockets: &mut HashMap<Ipv4Addr, InterfaceSocket>,
     identity: Ipv4Interface,
     topology: Option<Arc<Topology>>,
     generation: u64,
@@ -948,98 +1066,97 @@ fn add_interface_with_identity(
         siblings: Vec::new(),
     };
 
-    match interface_sockets.lock() {
-        Ok(mut sockets) => {
-            if sockets
-                .values()
-                .flat_map(InterfaceSocket::registrations)
-                .any(|other| other.identity == entry.identity)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "interface is already registered",
-                ));
-            }
-            // Serialize queue draining, membership publication, receive/route
-            // capture and sends. Old queued metadata must not acquire a newly
-            // registered socket generation after a scan.
-            if !entry.is_current()? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "interface topology changed during registration",
-                ));
-            }
-            if !sockets
-                .values()
-                .flat_map(InterfaceSocket::registrations)
-                .any(|other| other.identity.index == entry.identity.index)
-            {
-                set_membership(multicast_socket, entry.identity.index, true)?;
-            }
-            drain_socket(multicast_socket);
-            match sockets.get_mut(&addr) {
-                Some(group) => group.siblings.push(entry.lease()),
-                None => {
-                    sockets.insert(addr, entry.lease());
-                }
-            }
-        }
-        Err(_) => {
-            return Err(std::io::Error::other("interface socket map is poisoned"));
+    if sockets
+        .values()
+        .flat_map(InterfaceSocket::registrations)
+        .any(|other| other.identity == entry.identity)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "interface is already registered",
+        ));
+    }
+    // Serialize queue draining, membership publication, receive/route
+    // capture and sends. Old queued metadata must not acquire a newly
+    // registered socket generation after a scan.
+    if !entry.is_current()? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "interface topology changed during registration",
+        ));
+    }
+    if !sockets
+        .values()
+        .flat_map(InterfaceSocket::registrations)
+        .any(|other| other.identity.index == entry.identity.index)
+    {
+        set_membership(multicast_socket, entry.identity.index, true)?;
+    }
+    drain_socket(multicast_socket);
+    match sockets.get_mut(&addr) {
+        Some(group) => group.siblings.push(entry.lease()),
+        None => {
+            sockets.insert(addr, entry.lease());
         }
     }
 
     Ok(entry)
 }
 
+#[cfg(test)]
 fn remove_interface(
     multicast_socket: &Arc<UdpSocket>,
     interface_sockets: &InterfaceSockets,
     identity: &Ipv4Interface,
 ) {
-    match interface_sockets.lock() {
-        Ok(mut sockets) => {
-            let entry = if let Some(mut group) = sockets.remove(&identity.addr) {
-                if group.identity == *identity {
-                    if let Some(mut replacement) = group.siblings.pop() {
-                        replacement.siblings = std::mem::take(&mut group.siblings);
-                        sockets.insert(identity.addr, replacement);
-                    }
-                    Some(group)
-                } else {
-                    let removed = group
-                        .siblings
-                        .iter()
-                        .position(|entry| entry.identity == *identity)
-                        .map(|index| group.siblings.remove(index));
-                    sockets.insert(identity.addr, group);
-                    removed
-                }
-            } else {
-                None
-            };
-            if let Some(entry) = entry {
-                entry.cancel.cancel();
-                if !sockets
-                    .values()
-                    .flat_map(InterfaceSocket::registrations)
-                    .any(|other| other.identity.index == identity.index)
-                {
-                    if let Err(error) = set_membership(multicast_socket, identity.index, false) {
-                        warn!(
-                            "failed to leave discovery membership on {}: {}",
-                            identity.addr, error
-                        );
-                    }
-                }
-                drain_socket(multicast_socket);
-                info!(
-                    "left Ableton Link multicast group on interface {}",
-                    identity.addr
+    if let Ok(mut sockets) = interface_sockets.lock() {
+        remove_interface_locked(multicast_socket, &mut sockets, identity);
+    }
+}
+
+fn remove_interface_locked(
+    multicast_socket: &Arc<UdpSocket>,
+    sockets: &mut HashMap<Ipv4Addr, InterfaceSocket>,
+    identity: &Ipv4Interface,
+) {
+    let entry = if let Some(mut group) = sockets.remove(&identity.addr) {
+        if group.identity == *identity {
+            if let Some(mut replacement) = group.siblings.pop() {
+                replacement.siblings = std::mem::take(&mut group.siblings);
+                sockets.insert(identity.addr, replacement);
+            }
+            Some(group)
+        } else {
+            let removed = group
+                .siblings
+                .iter()
+                .position(|entry| entry.identity == *identity)
+                .map(|index| group.siblings.remove(index));
+            sockets.insert(identity.addr, group);
+            removed
+        }
+    } else {
+        None
+    };
+    if let Some(entry) = entry {
+        entry.cancel.cancel();
+        if !sockets
+            .values()
+            .flat_map(InterfaceSocket::registrations)
+            .any(|other| other.identity.index == identity.index)
+        {
+            if let Err(error) = set_membership(multicast_socket, identity.index, false) {
+                warn!(
+                    "failed to leave discovery membership on {}: {}",
+                    identity.addr, error
                 );
             }
         }
-        Err(_) => warn!("cannot remove discovery interface: socket map is poisoned"),
+        drain_socket(multicast_socket);
+        info!(
+            "left Ableton Link multicast group on interface {}",
+            identity.addr
+        );
     }
 }
 
@@ -1074,10 +1191,23 @@ async fn scan_interface_snapshot(
 }
 
 async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContext) {
+    interface_scan_with(multicast_socket, context, || {
+        Ok((scan_discovery_interfaces()?, LocalDelivery::identity()))
+    })
+    .await
+}
+
+async fn interface_scan_with(
+    multicast_socket: Arc<UdpSocket>,
+    context: ReceiveContext,
+    scan: impl Fn() -> std::io::Result<(Vec<Ipv4Interface>, LocalIdentity)> + Send + Sync + 'static,
+) {
+    let scan = Arc::new(scan);
     let mut children = tokio::task::JoinSet::new();
     let mut failures = SetupFailures::default();
     let mut interval = tokio::time::interval(INTERFACE_SCAN_PERIOD);
-    let mut observed = interface_socket_entries(&context.interface_sockets)
+    let mut observed = interface_socket_entries_async(&context.interface_sockets)
+        .await
         .first()
         .map_or(0, |entry| entry.generation);
 
@@ -1103,7 +1233,7 @@ async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContex
             }
         }
 
-        context.measurement_routes.prune();
+        context.measurement_routes.prune_async().await;
         let generation = match &context.topology {
             Some(topology) => match topology.check() {
                 Ok(generation) => generation,
@@ -1114,11 +1244,8 @@ async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContex
             },
             None => 0,
         };
-        let (current, local_identity) = match scan_interface_snapshot(|| {
-            Ok((scan_discovery_interfaces()?, LocalDelivery::identity()))
-        })
-        .await
-        {
+        let scanner = scan.clone();
+        let (current, local_identity) = match scan_interface_snapshot(move || scanner()).await {
             Ok(Ok(current)) => current,
             Ok(Err(error)) => {
                 warn!("discovery interface scan failed: {}", error);
@@ -1146,7 +1273,9 @@ async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContex
                 }
             }
         }
-        reconcile_interfaces_at(
+        #[cfg(test)]
+        context.scan_reconciliations.fetch_add(1, Ordering::SeqCst);
+        reconcile_interfaces_async(
             &multicast_socket,
             &context,
             &mut children,
@@ -1154,7 +1283,8 @@ async fn interface_scan(multicast_socket: Arc<UdpSocket>, context: ReceiveContex
             &local_identity,
             generation,
             &mut failures,
-        );
+        )
+        .await;
         observed = generation;
     }
 }
@@ -1187,6 +1317,7 @@ fn reconcile_interfaces(
     );
 }
 
+#[cfg(test)]
 fn reconcile_interfaces_at(
     multicast_socket: &Arc<UdpSocket>,
     context: &ReceiveContext,
@@ -1196,12 +1327,78 @@ fn reconcile_interfaces_at(
     generation: u64,
     failures: &mut SetupFailures,
 ) {
+    if let Ok(mut sockets) = context.interface_sockets.lock() {
+        reconcile_interfaces_locked(
+            &mut sockets,
+            multicast_socket,
+            context,
+            children,
+            current,
+            local_identity,
+            generation,
+            failures,
+        );
+    }
+}
+
+async fn reconcile_interfaces_async(
+    multicast_socket: &Arc<UdpSocket>,
+    context: &ReceiveContext,
+    children: &mut tokio::task::JoinSet<()>,
+    current: &[Ipv4Interface],
+    local_identity: &LocalIdentity,
+    generation: u64,
+    failures: &mut SetupFailures,
+) {
+    crate::platform::io_context::retry_state(|| {
+        let mut sockets = match context.interface_sockets.try_lock() {
+            Ok(sockets) => sockets,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(_)) => return Some(()),
+        };
+        if context
+            .topology
+            .as_ref()
+            .is_some_and(|topology| topology.check().ok() != Some(generation))
+        {
+            return Some(());
+        }
+        reconcile_interfaces_locked(
+            &mut sockets,
+            multicast_socket,
+            context,
+            children,
+            current,
+            local_identity,
+            generation,
+            failures,
+        );
+        Some(())
+    })
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_interfaces_locked(
+    sockets: &mut HashMap<Ipv4Addr, InterfaceSocket>,
+    multicast_socket: &Arc<UdpSocket>,
+    context: &ReceiveContext,
+    children: &mut tokio::task::JoinSet<()>,
+    current: &[Ipv4Interface],
+    local_identity: &LocalIdentity,
+    generation: u64,
+    failures: &mut SetupFailures,
+) {
     failures.forget_except(current);
-    for entry in interface_socket_entries(&context.interface_sockets) {
+    let entries: Vec<_> = sockets
+        .values()
+        .flat_map(InterfaceSocket::registrations)
+        .map(InterfaceSocket::lease)
+        .collect();
+    for entry in &entries {
         entry.local_delivery.refresh(local_identity);
     }
 
-    let entries = interface_socket_entries(&context.interface_sockets);
     let known: Vec<_> = entries.iter().map(|entry| entry.identity.clone()).collect();
 
     let stale_addrs: Vec<_> = known
@@ -1217,14 +1414,14 @@ fn reconcile_interfaces_at(
         .collect();
 
     for addr in &stale_addrs {
-        remove_interface(multicast_socket, &context.interface_sockets, addr);
+        remove_interface_locked(multicast_socket, sockets, addr);
     }
 
     let mut changed = !stale_addrs.is_empty();
     for addr in &new_addrs {
-        match add_interface_with_identity(
+        match add_interface_locked(
             multicast_socket,
-            &context.interface_sockets,
+            sockets,
             addr.clone(),
             context.topology.clone(),
             generation,
@@ -1293,6 +1490,21 @@ async fn receive_datagram(
     receive_datagram_observing(receiver, sockets, buf, owner, |_, _| {}).await
 }
 
+async fn owner_cancelled(owner: Option<&Cancel>) {
+    match owner {
+        Some(owner) => owner.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn retired_receiver() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "receiving socket generation was removed",
+    )
+}
+
+#[cfg(test)]
 async fn receive_datagram_observing(
     receiver: &PacketSocket,
     sockets: &InterfaceSockets,
@@ -1300,19 +1512,45 @@ async fn receive_datagram_observing(
     owner: Option<&Cancel>,
     mut observe: impl FnMut(&[u8], Option<&InterfaceSocket>),
 ) -> std::io::Result<(usize, SocketAddr, Option<InterfaceSocket>)> {
+    receive_datagram_committing(
+        receiver,
+        sockets,
+        buf,
+        owner,
+        || Some(()),
+        |bytes, route, _| observe(bytes, route),
+    )
+    .await
+}
+
+async fn receive_datagram_committing<A>(
+    receiver: &PacketSocket,
+    sockets: &InterfaceSockets,
+    buf: &mut [u8],
+    owner: Option<&Cancel>,
+    mut acquire: impl FnMut() -> Option<A>,
+    mut observe: impl FnMut(&[u8], Option<&InterfaceSocket>, &mut A),
+) -> std::io::Result<(usize, SocketAddr, Option<InterfaceSocket>)> {
     loop {
-        receiver.readable().await?;
-        let result = {
-            let sockets = sockets
-                .lock()
-                .map_err(|_| std::io::Error::other("interface socket map is poisoned"))?;
+        select! {
+            biased;
+            _ = owner_cancelled(owner) => return Err(retired_receiver()),
+            result = receiver.readable() => result?,
+        }
+        let result = select! {
+            biased;
+            _ = owner_cancelled(owner) => return Err(retired_receiver()),
+            result = crate::platform::io_context::retry_state(|| {
+            let sockets = match sockets.try_lock() {
+                Ok(sockets) => sockets,
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+                Err(std::sync::TryLockError::Poisoned(_)) => return Some(Err(std::io::Error::other("interface socket map is poisoned"))),
+            };
+            let mut admission = acquire()?;
             if owner.is_some_and(Cancel::is_cancelled) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "receiving socket generation was removed",
-                ));
+                return Some(Err(retired_receiver()));
             }
-            receiver.try_recv(buf).and_then(|(size, info)| {
+            Some(receiver.try_recv(buf).and_then(|(size, info)| {
                 let route = if owner.is_some()
                     && buf[..size].starts_with(&crate::link::pingresponder::PROTOCOL_HEADER)
                 {
@@ -1339,9 +1577,10 @@ async fn receive_datagram_observing(
                     Some(entry) if entry.is_current()? => Some(entry),
                     _ => None,
                 };
-                observe(&buf[..size], route.as_ref());
+                observe(&buf[..size], route.as_ref(), &mut admission);
                 Ok((size, info.addr_src, route))
-            })
+            }))
+            }) => result,
         };
         match result {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -1434,15 +1673,16 @@ fn receive_loop(
                     _ = delivery_open.closed() => {},
                     _ = PeerObservation::invalidated(Some(&observation)) => {},
                     _ = tokio::time::sleep_until(expires), if state.ttl > 0 => {},
-                    _ = crate::platform::io_context::retry_state(|| observation.try_while_current(|| {
+                    _ = crate::platform::io_context::retry_state(|| observation.try_commit(|| {
+                    let mut hints = crate::platform::io_context::try_state(&routes.0)?;
                     let expires = state.expires_at.expect("managed announcement deadline");
                     if state.ttl > 0 && expires <= Instant::now() {
-                        return;
+                        return Some(());
                     }
                     if state.ttl == 0 {
-                        routes.remove_peer_before(state.node_state.ident(), event.received);
+                        hints.retain(|(peer, _), hint| *peer != state.node_state.ident() || hint.observed > event.received);
                     } else {
-                        routes.record_received(
+                        MeasurementRoutes::record_received_locked(&mut hints,
                             state.node_state.ident(),
                             state.measurement_endpoint,
                             event.received,
@@ -1452,6 +1692,7 @@ fn receive_loop(
                         );
                     }
                     slot.take().unwrap().send(OnEvent::PeerState(state.clone()));
+                    Some(())
                 })) => {},
                 }
             }
@@ -1483,10 +1724,10 @@ fn receive_loop(
                 biased;
                 _ = &mut cancelled => break,
                 _ = open.closed() => continue,
-                result = receive_datagram_observing(&receive_socket, &context.interface_sockets, &mut buf, cancel.as_ref(), |bytes, ingress| {
+                result = receive_datagram_committing(&receive_socket, &context.interface_sockets, &mut buf, cancel.as_ref(), || ReceiveAdmission::try_new(&context), |bytes, ingress, admission| {
                     #[cfg(test)]
                     if context.fail_receive_once.load(Ordering::Relaxed) { return; }
-                    observe_discovery(&context, &handoff, bytes, ingress);
+                    observe_discovery_guarded(&context, &handoff, bytes, ingress, admission);
                 }) => result,
             };
             #[cfg(test)]
@@ -1726,7 +1967,11 @@ async fn broadcast_state_loop(
                     if should_broadcast {
                         // Announce ourselves through every interface, so peers on any
                         // of them can discover us.
-                        for entry in interface_socket_entries(&interface_sockets) {
+                        let entries = select! {
+                            _ = n.notified() => { if stop_on_notify { return; } continue; },
+                            entries = interface_socket_entries_async(&interface_sockets) => entries,
+                        };
+                        for entry in entries {
                             send_peer_state_via(entry.socket.clone(), peer_state.clone(), ttl, ALIVE, to, lbt.clone(), group_id, Some((&entry, &interface_sockets))).await;
                         }
                     }
@@ -1849,23 +2094,33 @@ async fn send_registered(
             }
             result = entry.socket.writable() => result?,
         }
-        let result = {
-            let sockets = sockets
-                .lock()
-                .map_err(|_| std::io::Error::other("interface socket map is poisoned"))?;
+        let result = select! {
+            biased;
+            _ = entry.invalidated() => return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "ingress lease was invalidated")),
+            result = crate::platform::io_context::retry_state(|| {
+            let sockets = match sockets.try_lock() {
+                Ok(sockets) => sockets,
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+                Err(std::sync::TryLockError::Poisoned(_)) => return Some(Err(std::io::Error::other("interface socket map is poisoned"))),
+            };
             let current = sockets.get(&entry.identity.addr).is_some_and(|current| {
                 current
                     .registrations()
                     .any(|current| Arc::ptr_eq(&current.socket, &entry.socket))
             });
-            if !current || !entry.is_current()? {
-                return Err(std::io::Error::new(
+            let valid = match entry.is_current() {
+                Ok(valid) => valid,
+                Err(error) => return Some(Err(error)),
+            };
+            if !current || !valid {
+                return Some(Err(std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
                     "ingress socket generation is no longer registered",
-                ));
+                )));
             }
             // No await between checking the registration and the actual syscall.
-            entry.socket.try_send_to(message, to.into())
+            Some(entry.socket.try_send_to(message, to.into()))
+            }) => result,
         };
         match result {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -1991,16 +2246,76 @@ async fn receive_peer_state_with_route(
     buf: &[u8],
     route: Option<(&MeasurementRoutes, MeasurementRoute)>,
 ) {
-    if let Some(event) = peer_state_event(header, buf, route) {
+    if let Some(event) = peer_state_event(header, buf) {
+        if let (Some((routes, ingress)), OnEvent::PeerState(state)) = (route, &event) {
+            let received = Instant::now();
+            let expires = state.expires_at.expect("parsed announcement deadline");
+            crate::platform::io_context::retry_state(|| {
+                let mut hints = crate::platform::io_context::try_state(&routes.0)?;
+                MeasurementRoutes::record_received_locked(
+                    &mut hints,
+                    state.node_state.ident(),
+                    state.measurement_endpoint,
+                    received,
+                    expires,
+                    ingress.clone(),
+                    false,
+                );
+                Some(())
+            })
+            .await;
+        }
         let _ = tx.send(event).await;
     }
 }
 
+struct ReceiveAdmission<'a> {
+    peer: std::sync::MutexGuard<'a, PeerState>,
+    enabled: std::sync::MutexGuard<'a, bool>,
+    pending: std::sync::MutexGuard<'a, PendingRevisions>,
+    routes: std::sync::MutexGuard<'a, MeasurementRouteMap>,
+}
+impl<'a> ReceiveAdmission<'a> {
+    fn try_new(context: &'a ReceiveContext) -> Option<Self> {
+        Some(Self {
+            peer: crate::platform::io_context::try_state(&context.peer_state)?,
+            enabled: crate::platform::io_context::try_state(&context.enabled)?,
+            pending: crate::platform::io_context::try_state(&context.measurement_routes.1)?,
+            routes: crate::platform::io_context::try_state(&context.measurement_routes.0)?,
+        })
+    }
+}
+
+#[cfg(test)]
 fn observe_discovery(
     context: &ReceiveContext,
     handoff: &Sender<DiscoveryEvent>,
     bytes: &[u8],
     ingress: Option<&InterfaceSocket>,
+) {
+    let mut admission = ReceiveAdmission {
+        peer: context.peer_state.lock().unwrap_or_else(|e| e.into_inner()),
+        enabled: context.enabled.lock().unwrap_or_else(|e| e.into_inner()),
+        pending: context
+            .measurement_routes
+            .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        routes: context
+            .measurement_routes
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    };
+    observe_discovery_guarded(context, handoff, bytes, ingress, &mut admission);
+}
+
+fn observe_discovery_guarded(
+    context: &ReceiveContext,
+    handoff: &Sender<DiscoveryEvent>,
+    bytes: &[u8],
+    ingress: Option<&InterfaceSocket>,
+    admission: &mut ReceiveAdmission<'_>,
 ) {
     let Some(entry) = ingress else {
         return;
@@ -2015,18 +2330,10 @@ fn observe_discovery(
     if !matches!(header.message_type, ALIVE | RESPONSE | BYEBYE) {
         return;
     }
-    if context
-        .peer_state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .ident()
-        == header.ident
-        && header.group_id == context.group_id
-    {
+    if admission.peer.ident() == header.ident && header.group_id == context.group_id {
         return;
     }
-    if header.message_type != BYEBYE && !*context.enabled.lock().unwrap_or_else(|e| e.into_inner())
-    {
+    if header.message_type != BYEBYE && !*admission.enabled {
         return;
     }
     let payload = if header.message_type == BYEBYE {
@@ -2035,12 +2342,14 @@ fn observe_discovery(
     } else {
         &bytes[len..]
     };
-    queue_peer_state_current(
+    queue_peer_state_guarded(
         handoff,
         received,
         header,
         payload,
         &context.measurement_routes,
+        &mut admission.pending,
+        &mut admission.routes,
         MeasurementRoute {
             #[cfg(test)]
             retire_before_samples: Default::default(),
@@ -2068,6 +2377,7 @@ fn queue_peer_state(
 
 // Caller holds the ingress map from recv through observation/admission. A reader
 // cannot retain an older timestamp outside that serialized region.
+#[cfg(test)]
 fn queue_peer_state_current(
     tx: &Sender<DiscoveryEvent>,
     received: Instant,
@@ -2076,21 +2386,50 @@ fn queue_peer_state_current(
     routes: &MeasurementRoutes,
     ingress: MeasurementRoute,
 ) {
+    let mut pending = routes.1.lock().unwrap_or_else(|e| e.into_inner());
+    let mut hints = routes.0.lock().unwrap_or_else(|e| e.into_inner());
+    queue_peer_state_guarded(
+        tx,
+        received,
+        header,
+        buf,
+        routes,
+        &mut pending,
+        &mut hints,
+        ingress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_peer_state_guarded(
+    tx: &Sender<DiscoveryEvent>,
+    received: Instant,
+    header: MessageHeader,
+    buf: &[u8],
+    routes: &MeasurementRoutes,
+    pending: &mut PendingRevisions,
+    hints: &mut MeasurementRouteMap,
+    ingress: MeasurementRoute,
+) {
     let expires = received + Duration::from_secs(u64::from(header.ttl));
-    let Some(OnEvent::PeerState(mut state)) = peer_state_event(header, buf, None) else {
+    let Some(OnEvent::PeerState(mut state)) = peer_state_event(header, buf) else {
         return;
     };
     let slot = tx.try_reserve().ok();
-    let revision = routes.observe(
+    let revision = MeasurementRoutes::observe_locked(
+        pending,
         state.node_state.ident(),
         state.measurement_endpoint,
         received,
         slot.is_some() && (state.ttl == 0 || expires > Instant::now()),
     );
     if state.ttl == 0 {
-        routes.remove_peer_before(state.node_state.ident(), received);
+        hints.retain(|(peer, _), hint| {
+            *peer != state.node_state.ident() || hint.observed > received
+        });
     } else {
-        routes.record_received(
+        MeasurementRoutes::record_received_locked(
+            hints,
             state.node_state.ident(),
             state.measurement_endpoint,
             received,
@@ -2115,11 +2454,7 @@ fn queue_peer_state_current(
     }
 }
 
-fn peer_state_event(
-    header: MessageHeader,
-    buf: &[u8],
-    route: Option<(&MeasurementRoutes, MeasurementRoute)>,
-) -> Option<OnEvent> {
+fn peer_state_event(header: MessageHeader, buf: &[u8]) -> Option<OnEvent> {
     // Received from the network: a malformed payload is dropped.
     let payload = match parse_payload(buf) {
         Ok(payload) => payload,
@@ -2145,9 +2480,6 @@ fn peer_state_event(
     });
 
     let node_state: NodeState = NodeState::from_payload(header.ident, &payload);
-    if let Some((routes, route)) = route {
-        routes.record(header.ident, measurement_endpoint, header.ttl, route);
-    }
 
     Some(OnEvent::PeerState(PeerStateMessageType {
         node_state,
@@ -2560,6 +2892,292 @@ mod tests {
             );
         }
         children.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn wide_socket_owned_traffic_scans_and_withdrawals_remain_cancellable() {
+        for held_kind in 0..5 {
+            for mode in 0..3 {
+                let io = crate::platform::io_context::IoContext::new().unwrap();
+                let (outbound, mut events) = tokio::sync::mpsc::channel(1);
+                outbound
+                    .send(OnEvent::Byebye(NodeId::default()))
+                    .await
+                    .unwrap();
+                let (listener, context, route, reader) = io
+                    .spawn(async move {
+                        let listener = Arc::new(
+                            PacketSocket::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), None)
+                                .unwrap(),
+                        );
+                        let context = receive_context(outbound);
+                        let entry = interface_socket_entries(&context.interface_sockets)
+                            .pop()
+                            .unwrap();
+                        let route = MeasurementRoute {
+                            retire_before_samples: Default::default(),
+                            entry,
+                            sockets: context.interface_sockets.clone(),
+                        };
+                        let reader =
+                            tokio::spawn(receive_loop(listener.clone(), None, context.clone()));
+                        (listener, context, route, reader)
+                    })
+                    .await
+                    .unwrap();
+                let remote = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                let SocketAddr::V4(remote_addr) = remote.local_addr().unwrap() else {
+                    panic!("IPv4")
+                };
+                let peer = PeerState {
+                    node_state: NodeState {
+                        node_id: NodeId::from_array([194; 8]),
+                        ..Default::default()
+                    },
+                    measurement_endpoint: Some(remote_addr),
+                    ..Default::default()
+                };
+                context.measurement_routes.test_record(&peer, route.clone());
+                let (requests, request_rx) = tokio::sync::mpsc::channel(2);
+                let (results, _result_rx) = tokio::sync::mpsc::channel(8);
+                let service_context = context.clone();
+                let service_socket = route.socket();
+                let service = io
+                    .spawn(async move {
+                        crate::link::measurement::MeasurementService::new_with_routes(
+                            service_socket,
+                            service_context.peer_state.clone(),
+                            Arc::new(Mutex::new(crate::link::state::SessionState::default())),
+                            crate::link::clock::Clock::new(),
+                            results,
+                            Arc::new(Notify::new()),
+                            request_rx,
+                            Some(service_context.measurement_routes.clone()),
+                        )
+                        .await
+                    })
+                    .await
+                    .unwrap();
+                let positive =
+                    encode_message(peer.ident(), 1, RESPONSE, &Payload::from(peer.clone()), 0)
+                        .unwrap();
+                remote
+                    .send_to(&positive, listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while context.pending_delivery.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+
+                // Pause the real scanner's snapshot producer, not its reconciliation.
+                let (scan_ready, scan_ready_rx) = std::sync::mpsc::channel();
+                let (scan_release, scan_release_rx) = std::sync::mpsc::channel();
+                let scan_release_rx = Mutex::new(scan_release_rx);
+                let first = AtomicBool::new(true);
+                let identity = route.entry.identity.clone();
+                let local = LocalDelivery::identity();
+                let scan_context = context.clone();
+                let multicast = listener.socket.clone();
+                let scanner = io.spawn(interface_scan_with(multicast, scan_context, move || {
+                    if first.swap(false, Ordering::SeqCst) {
+                        scan_ready.send(()).unwrap();
+                        scan_release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(3))
+                            .unwrap();
+                    }
+                    Ok((vec![identity.clone()], local.clone()))
+                }));
+                scan_ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let map = context.interface_sockets.clone();
+                let revisions = context.measurement_routes.1.clone();
+                let hints = context.measurement_routes.0.clone();
+                let peer_state = context.peer_state.clone();
+                let enabled = context.enabled.clone();
+                let (ready, ready_rx) = std::sync::mpsc::channel();
+                let (release, release_rx) = std::sync::mpsc::channel();
+                fn hold<T>(
+                    state: Arc<Mutex<T>>,
+                    ready: std::sync::mpsc::Sender<()>,
+                    release: std::sync::mpsc::Receiver<()>,
+                ) {
+                    let _guard = state.lock().unwrap();
+                    ready.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(4)).unwrap();
+                }
+                let holder = std::thread::spawn(move || match held_kind {
+                    0 => hold(map, ready, release_rx),
+                    1 => hold(revisions, ready, release_rx),
+                    2 => hold(hints, ready, release_rx),
+                    3 => hold(peer_state, ready, release_rx),
+                    _ => hold(enabled, ready, release_rx),
+                });
+                ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                scan_release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while context.scan_reconciliations.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(matches!(events.recv().await, Some(OnEvent::Byebye(_))));
+                requests
+                    .send(crate::link::measurement::MeasurePeerEvent::PeerState(
+                        crate::link::sessions::SessionKey::new(peer.node_state.session_id),
+                        peer.clone(),
+                    ))
+                    .await
+                    .unwrap();
+                let extra_context = context.clone();
+                let extra_socket = listener.socket.clone();
+                let extra_identity = route.entry.identity.clone();
+                let extra_local = LocalDelivery::identity();
+                let pruning_scanner = io.spawn(interface_scan_with(
+                    extra_socket,
+                    extra_context,
+                    move || Ok((vec![extra_identity.clone()], extra_local.clone())),
+                ));
+                let broadcaster = io.spawn(broadcast_state_loop(
+                    1,
+                    20,
+                    Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1))),
+                    context.interface_sockets.clone(),
+                    context.peer_state.clone(),
+                    remote_addr,
+                    Arc::new(Notify::new()),
+                    context.enabled.clone(),
+                    0,
+                    false,
+                ));
+                let send_route = route.clone();
+                let mut send = io.spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    crate::link::measurement::send_ping_route_fixture(send_route, remote_addr).await
+                });
+                let withdrawal =
+                    encode_message(peer.ident(), 0, BYEBYE, &Payload::default(), 0).unwrap();
+                remote
+                    .send_to(&withdrawal, listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let heartbeat = io.spawn(async {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                });
+                let responsive = matches!(
+                    tokio::time::timeout(Duration::from_millis(150), heartbeat).await,
+                    Ok(Ok(()))
+                );
+                let no_early_commit = held_kind >= 3 || events.try_recv().is_err();
+                if mode == 1 {
+                    tokio::time::sleep(Duration::from_millis(1100)).await;
+                }
+                let service_stopped = if mode == 2 {
+                    tokio::time::timeout(Duration::from_millis(200), service.stop())
+                        .await
+                        .is_ok()
+                } else {
+                    true
+                };
+                let stopped = if mode == 2 {
+                    route.entry.cancel.cancel();
+                    tokio::time::timeout(Duration::from_millis(200), context.gate.stop())
+                        .await
+                        .is_ok()
+                } else {
+                    true
+                };
+                let mut send_result = None;
+                let send_cancelled = if mode == 2 && held_kind == 0 {
+                    send_result = tokio::time::timeout(Duration::from_millis(150), &mut send)
+                        .await
+                        .ok();
+                    matches!(&send_result,Some(Ok(Err(error))) if error.kind()==std::io::ErrorKind::NotConnected)
+                } else {
+                    true
+                };
+                release.send(()).unwrap();
+                holder.join().unwrap();
+                let mut positive_seen = false;
+                let delivered = if mode != 2 {
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        loop {
+                            if let Some(OnEvent::PeerState(state)) = events.recv().await {
+                                assert_eq!(state.node_state.ident(), peer.ident());
+                                if state.ttl == 0 {
+                                    break;
+                                }
+                                positive_seen = true;
+                            } else {
+                                panic!("event worker closed");
+                            }
+                        }
+                    })
+                    .await
+                    .is_ok()
+                } else {
+                    true
+                };
+                if send_result.is_none() {
+                    send_result = tokio::time::timeout(Duration::from_secs(1), send)
+                        .await
+                        .ok();
+                }
+                let send_settled = if mode == 2 {
+                    matches!(send_result, Some(Ok(_)))
+                } else {
+                    matches!(send_result, Some(Ok(Ok(_))))
+                };
+                let sent_on_registration = if mode != 2 {
+                    let expected = crate::link::pingresponder::encode_message(
+                        crate::link::pingresponder::PING,
+                        &Payload::default(),
+                    )
+                    .unwrap();
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        let mut bytes = [0; MAX_MESSAGE_SIZE];
+                        loop {
+                            let (size, source) = remote.recv_from(&mut bytes).await.unwrap();
+                            if bytes[..size] == expected {
+                                assert_eq!(source, route.entry.socket.local_addr().unwrap());
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .is_ok()
+                } else {
+                    true
+                };
+                // All real workers are owned and abortable, including reconciliation children.
+                scanner.abort();
+                pruning_scanner.abort();
+                broadcaster.abort();
+                reader.abort();
+                let _ = scanner.await;
+                let _ = pruning_scanner.await;
+                let _ = broadcaster.await;
+                let _ = reader.await;
+                context.gate.stop().await;
+                service.stop().await;
+                drop(service);
+                assert_eq!(
+                    context.interface_sockets.lock().unwrap().len(),
+                    1,
+                    "contention is not an empty interface snapshot"
+                );
+                drop(io);
+                assert!(responsive && no_early_commit && stopped && delivered && send_settled && send_cancelled && sent_on_registration && service_stopped,"coupled socket/scan boundary: guard={held_kind}, mode={mode}, heartbeat={responsive}, commit={no_early_commit}, stop={stopped}, withdrawal={delivered}, send={send_settled}");
+                if held_kind < 3 && mode == 1 {
+                    assert!(!positive_seen,"waiting for final hint acquisition cannot refresh the original one-second TTL");
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -3478,6 +4096,8 @@ mod tests {
             fail_receive_once: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             pending_delivery: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            scan_reconciliations: Arc::new(AtomicUsize::new(0)),
             gate: Arc::new(crate::link::controller::DispatchGate::new_open()),
             interface_sockets: Arc::new(Mutex::new(HashMap::from([(
                 Ipv4Addr::LOCALHOST,

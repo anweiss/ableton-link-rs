@@ -194,7 +194,11 @@ impl MeasurementService {
                 if let MeasurePeerEvent::PeerState(session_id, peer) = event {
                     let route = match &routes {
                         Some(routes) if peer.measurement_endpoint.is_some() => {
-                            match routes.resolve(&peer) {
+                            match tokio::select! {
+                                biased;
+                                _ = open.closed() => continue,
+                                result = routes.resolve_async(&peer) => result,
+                            } {
                                 Some(route) => Some(route),
                                 None => {
                                     tokio::select! {
@@ -1129,6 +1133,14 @@ pub async fn send_ping(
     payload: &Payload,
 ) -> io::Result<usize> {
     send_ping_via(socket, None, measurement_endpoint, payload).await
+}
+
+#[cfg(test)]
+pub(crate) async fn send_ping_route_fixture(
+    route: MeasurementRoute,
+    endpoint: SocketAddrV4,
+) -> std::io::Result<usize> {
+    send_ping_via(route.socket(), Some(route), endpoint, &Payload::default()).await
 }
 
 async fn send_ping_via(

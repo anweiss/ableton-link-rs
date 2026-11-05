@@ -199,8 +199,17 @@ impl DispatchGate {
     }
 
     async fn start_with(&self, publish: impl FnOnce()) {
+        let mut publish = Some(publish);
+        self.start_with_retry(|| {
+            publish.take().unwrap()();
+            Some(())
+        })
+        .await;
+    }
+
+    async fn start_with_retry(&self, mut publish: impl FnMut() -> Option<()>) {
         if self.is_open() {
-            publish();
+            retry_state(&mut publish).await;
             return;
         }
         let epoch = self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
@@ -209,11 +218,8 @@ impl DispatchGate {
             let ready = self.ready.notified();
             tokio::pin!(ready);
             ready.as_mut().enable();
-            {
-                let mut subscribers = self
-                    .subscribers
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let opened = retry_state(|| {
+                let mut subscribers = try_state(&self.subscribers)?;
                 subscribers.retain(|subscriber| subscriber.strong_count() != 0);
                 let all_ready = subscribers.iter().all(|subscriber| {
                     subscriber.upgrade().is_none_or(|prepared| {
@@ -221,12 +227,15 @@ impl DispatchGate {
                     })
                 });
                 if all_ready {
-                    // Serialize the final readiness check and opening with
-                    // subscribe(), including receivers created by interface scans.
-                    publish();
+                    // The complete drain/policy attempt and opening share subscribe's lock.
+                    publish()?;
                     self.active.send_replace(DispatchState::Open);
-                    return;
                 }
+                Some(all_ready)
+            })
+            .await;
+            if opened {
+                return;
             }
             ready.await;
         }
@@ -770,11 +779,7 @@ impl Controller {
     }
 
     pub async fn enable(&mut self) {
-        if *self
-            .enabled
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
+        if retry_state(|| Some(*try_state(&self.enabled)?)).await {
             return;
         }
 
@@ -822,23 +827,23 @@ impl Controller {
         }
         self.discovery
             .gate
-            .start_with(|| {
-                self.discovery.discard_queued_datagrams();
-                *self
-                    .enabled
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            .start_with_retry(|| {
+                let mut enabled = try_state(&self.enabled)?;
+                self.discovery.try_discard_queued_datagrams()?;
+                *enabled = true;
+                Some(())
             })
             .await;
     }
 
     pub async fn disable(&mut self) {
-        // Publish the transition before awaiting, so cancellation cannot leave
-        // is_enabled true with only part of the pipeline running.
-        *self
-            .enabled
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        // Commit the disabled flag before stopping any pipeline stage. Contention
+        // must yield without starting a partially disabled lifecycle.
+        retry_state(|| {
+            *try_state(&self.enabled)? = false;
+            Some(())
+        })
+        .await;
         // Stop request intake and cancel active measurements first. Its closed
         // consumer keeps draining sends from dispatch while those loops wind down.
         self.discovery.measurement_service.stop().await;
@@ -2194,8 +2199,88 @@ mod dispatch_gate_tests {
     }
 
     #[tokio::test]
-    async fn admission_disable_waits_for_public_guards_without_parking_owned_io() {
+    async fn wide_socket_enable_waits_for_complete_drain_without_parking_io() {
         for held_kind in 0..3 {
+            for cancel in [false, true] {
+                let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+                    .await
+                    .unwrap();
+                controller.enable().await;
+                controller.disable().await;
+                let enabled = controller.enabled.clone();
+                let gate = controller.discovery.gate.clone();
+                let (ready, ready_rx) = std::sync::mpsc::channel();
+                let (release, release_rx) = std::sync::mpsc::channel();
+                let holder = if held_kind < 2 {
+                    controller.discovery.hold_discovery_boundary_fixture(
+                        held_kind == 1,
+                        ready,
+                        release_rx,
+                    )
+                } else {
+                    let flag = enabled.clone();
+                    std::thread::spawn(move || {
+                        let _guard = flag.lock().unwrap();
+                        ready.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                    })
+                };
+                ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let io = controller.io.take().unwrap();
+                let mut work = io.spawn(async move {
+                    controller.enable().await;
+                    controller
+                });
+                let heartbeat = io.spawn(async {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                });
+                let responsive = matches!(
+                    tokio::time::timeout(Duration::from_millis(150), heartbeat).await,
+                    Ok(Ok(()))
+                );
+                let pending = !work.is_finished() && !gate.is_open();
+                let not_enabled = enabled.try_lock().map(|value| !*value).unwrap_or(true);
+                let mut consumed = false;
+                let cancelled = if cancel {
+                    work.abort();
+                    match tokio::time::timeout(Duration::from_millis(150), &mut work).await {
+                        Ok(Err(error)) => {
+                            consumed = true;
+                            error.is_cancelled()
+                        }
+                        _ => false,
+                    }
+                } else {
+                    true
+                };
+                release.send(()).unwrap();
+                holder.join().unwrap();
+                if !cancel {
+                    let mut controller = tokio::time::timeout(Duration::from_secs(2), work)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    controller.io = Some(io);
+                    assert!(*enabled.lock().unwrap() && gate.is_open());
+                    controller.disable().await;
+                } else {
+                    if !consumed {
+                        assert!(matches!(work.await,Err(error) if error.is_cancelled()));
+                    }
+                    assert!(!*enabled.lock().unwrap());
+                    drop(io);
+                }
+                assert!(
+                    responsive && pending && not_enabled && cancelled,
+                    "enable drain remains owned and atomic: guard={held_kind}, cancel={cancel}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_disable_waits_for_public_guards_without_parking_owned_io() {
+        for held_kind in 0..4 {
             let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
                 .await
                 .unwrap();
@@ -2203,6 +2288,7 @@ mod dispatch_gate_tests {
             let current = controller.sessions.current.clone();
             let others = controller.sessions.other_sessions.clone();
             let peers = controller.peers.clone();
+            let enabled = controller.enabled.clone();
             let (ready, ready_rx) = std::sync::mpsc::channel();
             let (release, release_rx) = std::sync::mpsc::channel();
             fn hold<T>(
@@ -2217,7 +2303,8 @@ mod dispatch_gate_tests {
             let holder = std::thread::spawn(move || match held_kind {
                 0 => hold(current, ready, release_rx),
                 1 => hold(others, ready, release_rx),
-                _ => hold(peers, ready, release_rx),
+                2 => hold(peers, ready, release_rx),
+                _ => hold(enabled, ready, release_rx),
             });
             ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             let io = controller.io.take().unwrap();

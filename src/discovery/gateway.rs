@@ -53,8 +53,30 @@ pub enum OnEvent {
 }
 
 impl PeerGateway {
-    pub(crate) fn discard_queued_datagrams(&self) {
-        self.messenger.discard_queued_datagrams();
+    #[cfg(test)]
+    pub(crate) fn hold_discovery_boundary_fixture(
+        &self,
+        hints: bool,
+        ready: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> std::thread::JoinHandle<()> {
+        let map = self.messenger.interface_sockets.clone();
+        let routes = self.messenger.measurement_routes.clone();
+        std::thread::spawn(move || {
+            if hints {
+                routes.hold_hints_fixture(ready, release);
+            } else {
+                let _guard = map.lock().unwrap();
+                ready.send(()).unwrap();
+                release
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+            }
+        })
+    }
+
+    pub(crate) fn try_discard_queued_datagrams(&self) -> Option<()> {
+        self.messenger.try_discard_queued_datagrams()
     }
 
     pub(crate) async fn stop(&self) {
