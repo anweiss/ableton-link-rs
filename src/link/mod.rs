@@ -622,6 +622,32 @@ mod tests {
     }
 
     #[test]
+    fn public_force_microbeats_preserves_nanosecond_anchors_at_max() {
+        for (bpm, microbeats, offset) in [(150.0, 2, 800), (120.0, 1, 500)] {
+            for origin in [Duration::zero(), Duration::MAX] {
+                let mut state = SessionState::new(
+                    ApiState {
+                        timeline: Timeline {
+                            tempo: Tempo::new(bpm),
+                            time_origin: origin,
+                            ..Timeline::default()
+                        },
+                        ..ApiState::default()
+                    },
+                    false,
+                );
+                let beat = Beats::from_microbeats(microbeats).floating();
+                state.force_beat_at_time(beat, Duration::MAX, 4.0);
+                assert_eq!(state.beat_at_time(Duration::MAX, 4.0), beat);
+                assert_eq!(
+                    state.timeline().time_origin,
+                    Duration::MAX - Duration::nanoseconds(offset)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn review_round_public_force_beat_handles_duration_limits() {
         for time in [Duration::MAX, Duration::MIN] {
             let mut state = SessionState::new(

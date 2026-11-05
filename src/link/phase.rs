@@ -118,31 +118,62 @@ pub fn force_beat_at_time_impl(
         .saturating_sub(closest_in_phase);
     let min_time = super::duration_nanos(Duration::MIN);
     let max_time = super::duration_nanos(Duration::MAX);
-    if !(i64::MIN as i128..=i64::MAX as i128).contains(&beat_origin)
-        || !(min_time..=max_time).contains(&time_origin)
+    let out_of_range = !(i64::MIN as i128..=i64::MAX as i128).contains(&beat_origin)
+        || !(min_time..=max_time).contains(&time_origin);
+    let adjusted = Timeline {
+        beat_origin: narrow(beat_origin),
+        time_origin: super::duration_from_nanos(time_origin),
+        ..*timeline
+    };
+    if out_of_range
+        || to_phase_encoded_microbeats(&adjusted, time, quantum) != i128::from(beat.value)
     {
         // The effective boundary is the closest quantum multiple to the stored
         // origin, and can lie just outside that origin's i64 range.
         let boundary = i128::from(beat.value) - phase_wide(beat.value.into(), quantum.value.into());
-        for boundary in [boundary, boundary + i128::from(quantum.value).abs()] {
-            let origin = narrow(boundary);
-            if closest_phase_match_wide(origin.value.into(), 0, quantum.value.into()) != boundary {
-                continue;
+        // Prefer exact nanosecond anchors, retaining the old quantized fallback.
+        for precise in [true, false] {
+            if !precise && !out_of_range {
+                break;
             }
-            let elapsed = timeline
-                .tempo
-                .micros_from_microbeats(i128::from(beat.value) - boundary);
-            let anchored_time =
-                super::duration_nanos(time).saturating_sub(elapsed.saturating_mul(1_000));
-            if (min_time..=max_time).contains(&anchored_time) {
-                timeline.beat_origin = origin;
-                timeline.time_origin = super::duration_from_nanos(anchored_time);
-                return;
+            for boundary in [boundary, boundary + i128::from(quantum.value).abs()] {
+                let origin = narrow(boundary);
+                if closest_phase_match_wide(origin.value.into(), 0, quantum.value.into())
+                    != boundary
+                {
+                    continue;
+                }
+                let offset = i128::from(beat.value) - boundary;
+                let elapsed = if precise {
+                    let period = timeline.tempo.period_micros();
+                    offset
+                        .saturating_mul(period / 1_000)
+                        .saturating_add(super::round_ratio(offset * (period % 1_000), 1_000))
+                } else {
+                    timeline
+                        .tempo
+                        .micros_from_microbeats(offset)
+                        .saturating_mul(1_000)
+                };
+                let anchored_time = super::duration_nanos(time).saturating_sub(elapsed);
+                if (min_time..=max_time).contains(&anchored_time) {
+                    let anchored = Timeline {
+                        beat_origin: origin,
+                        time_origin: super::duration_from_nanos(anchored_time),
+                        ..*timeline
+                    };
+                    if !precise
+                        || to_phase_encoded_microbeats(&anchored, time, quantum)
+                            == i128::from(beat.value)
+                    {
+                        *timeline = anchored;
+                        return;
+                    }
+                }
             }
         }
     }
-    timeline.beat_origin = narrow(beat_origin);
-    timeline.time_origin = super::duration_from_nanos(time_origin);
+    *timeline = adjusted;
 }
 
 /// Shift client timeline by the given beat offset
@@ -172,6 +203,34 @@ fn shifted_time_origin_nanos(timeline: Timeline, shift: i128) -> i128 {
 mod tests {
     use super::*;
     use crate::link::tempo::Tempo;
+
+    #[test]
+    fn force_microbeats_preserves_nanosecond_anchors_at_duration_limits() {
+        for (bpm, microbeats) in [(120.0, 1), (150.0, 2), (-120.0, -1), (-150.0, -2)] {
+            for time in [
+                Duration::MAX,
+                Duration::MIN,
+                Duration::MAX - Duration::nanoseconds(1),
+            ] {
+                for origin in [Duration::zero(), time] {
+                    for quantum in [Beats::new(4.0), Beats::new(-4.0), Beats::default()] {
+                        let mut timeline = Timeline {
+                            tempo: Tempo::new(bpm),
+                            beat_origin: Beats::default(),
+                            time_origin: origin,
+                        };
+                        let beat = Beats::from_microbeats(microbeats);
+                        force_beat_at_time_impl(&mut timeline, beat, time, quantum);
+                        assert_eq!(
+                            to_phase_encoded_beats(&timeline, time, quantum),
+                            beat,
+                            "bpm={bpm}, time={time}, origin={origin}, quantum={quantum:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn review_round_force_beat_keeps_effective_quantum_boundaries() {
