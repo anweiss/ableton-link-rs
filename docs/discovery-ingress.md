@@ -319,3 +319,12 @@ metadata change, not a wire-format change. Same-adapter alias selection uses
 verified subnet masks and link-local scope only after the ingress index is fixed.
 Local-delivery identity is refreshed on subsequent scans, including for leases
 captured before an enumeration failure recovered. This does not close #154.
+
+Queued announcements own per-identity supersession tokens independently of active
+route hints. Newer received updates, TTL-zero withdrawals and BYEBYE invalidate
+older pending work; removing or expiring a hint cannot erase that cancellation.
+The weak token index allocates only for admitted handoff work, never for dropped
+traffic. Its live size is bounded by the64 queued items plus one delivery item
+per reader, and dead keys are reclaimed on the next observation. It retains no
+unbounded tombstones or extra route leases. ALIVE handoff admission precedes its
+response send, so response backpressure cannot postpone supersession tracking.
