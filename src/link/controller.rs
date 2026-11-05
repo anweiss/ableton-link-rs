@@ -393,7 +393,15 @@ pub(crate) fn dispatch_audio_endpoint_change(
     }
 }
 
+#[cfg(test)]
+type PublicationPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 pub struct Controller {
+    #[cfg(test)]
+    publication_pause: Arc<Mutex<Option<PublicationPause>>>,
     // Retains cancellation handles; Controller::drop also joins the IO runtime.
     dispatch: DispatchTasks,
     io: Option<crate::platform::io_context::IoContext>,
@@ -696,59 +704,11 @@ impl Controller {
                                     peer_session,
                                 );
 
-                            let peer_session_id = if let Ok(ps) = peer_state_loop.try_lock() {
-                                ps.session_id()
-                            } else {
-                                continue;
-                            };
-
-                            let current_timestamp = if let Ok(s_state) = s_state_loop.try_lock() {
-                                s_state.start_stop_state.timestamp
-                            } else {
-                                continue;
-                            };
-
-                            if *peer_session == peer_session_id
-                                && peer_start_stop_state.timestamp > current_timestamp
-                            {
-                                if let Ok(mut s_state) = s_state_loop.try_lock() {
-                                    s_state.start_stop_state = *peer_start_stop_state;
-                                } else {
-                                    continue;
-                                }
-
-                                update_discovery(
-                                    s_state_loop.clone(),
-                                    peer_state_loop.clone(),
-                                    discovery_loop.clone(),
-                                )
-                                .await;
-
-                                let sync_enabled =
-                                    if let Ok(enabled) = s_stop_sync_enabled_loop.try_lock() {
-                                        *enabled
-                                    } else {
-                                        continue;
-                                    };
-
-                                if sync_enabled {
-                                    let (timeline, ghost_x_form) =
-                                        if let Ok(s_state) = s_state_loop.try_lock() {
-                                            (s_state.timeline, s_state.ghost_x_form)
-                                        } else {
-                                            continue;
-                                        };
-
-                                    if let Ok(mut c_state) = c_state_loop.try_lock() {
-                                        c_state.start_stop_state =
-                                            map_start_stop_state_from_session_to_client(
-                                                *peer_start_stop_state,
-                                                timeline,
-                                                ghost_x_form,
-                                            );
-                                    }
-                                }
-                            }
+                            apply_received_start_stop(
+                                *peer_session, *peer_start_stop_state, &sessions_loop,
+                                &peer_state_loop, &s_state_loop, &c_state_loop,
+                                &s_stop_sync_enabled_loop, &discovery_loop, clock, &tempo_cb_loop,
+                            ).await;
                         }
                         PeerStateChange::PeerLeft => {
                             let (s_id, old_count, count) = refresh_peer_count(&peer_state_loop, &p_loop, &s_peer_counter_loop).await;
@@ -786,6 +746,8 @@ impl Controller {
         }));
 
         Ok(Self {
+            #[cfg(test)]
+            publication_pause: Arc::new(Mutex::new(None)),
             dispatch,
             io: None,
             callbacks_closed,
@@ -1231,7 +1193,7 @@ impl SessionCommit<'_> {
             let timeline = clamp_tempo(timeline);
             let mapping = self.session.ghost_x_form;
             let target = update_session_timeline_from_client(
-                self.session.timeline,
+                self.current.timeline,
                 timeline,
                 incoming.timeline_timestamp,
                 mapping,
@@ -1271,6 +1233,45 @@ impl SessionCommit<'_> {
                     self.session.ghost_x_form,
                 );
             }
+        }
+        self.publish_discovery();
+        ClientCommit::Complete(changed)
+    }
+
+    fn received_start_stop(
+        &mut self,
+        source: SessionId,
+        incoming: StartStopState,
+        clock: Clock,
+    ) -> ClientCommit {
+        if source != self.current.session_id {
+            return ClientCommit::Complete(None);
+        }
+        if !self.published.matches(self.current)
+            || self.peer.session_id() != source
+            || self.current.measurement.x_form != self.session.ghost_x_form
+        {
+            return ClientCommit::WaitingForPublication;
+        }
+        if incoming.timestamp <= self.session.start_stop_state.timestamp {
+            return ClientCommit::Complete(None);
+        }
+        self.session.start_stop_state = incoming;
+        let changed = update_timing_guarded(
+            self.session,
+            self.client,
+            self.current.timeline,
+            self.current.measurement.x_form,
+            clock,
+            self.sync_enabled,
+            source,
+        );
+        if self.sync_enabled {
+            self.client.start_stop_state = map_start_stop_state_from_session_to_client(
+                incoming,
+                self.session.timeline,
+                self.session.ghost_x_form,
+            );
         }
         self.publish_discovery();
         ClientCommit::Complete(changed)
@@ -1332,6 +1333,47 @@ async fn refresh_current_session_timing(
     .await;
     if let Some(tempo) = changed {
         dispatch_current_tempo(session_state, tempo_callback, tempo);
+    }
+}
+
+async fn apply_received_start_stop(
+    source: SessionId,
+    incoming: StartStopState,
+    sessions: &Sessions,
+    peer: &Arc<Mutex<PeerState>>,
+    session: &Arc<Mutex<SessionState>>,
+    client: &Arc<Mutex<ClientState>>,
+    sync: &Arc<Mutex<bool>>,
+    discovery: &Arc<PeerGateway>,
+    clock: Clock,
+    callback: &Arc<Mutex<Option<TempoCallback>>>,
+) {
+    loop {
+        let result = retry_state(|| {
+            try_session_commit(
+                sessions,
+                &sessions.peers,
+                peer,
+                session,
+                client,
+                &discovery.session_peer_counter,
+                sync,
+                discovery,
+                |state| state.received_start_stop(source, incoming, clock),
+            )
+        })
+        .await;
+        match result {
+            ClientCommit::WaitingForPublication => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await
+            }
+            ClientCommit::Complete(changed) => {
+                if let Some(tempo) = changed {
+                    dispatch_current_tempo(session, callback, tempo);
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -1431,50 +1473,31 @@ async fn reset_state_if_peerless(
     }
 }
 
-pub async fn update_discovery(
-    session_state: Arc<Mutex<SessionState>>,
-    peer_state: Arc<Mutex<PeerState>>,
-    discovery: Arc<PeerGateway>,
-) {
-    update_discovery_now(session_state, peer_state, discovery);
+/// Refresh discovery through its controller's complete publication boundary.
+/// Independent state Arcs cannot establish session/clock snapshot authority.
+pub async fn update_discovery(controller: &Controller) {
+    #[cfg(test)]
+    pause_publication(controller).await;
+    refresh_current_session_timing(
+        &controller.sessions,
+        &controller.peer_state,
+        &controller.session_state,
+        &controller.client_state,
+        &controller.start_stop_sync_enabled,
+        &controller.discovery,
+        controller.clock,
+        &controller.managed_tempo_callback,
+    )
+    .await;
 }
 
-fn update_discovery_now(
-    session_state: Arc<Mutex<SessionState>>,
-    peer_state: Arc<Mutex<PeerState>>,
-    discovery: Arc<PeerGateway>,
-) {
-    let (timeline, start_stop_state, ghost_xform) =
-        if let Ok(session_state_guard) = session_state.try_lock() {
-            (
-                session_state_guard.timeline,
-                session_state_guard.start_stop_state,
-                session_state_guard.ghost_x_form,
-            )
-        } else {
-            return; // Skip update if we can't get the lock
-        };
-
-    let (node_id, session_id, _measurement_endpoint) =
-        if let Ok(peer_state_guard) = peer_state.try_lock() {
-            (
-                peer_state_guard.node_state.node_id,
-                peer_state_guard.session_id(),
-                peer_state_guard.measurement_endpoint,
-            )
-        } else {
-            return; // Skip update if we can't get the lock
-        };
-
-    discovery.update_node_state_now(
-        NodeState {
-            node_id,
-            session_id,
-            timeline,
-            start_stop_state,
-        },
-        ghost_xform,
-    );
+#[cfg(test)]
+async fn pause_publication(controller: &Controller) {
+    let pause = controller.publication_pause.lock().unwrap().take();
+    if let Some((ready, resume)) = pause {
+        ready.send(()).unwrap();
+        resume.await.unwrap();
+    }
 }
 
 pub fn reset_session_start_stop_state(session_state: Arc<Mutex<SessionState>>) {
@@ -1676,6 +1699,390 @@ pub struct SessionPeerCounter {
 
 #[cfg(test)]
 mod dispatch_gate_tests {
+    #[tokio::test]
+    async fn admission_received_start_stop_waits_coherently_and_cancels_without_parking_io() {
+        for hold_form in [false, true] {
+            for cancel in [false, true] {
+                let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+                    .await
+                    .unwrap();
+                *controller.start_stop_sync_enabled.lock().unwrap() = true;
+                let (ack, mut acknowledged) = tokio::sync::mpsc::channel(2);
+                *controller.audio_endpoint_callback.lock().unwrap() =
+                    Some(Arc::new(Mutex::new(Box::new(move |_, _| {
+                        ack.try_send(()).unwrap();
+                    }))));
+                controller.enable().await;
+                let local = controller
+                    .discovery
+                    .socket_probes()
+                    .into_iter()
+                    .filter_map(|socket| socket.upgrade())
+                    .find_map(|socket| match socket.local_addr().unwrap() {
+                        std::net::SocketAddr::V4(addr) if !addr.ip().is_unspecified() => {
+                            Some(*addr.ip())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let current = controller.sessions.current.lock().unwrap().clone();
+                let node = NodeId::from_array([97; 8]);
+                let incoming = StartStopState {
+                    is_playing: true,
+                    beats: Beats::new(4.0),
+                    timestamp: chrono::Duration::seconds(1),
+                };
+                let packet = |second: bool| {
+                    let peer = PeerState {
+                        node_state: NodeState {
+                            node_id: node,
+                            session_id: current.session_id,
+                            timeline: current.timeline,
+                            start_stop_state: if second {
+                                incoming
+                            } else {
+                                StartStopState::default()
+                            },
+                        },
+                        audio_endpoint: second.then(|| "127.0.0.1:12347".parse().unwrap()),
+                        ..Default::default()
+                    };
+                    crate::discovery::messages::encode_message(
+                        node,
+                        30,
+                        crate::discovery::messages::RESPONSE,
+                        &crate::link::payload::Payload::from(peer),
+                        0,
+                    )
+                    .unwrap()
+                };
+                controller
+                    .discovery
+                    .receive_peer_state_fixture(local, &packet(false))
+                    .await;
+                tokio::time::timeout(TEST_TIMEOUT, acknowledged.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let before = *controller.session_state.lock().unwrap();
+                let before_client = *controller.client_state.lock().unwrap();
+                let responder = &controller.discovery.measurement_service.ping_responder;
+                let id = responder.session_id.clone();
+                let form = responder.ghost_x_form.clone();
+                let (ready, ready_rx) = std::sync::mpsc::channel();
+                let (release, release_rx) = std::sync::mpsc::channel();
+                fn hold<T>(
+                    state: Arc<Mutex<T>>,
+                    ready: std::sync::mpsc::Sender<()>,
+                    release: std::sync::mpsc::Receiver<()>,
+                ) {
+                    let _guard = state.lock().unwrap();
+                    ready.send(()).unwrap();
+                    release.recv_timeout(TEST_TIMEOUT).unwrap();
+                }
+                let holder = std::thread::spawn(move || {
+                    if hold_form {
+                        hold(form, ready, release_rx)
+                    } else {
+                        hold(id, ready, release_rx)
+                    }
+                });
+                ready_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+                controller
+                    .discovery
+                    .receive_peer_state_fixture(local, &packet(true))
+                    .await;
+                tokio::time::timeout(TEST_TIMEOUT, async {
+                    loop {
+                        if controller.peers.lock().unwrap().iter().any(|peer| {
+                            peer.peer_state.ident() == node
+                                && peer.peer_state.start_stop_state() == incoming
+                        }) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let heartbeat = controller.io.as_ref().unwrap().spawn(async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                });
+                let responsive = matches!(
+                    tokio::time::timeout(Duration::from_millis(100), heartbeat).await,
+                    Ok(Ok(()))
+                );
+                let unchanged = *controller.session_state.lock().unwrap() == before
+                    && *controller.client_state.lock().unwrap() == before_client;
+                let stopped = !cancel
+                    || tokio::time::timeout(
+                        Duration::from_millis(100),
+                        controller.dispatch.gate.stop(),
+                    )
+                    .await
+                    .is_ok();
+                release.send(()).unwrap();
+                holder.join().unwrap();
+                if cancel {
+                    tokio::time::timeout(TEST_TIMEOUT, controller.dispatch.gate.stop())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        *controller.session_state.lock().unwrap(),
+                        before,
+                        "cancelled received state must not publish after guard release"
+                    );
+                    assert!(acknowledged.try_recv().is_err());
+                } else {
+                    tokio::time::timeout(TEST_TIMEOUT, acknowledged.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        controller.session_state.lock().unwrap().start_stop_state,
+                        incoming
+                    );
+                    assert_eq!(
+                        controller.client_state.lock().unwrap().start_stop_state,
+                        map_start_stop_state_from_session_to_client(
+                            incoming,
+                            current.timeline,
+                            current.measurement.x_form
+                        )
+                    );
+                    assert_eq!(*responder.session_id.lock().unwrap(), current.session_id);
+                    assert_eq!(
+                        *responder.ghost_x_form.lock().unwrap(),
+                        current.measurement.x_form
+                    );
+                }
+                assert!(responsive && unchanged && stopped, "received start/stop must wait without parking, partial mutation or uncancellable work: form={hold_form}, cancel={cancel}");
+                controller.disable().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_public_discovery_refresh_cannot_overwrite_intervening_join() {
+        let controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+            .await
+            .unwrap();
+        let before = *controller.session_state.lock().unwrap();
+        let (ready, mut ready_rx) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        *controller.publication_pause.lock().unwrap() = Some((ready, resume_rx));
+        let mut refresh = Box::pin(update_discovery(&controller));
+        assert!(refresh
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        ready_rx.try_recv().unwrap();
+        let remote = Session::new(
+            SessionId(NodeId::from_array([95; 8])),
+            Timeline {
+                tempo: tempo::Tempo::new(138.0),
+                ..before.timeline
+            },
+            SessionMeasurement {
+                x_form: GhostXForm {
+                    slope: 1.0,
+                    intercept: before.ghost_x_form.intercept + chrono::Duration::seconds(60),
+                },
+                timestamp: controller.clock.micros(),
+            },
+        );
+        controller
+            .sessions
+            .other_sessions
+            .lock()
+            .unwrap()
+            .push(remote.clone());
+        controller.peers.lock().unwrap().push(ControllerPeer {
+            peer_state: PeerState {
+                node_state: NodeState {
+                    node_id: remote.session_id.0,
+                    session_id: remote.session_id,
+                    timeline: remote.timeline,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        });
+        let (joins, mut queued) = tokio::sync::mpsc::channel(1);
+        let _owner = crate::link::sessions::handle_successful_measurement(
+            remote.key(),
+            remote.measurement.x_form,
+            controller.sessions.other_sessions.clone(),
+            controller.sessions.current.clone(),
+            controller.clock,
+            joins,
+            controller.peers.clone(),
+            controller.sessions.tx_measure_peer_state.clone(),
+        )
+        .await;
+        join_session(
+            queued.recv().await.unwrap(),
+            controller.peer_state.clone(),
+            controller.session_state.clone(),
+            controller.client_state.clone(),
+            controller.clock,
+            controller.start_stop_sync_enabled.clone(),
+            controller.discovery.clone(),
+            controller.peers.clone(),
+            controller.session_peer_counter.clone(),
+            controller.sessions.clone(),
+            controller.tempo_callback.clone(),
+        )
+        .await;
+        resume.send(()).unwrap();
+        refresh.await;
+        let state = *controller.session_state.lock().unwrap();
+        let peer = controller.peer_state.lock().unwrap().clone();
+        let responder = &controller.discovery.measurement_service.ping_responder;
+        assert_eq!(state.timeline, remote.timeline);
+        assert_eq!(state.ghost_x_form, remote.measurement.x_form);
+        assert_eq!(peer.session_id(), remote.session_id);
+        assert_eq!(
+            peer.timeline(),
+            state.timeline,
+            "stale A timing must not overwrite B gateway publication"
+        );
+        assert_eq!(*responder.session_id.lock().unwrap(), remote.session_id);
+        assert_eq!(
+            *responder.ghost_x_form.lock().unwrap(),
+            state.ghost_x_form,
+            "B identity must not be paired with A's mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_client_edit_uses_received_timeline_ahead_of_publication() {
+        for changed_tempo in [false, true] {
+            let mut controller = Controller::new(tempo::Tempo::new(120.0), Clock::new())
+                .await
+                .unwrap();
+            let (ack, mut acknowledged) = tokio::sync::mpsc::channel(1);
+            *controller.audio_endpoint_callback.lock().unwrap() =
+                Some(Arc::new(Mutex::new(Box::new(move |_, _| {
+                    ack.try_send(()).unwrap();
+                }))));
+            controller.enable().await;
+            let original = controller.sessions.current.lock().unwrap().clone();
+            let published = *controller.session_state.lock().unwrap();
+            let client = *controller.client_state.lock().unwrap();
+            let accepted = Timeline {
+                beat_origin: Beats::new(100.0),
+                time_origin: original.timeline.from_beats(Beats::new(100.0)),
+                ..original.timeline
+            };
+            let local = controller
+                .discovery
+                .socket_probes()
+                .into_iter()
+                .filter_map(|socket| socket.upgrade())
+                .find_map(|socket| match socket.local_addr().unwrap() {
+                    std::net::SocketAddr::V4(addr) if !addr.ip().is_unspecified() => {
+                        Some(*addr.ip())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let state = controller.session_state.clone();
+            let (held, held_rx) = std::sync::mpsc::channel();
+            let (release_state, state_release) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let _guard = state.lock().unwrap();
+                held.send(()).unwrap();
+                state_release.recv_timeout(TEST_TIMEOUT).unwrap();
+            });
+            held_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+            let node = NodeId::from_array([96; 8]);
+            let peer = PeerState {
+                node_state: NodeState {
+                    node_id: node,
+                    session_id: original.session_id,
+                    timeline: accepted,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let bytes = crate::discovery::messages::encode_message(
+                node,
+                30,
+                crate::discovery::messages::RESPONSE,
+                &crate::link::payload::Payload::from(peer),
+                0,
+            )
+            .unwrap();
+            controller
+                .discovery
+                .receive_peer_state_fixture(local, &bytes)
+                .await;
+            tokio::time::timeout(TEST_TIMEOUT, async {
+                loop {
+                    if controller.sessions.current.lock().unwrap().timeline == accepted {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // Hold the executor only as a test scheduling barrier: publication is
+            // already awaiting the public state guard, and the app edit wins next.
+            let (paused, paused_rx) = std::sync::mpsc::channel();
+            let (resume, resume_rx) = std::sync::mpsc::channel();
+            let barrier = controller.io.as_ref().unwrap().spawn(async move {
+                paused.send(()).unwrap();
+                resume_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+            });
+            paused_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+            release_state.send(()).unwrap();
+            holder.join().unwrap();
+            assert_eq!(*controller.session_state.lock().unwrap(), published);
+            assert_eq!(*controller.client_state.lock().unwrap(), client);
+            let edit = Timeline {
+                tempo: if changed_tempo {
+                    tempo::Tempo::new(145.0)
+                } else {
+                    published.timeline.tempo
+                },
+                beat_origin: Beats::default(),
+                time_origin: published
+                    .ghost_x_form
+                    .ghost_to_host(published.timeline.from_beats(Beats::default())),
+            };
+            let at = controller.clock.micros();
+            controller
+                .set_state(IncomingClientState {
+                    timeline: Some(edit),
+                    start_stop_state: None,
+                    timeline_timestamp: at,
+                })
+                .await;
+            let actual = controller.sessions.current.lock().unwrap().timeline;
+            resume.send(()).unwrap();
+            barrier.await.unwrap();
+            tokio::time::timeout(TEST_TIMEOUT, acknowledged.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let expected =
+                update_session_timeline_from_client(accepted, edit, at, published.ghost_x_form);
+            assert_eq!(
+                actual, expected,
+                "client edit rolled back the already accepted wire timeline"
+            );
+            assert_eq!(controller.session_state.lock().unwrap().timeline, expected);
+            if changed_tempo {
+                assert!(expected.beat_origin > accepted.beat_origin);
+            } else {
+                assert_eq!(expected, accepted);
+            }
+            controller.disable().await;
+        }
+    }
+
     #[tokio::test]
     async fn admission_disable_waits_for_public_guards_without_parking_owned_io() {
         for held_kind in 0..3 {
