@@ -475,3 +475,22 @@ Managed discovery forwarding and measurement publication use the same cooperativ
 interface-lease checks; timeout lookup, pruning and shutdown also release guards
 before waiting. Ignoring an `Option<RemeasurementTask>` returned by a public result
 handler drops the owner and aborts that pending retry immediately.
+
+The receive path acquires the interface map, peer/enabled policy, observation
+revision index and route cache before its nonblocking receive syscall. Receipt
+sampling, observation and bounded admission remain one synchronous region; a
+contended guard cannot consume and silently drop a withdrawal. Final forwarding
+acquires its route-cache guard before checking the original receive deadline.
+Registered sends likewise acquire their map cooperatively, then check the exact
+registration and perform the syscall without an intervening await. Lease and
+epoch cancellation remain active while these attempts wait.
+
+Owned startup snapshots, scanning/reconciliation, route pruning/resolution and
+broadcast snapshots also yield on contention. Reconciliation revalidates topology
+after acquiring the map; membership changes, queue draining and registration
+publication stay serialized with receive and send. Enable acquires every final
+drain/policy guard before clearing hints and opening its gate; asynchronous
+lifecycle checks never block on the enabled flag. Synchronous setup helpers remain
+synchronous. The owned-runtime regression overlaps raw withdrawals, encoded PING
+traffic, scanning/reconciliation and broadcasting under five contended guards,
+and checks original-deadline expiry, registered-source delivery and cancellation.
