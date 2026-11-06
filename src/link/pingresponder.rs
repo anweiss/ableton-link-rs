@@ -253,11 +253,13 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
     let min_message_size = PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE;
 
     if data.len() < min_message_size {
-        return Err(encoding::DecodeError::UnexpectedEnd.into());
+        return Err(crate::link::error::Error::Protocol("invalid message size"));
     }
 
     if !data.starts_with(&PROTOCOL_HEADER) {
-        return Err(encoding::DecodeError::UnexpectedEnd.into());
+        return Err(crate::link::error::Error::Protocol(
+            "invalid protocol header",
+        ));
     }
 
     let (header, consumed) = encoding::decode_from_slice::<MessageHeader>(
@@ -268,6 +270,26 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_message_header_classifies_rejections() {
+        use super::*;
+        use crate::link::error::Error;
+
+        assert!(matches!(
+            parse_message_header(&[]),
+            Err(Error::Protocol("invalid message size"))
+        ));
+        let payload = Payload::default();
+        let mut message = encode_message(PING, &payload).unwrap();
+        message[0] ^= 0xff;
+        assert!(matches!(
+            parse_message_header(&message),
+            Err(Error::Protocol("invalid protocol header"))
+        ));
+        message[0] ^= 0xff;
+        assert_eq!(parse_message_header(&message).unwrap().0.message_type, PING);
+    }
+
     #[tokio::test]
     async fn wide_boundary_shared_reader_survives_extreme_pong_and_ghost_time() {
         use crate::{

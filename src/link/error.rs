@@ -35,6 +35,9 @@ pub enum Error {
     Encoding(#[cfg_attr(feature = "std", from)] encoding::EncodeError),
     #[cfg_attr(feature = "std", error("decoding error: {0}"))]
     Decoding(#[cfg_attr(feature = "std", from)] encoding::DecodeError),
+    /// A value violates the Link wire protocol.
+    #[cfg_attr(feature = "std", error("protocol error: {0}"))]
+    Protocol(&'static str),
 }
 
 #[cfg(not(feature = "std"))]
@@ -43,6 +46,7 @@ impl core::fmt::Display for Error {
         match self {
             Error::Encoding(e) => write!(f, "encoding error: {}", e),
             Error::Decoding(e) => write!(f, "decoding error: {}", e),
+            Error::Protocol(e) => write!(f, "protocol error: {}", e),
         }
     }
 }

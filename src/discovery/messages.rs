@@ -135,11 +135,13 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
     let min_message_size = PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE;
 
     if data.len() < min_message_size {
-        return Err(encoding::DecodeError::UnexpectedEnd.into());
+        return Err(crate::link::error::Error::Protocol("invalid message size"));
     }
 
     if !data.starts_with(&PROTOCOL_HEADER) {
-        return Err(encoding::DecodeError::UnexpectedEnd.into());
+        return Err(crate::link::error::Error::Protocol(
+            "invalid protocol header",
+        ));
     }
 
     let (header, consumed) = encoding::decode_from_slice::<MessageHeader>(
@@ -267,7 +269,10 @@ mod tests {
     #[test]
     fn parse_message_header_too_short() {
         let data = [0u8; 4]; // Way too short
-        assert!(parse_message_header(&data).is_err());
+        assert!(matches!(
+            parse_message_header(&data),
+            Err(crate::link::error::Error::Protocol("invalid message size"))
+        ));
     }
 
     #[test]
@@ -275,7 +280,12 @@ mod tests {
         // Create data of correct length but wrong protocol header
         let mut data = vec![0u8; PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE];
         data[0] = 0xFF; // Wrong protocol
-        assert!(parse_message_header(&data).is_err());
+        assert!(matches!(
+            parse_message_header(&data),
+            Err(crate::link::error::Error::Protocol(
+                "invalid protocol header"
+            ))
+        ));
     }
 
     #[test]
