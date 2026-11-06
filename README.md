@@ -148,6 +148,18 @@ same-ID sighting rearms measurement with a fresh incarnation rather than strandi
 
 ## Source migration and managed lifecycle
 
+### Protocol-error classification
+
+`link::error::Error` adds `Protocol(&'static str)`; downstream exhaustive matches
+must handle it. Discovery and PING/PONG header parsers distinguish an invalid
+message size from an invalid protocol header. Payload decoding distinguishes a
+declared body extending past the available bytes (`truncated payload entry`) from
+a fully present known entry with the wrong declared size (`payload entry size
+mismatch`). These failures no longer masquerade as
+`Decoding(DecodeError::UnexpectedEnd)`. Primitive decoders still use
+`DecodeError::UnexpectedEnd` for missing bytes. Packet acceptance, unknown-entry
+skipping and explicit unsupported-IPv6-entry handling are unchanged.
+
 ### Breaking managed-event and measurement identity changes
 
 - `PeerStateMessageType` literals add `expires_at` and `observation`. Standalone

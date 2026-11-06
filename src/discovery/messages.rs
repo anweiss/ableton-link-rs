@@ -274,8 +274,10 @@ mod tests {
     #[test]
     fn parse_message_header_too_short() {
         let data = [0u8; 4]; // Way too short
-        let err = parse_message_header(&data).unwrap_err();
-        assert!(err.to_string().contains("invalid message size"), "{}", err);
+        assert!(matches!(
+            parse_message_header(&data),
+            Err(crate::link::error::Error::Protocol("invalid message size"))
+        ));
     }
 
     #[test]
@@ -283,12 +285,12 @@ mod tests {
         // Create data of correct length but wrong protocol header
         let mut data = vec![0u8; PROTOCOL_HEADER_SIZE + MESSAGE_HEADER_SIZE];
         data[0] = 0xFF; // Wrong protocol
-        let err = parse_message_header(&data).unwrap_err();
-        assert!(
-            err.to_string().contains("invalid protocol header"),
-            "{}",
-            err
-        );
+        assert!(matches!(
+            parse_message_header(&data),
+            Err(crate::link::error::Error::Protocol(
+                "invalid protocol header"
+            ))
+        ));
     }
 
     /// Whatever arrives on the Link port, parsing must return, never panic:

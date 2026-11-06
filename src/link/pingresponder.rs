@@ -274,6 +274,26 @@ pub fn parse_message_header(data: &[u8]) -> Result<(MessageHeader, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_message_header_classifies_rejections() {
+        use super::*;
+        use crate::link::error::Error;
+
+        assert!(matches!(
+            parse_message_header(&[]),
+            Err(Error::Protocol("invalid message size"))
+        ));
+        let payload = Payload::default();
+        let mut message = encode_message(PING, &payload).unwrap();
+        message[0] ^= 0xff;
+        assert!(matches!(
+            parse_message_header(&message),
+            Err(Error::Protocol("invalid protocol header"))
+        ));
+        message[0] ^= 0xff;
+        assert_eq!(parse_message_header(&message).unwrap().0.message_type, PING);
+    }
+
     #[tokio::test]
     async fn wide_boundary_shared_reader_survives_extreme_pong_and_ghost_time() {
         use crate::{

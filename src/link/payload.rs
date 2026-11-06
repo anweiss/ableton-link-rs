@@ -527,6 +527,35 @@ mod tests {
     }
 
     #[test]
+    fn decode_classifies_entry_rejections() {
+        use crate::link::error::Error;
+
+        for (size, body_len, expected) in [
+            (16u32, 8, "truncated payload entry"),
+            (16, 16, "payload entry size mismatch"),
+            (7, 7, "payload entry size mismatch"),
+        ] {
+            let mut bytes = HOST_TIME_HEADER_KEY.to_be_bytes().to_vec();
+            bytes.extend_from_slice(&size.to_be_bytes());
+            bytes.extend_from_slice(&vec![0; body_len]);
+            let mut payload = Payload::default();
+            assert!(matches!(
+                decode(&mut payload, &bytes),
+                Err(Error::Protocol(reason)) if reason == expected
+            ));
+            assert!(payload.entries.is_empty());
+        }
+        let bytes = HostTime::new(Duration::microseconds(123)).encode().unwrap();
+        let mut payload = Payload::default();
+        decode(&mut payload, &bytes).unwrap();
+        assert!(matches!(
+            payload.entries.as_slice(),
+            [PayloadEntry::HostTime(HostTime { time })]
+                if *time == Duration::microseconds(123)
+        ));
+    }
+
+    #[test]
     fn host_time_header() {
         assert_eq!(HOST_TIME_HEADER_KEY, 0x5f5f6874, "unexpected byte order");
         assert_eq!(HOST_TIME_SIZE, 8, "unexpected size");
