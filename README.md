@@ -332,6 +332,16 @@ have encountered a contended lock and returns no ticket. During result
 acknowledgment, `Busy` consumes nothing and does not validate the supplied
 ticket or prove that a result is ready. Retain the ticket and retry later,
 without spinning in the audio callback; drain or acknowledge only actual tickets.
+Retain a ticket until acknowledgment. If every caller-held copy is discarded,
+recover the current ticket with `outstanding_audio_commit_ticket()` on
+`BasicLink` or `LinkAudio` (through its shared `BasicLink` dereference).
+Low-level handlers expose `outstanding_commit_ticket()`. Lookup uses one
+try-only lock without allocation; it neither drains a proposal nor consumes a
+completed result. `None` means the slot was empty at lookup, while `Busy` means
+the lock was unavailable. Drain pending work normally and explicitly read its
+result with the recovered ticket before reusing the slot. A concurrent consumer
+can acknowledge first, making that copy stale. Lookup does not reset exhausted
+identifiers, and discarding a ticket is not cancellation or acknowledgment.
 Tickets also carry a non-reused queue identity. A ticket from another instance
 returns `UnknownTicket` without acknowledging the local result; low-level
 completion rejects it too.

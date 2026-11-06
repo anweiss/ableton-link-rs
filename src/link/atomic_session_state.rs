@@ -15,7 +15,7 @@ use crate::link::IncomingClientState;
 
 /// Try-only audio capture and a bounded proposal queue.
 /// A non-RT consumer must validate each request and acknowledge its ticket.
-/// Only audio capture, queue admission and result acknowledgment use try-only
+/// Audio capture, queue admission, ticket lookup and acknowledgment use try-only
 /// acquisition. Non-RT peek, publication, completion and app capture may block
 /// on synchronous locks; calling them from async code does not make them yield.
 ///
@@ -126,6 +126,13 @@ impl AtomicSessionState {
         ticket: AudioCommitTicket,
     ) -> Result<Option<Result<(), CommitError>>, AudioQueueError> {
         self.rt_handler.take_commit_result(ticket)
+    }
+
+    /// Recover the outstanding ticket with one try-only lock and no allocation.
+    /// Does not process a proposal or consume its result; acknowledge completion
+    /// with `take_commit_result`. Another consumer can make the copy stale.
+    pub fn outstanding_commit_ticket(&self) -> Result<Option<AudioCommitTicket>, AudioQueueError> {
+        self.rt_handler.outstanding_commit_ticket()
     }
 
     /// Mirror the owner's enable state; the non-RT consumer decides acceptance.
