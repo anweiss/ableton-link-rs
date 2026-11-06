@@ -153,6 +153,30 @@ mismatch`). These failures no longer masquerade as
 `DecodeError::UnexpectedEnd` for missing bytes. Packet acceptance, unknown-entry
 skipping and explicit unsupported-IPv6-entry handling are unchanged.
 
+### Stricter packet validation
+
+Compared with 0.3.0, supported known payload entries must declare their fixed
+encoded size, and every declared entry body must fit in the remaining datagram.
+The earlier decoder ignored the declared size for supported entries, so some
+noncanonical packets were accepted or parsed differently; short bodies could
+also panic. A truncated unknown or unsupported `aep6` entry now rejects the
+payload instead of silently stopping. Custom packet producers must use the
+fixed-size encoders and put extensions under separate unknown keys, not enlarge
+or mislabel an existing supported entry. There is no wire-version change.
+
+Fully present unknown entries still skip by their declared size, including
+zero-length entries. Bounded unsupported `aep6` entries still skip even with an
+unexpected size (with a warning); they are not decoded as IPv4 endpoints.
+Trailing fragments shorter than the eight-byte entry header are still ignored.
+Regression coverage checks all eight supported entry types, bounded extensions
+around a canonical payload, and every trailing-fragment length from zero to
+seven bytes.
+
+Stock discovery, measurement and PING receive paths discard a payload that
+fails parsing. Direct callers of `payload::decode(&mut payload, bytes)` must
+discard partial entries after an error: entries decoded before the failure
+can already have been appended. `parse_payload` returns no partial payload.
+
 ### Breaking managed-event and measurement identity changes
 
 - `PeerStateMessageType` literals add `expires_at` and `observation`. Standalone
@@ -406,6 +430,19 @@ infallible result through a separate non-RT cache read that serializes with
 publication and may block. Do not use app capture as an audio-callback fallback.
 Publication can remain pending while concurrent readers overlap continuously;
 there is no bounded freshness guarantee under that scheduling pattern.
+The controller can also advance after a refresher samples state but before its
+RT-cache publication. App and audio captures need not be equally fresh. This
+cache lag does not roll back authoritative controller state: managed commits
+check capture provenance under their commit guards, and an overtaken or
+unprovenanced edit returns `StaleClientState` rather than overwriting newer state.
+
+The public low-level `publish_client_state` methods do not compare revisions.
+Custom callers own snapshot order: an old accepted snapshot published after a
+newer publication can replace newer cache contents. Serialize sampling and
+publication across publishers, or reject superseded snapshots before calling.
+The managed BasicLink refreshers serialize their sampling/publication sequence;
+that does not give arbitrary low-level callers a monotonic-publication guarantee.
+
 The obsolete local grace period is removed: `AtomicSessionState::new` and
 `SafeRtSessionStateHandler::new` take only the initial state, capture/get methods
 take no time argument, and low-level commit/update methods take only the incoming

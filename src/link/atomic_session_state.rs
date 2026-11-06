@@ -106,6 +106,10 @@ impl AtomicSessionState {
     }
 
     /// Install accepted state; this non-RT operation may block on publication.
+    /// The caller owns snapshot ordering. There is no version arbitration here;
+    /// serialize sampling and publication across publishers, or reject superseded
+    /// snapshots before calling. An old snapshot published later can replace a
+    /// newer cached value.
     pub fn publish_client_state(&self, accepted: ClientState) {
         self.rt_handler.publish_client_state(accepted);
     }
