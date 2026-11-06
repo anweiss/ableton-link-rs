@@ -346,9 +346,13 @@ tempo changes may coalesce. The current accepted tempo is selected after
 callback serialization, and delivery is recorded after invocation.
 The lower-level `AtomicSessionState` and
 `SafeRtSessionStateHandler` follow the same proposal/completion contract:
-`process_pending_updates` peeks, `pending_update` also supplies the ticket,
-`publish_client_state` installs only a controller-accepted snapshot, and
-`complete_pending_update` records the validation result before acknowledgment.
+the legacy `process_pending_updates` helpers are removed rather than silently
+changing consuming drains into repeated peeks. Migrate to `pending_update`,
+which returns `(ticket, proposal)` without consuming it. Validate the proposal,
+use `publish_client_state` only for an accepted snapshot, and record the result
+with `complete_pending_update` before advancing a drain loop. Read the result
+with `take_commit_result` before reusing the slot. Neither peeking nor successful
+queue admission is acceptance.
 
 Accepted RT snapshots use pinned, preallocated value slots. A preempted publisher
 does not force readers to block or substitute default values for accepted state.
@@ -384,6 +388,9 @@ cancellation rather than narrowing it through public `Timeline::to_beats`.
 A sampled beat outside signed microbeat storage no longer shifts an otherwise
 representable replacement origin. An unrepresentable final time still clamps
 at Chrono's duration limits.
+If the normalized tempo is unchanged, the setter leaves the complete timeline
+unchanged instead of re-anchoring it at a rounded reference beat. Repeated
+same-tempo commits therefore do not move the grid or invalidate held captures.
 
 `controller::update_discovery` now accepts `&Controller`, replacing three independent
 state arguments. It reads and publishes through the owner's full guarded boundary;

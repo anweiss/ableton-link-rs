@@ -596,6 +596,9 @@ impl SessionState {
             ..self.state.timeline
         })
         .tempo;
+        if tempo == self.state.timeline.tempo {
+            return;
+        }
         let difference = i128::from(self.state.timeline.beat_origin.value)
             .saturating_sub(self.state.timeline.microbeats_at(at_time));
         self.state.timeline.time_origin = duration_from_nanos(
@@ -693,6 +696,56 @@ mod tests {
     use tracing::info;
 
     use super::*;
+
+    #[test]
+    fn ordering_same_normalized_tempo_preserves_exact_timeline() {
+        for (current, requested) in [
+            (121.0, 121.0),
+            (120.0, f64::NAN),
+            (999.0, f64::INFINITY),
+            (20.0, -1.0),
+        ] {
+            for nanos in [1_000, -1_000, 333, -333] {
+                let mut state = SessionState::new(
+                    ApiState {
+                        timeline: Timeline {
+                            tempo: Tempo::new(current),
+                            ..Timeline::default()
+                        },
+                        ..ApiState::default()
+                    },
+                    false,
+                );
+                let original = state.clone();
+                state.set_tempo(requested, Duration::nanoseconds(nanos));
+                assert_eq!(state, original);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordering_same_tempo_commits_preserve_grid_and_held_capture() {
+        let mut link = BasicLink::new(121.0).await.unwrap();
+        let mut held = link.capture_app_session_state();
+        let client = *link.controller.client_state.lock().unwrap();
+        let session = link.controller.session_state.lock().unwrap().timeline;
+        for offset in [1, 2, 3] {
+            let mut state = link.capture_app_session_state();
+            state.set_tempo(
+                121.0,
+                state.timeline().time_origin + Duration::microseconds(offset),
+            );
+            link.commit_app_session_state(state).await.unwrap();
+            assert_eq!(*link.controller.client_state.lock().unwrap(), client);
+            assert_eq!(
+                link.controller.session_state.lock().unwrap().timeline,
+                session,
+            );
+        }
+        held.set_is_playing(true, link.clock.micros());
+        assert_eq!(link.commit_app_session_state(held).await, Ok(()));
+        assert!(link.capture_app_session_state().is_playing());
+    }
 
     #[test]
     fn ordering_public_tempo_change_preserves_wide_reference_beat() {

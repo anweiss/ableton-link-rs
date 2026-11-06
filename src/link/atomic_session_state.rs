@@ -15,6 +15,17 @@ use crate::link::IncomingClientState;
 
 /// Non-blocking accepted-state capture and a bounded proposal queue.
 /// A non-RT consumer must validate each request and acknowledge its ticket.
+///
+/// The legacy consuming helper is removed. Use [`Self::pending_update`],
+/// publish only accepted state, complete the ticket, then read its result.
+///
+/// ```compile_fail,E0599
+/// use ableton_link_rs::link::atomic_session_state::AtomicSessionState;
+///
+/// fn legacy_drain(state: &AtomicSessionState) {
+///     while state.process_pending_updates().is_some() {}
+/// }
+/// ```
 pub struct AtomicSessionState {
     /// Accepted value snapshots and the acknowledged proposal queue.
     rt_handler: Arc<SafeRtSessionStateHandler>,
@@ -82,11 +93,9 @@ impl AtomicSessionState {
         self.rt_handler.update_rt_client_state(incoming_state)
     }
 
-    /// Peek at a request; it remains pending until explicitly completed.
-    pub fn process_pending_updates(&self) -> Option<IncomingClientState> {
-        self.rt_handler.process_pending_updates()
-    }
-
+    /// Peek at a ticketed proposal without consuming it.
+    /// Validate, publish accepted state, and complete the ticket before advancing.
+    /// Read its result with `take_commit_result` before reusing the queue slot.
     pub fn pending_update(&self) -> Option<(AudioCommitTicket, IncomingClientState)> {
         self.rt_handler.pending_update()
     }
