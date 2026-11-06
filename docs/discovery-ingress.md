@@ -57,7 +57,72 @@ Linux/macOS and Winsock's indexed `0.x.x.x` form through socket2 on Windows.
 Address-only outgoing multicast setters are ambiguous when two adapters share
 an address. The Unix setter no longer needs repository-owned unsafe code.
 
+## Measurement reply source
+
+Managed announcements advertise the concrete address **and port** of that
+interface's registered discovery socket as the measurement endpoint. Its receive
+worker also recognizes measurement PINGs and builds replies from the shared
+session/clock state. Each PONG uses that same captured registration and the
+existing checked send path; wildcard multicast reception does not serve PINGs.
+This avoids wildcard source-address selection on overlapping subnets without
+weakening exact source-endpoint matching in the measurement dispatcher. The
+wildcard socket remains available for standalone measurement/responder usage.
+Managed outbound PINGs use the captured discovery registration too. Hints are
+keyed by peer identity and advertised endpoint, expire with the announcement TTL,
+and are cleared on restart. Expired and invalidated leases are pruned on lookup,
+recording, and reconciliation. Each sweep drains a shared topology monitor once
+and compares all its leases against that snapshot and their cancellation flags.
+The cache holds at most 1,024 hints overall and 16
+endpoints per node; insertion at a limit evicts the earliest-expiring hint. Refresh
+of an existing key does not evict another hint. A missing or stale hint fails closed. Each interface
+registration owns a separate PONG dispatch table, so identical remote endpoints
+on different adapters do not overwrite each other's routes. All PING retries use
+the checked registered send path; this still does not close the atomic OS index
+incarnation gap described below.
+Measurement datagrams addressed to a unique bound port retain that registration's
+ownership. Same-host delivery can name the loopback adapter; this is accepted
+only when the registration's OS snapshot identifies both the loopback index and
+an assigned local source address. Missing snapshot evidence fails closed. This
+exception does not apply to discovery packets or foreign-adapter measurement
+traffic, and does not relax exact remote endpoint matching for PONGs.
+
+A bounded UDP regression demonstrates the problematic route choice first: a
+wildcard sender selects a different address than the advertised bound socket.
+It then decodes the real announcement, sends a PING to its measurement endpoint,
+and verifies the PONG comes from that exact address and port. It changes no host
+routes or interface configuration and does not establish atomic topology identity.
+A separate loopback test enables the responder through `Messenger`, checks the
+initial registration, removes and re-adds it through reconciliation, and verifies
+both announcements and PONG sources for the new registration as well.
+
 ## Registration, queues and lifecycle
+
+Each socket reader owns one delivery task and a 64-event discovery handoff queue.
+ALIVE/RESPONSE decoding is bounded by the datagram size. Valid received traffic
+refreshes only an already published route identity before attempting handoff;
+overflow updates cannot add new hints or block measurement datagrams. Each item
+retains its receive-time expiry, which also bounds the gateway's downstream wait.
+Expired work is discarded, fractional remaining life uses the absolute deadline,
+and older queued updates cannot overwrite a newer route refresh. The delivery task uses the lifecycle gate's receive
+permit and preparation drain. Every queued item retains its captured ingress
+lease; closure or lease invalidation interrupts its event-capacity wait. With
+capacity reserved, the worker verifies the exact socket remains registered and
+its generation is current, then records the route and publishes synchronously
+under the interface-map lock. No route is recorded merely by queueing an update.
+The worker is aborted when its owning reader exits. The bounded saturation regression
+keeps the public discovery queue full while real UDP PING/PONG round trips finish,
+then verifies stop/restart discards stale handoff events. A separate real-UDP
+wildcard-reader regression fills downstream capacity, invalidates the old ingress
+registration while its delivery waits, and verifies that only a replacement
+registration's event and route survive when capacity returns. This local lease
+proof does not establish atomic physical OS interface incarnation identity.
+
+Measurement completion uses a private capacity-one terminal channel per job.
+Success, timeout and send failure compete without blocking that private channel;
+its winning result is forwarded to the public caller using cancellation-aware
+backpressure. This distinguishes competing outcomes of one job from independent
+public measurements sharing a result channel. Both full-private-channel and
+shared-public-channel regressions cover the distinction.
 
 Each registration retains index, name, local address and its own socket/Cancel
 generation. Receiving a datagram and capturing its response registration are
@@ -70,8 +135,12 @@ registration when the original has disappeared.
 Before initial enumeration, discovery subscribes to raw topology notifications:
 Linux route-netlink link/IPv4-address groups, macOS routing-socket interface and
 address messages, and Windows IP Helper interface/address callbacks. Unix uses
-safe nix sockets and Tokio `AsyncFd`; only the Windows callback ownership needs
-local unsafe code. `netwatcher` was evaluated but rejected: its drain followed by
+safe nix sockets, with a narrowly scoped unsafe Tokio `AsyncFd::register` call.
+The registration moves an open `OwnedFd` into `AsyncFd` and never replaces or
+mutates that descriptor, so its identity remains stable until drop. Tokio
+deprecated the safe constructors without a safe replacement; its socket wrappers
+do not cover routing/netlink sockets, and `async-io` would add a second reactor.
+Windows callback registration/cancellation is a separate local unsafe exception. `netwatcher` was evaluated but rejected: its drain followed by
 snapshot-diff delivery collapses remove/add events whose final snapshot is
 identical. This monitor conservatively advances a global generation for relevant
 raw events, without comparing snapshots. Unrelated interface changes therefore
@@ -157,7 +226,9 @@ Both fixtures fail if their required overlap/churn assertions fail.
 The fixture also tries the independent NetTCPIP `New-NetIPAddress` provider
 when the native IP Helper call returns 5010. This is confined to the adapters
 it created, never the runner's transport adapter. Provider success must pass
-the existing duplicate-network assertions; a matching 5010 is still missing
+the existing duplicate-address unicast-response assertions. Managed outgoing
+multicast capture in this adapter fixture is macOS-only, so Windows provider
+success alone would still not prove duplicate-address multicast egress; a matching 5010 is still missing
 evidence, and any other failure fails setup. This tests a second provisioning
 API, not a different Windows network stack or an independent physical topology.
 These same-host tests are distinct from Linux's independent peer namespaces;
@@ -209,7 +280,10 @@ Complete repository-owned unsafe removal is also unfinished. `rustix` replaced
 Unix multicast egress and `crossterm` replaced the Windows example console calls.
 The remaining unicast/membership options still lack suitable safe APIs in the
 evaluated socket2/nix/rustix interfaces. Windows notification replacement must
-preserve raw changes even when the final address set is identical.
+preserve raw changes even when the final address set is identical. Unix topology
+registration also retains the `AsyncFd::register` exception and ownership proof
+described above; a safe replacement must preserve its reactor and descriptor
+lifetime guarantees.
 `if-watch` 3.2.2 was independently evaluated: its Windows callback sets a resync
 flag, then its public stream emits an address-set difference, so it loses that
 case just as the rejected snapshot watcher does. No local FFI was moved into a
@@ -235,3 +309,24 @@ shim dependency or replaced by an unsupported-platform success path.
 * Windows notifications and cancellation:
   <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-notifyipinterfacechange>
   and <https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-cancelmibchangenotify2>
+
+## Source migration
+
+`PeerStateMessageType` adds `expires_at: Option<tokio::time::Instant>` and
+`observation: Option<Arc<PeerObservation>>`. Standalone literals use None for both;
+managed forwarders retain both fields and the wire TTL. `PeerEvent::Observed` must
+be forwarded intact to `GatewayObserver`; managed BYEBYE is a zero-TTL peer-state
+withdrawal. Session construction uses `Session::new`; requests/results and standalone
+measurement/result helpers use the originating `SessionKey` (`session.key()`). The
+new `MeasurePeerEvent::Cancelled(key, attempted_peer)` denotes retryable registration retirement.
+See the [canonical README migration guide](../README.md#source-migration-and-managed-lifecycle)
+for every affected public signature and enum, session-aware observers, retry ownership,
+cooperative contention and clock publication. These source-breaking changes do not
+change the wire format. Same-adapter alias selection uses
+verified subnet masks and link-local scope only after the ingress index is fixed.
+Periodic local-delivery identity is collected with interface enumeration in the blocking
+scan and reused for all registrations in that reconciliation, including leases
+captured before a failed identity snapshot recovered. This does not close #154.
+
+Receive ordering, node supersession and committed departure cleanup are documented
+in the [README receive guarantees](../README.md#basic-usage).

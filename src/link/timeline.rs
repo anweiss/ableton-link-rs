@@ -39,11 +39,35 @@ impl Default for Timeline {
 
 impl Timeline {
     pub fn to_beats(&self, time: Duration) -> Beats {
-        self.beat_origin + self.tempo.micros_to_beats(time - self.time_origin)
+        Beats::from_microbeats(
+            self.microbeats_at(time)
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+        )
+    }
+
+    pub(crate) fn microbeats_at(&self, time: Duration) -> i128 {
+        self.microbeats_at_nanos(super::duration_nanos(time))
+    }
+
+    fn microbeats_at_nanos(&self, nanos: i128) -> i128 {
+        let elapsed = nanos.saturating_sub(super::duration_nanos(self.time_origin));
+        self.tempo
+            .microbeats_from_nanos(elapsed)
+            .saturating_add(i128::from(self.beat_origin.value))
     }
 
     pub fn from_beats(&self, beats: Beats) -> Duration {
-        self.time_origin + self.tempo.beats_to_micros(beats - self.beat_origin)
+        self.time_at_microbeats(beats.value.into())
+    }
+
+    pub(crate) fn time_at_microbeats(&self, beats: i128) -> Duration {
+        super::duration_from_nanos(self.nanos_at_microbeats(beats))
+    }
+
+    pub(crate) fn nanos_at_microbeats(&self, beats: i128) -> i128 {
+        let difference = beats - i128::from(self.beat_origin.value);
+        let elapsed = self.tempo.nanos_from_microbeats(difference);
+        super::duration_nanos(self.time_origin).saturating_add(elapsed)
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -60,10 +84,7 @@ impl Encode for Timeline {
     ) -> core::result::Result<(), crate::encoding::EncodeError> {
         self.tempo.encode_to(out)?;
         self.beat_origin.encode_to(out)?;
-        self.time_origin
-            .num_microseconds()
-            .unwrap()
-            .encode_to(out)?;
+        super::micros(self.time_origin).encode_to(out)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {
@@ -93,34 +114,47 @@ impl Decode for Timeline {
 pub fn clamp_tempo(timeline: Timeline) -> Timeline {
     const MIN_BPM: f64 = 20.0;
     const MAX_BPM: f64 = 999.0;
+    let bpm = timeline.tempo.bpm();
 
     Timeline {
         tempo: Tempo {
-            value: timeline.tempo.bpm().clamp(MIN_BPM, MAX_BPM),
+            value: if bpm.is_nan() {
+                120.0
+            } else {
+                bpm.clamp(MIN_BPM, MAX_BPM)
+            },
         },
         beat_origin: timeline.beat_origin,
         time_origin: timeline.time_origin,
     }
 }
 
+/// Preserve the mapped session-zero phase boundary and the current beat.
+/// Reject an unrepresentable origin rather than clamping or moving that boundary.
 pub fn update_client_timeline_from_session(
     cur_client: Timeline,
     session: Timeline,
     at_time: Duration,
     x_form: GhostXForm,
-) -> Timeline {
-    let temp_tl = Timeline {
+) -> core::result::Result<Timeline, super::error::CommitError> {
+    let host_beat_zero = x_form
+        .checked_ghost_nanos_to_host(session.nanos_at_microbeats(0))
+        .ok_or(super::error::CommitError::TimelineOriginExhausted)?;
+    let elapsed = super::duration_nanos(host_beat_zero) - super::duration_nanos(at_time);
+    let beat_origin = cur_client
+        .microbeats_at(at_time)
+        .checked_add(session.tempo.microbeats_from_nanos(elapsed))
+        .and_then(|origin| i64::try_from(origin).ok())
+        .ok_or(super::error::CommitError::TimelineOriginExhausted)?;
+    let timeline = Timeline {
         tempo: session.tempo,
-        beat_origin: cur_client.to_beats(at_time),
-        time_origin: at_time,
-    };
-
-    let host_beat_zero = x_form.ghost_to_host(session.from_beats(Beats { value: 0i64 }));
-    Timeline {
-        tempo: temp_tl.tempo,
-        beat_origin: temp_tl.to_beats(host_beat_zero),
+        beat_origin: Beats::from_microbeats(beat_origin),
         time_origin: host_beat_zero,
+    };
+    if timeline.microbeats_at(at_time) != cur_client.microbeats_at(at_time) {
+        return Err(super::error::CommitError::TimelineOriginExhausted);
     }
+    Ok(timeline)
 }
 
 pub fn update_session_timeline_from_client(
@@ -128,33 +162,42 @@ pub fn update_session_timeline_from_client(
     client: Timeline,
     at_time: Duration,
     x_form: GhostXForm,
-) -> Timeline {
-    let ghost_beat_0 = x_form.host_to_ghost(client.time_origin);
+) -> core::result::Result<Timeline, super::error::CommitError> {
+    let ghost_beat_0 = x_form.host_to_ghost_wide_nanos(client.time_origin);
 
-    let zero = Beats { value: 0i64 };
-
-    if cur_session.to_beats(ghost_beat_0) == zero && client.tempo == cur_session.tempo {
-        return cur_session;
+    if cur_session.nanos_at_microbeats(0) == ghost_beat_0 && client.tempo == cur_session.tempo {
+        return Ok(cur_session);
     }
-
-    let temp_tl = Timeline {
-        tempo: client.tempo,
-        beat_origin: zero,
-        time_origin: ghost_beat_0,
-    };
 
     let new_beat_origin = Beats {
         value: i64::max(
-            cur_session.to_beats(x_form.host_to_ghost(at_time)).value,
-            cur_session.beat_origin.value + 1_i64,
+            cur_session
+                .microbeats_at_nanos(x_form.host_to_ghost_wide_nanos(at_time))
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+            cur_session
+                .beat_origin
+                .value
+                .checked_add(1)
+                .ok_or(super::error::CommitError::TimelineOriginExhausted)?,
         ),
     };
 
-    Timeline {
+    let nanos = ghost_beat_0
+        .checked_add(
+            client
+                .tempo
+                .nanos_from_microbeats(i128::from(new_beat_origin.value)),
+        )
+        .ok_or(super::error::CommitError::TimelineOriginExhausted)?;
+    let time_origin = super::duration_from_nanos(nanos);
+    if super::duration_nanos(time_origin) != nanos {
+        return Err(super::error::CommitError::TimelineOriginExhausted);
+    }
+    Ok(Timeline {
         tempo: client.tempo,
         beat_origin: new_beat_origin,
-        time_origin: temp_tl.from_beats(new_beat_origin),
-    }
+        time_origin,
+    })
 }
 
 pub fn shift_client_timeline(client: Timeline, shift: Beats) -> Timeline {
@@ -164,7 +207,388 @@ pub fn shift_client_timeline(client: Timeline, shift: Beats) -> Timeline {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn composition_preserves_fractional_canonical_zero() {
+        let current = Timeline {
+            tempo: Tempo::new(120.0),
+            ..Timeline::default()
+        };
+        for sign in [-1, 1] {
+            let client = Timeline {
+                time_origin: Duration::nanoseconds(sign * 200),
+                ..current
+            };
+            let updated = update_session_timeline_from_client(
+                current,
+                client,
+                Duration::zero(),
+                GhostXForm {
+                    slope: 1.0,
+                    intercept: Duration::zero(),
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                updated.from_beats(Beats::from_microbeats(0)),
+                client.time_origin,
+            );
+            let probe = Duration::nanoseconds(sign * 300);
+            assert_eq!(updated.to_beats(probe), client.to_beats(probe));
+        }
+    }
+
+    #[test]
+    fn precision_conversion_examples_match_documented_rounding() {
+        let tempo = Tempo::new(120.0);
+        let timeline = Timeline {
+            tempo,
+            ..Timeline::default()
+        };
+        let beat = Beats::from_microbeats(1);
+        assert_eq!(Tempo::from(Duration::nanoseconds(500)).bpm(), 120_000_000.0);
+        assert_eq!(tempo.micros_to_beats(Duration::nanoseconds(500)), beat);
+        assert_eq!(timeline.to_beats(Duration::nanoseconds(500)), beat);
+        assert_eq!(timeline.from_beats(beat), Duration::nanoseconds(500));
+        assert_eq!(tempo.beats_to_micros(beat), Duration::microseconds(1));
+    }
+
+    #[test]
+    fn composition_rejects_received_wire_endpoints_without_a_beat_jump() {
+        let client = Timeline {
+            tempo: Tempo::new(120.0),
+            ..Timeline::default()
+        };
+        for sign in [-1, 1] {
+            let session = Timeline {
+                tempo: Tempo::new(120.0),
+                beat_origin: Beats::from_microbeats(-sign * i64::MAX),
+                time_origin: Duration::microseconds(sign * i64::MAX),
+            };
+            let mapped = update_client_timeline_from_session(
+                client,
+                session,
+                Duration::zero(),
+                GhostXForm {
+                    slope: 1.0,
+                    intercept: Duration::zero(),
+                },
+            );
+            assert_eq!(
+                mapped,
+                Err(crate::link::error::CommitError::TimelineOriginExhausted)
+            );
+        }
+    }
+
+    #[test]
+    fn composition_rejects_a_phase_changing_alternate_client_anchor() {
+        let client = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::from_microbeats(i64::MAX),
+            time_origin: Duration::zero(),
+        };
+        let session = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::from_microbeats(-i64::MAX),
+            time_origin: Duration::microseconds(i64::MAX),
+        };
+        let at_time = Duration::microseconds(1);
+        let mapped = update_client_timeline_from_session(
+            client,
+            session,
+            at_time,
+            GhostXForm {
+                slope: 1.0,
+                intercept: Duration::zero(),
+            },
+        );
+        assert_eq!(
+            mapped,
+            Err(crate::link::error::CommitError::TimelineOriginExhausted)
+        );
+        let observation_anchor = Timeline {
+            tempo: Tempo::new(120.0),
+            ..Timeline::default()
+        };
+        assert_eq!(observation_anchor.microbeats_at(Duration::zero()), 0);
+        let intended_origin = 3 * i128::from(i64::MAX);
+        assert_eq!(intended_origin.rem_euclid(2), 1);
+        assert_eq!(observation_anchor.beat_origin.value.rem_euclid(2), 0);
+        let same_phase = Timeline {
+            beat_origin: Beats::from_microbeats(1),
+            time_origin: Duration::nanoseconds(500),
+            ..observation_anchor
+        };
+        assert_eq!(same_phase.microbeats_at(Duration::zero()), 0);
+        let quantum = Beats::from_microbeats(2);
+        assert_ne!(
+            crate::link::phase::to_phase_encoded_beats(&same_phase, Duration::zero(), quantum),
+            crate::link::phase::to_phase_encoded_beats(
+                &observation_anchor,
+                Duration::zero(),
+                quantum,
+            )
+        );
+    }
+
+    #[test]
+    fn composition_rejects_a_clamped_mapped_boundary_despite_raw_continuity() {
+        let client = Timeline {
+            tempo: Tempo::new(120.0),
+            time_origin: Duration::MAX,
+            ..Timeline::default()
+        };
+        let session = Timeline {
+            time_origin: Duration::microseconds(i64::MAX),
+            ..client
+        };
+        assert_eq!(
+            update_client_timeline_from_session(
+                client,
+                session,
+                Duration::zero(),
+                GhostXForm {
+                    slope: 0.0001,
+                    intercept: Duration::zero(),
+                }
+            ),
+            Err(crate::link::error::CommitError::TimelineOriginExhausted)
+        );
+        for slope in [0.0, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                update_client_timeline_from_session(
+                    client,
+                    session,
+                    Duration::zero(),
+                    GhostXForm {
+                        slope,
+                        intercept: Duration::zero(),
+                    }
+                ),
+                Err(crate::link::error::CommitError::TimelineOriginExhausted)
+            );
+        }
+    }
+
+    #[test]
+    fn composition_rejects_an_unrepresentable_final_session_time() {
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            ..Timeline::default()
+        };
+        for time_origin in [Duration::MIN, Duration::MAX] {
+            assert_eq!(
+                update_session_timeline_from_client(
+                    timeline,
+                    Timeline {
+                        time_origin,
+                        ..timeline
+                    },
+                    Duration::zero(),
+                    GhostXForm {
+                        slope: 2.0,
+                        intercept: Duration::zero(),
+                    },
+                ),
+                Err(crate::link::error::CommitError::TimelineOriginExhausted)
+            );
+        }
+    }
+
+    #[test]
+    fn duration_boundary_wide_forward_endpoint_survives_composition() {
+        let session = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::from_microbeats(999),
+            time_origin: Duration::zero(),
+        };
+        let client = Timeline {
+            tempo: Tempo::new(1e-32),
+            time_origin: Duration::nanoseconds(-1),
+            ..Timeline::default()
+        };
+        let mapped = update_session_timeline_from_client(
+            session,
+            client,
+            Duration::zero(),
+            GhostXForm {
+                slope: f64::from_bits(1150_u64 << 52),
+                intercept: Duration::zero(),
+            },
+        )
+        .unwrap();
+        assert_eq!(mapped.beat_origin.value, 1_000);
+        assert_eq!(mapped.time_origin, Duration::nanoseconds(-1));
+    }
+
+    #[test]
+    fn duration_boundary_composition_does_not_narrow_the_client_beat() {
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            ..Timeline::default()
+        };
+        for at_time in [Duration::MIN, Duration::MAX] {
+            let mapped = update_client_timeline_from_session(
+                timeline,
+                timeline,
+                at_time,
+                GhostXForm {
+                    slope: 1.0,
+                    intercept: Duration::zero(),
+                },
+            )
+            .unwrap();
+            assert_eq!(mapped, timeline);
+        }
+    }
+
+    #[test]
+    fn duration_boundary_composition_keeps_a_representable_session_origin() {
+        for (edge, sign) in [(Duration::MIN, -1_i128), (Duration::MAX, 1)] {
+            for slope in [-2_i128, 2] {
+                let ghost_origin = crate::link::duration_nanos(edge) + sign * 100;
+                let client = Timeline {
+                    tempo: Tempo::new(120.0),
+                    time_origin: crate::link::duration_from_nanos(ghost_origin / slope),
+                    ..Timeline::default()
+                };
+                let session = Timeline {
+                    tempo: Tempo::new(120.0),
+                    beat_origin: Beats::from_microbeats(if sign > 0 { -2 } else { 0 }),
+                    ..Timeline::default()
+                };
+                let mapped = update_session_timeline_from_client(
+                    session,
+                    client,
+                    Duration::zero(),
+                    GhostXForm {
+                        slope: slope as f64,
+                        intercept: Duration::zero(),
+                    },
+                )
+                .unwrap();
+                assert_eq!(mapped.beat_origin.value, -sign as i64);
+                assert_eq!(
+                    crate::link::duration_nanos(mapped.time_origin),
+                    ghost_origin - sign * 500
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_beat_zero_is_mapped_before_chrono_clamping() {
+        for sign in [-1, 1] {
+            for slope in [-2, 2] {
+                let session = Timeline {
+                    tempo: Tempo::new(60.0),
+                    beat_origin: Beats::new(-f64::from(sign)),
+                    time_origin: if sign < 0 {
+                        Duration::MIN
+                    } else {
+                        Duration::MAX
+                    },
+                };
+                let wide = crate::link::duration_nanos(session.time_origin)
+                    + i128::from(sign) * 1_000_000_000;
+                let expected = crate::link::duration_from_nanos(crate::link::round_ratio(
+                    wide,
+                    i128::from(slope),
+                ));
+                let client = Timeline {
+                    tempo: session.tempo,
+                    time_origin: expected,
+                    ..Timeline::default()
+                };
+                let mapped = update_client_timeline_from_session(
+                    client,
+                    session,
+                    Duration::zero(),
+                    GhostXForm {
+                        slope: f64::from(slope),
+                        intercept: Duration::zero(),
+                    },
+                )
+                .unwrap();
+                assert_eq!(mapped, client);
+            }
+        }
+    }
+
+    #[test]
+    fn wide_boundary_timeline_converts_before_narrowing() {
+        let timeline = Timeline {
+            tempo: Tempo::new(20.0),
+            beat_origin: Beats::default(),
+            time_origin: Duration::microseconds(i64::MIN),
+        };
+        assert_eq!(
+            timeline.to_beats(Duration::microseconds(i64::MAX)).value,
+            6_148_914_691_236_517_205
+        );
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::from_microbeats(i64::MIN),
+            time_origin: Duration::zero(),
+        };
+        assert_eq!(
+            timeline.from_beats(Beats::from_microbeats(i64::MAX)),
+            Duration::microseconds(i64::MAX) + Duration::nanoseconds(500)
+        );
+        let timeline = Timeline {
+            time_origin: Duration::microseconds(-i64::MAX),
+            ..timeline
+        };
+        assert_eq!(
+            timeline.from_beats(Beats::from_microbeats(i64::MAX)),
+            Duration::nanoseconds(500)
+        );
+        let timeline = Timeline {
+            tempo: Tempo::new(120.0),
+            beat_origin: Beats::from_microbeats(i64::MIN),
+            time_origin: Duration::zero(),
+        };
+        assert_eq!(
+            timeline.to_beats(Duration::microseconds(i64::MAX)).value,
+            i64::MAX - 1
+        );
+        let reversed = Timeline {
+            beat_origin: Beats::from_microbeats(i64::MAX),
+            ..timeline
+        };
+        assert_eq!(
+            reversed.from_beats(Beats::from_microbeats(i64::MIN)),
+            -Duration::microseconds(i64::MAX) - Duration::nanoseconds(500)
+        );
+        assert_eq!(
+            timeline.from_beats(Beats::from_microbeats(i64::MIN + 1)),
+            Duration::nanoseconds(500)
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn timeline_encoding_saturates_both_wire_time_boundaries() {
+        for limit in [i64::MIN, i64::MAX] {
+            for delta in [-1, 0, 1] {
+                let expected = limit.saturating_add(delta);
+                let timeline = Timeline {
+                    tempo: Tempo::new(120.0),
+                    time_origin: Duration::microseconds(limit) + Duration::microseconds(delta),
+                    ..Timeline::default()
+                };
+                let bytes = crate::encoding::encode_to_vec(&timeline).unwrap();
+                assert_eq!(&bytes[bytes.len() - 8..], &expected.to_be_bytes());
+                let (decoded, consumed) = Timeline::decode_from(&bytes).unwrap();
+                assert_eq!(decoded.time_origin, Duration::microseconds(expected));
+                assert_eq!(consumed, bytes.len());
+                assert_eq!(decoded.tempo, timeline.tempo);
+                assert_eq!(decoded.beat_origin, timeline.beat_origin);
+            }
+        }
+    }
 
     #[test]
     fn session_to_client_updates_tempo() {
@@ -185,7 +609,8 @@ mod tests {
             beat_origin: b0,
             time_origin: x_form.host_to_ghost(t0),
         };
-        let new_client = update_client_timeline_from_session(cur_client, session, t0, x_form);
+        let new_client =
+            update_client_timeline_from_session(cur_client, session, t0, x_form).unwrap();
         assert_eq!(new_client.tempo, Tempo { value: 90.0 });
     }
 

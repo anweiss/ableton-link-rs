@@ -1,23 +1,39 @@
-// Real-time safe atomic session state implementation
-// Based on C++ Link's atomic and lock-free mechanisms
-
-use chrono::Duration;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::{safe_rt_session_state::SafeRtSessionStateHandler, state::ClientState};
+use super::{
+    error::CommitError,
+    safe_rt_session_state::{
+        AudioCaptureError, AudioCommitTicket, AudioQueueError, SafeRtSessionStateHandler,
+    },
+    state::ClientState,
+};
 
 #[cfg(test)]
 use super::{sessions::SessionId, state::ClientStartStopState, timeline::Timeline};
 use crate::link::IncomingClientState;
 
-/// Atomic session state that provides lock-free access for real-time threads
-/// This mirrors the C++ Link implementation's clientStateRtSafe() mechanism
+/// Try-only audio capture and a bounded proposal queue.
+/// A non-RT consumer must validate each request and acknowledge its ticket.
+/// Audio capture, queue admission, ticket lookup and acknowledgment use try-only
+/// acquisition. Non-RT peek, publication, completion and app capture may block
+/// on synchronous locks; calling them from async code does not make them yield.
+///
+/// The legacy consuming helper is removed. Use [`Self::pending_update`],
+/// publish only accepted state, complete the ticket, then read its result.
+///
+/// ```compile_fail,E0599
+/// use ableton_link_rs::link::atomic_session_state::AtomicSessionState;
+///
+/// fn legacy_drain(state: &AtomicSessionState) {
+///     while state.process_pending_updates().is_some() {}
+/// }
+/// ```
 pub struct AtomicSessionState {
-    /// Real-time session state handler for lock-free access (now using safe implementation)
+    /// Accepted value snapshots and the acknowledged proposal queue.
     rt_handler: Arc<SafeRtSessionStateHandler>,
 
-    /// Enable state for determining if we should respect remote updates
+    /// Mirrored owner enable state; acceptance belongs to the non-RT consumer.
     is_enabled: AtomicBool,
 
     /// Last known peer count for determining connection state
@@ -25,58 +41,105 @@ pub struct AtomicSessionState {
 }
 
 impl AtomicSessionState {
-    pub fn new(initial_state: ClientState, grace_period: Duration) -> Self {
+    pub fn new(initial_state: ClientState) -> Self {
         Self {
-            rt_handler: Arc::new(SafeRtSessionStateHandler::new(initial_state, grace_period)),
+            rt_handler: Arc::new(SafeRtSessionStateHandler::new(initial_state)),
             is_enabled: AtomicBool::new(false),
             peer_count: AtomicU64::new(0),
         }
     }
 
-    /// Get current session state for audio thread (real-time safe)
-    /// This method is guaranteed to be non-blocking and suitable for audio threads
-    pub fn capture_audio_session_state(&self, current_time: Duration) -> ClientState {
-        self.rt_handler.get_rt_client_state(current_time)
+    /// Capture with one reader-pin attempt, try-only locks, and no allocation.
+    /// On error, skip this capture or reuse a caller-owned accepted value.
+    /// A pending accepted publication may already have been flushed before error.
+    pub fn capture_audio_session_state(&self) -> Result<ClientState, AudioCaptureError> {
+        self.rt_handler.get_rt_client_state()
     }
 
-    /// Update session state from audio thread (real-time safe)
-    /// This method is guaranteed to be non-blocking and suitable for audio threads
+    /// Queue a proposal using try_lock, without allocating or changing capture.
     pub fn commit_audio_session_state(
         &self,
         incoming_state: IncomingClientState,
-        current_time: Duration,
-    ) {
-        let is_enabled = self.is_enabled.load(Ordering::Acquire);
+    ) -> Result<AudioCommitTicket, AudioQueueError> {
+        self.rt_handler.update_rt_client_state(incoming_state)
+    }
+
+    pub(crate) fn commit_audio_session_state_from_origin(
+        &self,
+        incoming: IncomingClientState,
+        origin: Option<super::sessions::SessionEditOrigin>,
+    ) -> Result<AudioCommitTicket, AudioQueueError> {
         self.rt_handler
-            .update_rt_client_state(incoming_state, current_time, is_enabled);
+            .update_rt_client_state_from_origin(incoming, origin)
     }
 
-    /// Get current session state for application thread (may block briefly)
-    /// This is the non-realtime version that can use more expensive operations
-    pub fn capture_app_session_state(&self, current_time: Duration) -> ClientState {
-        // For application threads, we can afford to get the most up-to-date state
-        self.rt_handler.get_rt_client_state(current_time)
+    pub(crate) fn pending_update_from_origin(
+        &self,
+    ) -> Option<(
+        AudioCommitTicket,
+        IncomingClientState,
+        Option<super::sessions::SessionEditOrigin>,
+    )> {
+        self.rt_handler.pending_update_from_origin()
     }
 
-    /// Update session state from application thread (may block briefly)
-    /// This method can use more expensive operations than the audio version
+    /// Read the accepted snapshot without applying queued proposals.
+    /// May block on accepted publication; use audio capture in callbacks.
+    pub fn capture_app_session_state(&self) -> ClientState {
+        self.rt_handler.get_app_client_state()
+    }
+
+    /// Queue an application proposal under the same explicit acknowledgment contract.
     pub fn commit_app_session_state(
         &self,
         incoming_state: IncomingClientState,
-        current_time: Duration,
-    ) {
-        let is_enabled = self.is_enabled.load(Ordering::Acquire);
-        self.rt_handler
-            .update_rt_client_state(incoming_state, current_time, is_enabled);
+    ) -> Result<AudioCommitTicket, AudioQueueError> {
+        self.rt_handler.update_rt_client_state(incoming_state)
     }
 
-    /// Process any pending updates from real-time thread
-    /// Should be called periodically from a background thread
-    pub fn process_pending_updates(&self) -> Option<IncomingClientState> {
-        self.rt_handler.process_pending_updates()
+    /// Peek at a ticketed proposal without consuming it.
+    /// Validate, publish accepted state, and complete the ticket before advancing.
+    /// Read its result with `take_commit_result` before reusing the queue slot.
+    /// This non-RT operation may block on a synchronous mutex.
+    pub fn pending_update(&self) -> Option<(AudioCommitTicket, IncomingClientState)> {
+        self.rt_handler.pending_update()
     }
 
-    /// Update enable state (affects how updates are processed)
+    /// Install accepted state; this non-RT operation may block on publication.
+    /// The caller owns snapshot ordering. There is no version arbitration here;
+    /// serialize sampling and publication across publishers, or reject superseded
+    /// snapshots before calling. An old snapshot published later can replace a
+    /// newer cached value.
+    pub fn publish_client_state(&self, accepted: ClientState) {
+        self.rt_handler.publish_client_state(accepted);
+    }
+
+    /// Record completion; this non-RT operation may block on the queue mutex.
+    pub fn complete_pending_update(
+        &self,
+        ticket: AudioCommitTicket,
+        result: Result<(), CommitError>,
+    ) -> bool {
+        self.rt_handler.complete_pending_update(ticket, result)
+    }
+
+    /// Try to acknowledge a result. `Busy` consumes nothing and does not
+    /// establish that this ticket is valid or has a result; retry later.
+    pub fn take_commit_result(
+        &self,
+        ticket: AudioCommitTicket,
+    ) -> Result<Option<Result<(), CommitError>>, AudioQueueError> {
+        self.rt_handler.take_commit_result(ticket)
+    }
+
+    /// Recover the outstanding ticket with one try-only lock and no allocation.
+    /// Does not process a proposal or consume its result; acknowledge completion
+    /// with `take_commit_result`. Another consumer can make the copy stale.
+    pub fn outstanding_commit_ticket(&self) -> Result<Option<AudioCommitTicket>, AudioQueueError> {
+        self.rt_handler.outstanding_commit_ticket()
+    }
+
+    /// Mirror the owner's enable state; the non-RT consumer decides acceptance.
     pub fn set_enabled(&self, enabled: bool) {
         self.is_enabled.store(enabled, Ordering::Release);
     }
@@ -100,17 +163,13 @@ impl AtomicSessionState {
     pub fn has_pending_updates(&self) -> bool {
         self.rt_handler.has_pending_updates()
     }
-
-    /// Get the current grace period
-    pub fn grace_period(&self) -> Duration {
-        self.rt_handler.grace_period()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::link::{beats::Beats, tempo::Tempo};
+    use chrono::Duration;
 
     fn create_test_client_state() -> ClientState {
         ClientState {
@@ -131,17 +190,16 @@ mod tests {
     #[test]
     fn test_atomic_session_state_creation() {
         let client_state = create_test_client_state();
-        let session_state = AtomicSessionState::new(client_state, Duration::milliseconds(1000));
+        let session_state = AtomicSessionState::new(client_state);
 
         assert!(!session_state.is_enabled());
         assert_eq!(session_state.peer_count(), 0);
-        assert_eq!(session_state.grace_period(), Duration::milliseconds(1000));
     }
 
     #[test]
     fn test_atomic_session_state_enable() {
         let client_state = create_test_client_state();
-        let session_state = AtomicSessionState::new(client_state, Duration::milliseconds(1000));
+        let session_state = AtomicSessionState::new(client_state);
 
         session_state.set_enabled(true);
         assert!(session_state.is_enabled());
@@ -153,7 +211,7 @@ mod tests {
     #[test]
     fn test_atomic_session_state_peer_count() {
         let client_state = create_test_client_state();
-        let session_state = AtomicSessionState::new(client_state, Duration::milliseconds(1000));
+        let session_state = AtomicSessionState::new(client_state);
 
         session_state.set_peer_count(5);
         assert_eq!(session_state.peer_count(), 5);
@@ -165,16 +223,14 @@ mod tests {
     #[test]
     fn test_atomic_session_state_capture_commit() {
         let client_state = create_test_client_state();
-        let session_state = AtomicSessionState::new(client_state, Duration::milliseconds(1000));
-
-        let current_time = Duration::milliseconds(1000);
+        let session_state = AtomicSessionState::new(client_state);
 
         // Test audio thread capture
-        let captured_audio = session_state.capture_audio_session_state(current_time);
+        let captured_audio = session_state.capture_audio_session_state().unwrap();
         assert_eq!(captured_audio.timeline.tempo.bpm(), 120.0);
 
         // Test app thread capture
-        let captured_app = session_state.capture_app_session_state(current_time);
+        let captured_app = session_state.capture_app_session_state();
         assert_eq!(captured_app.timeline.tempo.bpm(), 120.0);
 
         // Test commit from audio thread
@@ -190,7 +246,9 @@ mod tests {
             timeline_timestamp: Duration::milliseconds(2000),
         };
 
-        session_state.commit_audio_session_state(incoming_state, current_time);
+        session_state
+            .commit_audio_session_state(incoming_state)
+            .unwrap();
         assert!(session_state.has_pending_updates());
     }
 }

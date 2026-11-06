@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tracing::{debug, error};
 
 /// A discovery registration retains OS identity, not just a routable address.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Ipv4Interface {
     pub addr: Ipv4Addr,
     pub index: u32,
@@ -16,8 +16,12 @@ pub(crate) struct Ipv4Interface {
 
 pub(crate) fn scan_discovery_interfaces() -> std::io::Result<Vec<Ipv4Interface>> {
     let interfaces = network_interface::NetworkInterface::show().map_err(std::io::Error::other)?;
+    let down = down_interface_indices();
     let mut result = Vec::new();
     for interface in interfaces {
+        if down.contains(&interface.index) {
+            continue;
+        }
         for address in interface.addr {
             if let IpAddr::V4(addr) = address.ip() {
                 if is_usable_ipv4(&addr) && interface.index != 0 {
@@ -33,6 +37,40 @@ pub(crate) fn scan_discovery_interfaces() -> std::io::Result<Vec<Ipv4Interface>>
     result.sort_by_key(|interface| (interface.addr, interface.index));
     result.dedup();
     Ok(result)
+}
+
+/// Indices of adapters the OS reports as not operationally up. Upstream's
+/// scanners take only running adapters (Windows: `IfOperStatusUp`; POSIX:
+/// `IFF_RUNNING`), but `network-interface` doesn't report the status. On
+/// Windows that matters: a disconnected adapter (Bluetooth PAN, the Wi-Fi
+/// Direct virtual adapters) still lists an APIPA 169.254 address, binding it
+/// fails with WSAEADDRNOTAVAIL (10049), and every scan retried it.
+///
+/// Only adapters positively reported as down are excluded: if `if-addrs`
+/// fails, or doesn't know an index, nothing is filtered.
+fn down_interface_indices() -> std::collections::HashSet<u32> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return std::collections::HashSet::new();
+    };
+    down_indices(
+        interfaces
+            .iter()
+            .filter_map(|i| Some((i.index?, i.is_oper_up()))),
+    )
+}
+
+/// The indices with no "up" entry among `(index, up)` pairs (an adapter can
+/// list several addresses).
+fn down_indices(entries: impl IntoIterator<Item = (u32, bool)>) -> std::collections::HashSet<u32> {
+    let mut up = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    for (index, is_up) in entries {
+        seen.insert(index);
+        if is_up {
+            up.insert(index);
+        }
+    }
+    seen.difference(&up).copied().collect()
 }
 
 /// Safe Rust implementation using the network-interface crate
@@ -53,70 +91,22 @@ pub fn scan_network_interfaces_blocking() -> Vec<IpAddr> {
 
 // Safe implementation using the network-interface crate
 fn scan_interfaces_safe() -> Vec<IpAddr> {
-    use std::collections::HashMap;
-
-    let mut addresses = Vec::new();
-    let mut ipv4_interfaces: HashMap<String, IpAddr> = HashMap::new();
-
-    // Get network interfaces using the safe network-interface crate
-    match network_interface::NetworkInterface::show() {
-        Ok(interfaces) => {
-            // First pass: collect IPv4 addresses
-            for interface in &interfaces {
-                if !interface.addr.is_empty() {
-                    for addr in &interface.addr {
-                        let ip_addr = addr.ip();
-
-                        if let IpAddr::V4(ipv4) = ip_addr {
-                            if is_usable_ipv4(&ipv4) {
-                                addresses.push(ip_addr);
-                                ipv4_interfaces.insert(interface.name.clone(), ip_addr);
-                                debug!("Found IPv4 interface: {} ({})", interface.name, ip_addr);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Second pass: collect IPv6 addresses only for interfaces that have IPv4
-            for interface in &interfaces {
-                if ipv4_interfaces.contains_key(&interface.name) && !interface.addr.is_empty() {
-                    for addr in &interface.addr {
-                        let ip_addr = addr.ip();
-
-                        if let IpAddr::V6(ipv6) = ip_addr {
-                            if is_usable_ipv6(&ipv6) {
-                                addresses.push(ip_addr);
-                                debug!("Found IPv6 interface: {} ({})", interface.name, ip_addr);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    let mut addresses = match network_interface::NetworkInterface::show() {
+        Ok(interfaces) => collect_interface_addresses(&interfaces, &down_interface_indices()),
         Err(e) => {
             error!(
                 "Failed to get network interfaces using network-interface crate: {}",
                 e
             );
-
-            // Fallback to if-addrs crate for better compatibility
             match if_addrs::get_if_addrs() {
-                Ok(interfaces) => {
-                    for interface in interfaces {
-                        let addr = interface.ip();
-                        if is_usable_interface(&addr) {
-                            addresses.push(addr);
-                            debug!("Found fallback interface: {} ({})", interface.name, addr);
-                        }
-                    }
-                }
+                Ok(interfaces) => collect_fallback_addresses(&interfaces),
                 Err(e2) => {
                     error!("Both network-interface and if-addrs failed: {} / {}", e, e2);
+                    Vec::new()
                 }
             }
         }
-    }
+    };
 
     // Sort and deduplicate
     addresses.sort();
@@ -127,6 +117,54 @@ fn scan_interfaces_safe() -> Vec<IpAddr> {
         addresses.len()
     );
     addresses
+}
+
+fn collect_interface_addresses(
+    interfaces: &[network_interface::NetworkInterface],
+    down: &std::collections::HashSet<u32>,
+) -> Vec<IpAddr> {
+    let mut addresses = Vec::new();
+    let mut ipv4_interfaces = std::collections::HashSet::new();
+    for interface in interfaces.iter().filter(|i| !down.contains(&i.index)) {
+        for addr in &interface.addr {
+            if let IpAddr::V4(ipv4) = addr.ip() {
+                if is_usable_ipv4(&ipv4) {
+                    addresses.push(IpAddr::V4(ipv4));
+                    ipv4_interfaces.insert((interface.index, &interface.name));
+                    debug!("Found IPv4 interface: {} ({})", interface.name, ipv4);
+                }
+            }
+        }
+    }
+    for interface in interfaces.iter().filter(|i| !down.contains(&i.index)) {
+        if ipv4_interfaces.contains(&(interface.index, &interface.name)) {
+            for addr in &interface.addr {
+                if let IpAddr::V6(ipv6) = addr.ip() {
+                    if is_usable_ipv6(&ipv6) {
+                        addresses.push(IpAddr::V6(ipv6));
+                        debug!("Found IPv6 interface: {} ({})", interface.name, ipv6);
+                    }
+                }
+            }
+        }
+    }
+    addresses
+}
+
+fn collect_fallback_addresses(interfaces: &[if_addrs::Interface]) -> Vec<IpAddr> {
+    // Use this same snapshot for status and addresses. An adapter is excluded
+    // only if all of its entries report down; unknown indices remain usable.
+    let down = down_indices(
+        interfaces
+            .iter()
+            .filter_map(|interface| Some((interface.index?, interface.is_oper_up()))),
+    );
+    interfaces
+        .iter()
+        .filter(|interface| !interface.index.is_some_and(|index| down.contains(&index)))
+        .map(if_addrs::Interface::ip)
+        .filter(is_usable_interface)
+        .collect()
 }
 
 /// Check if an IP address represents a usable interface for Link discovery
@@ -140,12 +178,18 @@ fn is_usable_interface(addr: &IpAddr) -> bool {
 
 /// Check if an IPv4 address is usable for Link discovery
 fn is_usable_ipv4(addr: &Ipv4Addr) -> bool {
-    // Exclude loopback, broadcast, and other special addresses
+    // Exclude loopback, broadcast, and other special addresses.
+    //
+    // Link-local (169.254.0.0/16) addresses are deliberately *kept*: upstream's
+    // `platforms/posix/ScanIpIfAddrs.hpp` takes every running IPv4 address
+    // without filtering link-local ones, and they are often the only address a
+    // machine has on a wired network without a DHCP server (a laptop cabled
+    // straight to a switch, as is common on stage). Excluding them left Link
+    // unable to discover peers on such networks.
     !addr.is_loopback()
         && !addr.is_broadcast()
         && !addr.is_multicast()
         && !addr.is_unspecified()
-        && !addr.is_link_local()
         && *addr != Ipv4Addr::new(0, 0, 0, 0)
 }
 
@@ -158,6 +202,70 @@ fn is_usable_ipv6(addr: &Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn down_indices_needs_every_entry_down() {
+        // 8: down (a Bluetooth PAN with an APIPA address). 2: one address up
+        // and one down — up, as the adapter is running. 5: up.
+        let down = down_indices([(8, false), (2, true), (2, false), (5, true)]);
+        assert_eq!(down, std::collections::HashSet::from([8]));
+        // Nothing reported → nothing filtered.
+        assert!(down_indices([]).is_empty());
+    }
+
+    #[test]
+    fn public_scanner_excludes_down_adapters_in_both_address_families() {
+        use network_interface::NetworkInterface;
+        let apipa = Ipv4Addr::new(169, 254, 1, 2);
+        let ipv6: Ipv6Addr = "fe80::2".parse().unwrap();
+        let interfaces = vec![
+            NetworkInterface::new_afinet("down", apipa, None, None, 8, false),
+            NetworkInterface::new_afinet6("down", ipv6, None, None, 8, false),
+            NetworkInterface::new_afinet("up", apipa, None, None, 2, false),
+            NetworkInterface::new_afinet6("up", ipv6, None, None, 2, false),
+            NetworkInterface::new_afinet("unreported", apipa, None, None, 9, false),
+            NetworkInterface::new_afinet6("v6-only", ipv6, None, None, 10, false),
+        ];
+        assert_eq!(
+            collect_interface_addresses(&interfaces, &std::collections::HashSet::from([8])),
+            vec![IpAddr::V4(apipa), IpAddr::V4(apipa), IpAddr::V6(ipv6)]
+        );
+        // A failed status lookup must not discard otherwise usable adapters.
+        assert_eq!(
+            collect_interface_addresses(&interfaces, &std::collections::HashSet::new()).len(),
+            5
+        );
+    }
+
+    #[test]
+    fn fallback_scanner_filters_down_indices_but_keeps_up_and_unindexed_entries() {
+        use if_addrs::{IfAddr, IfOperStatus, Ifv4Addr, Interface};
+        let interface = |index, status, last| Interface {
+            name: format!("adapter-{index:?}"),
+            index,
+            oper_status: status,
+            is_p2p: false,
+            #[cfg(windows)]
+            adapter_name: format!("adapter-{index:?}"),
+            addr: IfAddr::V4(Ifv4Addr {
+                ip: Ipv4Addr::new(169, 254, 1, last),
+                netmask: Ipv4Addr::new(255, 255, 0, 0),
+                prefixlen: 16,
+                broadcast: None,
+            }),
+        };
+        let interfaces = vec![
+            interface(Some(8), IfOperStatus::Down, 1),
+            interface(Some(8), IfOperStatus::Down, 2),
+            interface(Some(2), IfOperStatus::Up, 3),
+            interface(Some(2), IfOperStatus::Down, 4),
+            interface(None, IfOperStatus::Down, 5),
+        ];
+        assert_eq!(
+            collect_fallback_addresses(&interfaces),
+            [3, 4, 5].map(|last| IpAddr::V4(Ipv4Addr::new(169, 254, 1, last)))
+        );
+    }
 
     #[tokio::test]
     async fn test_safe_interface_scanning() {
@@ -187,6 +295,9 @@ mod tests {
         assert!(!is_usable_ipv4(&Ipv4Addr::UNSPECIFIED)); // 0.0.0.0
         assert!(!is_usable_ipv4(&Ipv4Addr::BROADCAST)); // 255.255.255.255
         assert!(is_usable_ipv4(&Ipv4Addr::new(192, 168, 1, 100))); // Private network
+                                                                   // Self-assigned link-local: the only address on a wired network
+                                                                   // without DHCP. Upstream Link uses these too.
+        assert!(is_usable_ipv4(&Ipv4Addr::new(169, 254, 0, 2)));
 
         // IPv6 tests
         assert!(!is_usable_ipv6(&Ipv6Addr::LOCALHOST)); // ::1

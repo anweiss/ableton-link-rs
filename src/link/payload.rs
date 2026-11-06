@@ -87,11 +87,15 @@ impl From<NodeState> for Payload {
 impl From<PeerState> for Payload {
     fn from(value: PeerState) -> Self {
         let mut payload = Payload::from(value.node_state);
-        payload
-            .entries
-            .push(PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
-                endpoint: value.measurement_endpoint,
-            }));
+        // Only a known endpoint is announced: a peer can't measure against an
+        // empty one, and it isn't sent until the responder has an address.
+        if value.measurement_endpoint.is_some() {
+            payload
+                .entries
+                .push(PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
+                    endpoint: value.measurement_endpoint,
+                }));
+        }
         if value.audio_endpoint.is_some() {
             payload
                 .entries
@@ -103,136 +107,114 @@ impl From<PeerState> for Payload {
     }
 }
 
-pub fn decode(payload: &mut Payload, data: &[u8]) -> Result<()> {
-    if PAYLOAD_ENTRY_HEADER_SIZE > data.len() {
-        return Ok(());
-    }
+/// Microseconds for encoding a time, or an error if it's outside the range
+/// the wire format (and chrono) can represent.
+fn wire_micros(time: Duration) -> Result<i64> {
+    time.num_microseconds()
+        .ok_or(crate::link::error::Error::Protocol("time out of range"))
+}
 
-    let (payload_entry_header, _) =
-        encoding::decode_from_slice::<PayloadEntryHeader>(&data[..PAYLOAD_ENTRY_HEADER_SIZE])
-            .unwrap();
+/// Decode a payload: a run of entries, each a header (key and size) and that
+/// many bytes. Received from the network, so every length is checked before
+/// it's used: an entry must fit in what's left (with checked arithmetic, so a
+/// huge size can't wrap), and a known entry's declared size must be its real
+/// size, as upstream requires an entry to consume exactly its declared bytes.
+/// Unknown entries (and `aep6`) are skipped by their declared size. Trailing
+/// bytes too short for an entry header are ignored, as before.
+pub fn decode(payload: &mut Payload, mut data: &[u8]) -> Result<()> {
+    use crate::link::error::Error;
 
-    match payload_entry_header.key {
-        HOST_TIME_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + HOST_TIME_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<HostTime>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
-
-            debug!("decoded payload entry {:?}", entry);
-
-            payload.entries.push(PayloadEntry::HostTime(entry));
-            decode(payload, &data[decode_len..])?;
-        }
-        TIMELINE_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + TIMELINE_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<Timeline>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )
-            .unwrap();
-
-            debug!("decoded payload entry {:?}", entry);
-
-            payload.entries.push(PayloadEntry::Timeline(entry));
-            decode(payload, &data[decode_len..])?;
-        }
-        SESSION_MEMBERSHIP_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + SESSION_MEMBERSHIP_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<SessionMembership>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
-
-            debug!("decoded payload entry {:?}", entry);
-
-            payload.entries.push(PayloadEntry::SessionMembership(entry));
-            decode(payload, &data[decode_len..])?;
-        }
-        START_STOP_STATE_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + START_STOP_STATE_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<StartStopState>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
-
-            debug!("decoded payload entry {:?}", entry);
-
-            payload.entries.push(PayloadEntry::StartStopState(entry));
-            decode(payload, &data[decode_len..])?;
-        }
-        MEASUREMENT_ENDPOINT_V4_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + MEASUREMENT_ENDPOINT_V4_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<MeasurementEndpointV4>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
-
-            debug!("decoded payload entry {:?}", entry);
-
-            payload
-                .entries
-                .push(PayloadEntry::MeasurementEndpointV4(entry));
-            decode(payload, &data[decode_len..])?;
-        }
-        AUDIO_ENDPOINT_V4_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + AUDIO_ENDPOINT_V4_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<AudioEndpointV4>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
-
-            debug!("decoded payload entry {:?}", entry);
-
-            payload.entries.push(PayloadEntry::AudioEndpointV4(entry));
-            decode(payload, &data[decode_len..])?;
-        }
-        AUDIO_ENDPOINT_V6_HEADER_KEY => {
-            // A peer whose audio endpoint is IPv6 announces it as an `aep6`
-            // entry (PeerState::toPayload, Ableton/link@5226d02, where the
-            // entry for the opposite address family has size zero and is
-            // therefore omitted). This crate only tracks IPv4 audio endpoints
-            // (see `link::audio_endpoint`), so the `aep6` entry is recognized
-            // here and skipped explicitly rather than falling through to the
-            // generic "unknown key" branch below, matching the "peers that
-            // don't understand this entry skip it" behavior described upstream.
-            if payload_entry_header.size != AUDIO_ENDPOINT_V6_SIZE {
-                warn!(
-                    "unexpected aep6 payload entry size {}, expected {}",
-                    payload_entry_header.size, AUDIO_ENDPOINT_V6_SIZE
-                );
+    while data.len() >= PAYLOAD_ENTRY_HEADER_SIZE {
+        let (header, _) =
+            encoding::decode_from_slice::<PayloadEntryHeader>(&data[..PAYLOAD_ENTRY_HEADER_SIZE])?;
+        let end = usize::try_from(header.size)
+            .ok()
+            .and_then(|size| PAYLOAD_ENTRY_HEADER_SIZE.checked_add(size))
+            .filter(|&end| end <= data.len())
+            .ok_or(Error::Protocol("truncated payload entry"))?;
+        let body = &data[PAYLOAD_ENTRY_HEADER_SIZE..end];
+        let sized = |expected: u32| {
+            if header.size == expected {
+                Ok(())
+            } else {
+                Err(Error::Protocol("payload entry size mismatch"))
             }
+        };
 
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + payload_entry_header.size as usize;
-            if decode_len <= data.len() {
+        let entry = match header.key {
+            HOST_TIME_HEADER_KEY => {
+                sized(HOST_TIME_SIZE)?;
+                Some(PayloadEntry::HostTime(encoding::decode_from_slice(body)?.0))
+            }
+            TIMELINE_HEADER_KEY => {
+                sized(TIMELINE_SIZE)?;
+                Some(PayloadEntry::Timeline(encoding::decode_from_slice(body)?.0))
+            }
+            SESSION_MEMBERSHIP_HEADER_KEY => {
+                sized(SESSION_MEMBERSHIP_SIZE)?;
+                Some(PayloadEntry::SessionMembership(
+                    encoding::decode_from_slice(body)?.0,
+                ))
+            }
+            START_STOP_STATE_HEADER_KEY => {
+                sized(START_STOP_STATE_SIZE)?;
+                Some(PayloadEntry::StartStopState(
+                    encoding::decode_from_slice(body)?.0,
+                ))
+            }
+            MEASUREMENT_ENDPOINT_V4_HEADER_KEY => {
+                sized(MEASUREMENT_ENDPOINT_V4_SIZE)?;
+                Some(PayloadEntry::MeasurementEndpointV4(
+                    encoding::decode_from_slice(body)?.0,
+                ))
+            }
+            AUDIO_ENDPOINT_V4_HEADER_KEY => {
+                sized(AUDIO_ENDPOINT_V4_SIZE)?;
+                Some(PayloadEntry::AudioEndpointV4(
+                    encoding::decode_from_slice(body)?.0,
+                ))
+            }
+            AUDIO_ENDPOINT_V6_HEADER_KEY => {
+                // A peer whose audio endpoint is IPv6 announces it as an `aep6`
+                // entry (PeerState::toPayload, Ableton/link@5226d02, where the
+                // entry for the opposite address family has size zero and is
+                // therefore omitted). This crate only tracks IPv4 audio
+                // endpoints (see `link::audio_endpoint`), so the `aep6` entry is
+                // recognized here and skipped explicitly rather than falling
+                // through to the generic "unknown key" branch below, matching
+                // the "peers that don't understand this entry skip it" behavior
+                // described upstream.
+                if header.size != AUDIO_ENDPOINT_V6_SIZE {
+                    warn!(
+                        "unexpected aep6 payload entry size {}, expected {}",
+                        header.size, AUDIO_ENDPOINT_V6_SIZE
+                    );
+                }
                 debug!("skipping unsupported aep6 (IPv6 audio endpoint) payload entry");
-                decode(payload, &data[decode_len..])?;
+                None
             }
-        }
-        GHOST_TIME_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + GHOST_TIME_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<GhostTime>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
-
-            debug!("decoded payload entry {:?}", entry);
-
-            payload.entries.push(PayloadEntry::GhostTime(entry));
-            decode(payload, &data[decode_len..])?;
-        }
-        PREV_GHOST_TIME_HEADER_KEY => {
-            let decode_len = PAYLOAD_ENTRY_HEADER_SIZE + PREV_GHOST_TIME_SIZE as usize;
-            let (entry, _) = encoding::decode_from_slice::<PrevGhostTime>(
-                &data[PAYLOAD_ENTRY_HEADER_SIZE..decode_len],
-            )?;
-
-            debug!("decoded payload entry {:?}", entry);
-
-            payload.entries.push(PayloadEntry::PrevGhostTime(entry));
-            decode(payload, &data[decode_len..])?;
-        }
-        _ => {
-            warn!("unknown payload entry key {:x}", payload_entry_header.key);
-            let skip_len = PAYLOAD_ENTRY_HEADER_SIZE + payload_entry_header.size as usize;
-            if skip_len <= data.len() {
-                decode(payload, &data[skip_len..])?;
+            GHOST_TIME_HEADER_KEY => {
+                sized(GHOST_TIME_SIZE)?;
+                Some(PayloadEntry::GhostTime(
+                    encoding::decode_from_slice(body)?.0,
+                ))
             }
+            PREV_GHOST_TIME_HEADER_KEY => {
+                sized(PREV_GHOST_TIME_SIZE)?;
+                Some(PayloadEntry::PrevGhostTime(
+                    encoding::decode_from_slice(body)?.0,
+                ))
+            }
+            key => {
+                warn!("unknown payload entry key {:x}", key);
+                None
+            }
+        };
+        if let Some(entry) = entry {
+            debug!("decoded payload entry {:?}", entry);
+            payload.entries.push(entry);
         }
+        data = &data[end..];
     }
 
     Ok(())
@@ -292,9 +274,7 @@ impl HostTime {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = HOST_TIME_HEADER.encode()?;
-        encoded.append(&mut encoding::encode_to_vec(
-            &self.time.num_microseconds().unwrap(),
-        )?);
+        encoded.append(&mut encoding::encode_to_vec(&wire_micros(self.time)?)?);
         Ok(encoded)
     }
 }
@@ -331,9 +311,7 @@ impl GhostTime {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = GHOST_TIME_HEADER.encode()?;
-        encoded.append(&mut encoding::encode_to_vec(
-            &self.time.num_microseconds().unwrap(),
-        )?);
+        encoded.append(&mut encoding::encode_to_vec(&wire_micros(self.time)?)?);
         Ok(encoded)
     }
 }
@@ -362,9 +340,7 @@ impl PrevGhostTime {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoded = PREV_GHOST_TIME_HEADER.encode()?;
-        encoded.append(&mut encoding::encode_to_vec(
-            &self.time.num_microseconds().unwrap(),
-        )?);
+        encoded.append(&mut encoding::encode_to_vec(&wire_micros(self.time)?)?);
         Ok(encoded)
     }
 }
@@ -392,6 +368,299 @@ mod tests {
         tempo::Tempo,
         timeline::Timeline,
     };
+
+    #[test]
+    fn wide_boundary_all_clock_fields_preserve_direct_encoding_validation() {
+        for time in [Duration::MIN, Duration::MAX] {
+            for entry in [
+                PayloadEntry::HostTime(HostTime::new(time)),
+                PayloadEntry::GhostTime(GhostTime::new(time)),
+                PayloadEntry::PrevGhostTime(PrevGhostTime::new(time)),
+            ] {
+                assert!(Payload {
+                    entries: vec![entry]
+                }
+                .encode()
+                .is_err());
+            }
+        }
+        for expected in [i64::MIN, i64::MAX] {
+            let time = Duration::microseconds(expected);
+            let payload = Payload {
+                entries: vec![
+                    PayloadEntry::HostTime(HostTime::new(time)),
+                    PayloadEntry::GhostTime(GhostTime::new(time)),
+                    PayloadEntry::PrevGhostTime(PrevGhostTime::new(time)),
+                ],
+            };
+            let bytes = payload.encode().unwrap();
+            let decoded = crate::discovery::messages::parse_payload(&bytes).unwrap();
+            for entry in decoded.entries {
+                let actual = match entry {
+                    PayloadEntry::HostTime(v) => v.time,
+                    PayloadEntry::GhostTime(v) => v.time,
+                    PayloadEntry::PrevGhostTime(v) => v.time,
+                    _ => panic!("clock"),
+                };
+                assert_eq!(actual, time);
+            }
+        }
+    }
+
+    #[test]
+    fn peer_state_without_an_endpoint_announces_none() {
+        let without = Payload::from(PeerState::default());
+        assert!(!without
+            .entries
+            .iter()
+            .any(|e| matches!(e, PayloadEntry::MeasurementEndpointV4(_))));
+
+        let endpoint = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, 5), 4321);
+        let with = Payload::from(PeerState {
+            measurement_endpoint: Some(endpoint),
+            ..PeerState::default()
+        });
+        assert!(with.entries.iter().any(|e| matches!(
+            e,
+            PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 { endpoint: Some(ep) }) if *ep == endpoint
+        )));
+
+        // Encoding an empty endpoint writes 0.0.0.0:0 rather than panicking.
+        let bytes =
+            crate::encoding::encode_to_vec(&MeasurementEndpointV4 { endpoint: None }).unwrap();
+        assert_eq!(bytes, vec![0; 6]);
+        let (decoded, consumed) =
+            crate::encoding::decode_from_slice::<MeasurementEndpointV4>(&bytes).unwrap();
+        assert_eq!(decoded.endpoint, None);
+        assert_eq!(consumed, bytes.len());
+        for endpoint in [
+            Some(endpoint),
+            Some(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::UNSPECIFIED,
+                4321,
+            )),
+        ] {
+            let original = MeasurementEndpointV4 { endpoint };
+            let bytes = crate::encoding::encode_to_vec(&original).unwrap();
+            assert_eq!(
+                crate::encoding::decode_from_slice::<MeasurementEndpointV4>(&bytes)
+                    .unwrap()
+                    .0,
+                original
+            );
+        }
+    }
+
+    fn entry(key: u32, size: u32, body: &[u8]) -> Vec<u8> {
+        let mut out = key.to_be_bytes().to_vec();
+        out.extend_from_slice(&size.to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Declared entry lengths come from the network: they must fit, can't
+    /// wrap, and must match a known entry's size.
+    #[test]
+    fn decode_checks_declared_entry_lengths() {
+        let host_time = 1_000_000i64.to_be_bytes();
+        let mut payload = Payload::default();
+
+        // A huge size on an unknown key: an error, not an overflow or a loop.
+        let huge = entry(0x7a7a_7a7a, 0xffff_fff8, &[0; 8]);
+        assert!(decode(&mut payload, &huge).is_err());
+        // The same on `aep6`.
+        let huge6 = entry(
+            crate::link::audio_endpoint::AUDIO_ENDPOINT_V6_HEADER_KEY,
+            0xffff_fff8,
+            &[],
+        );
+        assert!(decode(&mut payload, &huge6).is_err());
+
+        // `__ht` declaring 16 bytes with 8 following: truncated.
+        let short = entry(HOST_TIME_HEADER_KEY, 16, &host_time);
+        let err = decode(&mut payload, &short).unwrap_err();
+        assert!(err.to_string().contains("truncated"), "{}", err);
+        // ...and with 16 following: the wrong size for a host time.
+        let mut long_body = host_time.to_vec();
+        long_body.extend_from_slice(&[0; 8]);
+        let long = entry(HOST_TIME_HEADER_KEY, 16, &long_body);
+        let err = decode(&mut payload, &long).unwrap_err();
+        assert!(err.to_string().contains("size mismatch"), "{}", err);
+        assert!(payload.entries.is_empty());
+
+        // An empty unknown entry is skipped, and decoding carries on.
+        let mut ok = entry(0x7a7a_7a7a, 0, &[]);
+        ok.extend(entry(HOST_TIME_HEADER_KEY, HOST_TIME_SIZE, &host_time));
+        decode(&mut payload, &ok).unwrap();
+        assert!(matches!(
+            payload.entries.as_slice(),
+            [PayloadEntry::HostTime(HostTime { time })] if time.num_microseconds() == Some(1_000_000)
+        ));
+    }
+
+    #[test]
+    fn time_entry_encoders_check_both_microsecond_boundaries() {
+        for (limit, step) in [(i64::MIN, -1), (i64::MAX, 1)] {
+            let boundary = Duration::microseconds(limit);
+            for encoded in [
+                HostTime::new(boundary).encode(),
+                GhostTime::new(boundary).encode(),
+                PrevGhostTime::new(boundary).encode(),
+            ] {
+                assert_eq!(
+                    &encoded.unwrap()[PAYLOAD_ENTRY_HEADER_SIZE..],
+                    &limit.to_be_bytes()
+                );
+            }
+            let outside = boundary + Duration::microseconds(step);
+            for encoded in [
+                HostTime::new(outside).encode(),
+                GhostTime::new(outside).encode(),
+                PrevGhostTime::new(outside).encode(),
+            ] {
+                assert!(matches!(
+                    encoded,
+                    Err(crate::link::error::Error::Protocol("time out of range"))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn packet_compatibility_rejects_noncanonical_entry_lengths() {
+        use crate::link::error::Error;
+
+        for (key, expected) in [
+            (HOST_TIME_HEADER_KEY, HOST_TIME_SIZE),
+            (GHOST_TIME_HEADER_KEY, GHOST_TIME_SIZE),
+            (PREV_GHOST_TIME_HEADER_KEY, PREV_GHOST_TIME_SIZE),
+            (TIMELINE_HEADER_KEY, TIMELINE_SIZE),
+            (SESSION_MEMBERSHIP_HEADER_KEY, SESSION_MEMBERSHIP_SIZE),
+            (START_STOP_STATE_HEADER_KEY, START_STOP_STATE_SIZE),
+            (
+                MEASUREMENT_ENDPOINT_V4_HEADER_KEY,
+                MEASUREMENT_ENDPOINT_V4_SIZE,
+            ),
+            (AUDIO_ENDPOINT_V4_HEADER_KEY, AUDIO_ENDPOINT_V4_SIZE),
+        ] {
+            for (size, available, reason) in [
+                (expected - 1, expected - 1, "payload entry size mismatch"),
+                (expected + 1, expected + 1, "payload entry size mismatch"),
+                (expected, expected - 1, "truncated payload entry"),
+            ] {
+                let mut bytes = PayloadEntryHeader { key, size }.encode().unwrap();
+                bytes.resize(bytes.len() + available as usize, 0);
+                assert!(matches!(
+                    crate::discovery::messages::parse_payload(&bytes),
+                    Err(Error::Protocol(actual)) if actual == reason
+                ));
+            }
+        }
+        for key in [u32::from_be_bytes(*b"new!"), AUDIO_ENDPOINT_V6_HEADER_KEY] {
+            let bytes = PayloadEntryHeader {
+                key,
+                size: u32::MAX,
+            }
+            .encode()
+            .unwrap();
+            assert!(matches!(
+                crate::discovery::messages::parse_payload(&bytes),
+                Err(Error::Protocol("truncated payload entry"))
+            ));
+        }
+
+        let mut bytes = HostTime::new(Duration::microseconds(123)).encode().unwrap();
+        bytes.extend(
+            PayloadEntryHeader {
+                key: HOST_TIME_HEADER_KEY,
+                size: HOST_TIME_SIZE + 1,
+            }
+            .encode()
+            .unwrap(),
+        );
+        bytes.resize(bytes.len() + HOST_TIME_SIZE as usize + 1, 0);
+        let mut partial = Payload::default();
+        assert!(decode(&mut partial, &bytes).is_err());
+        assert!(matches!(
+            partial.entries.as_slice(),
+            [PayloadEntry::HostTime(HostTime { time })]
+                if *time == Duration::microseconds(123)
+        ));
+        assert!(crate::discovery::messages::parse_payload(&bytes).is_err());
+    }
+
+    #[test]
+    fn packet_compatibility_preserves_bounded_extensions_and_trailing_fragments() {
+        let node = NodeId::from_array([7; 8]);
+        let mut payload = Payload::from(NodeState {
+            node_id: node,
+            session_id: SessionId(node),
+            timeline: Timeline {
+                tempo: Tempo::new(120.0),
+                beat_origin: Beats::new(3.0),
+                time_origin: Duration::microseconds(123),
+            },
+            start_stop_state: StartStopState::default(),
+        });
+        payload.entries.extend([
+            PayloadEntry::HostTime(HostTime::new(Duration::microseconds(123))),
+            PayloadEntry::GhostTime(GhostTime::new(Duration::microseconds(-456))),
+            PayloadEntry::PrevGhostTime(PrevGhostTime::new(Duration::microseconds(789))),
+            PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
+                endpoint: Some("127.0.0.1:3000".parse().unwrap()),
+            }),
+            PayloadEntry::AudioEndpointV4(AudioEndpointV4 {
+                endpoint: Some("127.0.0.1:3001".parse().unwrap()),
+            }),
+        ]);
+        let canonical = payload.encode().unwrap();
+        for (key, size) in [
+            (u32::from_be_bytes(*b"new!"), 0),
+            (u32::from_be_bytes(*b"new!"), 3),
+            (AUDIO_ENDPOINT_V6_HEADER_KEY, AUDIO_ENDPOINT_V6_SIZE),
+            (AUDIO_ENDPOINT_V6_HEADER_KEY, 3),
+        ] {
+            let mut extension = PayloadEntryHeader { key, size }.encode().unwrap();
+            extension.resize(extension.len() + size as usize, 0);
+            for trailing in 0..PAYLOAD_ENTRY_HEADER_SIZE {
+                let mut bytes = extension.clone();
+                bytes.extend_from_slice(&canonical);
+                bytes.extend_from_slice(&extension);
+                bytes.resize(bytes.len() + trailing, 0);
+                let decoded = crate::discovery::messages::parse_payload(&bytes).unwrap();
+                assert_eq!(decoded.encode().unwrap(), canonical);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_classifies_entry_rejections() {
+        use crate::link::error::Error;
+
+        for (size, body_len, expected) in [
+            (16u32, 8, "truncated payload entry"),
+            (16, 16, "payload entry size mismatch"),
+            (7, 7, "payload entry size mismatch"),
+        ] {
+            let mut bytes = HOST_TIME_HEADER_KEY.to_be_bytes().to_vec();
+            bytes.extend_from_slice(&size.to_be_bytes());
+            bytes.extend_from_slice(&vec![0; body_len]);
+            let mut payload = Payload::default();
+            assert!(matches!(
+                decode(&mut payload, &bytes),
+                Err(Error::Protocol(reason)) if reason == expected
+            ));
+            assert!(payload.entries.is_empty());
+        }
+        let bytes = HostTime::new(Duration::microseconds(123)).encode().unwrap();
+        let mut payload = Payload::default();
+        decode(&mut payload, &bytes).unwrap();
+        assert!(matches!(
+            payload.entries.as_slice(),
+            [PayloadEntry::HostTime(HostTime { time })]
+                if *time == Duration::microseconds(123)
+        ));
+    }
 
     #[test]
     fn host_time_header() {

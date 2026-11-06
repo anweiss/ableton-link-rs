@@ -41,7 +41,7 @@ impl Encode for StartStopState {
     ) -> core::result::Result<(), crate::encoding::EncodeError> {
         self.is_playing.encode_to(out)?;
         self.beats.encode_to(out)?;
-        self.timestamp.num_microseconds().unwrap().encode_to(out)?;
+        super::micros(self.timestamp).encode_to(out)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {
@@ -77,6 +77,9 @@ impl StartStopState {
 pub struct ClientStartStopState {
     pub is_playing: bool,
     pub time: Duration,
+    /// Local capture/observation ordering, not the advertised logical wire clock.
+    /// Received updates are stamped when observed locally; clock-map refreshes
+    /// preserve this watermark rather than copying a remote future timestamp.
     pub timestamp: Duration,
 }
 
@@ -121,6 +124,40 @@ pub struct ClientState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_boundary_start_stop_timestamp_saturates_at_wire_encoding() {
+        for (timestamp, expected) in [(Duration::MAX, i64::MAX), (Duration::MIN, i64::MIN)] {
+            let state = StartStopState {
+                timestamp,
+                ..Default::default()
+            };
+            let bytes = crate::encoding::encode_to_vec(&state).unwrap();
+            let (decoded, _) =
+                crate::encoding::decode_from_slice::<StartStopState>(&bytes).unwrap();
+            assert_eq!(decoded.timestamp, Duration::microseconds(expected));
+        }
+    }
+
+    #[test]
+    fn start_stop_encoding_saturates_both_wire_time_boundaries() {
+        for limit in [i64::MIN, i64::MAX] {
+            for delta in [-1, 0, 1] {
+                let expected = limit.saturating_add(delta);
+                let state = StartStopState {
+                    timestamp: Duration::microseconds(limit) + Duration::microseconds(delta),
+                    ..StartStopState::default()
+                };
+                let bytes = crate::encoding::encode_to_vec(&state).unwrap();
+                assert_eq!(&bytes[bytes.len() - 8..], &expected.to_be_bytes());
+                let (decoded, consumed) = StartStopState::decode_from(&bytes).unwrap();
+                assert_eq!(decoded.timestamp, Duration::microseconds(expected));
+                assert_eq!(consumed, bytes.len());
+                assert_eq!(decoded.is_playing, state.is_playing);
+                assert_eq!(decoded.beats, state.beats);
+            }
+        }
+    }
 
     #[test]
     fn test_key() {

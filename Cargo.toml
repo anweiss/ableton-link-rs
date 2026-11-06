@@ -44,9 +44,7 @@ std = [
     "dep:nix",
     "dep:rustix",
     "tracing-subscriber",
-    "async-trait",
     "local-ip-address",
-    "triple_buffer",
     "rodio",
     "if-addrs",
     "network-interface",
@@ -73,11 +71,9 @@ socket2 = { version = "0.6.4", features = ["all"], optional = true }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", optional = true }
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
-async-trait = { version = "0.1.73", optional = true }
-chrono = { version = "0.4.31", default-features = false, features = ["alloc"] }
+chrono = { version = "0.4.39", default-features = false, features = ["alloc"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 local-ip-address = { version = "0.6.12", optional = true }
-triple_buffer = { version = "8.1.1", optional = true }
 rodio = { version = "0.23.0", optional = true }
 if-addrs = { version = "0.15.0", optional = true }
 network-interface = { version = "2.0.3", optional = true }
@@ -100,23 +96,6 @@ rustix = { version = "1.1.4", features = ["net", "time"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"], optional = true }
-winapi = { version = "0.3", features = [
-    "winnt",
-    "profileapi",
-    "libloaderapi",
-    "processthreadsapi",
-    "iphlpapi",
-    "iptypes",
-    "ws2def",
-    "winerror",
-    "consoleapi",
-    "wincon",
-    "handleapi",
-] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-mach2 = "0.7"
-
 # Supplies the safe `EspTaskTimerService::now()` wrapper that `platform::clock`
 # uses instead of declaring `esp_timer_get_time` as a raw C symbol. Gated to the
 # ESP-IDF target so its build script never runs for hosted targets. Version
@@ -133,6 +112,7 @@ esp-idf-svc = { version = "0.53", default-features = false, features = ["alloc"]
 
 [dev-dependencies]
 console-subscriber = "0.5.0"
+triple_buffer = "8.1.1"
 
 [target.'cfg(windows)'.dev-dependencies]
 crossterm = { version = "0.29", default-features = false, features = ["windows"] }

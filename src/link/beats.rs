@@ -10,6 +10,7 @@ use num_traits::float::FloatCore;
 pub const BEATS_SIZE: u32 = mem::size_of::<i64>() as u32;
 
 #[derive(PartialEq, Eq, Copy, Clone, Default, PartialOrd, Ord, Debug)]
+/// Fixed-point beats. Arithmetic saturates at the signed microbeat limits.
 pub struct Beats {
     pub value: i64,
 }
@@ -53,13 +54,14 @@ impl Beats {
 
     pub fn abs(self) -> Self {
         Self {
-            value: self.value.abs(),
+            value: self.value.saturating_abs(),
         }
     }
 
+    /// Signed remainder; zero divisor and MIN / -1 yield zero.
     pub fn r#mod(self, rhs: Beats) -> Self {
         Self {
-            value: self.value % rhs.value,
+            value: self.value.checked_rem(rhs.value).unwrap_or(0),
         }
     }
 
@@ -78,7 +80,9 @@ impl Neg for Beats {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
-        Self { value: -self.value }
+        Self {
+            value: self.value.saturating_neg(),
+        }
     }
 }
 
@@ -87,7 +91,7 @@ impl Add for Beats {
 
     fn add(self, rhs: Self) -> Self::Output {
         Self {
-            value: self.value + rhs.value,
+            value: self.value.saturating_add(rhs.value),
         }
     }
 }
@@ -97,13 +101,34 @@ impl Sub for Beats {
 
     fn sub(self, rhs: Self) -> Self::Output {
         Self {
-            value: self.value - rhs.value,
+            value: self.value.saturating_sub(rhs.value),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admission_extreme_beats_saturate_without_panicking() {
+        let lo = super::Beats::from_microbeats(i64::MIN);
+        let hi = super::Beats::from_microbeats(i64::MAX);
+        assert_eq!((-lo).value, i64::MAX);
+        assert_eq!(lo.abs().value, i64::MAX);
+        assert_eq!((hi + hi).value, i64::MAX);
+        assert_eq!((lo - hi).value, i64::MIN);
+        assert_eq!((super::Beats::default() - lo).value, i64::MAX);
+        assert_eq!(lo.r#mod(super::Beats::from_microbeats(-1)).value, 0);
+        assert_eq!(hi.r#mod(super::Beats::default()).value, 0);
+        assert_eq!(
+            crate::link::phase::phase(lo, super::Beats::from_microbeats(3)).value,
+            1
+        );
+        assert_eq!(
+            crate::link::phase::next_phase_match(hi, lo, hi).value,
+            i64::MAX
+        );
+    }
+
     use super::*;
 
     #[test]

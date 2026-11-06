@@ -3,6 +3,31 @@ use thiserror::Error;
 
 use crate::encoding;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(Error))]
+pub enum CommitError {
+    #[cfg_attr(feature = "std", error("session timeline origin exhausted"))]
+    TimelineOriginExhausted,
+    #[cfg_attr(feature = "std", error("start/stop wire timestamp exhausted"))]
+    StartStopTimestampExhausted,
+    #[cfg_attr(
+        feature = "std",
+        error("client edit is stale or its captured session was replaced")
+    )]
+    StaleClientState,
+}
+
+#[cfg(not(feature = "std"))]
+impl core::fmt::Display for CommitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::TimelineOriginExhausted => "session timeline origin exhausted",
+            Self::StartStopTimestampExhausted => "start/stop wire timestamp exhausted",
+            Self::StaleClientState => "client edit is stale or its captured session was replaced",
+        })
+    }
+}
+
 #[derive(Debug)]
 #[cfg_attr(feature = "std", derive(Error))]
 pub enum Error {
@@ -10,6 +35,11 @@ pub enum Error {
     Encoding(#[cfg_attr(feature = "std", from)] encoding::EncodeError),
     #[cfg_attr(feature = "std", error("decoding error: {0}"))]
     Decoding(#[cfg_attr(feature = "std", from)] encoding::DecodeError),
+    /// A value violates the Link wire protocol during decoding or encoding.
+    /// This includes malformed received data and locally supplied state that
+    /// cannot be encoded, such as a time outside signed 64-bit microseconds.
+    #[cfg_attr(feature = "std", error("protocol error: {0}"))]
+    Protocol(&'static str),
 }
 
 #[cfg(not(feature = "std"))]
@@ -18,6 +48,7 @@ impl core::fmt::Display for Error {
         match self {
             Error::Encoding(e) => write!(f, "encoding error: {}", e),
             Error::Decoding(e) => write!(f, "decoding error: {}", e),
+            Error::Protocol(e) => write!(f, "protocol error: {}", e),
         }
     }
 }

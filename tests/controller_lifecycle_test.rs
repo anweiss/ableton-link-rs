@@ -58,7 +58,7 @@ async fn test_set_tempo_via_commit() {
     let mut state = link.capture_app_session_state();
     let time = link.clock().micros();
     state.set_tempo(175.0, time);
-    link.commit_app_session_state(state).await;
+    link.commit_app_session_state(state).await.unwrap();
 
     let captured = link.capture_app_session_state();
     assert_eq!(captured.tempo(), 175.0);
@@ -78,7 +78,7 @@ async fn test_start_stop_via_commit() {
     let mut state = link.capture_app_session_state();
     let time = link.clock().micros();
     state.set_is_playing(true, time);
-    link.commit_app_session_state(state).await;
+    link.commit_app_session_state(state).await.unwrap();
 
     let captured = link.capture_app_session_state();
     assert!(captured.is_playing());
@@ -87,7 +87,7 @@ async fn test_start_stop_via_commit() {
     let mut state = link.capture_app_session_state();
     let time2 = link.clock().micros();
     state.set_is_playing(false, time2);
-    link.commit_app_session_state(state).await;
+    link.commit_app_session_state(state).await.unwrap();
 
     let captured2 = link.capture_app_session_state();
     assert!(!captured2.is_playing());
@@ -103,7 +103,7 @@ async fn test_multiple_tempo_changes() {
         let mut state = link.capture_app_session_state();
         let time = link.clock().micros();
         state.set_tempo(bpm, time);
-        link.commit_app_session_state(state).await;
+        link.commit_app_session_state(state).await.unwrap();
 
         let captured = link.capture_app_session_state();
         assert_eq!(
@@ -135,7 +135,7 @@ async fn test_tempo_callback_fires_on_each_commit() {
     let mut state = link.capture_app_session_state();
     let time = link.clock().micros();
     state.set_tempo(160.0, time);
-    link.commit_app_session_state(state).await;
+    link.commit_app_session_state(state).await.unwrap();
 
     let final_count = *call_count.lock().unwrap();
     assert!(
@@ -151,13 +151,19 @@ async fn test_audio_session_state_roundtrip() {
     let link = BasicLink::new(120.0).await.unwrap();
 
     // Capture, modify, commit via audio path
-    let mut state = link.capture_audio_session_state();
+    let mut state = link.capture_audio_session_state().unwrap();
     let time = link.clock().micros();
     state.set_tempo(144.0, time);
-    link.commit_audio_session_state(state);
+    let ticket = link.commit_audio_session_state(state).unwrap();
+    assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 120.0);
+    assert_eq!(
+        link.process_audio_session_state_updates().await,
+        Some((ticket, Ok(())))
+    );
+    assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
 
     // Re-capture via audio path
-    let state2 = link.capture_audio_session_state();
+    let state2 = link.capture_audio_session_state().unwrap();
     assert_eq!(state2.tempo(), 144.0);
 }
 

@@ -4,7 +4,7 @@ use rodio::{cpal, Player, SampleRate};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
@@ -153,11 +153,38 @@ impl MetronomeHandle {
     }
 }
 
+#[derive(Default)]
+struct PlaybackAlignment {
+    aligned: bool,
+    retry_at: Option<Instant>,
+}
+
+impl PlaybackAlignment {
+    fn request(&mut self, playing: bool, now: Instant) -> bool {
+        if !playing {
+            self.aligned = false;
+            self.retry_at = None;
+            return false;
+        }
+        if self.aligned || self.retry_at.is_some_and(|retry_at| now < retry_at) {
+            return false;
+        }
+        self.aligned = true;
+        self.retry_at = None;
+        true
+    }
+
+    fn rejected(&mut self, now: Instant) {
+        self.aligned = false;
+        self.retry_at = Some(now + Duration::from_millis(100));
+    }
+}
+
 struct State {
     running: Arc<AtomicBool>,
     link: BasicLink,
     quantum: f64,
-    is_playing: bool, // Track local playing state like C++ AudioEngine
+    alignment: PlaybackAlignment,
     metronome: Option<MetronomeHandle>, // Optional in case audio initialization fails
     last_tempo_change: Option<(f64, std::time::Instant)>, // Track recent tempo changes for immediate display
 }
@@ -178,7 +205,7 @@ impl State {
             running: Arc::new(AtomicBool::new(true)),
             link: BasicLink::new(120.0).await.unwrap(),
             quantum: 4.0,
-            is_playing: false,
+            alignment: PlaybackAlignment::default(),
             metronome,
             last_tempo_change: None,
         }
@@ -307,10 +334,14 @@ async fn handle_input(state: Arc<tokio::sync::Mutex<State>>) {
                     state_guard.last_tempo_change = Some((new_tempo, std::time::Instant::now()));
 
                     // Commit the change to Link in background
-                    state_guard
+                    if let Err(error) = state_guard
                         .link
                         .commit_app_session_state(session_state)
-                        .await;
+                        .await
+                    {
+                        state_guard.last_tempo_change = None;
+                        eprintln!("Link edit rejected: {error}");
+                    }
                 }
                 'e' => {
                     let new_tempo = (session_state.tempo() + 1.0).min(999.0); // Max tempo like C++
@@ -321,10 +352,14 @@ async fn handle_input(state: Arc<tokio::sync::Mutex<State>>) {
                     state_guard.last_tempo_change = Some((new_tempo, std::time::Instant::now()));
 
                     // Commit the change to Link in background
-                    state_guard
+                    if let Err(error) = state_guard
                         .link
                         .commit_app_session_state(session_state)
-                        .await;
+                        .await
+                    {
+                        state_guard.last_tempo_change = None;
+                        eprintln!("Link edit rejected: {error}");
+                    }
                 }
                 'r' => {
                     state_guard.quantum = (state_guard.quantum - 1.0).max(1.0);
@@ -346,10 +381,13 @@ async fn handle_input(state: Arc<tokio::sync::Mutex<State>>) {
                         let current_time = state_guard.link.clock().micros();
                         session_state.set_is_playing(true, current_time);
                     }
-                    state_guard
+                    if let Err(error) = state_guard
                         .link
                         .commit_app_session_state(session_state)
-                        .await;
+                        .await
+                    {
+                        eprintln!("Link edit rejected: {error}");
+                    }
                 }
                 _ => {}
             }
@@ -523,7 +561,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Capture all state in a single lock acquisition to ensure consistency
         let (
             time,
-            session_state,
+            mut session_state,
             link_enabled,
             num_peers,
             quantum,
@@ -533,7 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) = {
             let mut state_guard = state.lock().await;
             let time = state_guard.link.clock().micros();
-            let session_state = state_guard.link.capture_app_session_state();
+            let mut session_state = state_guard.link.capture_app_session_state();
             let link_enabled = state_guard.link.is_enabled();
             let num_peers = state_guard.link.num_peers();
             let quantum = state_guard.quantum;
@@ -555,61 +593,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 };
 
-            // Check for playing state transitions
-            let local_is_playing = state_guard.is_playing;
-            let session_is_playing = session_state.is_playing();
-            let mut should_commit = false;
-
-            if !local_is_playing && session_is_playing {
-                // Transition from not playing to playing - reset beat to 0
-                let mut modified_session_state = session_state;
-                modified_session_state.request_beat_at_start_playing_time(0.0, quantum);
-                state_guard.is_playing = true;
-                should_commit = true;
-                (
-                    time,
-                    modified_session_state,
-                    link_enabled,
-                    num_peers,
-                    quantum,
-                    start_stop_sync,
-                    should_commit,
-                    tempo_override,
-                )
-            } else if local_is_playing && !session_is_playing {
-                // Transition from playing to not playing
-                state_guard.is_playing = false;
-                (
-                    time,
-                    session_state,
-                    link_enabled,
-                    num_peers,
-                    quantum,
-                    start_stop_sync,
-                    should_commit,
-                    tempo_override,
-                )
-            } else {
-                (
-                    time,
-                    session_state,
-                    link_enabled,
-                    num_peers,
-                    quantum,
-                    start_stop_sync,
-                    should_commit,
-                    tempo_override,
-                )
+            let should_commit = state_guard
+                .alignment
+                .request(session_state.is_playing(), Instant::now());
+            if should_commit {
+                session_state.request_beat_at_start_playing_time(0.0, quantum);
             }
+            (
+                time,
+                session_state,
+                link_enabled,
+                num_peers,
+                quantum,
+                start_stop_sync,
+                should_commit,
+                tempo_override,
+            )
         };
 
         // Commit any timeline modifications outside the lock
         if should_commit {
             let mut state_guard = state.lock().await;
-            state_guard
+            if let Err(error) = state_guard
                 .link
-                .commit_app_session_state(session_state)
-                .await;
+                .commit_app_session_state(session_state.clone())
+                .await
+            {
+                state_guard.alignment.rejected(Instant::now());
+                session_state = state_guard.link.capture_app_session_state();
+                eprintln!("Link edit rejected: {error}");
+            }
         }
 
         let is_playing = session_state.is_playing();
@@ -635,4 +648,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     beat_task.abort();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_alignment_retries_after_backoff_during_playback() {
+        let mut alignment = PlaybackAlignment::default();
+        let now = Instant::now();
+        assert!(alignment.request(true, now));
+        alignment.rejected(now);
+        assert!(!alignment.request(true, now + Duration::from_millis(99)));
+        assert!(alignment.request(true, now + Duration::from_millis(100)));
+        assert!(!alignment.request(true, now + Duration::from_millis(101)));
+        alignment.rejected(now + Duration::from_millis(101));
+        assert!(!alignment.request(true, now + Duration::from_millis(200)));
+        assert!(alignment.request(true, now + Duration::from_millis(201)));
+    }
+
+    #[test]
+    fn stopping_clears_alignment_and_retry_backoff() {
+        let mut alignment = PlaybackAlignment::default();
+        let now = Instant::now();
+        assert!(alignment.request(true, now));
+        assert!(!alignment.request(true, now));
+        alignment.rejected(now);
+        assert!(!alignment.request(false, now));
+        assert!(alignment.request(true, now));
+    }
 }

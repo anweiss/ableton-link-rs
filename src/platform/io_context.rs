@@ -11,6 +11,25 @@ use tokio::{runtime::Handle, sync::oneshot};
 
 use super::thread::ThreadPriority;
 
+// A compound attempt must release every guard before returning None. Retrying
+// remains part of its caller's cancellable task, never an unowned blocking job.
+pub(crate) async fn retry_state<T>(mut attempt: impl FnMut() -> Option<T>) -> T {
+    loop {
+        if let Some(value) = attempt() {
+            return value;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+pub(crate) fn try_state<T>(mutex: &Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 struct PriorityGuard(ThreadPriority);
 
 impl Drop for PriorityGuard {
@@ -157,9 +176,13 @@ impl IoContext {
                 // The executing callback must return before its thread can be
                 // joined. A retained join service owns that completion, not a
                 // detached task or an abort-only fallback.
-                self.reaper
-                    .send(thread)
-                    .expect("retained Link join service must remain connected");
+                // If that service is gone, detach rather than panic: this
+                // runs from Drop, where a panic aborts the process. The
+                // thread is the current one and ends when its callback returns.
+                if let Err(unsent) = self.reaper.send(thread) {
+                    tracing::warn!("Link join service disconnected; detaching the IO thread");
+                    drop(unsent.0);
+                }
             } else if thread.join().is_err() {
                 tracing::error!("Link IO thread panicked during shutdown");
             }

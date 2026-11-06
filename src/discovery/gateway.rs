@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::Duration;
 use tokio::{
     net::UdpSocket,
     select,
@@ -23,14 +22,21 @@ use crate::link::{
     node::{NodeId, NodeState},
     state::SessionState,
 };
+#[cfg(test)]
+use crate::sync::lock;
 
 use super::{
-    messenger::{send_byebye, Messenger},
+    messenger::{send_byebye, Messenger, PeerObservation},
     peers::{
         ControllerPeer, GatewayObserver, PeerEvent, PeerState, PeerStateChange,
         PeerStateMessageType,
     },
 };
+
+#[cfg(test)]
+std::thread_local! {
+    static PRUNING_HANDOFF: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 
 pub struct PeerGateway {
     pub(crate) gate: Arc<DispatchGate>,
@@ -52,18 +58,60 @@ pub enum OnEvent {
 }
 
 impl PeerGateway {
-    pub(crate) fn discard_queued_datagrams(&self) {
-        self.messenger.discard_queued_datagrams();
+    #[cfg(test)]
+    pub(crate) fn broadcast_epoch_fixture(
+        &self,
+        to: std::net::SocketAddrV4,
+    ) -> super::messenger::BroadcastFixture {
+        self.messenger
+            .broadcast_epoch_fixture(to, self.gate.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_discovery_boundary_fixture(
+        &self,
+        hints: bool,
+        ready: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> std::thread::JoinHandle<()> {
+        let map = self.messenger.interface_sockets.clone();
+        let routes = self.messenger.measurement_routes.clone();
+        std::thread::spawn(move || {
+            if hints {
+                routes.hold_hints_fixture(ready, release);
+            } else {
+                let _guard = map.lock().unwrap();
+                ready.send(()).unwrap();
+                release
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+            }
+        })
+    }
+
+    pub(crate) fn try_discard_queued_datagrams(&self) -> Option<()> {
+        self.messenger.try_discard_queued_datagrams()
     }
 
     pub(crate) async fn stop(&self) {
         self.gate.stop().await;
-        self.peer_timeouts.lock().unwrap().clear();
+        crate::platform::io_context::retry_state(|| {
+            try_timeouts(&self.peer_timeouts)?.clear();
+            Some(())
+        })
+        .await;
     }
 
     #[cfg(test)]
     pub(crate) fn event_sender(&self) -> Sender<OnEvent> {
         self.messenger.tx_event.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn receive_peer_state_fixture(&self, local: std::net::Ipv4Addr, bytes: &[u8]) {
+        self.messenger
+            .receive_peer_state_fixture(local, bytes)
+            .await;
     }
 
     #[cfg(test)]
@@ -91,6 +139,7 @@ impl PeerGateway {
         rx_measure_peer_state: Receiver<MeasurePeerEvent>,
         ping_responder_unicast_socket: Arc<UdpSocket>,
         enabled: Arc<Mutex<bool>>,
+        sessions: Option<crate::link::sessions::Sessions>,
     ) -> Result<Self, std::io::Error> {
         let (tx_peer_event, rx_peer_event) = mpsc::channel::<PeerEvent>(1);
         let epoch = Instant::now();
@@ -114,6 +163,18 @@ impl PeerGateway {
             enabled.clone(),
         )?;
         messenger.gate = gate.clone();
+        let measurement_service = MeasurementService::new_with_routes(
+            ping_responder_unicast_socket,
+            peer_state.clone(),
+            session_state,
+            clock,
+            tx_measure_peer_result,
+            notifier,
+            rx_measure_peer_state,
+            Some(messenger.measurement_routes.clone()),
+        )
+        .await;
+        messenger.set_measurement_responder(measurement_service.ping_responder.clone());
 
         Ok(PeerGateway {
             gate: gate.clone(),
@@ -125,19 +186,11 @@ impl PeerGateway {
                 tx_peer_state_change,
                 peers,
                 gate,
+                sessions,
             )
             .await,
             messenger,
-            measurement_service: MeasurementService::new(
-                ping_responder_unicast_socket,
-                peer_state.clone(),
-                session_state,
-                clock,
-                tx_measure_peer_result,
-                notifier,
-                rx_measure_peer_state,
-            )
-            .await,
+            measurement_service,
             peer_state,
             tx_peer_event,
             peer_timeouts: Arc::new(Mutex::new(vec![])),
@@ -152,13 +205,17 @@ impl PeerGateway {
         _measurement_endpoint: Option<SocketAddrV4>,
         ghost_xform: GhostXForm,
     ) {
-        self.measurement_service
-            .update_node_state(node_state.session_id, ghost_xform)
-            .await;
-
-        if let Ok(mut state) = self.peer_state.try_lock() {
-            state.node_state = node_state;
-        }
+        crate::platform::io_context::retry_state(|| {
+            let mut peer = crate::platform::io_context::try_state(&self.peer_state)?;
+            let responder = &self.measurement_service.ping_responder;
+            let mut id = crate::platform::io_context::try_state(&responder.session_id)?;
+            let mut form = crate::platform::io_context::try_state(&responder.ghost_x_form)?;
+            peer.node_state = node_state.clone();
+            *id = node_state.session_id;
+            *form = ghost_xform;
+            Some(())
+        })
+        .await;
     }
 
     pub async fn listen(&self, rx_event: Receiver<OnEvent>, notifier: Arc<Notify>) {
@@ -181,10 +238,22 @@ impl PeerGateway {
 
     pub(crate) async fn listen_with_signal(
         &self,
+        rx_event: Receiver<OnEvent>,
+        notifier: Arc<Notify>,
+        open: DispatchReceiver,
+        signal: impl std::future::Future<Output = std::io::Result<()>>,
+    ) {
+        self.listen_with_signal_and_departure(rx_event, notifier, open, signal, send_byebye)
+            .await;
+    }
+
+    pub(crate) async fn listen_with_signal_and_departure(
+        &self,
         mut rx_event: Receiver<OnEvent>,
         notifier: Arc<Notify>,
         mut open: DispatchReceiver,
         signal: impl std::future::Future<Output = std::io::Result<()>>,
+        departure: impl Fn(NodeId),
     ) {
         let node_id = self
             .peer_state
@@ -193,14 +262,12 @@ impl PeerGateway {
             .unwrap_or_default();
 
         info!(
-            "initializing peer gateway {:?} on interface {}",
+            "initializing peer gateway {:?} on interface {:?}",
             node_id,
             self.messenger
                 .interface
                 .as_ref()
-                .unwrap()
-                .local_addr()
-                .unwrap()
+                .and_then(|socket| socket.local_addr().ok())
         );
 
         let peer_state = self.peer_state.clone();
@@ -270,7 +337,10 @@ impl PeerGateway {
                 result = &mut signal, if signal_available => {
                     match result {
                         Ok(()) => {
-                            send_byebye(peer_state.lock().unwrap().ident());
+                            let id = crate::platform::io_context::retry_state(|| {
+                                Some(crate::platform::io_context::try_state(&peer_state)?.ident())
+                            }).await;
+                            departure(id);
                             notifier.notify_waiters();
                             break;
                         }
@@ -312,7 +382,7 @@ pub async fn on_peer_state(
 }
 
 async fn on_peer_state_in_epoch(
-    msg: PeerStateMessageType,
+    mut msg: PeerStateMessageType,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
     tx_peer_event: Sender<PeerEvent>,
     epoch: Instant,
@@ -322,54 +392,79 @@ async fn on_peer_state_in_epoch(
 ) {
     debug!("received peer state from messenger");
 
-    let peer_id = msg.node_state.ident();
-    peer_timeouts
-        .try_lock()
-        .unwrap()
-        .retain(|(_, id)| id != &peer_id);
-
-    let new_to = (
-        Instant::now()
-            + Duration::seconds(std::cmp::min(msg.ttl as i64, 3))
-                .to_std()
-                .unwrap(), // Cap timeout at 3 seconds max
-        peer_id,
-    );
-
-    debug!(
-        "updating peer timeout status for peer {} with TTL {} seconds (capped at 3)",
-        peer_id, msg.ttl
-    );
-
-    if let Ok(mut timeouts) = peer_timeouts.try_lock() {
-        let i = timeouts
-            .iter()
-            .position(|(timeout, _)| timeout >= &new_to.0);
-        if let Some(i) = i {
-            timeouts.insert(i, new_to);
-        } else {
-            timeouts.push(new_to);
-        }
-    } else {
-        debug!(
-            "Could not acquire peer_timeouts lock to update timeout for peer {}",
-            peer_id
-        );
+    let deadline = msg
+        .expires_at
+        .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(u64::from(msg.ttl)));
+    msg.expires_at = Some(deadline);
+    let slot = select! {
+        biased;
+        _ = PeerObservation::invalidated(msg.observation.as_deref()) => return,
+        _ = tokio::time::sleep_until(deadline), if msg.ttl > 0 => return,
+        result = tx_peer_event.reserve() => match result { Ok(slot) => slot, Err(_) => return },
+    };
+    if msg.ttl > 0 && deadline <= Instant::now() {
+        return;
     }
-
-    debug!("sending peer state to observer");
-    if let Err(e) = tx_peer_event
-        .send(PeerEvent::SawPeer(PeerState {
-            node_state: msg.node_state,
-            measurement_endpoint: msg.measurement_endpoint,
-            audio_endpoint: msg.audio_endpoint,
-        }))
-        .await
-    {
-        debug!("Failed to send SawPeer event: {:?}", e);
+    let peer_id = msg.node_state.ident();
+    let ttl = msg.ttl;
+    let observation = msg.observation.clone();
+    let mut msg = Some(msg);
+    let mut slot = Some(slot);
+    let commit = crate::platform::io_context::retry_state(|| {
+        let mut timeouts = try_timeouts(&peer_timeouts)?;
+        let mut publish = || {
+            let now = Instant::now();
+            if ttl > 0 && deadline <= now {
+                return false;
+            }
+            if ttl == 0 {
+                if !timeouts.iter().any(|(_, id)| *id == peer_id) {
+                    return false;
+                }
+                timeouts.retain(|(_, id)| *id != peer_id);
+                // Once removed, cleanup remains an irrevocable FIFO obligation.
+                slot.take().unwrap().send(PeerEvent::PeerLeft(peer_id));
+            } else {
+                let new_to = (
+                    deadline.min(now + std::time::Duration::from_secs(3)),
+                    peer_id,
+                );
+                timeouts.retain(|(_, id)| *id != peer_id);
+                let position = timeouts
+                    .iter()
+                    .position(|(time, _)| *time >= new_to.0)
+                    .unwrap_or(timeouts.len());
+                timeouts.insert(position, new_to);
+                slot.take()
+                    .unwrap()
+                    .send(PeerEvent::Observed(msg.take().unwrap()));
+            }
+            true
+        };
+        if let Some(observation) = &observation {
+            observation
+                .try_while_current(publish)
+                .map(|result| result.unwrap_or(false))
+        } else {
+            Some(publish())
+        }
+    });
+    let committed = select! {
+        biased;
+        _ = PeerObservation::invalidated(observation.as_deref()) => false,
+        _ = tokio::time::sleep_until(deadline), if ttl > 0 => false,
+        committed = commit => committed,
+    };
+    if !committed {
         return;
     }
 
+    #[cfg(test)]
+    PRUNING_HANDOFF.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     cancel.notify_waiters();
     schedule_next_pruning_in_epoch(
         peer_timeouts.clone(),
@@ -377,8 +472,15 @@ async fn on_peer_state_in_epoch(
         tx_peer_event.clone(),
         cancel,
         lifecycle,
-    )
-    .await;
+    );
+}
+
+fn try_timeouts(
+    timeouts: &Mutex<Vec<(Instant, NodeId)>>,
+) -> Option<std::sync::MutexGuard<'_, Vec<(Instant, NodeId)>>> {
+    let guard = crate::platform::io_context::try_state(timeouts)?;
+    timeouts.clear_poison();
+    Some(guard)
 }
 
 pub async fn on_byebye(
@@ -387,57 +489,39 @@ pub async fn on_byebye(
     tx_peer_event: Sender<PeerEvent>,
     notifier: Arc<Notify>,
 ) {
-    info!("Processing BYEBYE from peer {}", peer_id);
-
-    if find_peer(&peer_id, peer_timeouts.clone()).await {
-        info!(
-            "Found peer {} in timeout list, sending PeerLeft event",
-            peer_id
-        );
-        let peer_event = tx_peer_event.clone();
-        if let Err(e) = peer_event.send(PeerEvent::PeerLeft(peer_id)).await {
-            debug!("Failed to send PeerLeft event: {:?}", e);
-        } else {
-            info!("Successfully sent PeerLeft event for peer {}", peer_id);
-        }
-
-        if let Ok(mut timeouts) = peer_timeouts.try_lock() {
-            timeouts.retain(|(_, id)| id != &peer_id);
-            info!("Removed peer {} from timeout list", peer_id);
-        } else {
-            debug!(
-                "Could not acquire peer_timeouts lock to remove peer {}",
-                peer_id
-            );
-        }
-    } else {
-        info!(
-            "Peer {} not found in timeout list (may have already been removed)",
-            peer_id
-        );
+    if !find_peer(&peer_id, peer_timeouts.clone()).await {
+        return;
     }
-
-    notifier.notify_waiters();
+    let Ok(slot) = tx_peer_event.reserve().await else {
+        return;
+    };
+    let mut slot = Some(slot);
+    crate::platform::io_context::retry_state(|| {
+        let mut timeouts = try_timeouts(&peer_timeouts)?;
+        if timeouts.iter().any(|(_, id)| *id == peer_id) {
+            timeouts.retain(|(_, id)| *id != peer_id);
+            slot.take().unwrap().send(PeerEvent::PeerLeft(peer_id));
+        }
+        if timeouts.is_empty() {
+            notifier.notify_waiters();
+        }
+        Some(())
+    })
+    .await;
 }
 
 pub async fn find_peer(
     peer_id: &NodeId,
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
 ) -> bool {
-    match peer_timeouts.try_lock() {
-        Ok(timeouts) => {
-            let found = timeouts.iter().any(|(_, id)| id == peer_id);
-            debug!("find_peer: Looking for peer {}, found: {}", peer_id, found);
-            found
-        }
-        Err(_) => {
-            debug!(
-                "Could not acquire peer_timeouts lock in find_peer for {}",
-                peer_id
-            );
-            false
-        }
-    }
+    crate::platform::io_context::retry_state(|| {
+        Some(
+            try_timeouts(&peer_timeouts)?
+                .iter()
+                .any(|(_, id)| id == peer_id),
+        )
+    })
+    .await
 }
 
 pub async fn schedule_next_pruning(
@@ -446,110 +530,64 @@ pub async fn schedule_next_pruning(
     tx_peer_event: Sender<PeerEvent>,
     cancel: Arc<Notify>,
 ) {
-    schedule_next_pruning_in_epoch(peer_timeouts, epoch, tx_peer_event, cancel, None).await;
+    schedule_next_pruning_in_epoch(peer_timeouts, epoch, tx_peer_event, cancel, None);
 }
 
-async fn schedule_next_pruning_in_epoch(
+fn schedule_next_pruning_in_epoch(
     peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
     epoch: Instant,
     tx_peer_event: Sender<PeerEvent>,
     cancel: Arc<Notify>,
     lifecycle: Option<(Arc<DispatchGate>, u64)>,
 ) {
-    let pt = peer_timeouts.clone();
-
-    let has_timeouts = peer_timeouts
-        .try_lock()
-        .map(|timeouts| !timeouts.is_empty())
-        .unwrap_or(false);
-
-    if !has_timeouts {
-        return;
-    }
-
-    let (timeout_instant, peer_id) = {
-        if let Ok(timeouts) = pt.try_lock() {
-            if let Some((timeout, peer_id)) = timeouts.first().copied() {
-                let timeout_instant = timeout + Duration::milliseconds(100).to_std().unwrap();
-                (timeout_instant, peer_id)
-            } else {
-                return; // No timeouts available
-            }
-        } else {
-            return; // Cannot acquire lock
-        }
-    };
-
-    debug!(
-        "scheduling next pruning for {}ms since gateway initialization epoch because of peer {}",
-        timeout_instant.duration_since(epoch).as_millis(),
-        peer_id
-    );
-
+    // Register before spawning so a renewal cannot be missed before the worker polls.
+    let mut cancelled = Box::pin(cancel.notified_owned());
+    cancelled.as_mut().enable();
     tokio::spawn(async move {
         let prune = async {
-            select! {
-                _ = tokio::time::sleep_until(timeout_instant) => {
-                    let has_timeouts = peer_timeouts.try_lock()
-                        .map(|timeouts| !timeouts.is_empty())
-                        .unwrap_or(false);
-
-                    if !has_timeouts {
-                        return;
+            loop {
+                let deadline = crate::platform::io_context::retry_state(|| {
+                    Some(try_timeouts(&peer_timeouts)?.first().map(|(time, _)| *time))
+                })
+                .await;
+                let Some(deadline) = deadline else {
+                    return;
+                };
+                tokio::time::sleep_until(deadline + std::time::Duration::from_millis(100)).await;
+                let Ok(slot) = tx_peer_event.reserve().await else {
+                    return;
+                };
+                // A renewal can win while capacity is unavailable. Removal and
+                // publication share one guard with the announcement commit.
+                let mut slot = Some(slot);
+                crate::platform::io_context::retry_state(|| {
+                    let mut timeouts = try_timeouts(&peer_timeouts)?;
+                    if timeouts
+                        .first()
+                        .is_some_and(|(time, _)| *time <= Instant::now())
+                    {
+                        let (_, peer) = timeouts.remove(0);
+                        debug!(
+                            "pruning peer {} after {:?}",
+                            peer,
+                            Instant::now().duration_since(epoch)
+                        );
+                        slot.take().unwrap().send(PeerEvent::PeerTimedOut(peer));
                     }
-                    let expired_peers = prune_expired_peers(peer_timeouts.clone(), epoch);
-                    for peer in expired_peers.iter() {
-                        info!("pruning peer {}", peer.1);
-                        if let Err(e) = tx_peer_event
-                            .send(PeerEvent::PeerTimedOut(peer.1))
-                            .await
-                        {
-                            debug!("Failed to send PeerTimedOut event: {:?}", e);
-                            // Receiver has been dropped, no point in continuing
-                            return;
-                        }
-                    }
-                }
-                _ = cancel.notified() => {}
+                    Some(())
+                })
+                .await;
             }
         };
+        let run = async {
+            select! { biased; _ = &mut cancelled => {}, _ = prune => {} }
+        };
         if let Some((gate, epoch)) = lifecycle {
-            gate.run_in_epoch(epoch, prune).await;
+            gate.run_in_epoch(epoch, run).await;
         } else {
-            prune.await;
+            run.await;
         }
     });
-}
-
-fn prune_expired_peers(
-    peer_timeouts: Arc<Mutex<Vec<(Instant, NodeId)>>>,
-    epoch: Instant,
-) -> Vec<(Instant, NodeId)> {
-    info!(
-        "pruning peers @ {}ms since gateway initialization epoch",
-        Instant::now().duration_since(epoch).as_millis(),
-    );
-
-    // find the first element in pt whose timeout value is not less than Instant::now()
-    // NOTE: peer_timeouts will be empty if byebye message is received prior to pruning
-
-    let i = peer_timeouts.try_lock().ok().and_then(|timeouts| {
-        timeouts
-            .iter()
-            .position(|(timeout, _)| timeout >= &Instant::now())
-    });
-
-    if let Some(i) = i {
-        peer_timeouts
-            .try_lock()
-            .map(|mut timeouts| timeouts.drain(0..i).collect::<Vec<_>>())
-            .unwrap_or_default()
-    } else {
-        peer_timeouts
-            .try_lock()
-            .map(|mut timeouts| timeouts.drain(..).collect::<Vec<_>>())
-            .unwrap_or_default()
-    }
 }
 
 impl Drop for PeerGateway {
@@ -563,6 +601,261 @@ impl Drop for PeerGateway {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn numeric_cleanup_cancelled_announcement_retains_timeout_worker() {
+        let io = crate::platform::io_context::IoContext::new().unwrap();
+        let id = NodeId::from_array([93; 8]);
+        let epoch = Instant::now();
+        let timeouts = Arc::new(Mutex::new(vec![(
+            epoch + std::time::Duration::from_secs(2),
+            id,
+        )]));
+        let held = timeouts.clone();
+        let (committed, committed_rx) = std::sync::mpsc::channel();
+        let (locked, locked_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            committed_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            let _guard = held.lock().unwrap();
+            locked.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(3));
+        });
+        let (events, mut rx) = mpsc::channel(4);
+        let cancel = Arc::new(Notify::new());
+        let state = timeouts.clone();
+        let work = io.spawn(async move {
+            schedule_next_pruning(state.clone(), epoch, events.clone(), cancel.clone()).await;
+            PRUNING_HANDOFF.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    committed.send(()).unwrap();
+                    locked_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap();
+                }))
+            });
+            let mut msg = announcement(id, 1);
+            msg.expires_at = Some(Instant::now() + std::time::Duration::from_millis(120));
+            let mut announce = Box::pin(on_peer_state(
+                msg,
+                state,
+                events,
+                epoch,
+                cancel,
+                NodeId::default(),
+            ));
+            let _ = std::future::Future::poll(
+                announce.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            );
+            // Cancel at the first possible suspension after the observable commit.
+            drop(announce);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), work)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(PeerEvent::Observed(_))));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            io.spawn(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            matches!(tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await.unwrap(), Some(PeerEvent::PeerTimedOut(peer)) if peer == id)
+        );
+        assert!(timeouts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn byebye_does_not_cancel_pruning_of_other_peers() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let first = NodeId::from_array([71; 8]);
+            let second = NodeId::from_array([72; 8]);
+            let now = Instant::now();
+            let timeouts = Arc::new(Mutex::new(vec![
+                (now + std::time::Duration::from_millis(10), first),
+                (now + std::time::Duration::from_millis(20), second),
+            ]));
+            let (tx, mut rx) = mpsc::channel(1);
+            let cancel = Arc::new(Notify::new());
+            schedule_next_pruning(timeouts.clone(), now, tx.clone(), cancel.clone()).await;
+            on_byebye(first, timeouts.clone(), tx, cancel).await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(id)) if id == first));
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerTimedOut(id)) if id == second));
+            assert!(timeouts.lock().unwrap().is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
+    fn announcement(id: NodeId, ttl: u8) -> PeerStateMessageType {
+        PeerStateMessageType {
+            node_state: NodeState {
+                node_id: id,
+                ..NodeState::default()
+            },
+            ttl,
+            expires_at: None,
+            observation: None,
+            measurement_endpoint: None,
+            audio_endpoint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn poisoned_timeouts_remain_findable_removable_and_prunable() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let id = NodeId::from_array([80; 8]);
+            let timeouts = Arc::new(Mutex::new(Vec::new()));
+            let poisoned = timeouts.clone();
+            assert!(std::thread::spawn(move || {
+                let _guard = poisoned.lock().unwrap();
+                panic!("fixture poison");
+            })
+            .join()
+            .is_err());
+            let (tx, mut rx) = mpsc::channel(4);
+            let cancel = Arc::new(Notify::new());
+            on_peer_state(
+                announcement(id, 1),
+                timeouts.clone(),
+                tx.clone(),
+                Instant::now(),
+                cancel.clone(),
+                NodeId::default(),
+            )
+            .await;
+            assert!(!timeouts.is_poisoned());
+            assert!(find_peer(&id, timeouts.clone()).await);
+            assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(_))));
+            on_byebye(id, timeouts.clone(), tx.clone(), cancel.clone()).await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(node)) if node == id));
+            assert!(!find_peer(&id, timeouts.clone()).await);
+            on_peer_state(
+                announcement(id, 1),
+                timeouts.clone(),
+                tx,
+                Instant::now(),
+                cancel,
+                NodeId::default(),
+            )
+            .await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(_))));
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerTimedOut(node)) if node == id));
+            assert!(timeouts.lock().unwrap().is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_departure_keeps_timeout_and_zero_ttl_withdraws_existing_peer() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let id = NodeId::from_array([79; 8]);
+            let original = vec![(Instant::now() + std::time::Duration::from_secs(2), id)];
+            let timeouts = Arc::new(Mutex::new(original.clone()));
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(PeerEvent::PeerLeft(NodeId::default()))
+                .await
+                .unwrap();
+            let mut departure = Box::pin(on_byebye(
+                id,
+                timeouts.clone(),
+                tx.clone(),
+                Arc::new(Notify::new()),
+            ));
+            assert!(std::future::Future::poll(
+                departure.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending());
+            drop(departure);
+            assert_eq!(*timeouts.lock().unwrap(), original);
+            rx.recv().await.unwrap();
+            on_peer_state(
+                announcement(id, 0),
+                timeouts.clone(),
+                tx.clone(),
+                Instant::now(),
+                Arc::new(Notify::new()),
+                NodeId::default(),
+            )
+            .await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(node)) if node == id));
+            assert!(timeouts.lock().unwrap().is_empty());
+            on_peer_state(
+                announcement(id, 0),
+                timeouts.clone(),
+                tx,
+                Instant::now(),
+                Arc::new(Notify::new()),
+                NodeId::default(),
+            )
+            .await;
+            assert!(
+                rx.try_recv().is_err(),
+                "unknown zero-TTL messages must not add peers or emit departures"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pruning_rechecks_after_backpressured_renewal() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let id = NodeId::from_array([78; 8]);
+            let deadline = Instant::now() + std::time::Duration::from_millis(80);
+            let timeouts = Arc::new(Mutex::new(vec![(deadline, id)]));
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(PeerEvent::PeerLeft(NodeId::default()))
+                .await
+                .unwrap();
+            let epoch = Instant::now();
+            let cancel = Arc::new(Notify::new());
+            let mut renewal = Box::pin(on_peer_state(
+                announcement(id, 30),
+                timeouts.clone(),
+                tx.clone(),
+                epoch,
+                cancel.clone(),
+                NodeId::default(),
+            ));
+            assert!(std::future::Future::poll(
+                renewal.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending());
+            schedule_next_pruning(timeouts.clone(), epoch, tx.clone(), cancel.clone()).await;
+            tokio::time::sleep_until(deadline + std::time::Duration::from_millis(180)).await;
+            assert_eq!(
+                timeouts.lock().unwrap().len(),
+                1,
+                "pruning must not remove before reserving notification capacity"
+            );
+            rx.recv().await.unwrap();
+            renewal.await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(_))));
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "obsolete pruning must not follow the renewal"
+            );
+            assert!(timeouts.lock().unwrap()[0].0 > deadline);
+            cancel.notify_waiters();
+        })
+        .await
+        .unwrap();
+    }
+
     use std::net::IpAddr;
 
     use local_ip_address::list_afinet_netifas;
@@ -571,8 +864,184 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_rechecks_receive_deadline_after_timeout_lock_contention() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let id = NodeId::from_array([81; 8]);
+            let other = NodeId::from_array([82; 8]);
+            let original = vec![
+                (Instant::now() + std::time::Duration::from_secs(100), id),
+                (Instant::now() + std::time::Duration::from_secs(200), other),
+            ];
+            let timeouts = Arc::new(Mutex::new(original.clone()));
+            let held = timeouts.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let _guard = held.lock().unwrap();
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(4));
+            });
+            ready_rx.await.unwrap();
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            let (tx, mut rx) = mpsc::channel(1);
+            let work = tokio::spawn(on_peer_state(
+                PeerStateMessageType {
+                    node_state: NodeState {
+                        node_id: id,
+                        ..NodeState::default()
+                    },
+                    ttl: 30,
+                    expires_at: Some(deadline),
+                    observation: None,
+                    measurement_endpoint: None,
+                    audio_endpoint: None,
+                },
+                timeouts.clone(),
+                tx.clone(),
+                Instant::now(),
+                Arc::new(Notify::new()),
+                other,
+            ));
+            while tx.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "capacity must be reserved before expiry while the mutex is held"
+            );
+            tokio::time::sleep_until(deadline + std::time::Duration::from_millis(20)).await;
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            work.await.unwrap();
+            assert!(
+                rx.try_recv().is_err(),
+                "expired input must not publish after a lock wait"
+            );
+            assert_eq!(
+                *timeouts.lock().unwrap(),
+                original,
+                "expired input must not replace even an existing same-peer timeout"
+            );
+        })
+        .await
+        .expect("lock contention must not renew an expired announcement");
+    }
+
+    #[tokio::test]
+    async fn gateway_preserves_receive_deadlines_and_rejects_expired_state() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for expired in [true, false] {
+                let (tx, mut rx) = mpsc::channel(2);
+                let timeouts = Arc::new(Mutex::new(Vec::new()));
+                let deadline = if expired {
+                    Instant::now() - std::time::Duration::from_secs(1)
+                } else {
+                    Instant::now() + std::time::Duration::from_millis(300)
+                };
+                let state = PeerStateMessageType {
+                    node_state: NodeState::default(),
+                    ttl: if expired { 2 } else { 1 },
+                    expires_at: Some(deadline),
+                    observation: None,
+                    measurement_endpoint: None,
+                    audio_endpoint: None,
+                };
+                on_peer_state(
+                    state,
+                    timeouts.clone(),
+                    tx,
+                    Instant::now(),
+                    Arc::new(Notify::new()),
+                    NodeId::default(),
+                )
+                .await;
+                if expired {
+                    assert!(rx.try_recv().is_err());
+                    assert!(timeouts.lock().unwrap().is_empty());
+                } else {
+                    assert_eq!(timeouts.lock().unwrap()[0].0, deadline);
+                    assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(_))));
+                    assert!(matches!(rx.recv().await, Some(PeerEvent::PeerTimedOut(_))));
+                }
+            }
+        })
+        .await
+        .expect("gateway must honor original deadlines, including subsecond remaining life");
+    }
+
     fn init_tracing() {
         let _ = tracing_subscriber::fmt::try_init();
+    }
+
+    #[tokio::test]
+    async fn poisoned_timeout_replacement_is_atomic_and_releases_before_event_send() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let id = NodeId::from_array([71; 8]);
+            let other = NodeId::from_array([72; 8]);
+            let epoch = Instant::now();
+            let timeouts = Arc::new(Mutex::new(vec![
+                (epoch - std::time::Duration::from_secs(1), id),
+                (epoch, id),
+                (epoch + std::time::Duration::from_secs(20), other),
+            ]));
+            let poisoned = timeouts.clone();
+            assert!(std::thread::spawn(move || {
+                let _guard = poisoned.lock().unwrap();
+                panic!("poison timeout fixture");
+            })
+            .join()
+            .is_err());
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(PeerEvent::PeerLeft(other)).await.unwrap();
+            let cancel = Arc::new(Notify::new());
+            let mut work = Box::pin(on_peer_state(
+                PeerStateMessageType {
+                    expires_at: None,
+                    observation: None,
+                    node_state: crate::link::node::NodeState {
+                        node_id: id,
+                        ..Default::default()
+                    },
+                    ttl: 30,
+                    measurement_endpoint: None,
+                    audio_endpoint: None,
+                },
+                timeouts.clone(),
+                tx.clone(),
+                epoch,
+                cancel.clone(),
+                other,
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(work.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                lock(&timeouts).len(),
+                3,
+                "waiting for capacity must not prematurely renew a timeout"
+            );
+            assert!(find_peer(&id, timeouts.clone()).await);
+            rx.recv().await.unwrap();
+            work.await;
+            {
+                let current = lock(&timeouts);
+                assert_eq!(current.len(), 2);
+                assert_eq!(current[0].1, id);
+                assert!(current[0].0 <= Instant::now() + std::time::Duration::from_secs(3));
+                assert_eq!(current[1].1, other);
+            }
+            assert!(matches!(rx.recv().await, Some(PeerEvent::Observed(state)) if state.node_state.ident() == id && state.ttl == 30 && state.expires_at.is_some() && state.observation.is_none()));
+            on_byebye(id, timeouts.clone(), tx, cancel).await;
+            assert!(matches!(rx.recv().await, Some(PeerEvent::PeerLeft(peer)) if peer == id));
+            assert!(!find_peer(&id, timeouts).await);
+        })
+        .await
+        .expect(
+            "timeout replacement must recover poison and release its guard before awaiting events",
+        );
     }
 
     #[tokio::test]
@@ -627,6 +1096,7 @@ mod tests {
             rx_measure_peer_state,
             ping_responder_unicast_socket,
             Arc::new(Mutex::new(true)), // enabled for test
+            None,
         )
         .await
         .unwrap();

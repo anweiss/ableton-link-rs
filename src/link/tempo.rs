@@ -25,7 +25,7 @@ impl Display for Tempo {
 impl From<Duration> for Tempo {
     fn from(value: Duration) -> Self {
         Tempo {
-            value: 60.0 * 1e6 / value.num_microseconds().unwrap() as f64,
+            value: 60.0 * 1e9 / super::duration_nanos(value) as f64,
         }
     }
 }
@@ -40,21 +40,98 @@ impl Tempo {
     }
 
     pub fn micros_per_beat(&self) -> Duration {
-        Duration::microseconds((60.0 * 1e6 / self.bpm()).round() as i64)
+        super::duration_from_nanos(self.period_micros().saturating_mul(1_000))
+    }
+
+    pub(crate) fn period_micros(&self) -> i128 {
+        (60.0 * 1e6 / self.bpm()).round() as i128
     }
 
     pub fn micros_to_beats(&self, micros: Duration) -> Beats {
-        Beats::new(
-            micros.num_microseconds().unwrap() as f64
-                / self.micros_per_beat().num_microseconds().unwrap() as f64,
+        Beats::from_microbeats(
+            self.microbeats_from_nanos(super::duration_nanos(micros))
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
         )
     }
 
     pub fn beats_to_micros(&self, beats: Beats) -> Duration {
-        Duration::microseconds(
-            (beats.floating() * self.micros_per_beat().num_microseconds().unwrap() as f64).round()
-                as i64,
+        super::duration_from_nanos(
+            self.micros_from_microbeats(i128::from(beats.value))
+                .saturating_mul(1_000),
         )
+    }
+
+    pub(crate) fn microbeats_from_nanos(&self, nanos: i128) -> i128 {
+        let period = self.period_micros();
+        if period == 0 {
+            return super::round_ratio(nanos, period);
+        }
+        if let Some(scaled) = nanos.checked_mul(1_000) {
+            return super::round_ratio(scaled, period);
+        }
+        let negative = (nanos < 0) != (period < 0);
+        let magnitude = nanos.unsigned_abs();
+        let denominator = period.unsigned_abs();
+        let remainder = magnitude % denominator;
+        let scale = 1_000_u128;
+        let mut fraction = 0_u128;
+        let mut residue = 0_u128;
+        // Divide the remainder's small product without forming an overflowing numerator.
+        for bit in (0..u128::BITS - scale.leading_zeros()).rev() {
+            fraction *= 2;
+            if residue >= denominator - residue {
+                residue -= denominator - residue;
+                fraction += 1;
+            } else {
+                residue *= 2;
+            }
+            if scale >> bit & 1 != 0 {
+                if residue >= denominator - remainder {
+                    residue -= denominator - remainder;
+                    fraction += 1;
+                } else {
+                    residue += remainder;
+                }
+            }
+        }
+        let rounded = (magnitude / denominator)
+            .saturating_mul(scale)
+            .saturating_add(fraction)
+            .saturating_add(u128::from(residue >= denominator.div_ceil(2)));
+        let bounded = rounded.min(i128::MAX as u128) as i128;
+        if negative {
+            if rounded > i128::MAX as u128 {
+                i128::MIN
+            } else {
+                -bounded
+            }
+        } else {
+            bounded
+        }
+    }
+
+    pub(crate) fn micros_from_microbeats(&self, beats: i128) -> i128 {
+        let period = self.period_micros();
+        // Split before multiplying: phase composition can exceed the public
+        // microbeat range even when its final time remains representable.
+        (beats / 1_000_000)
+            .saturating_mul(period)
+            .saturating_add((beats % 1_000_000).saturating_mul(period / 1_000_000))
+            .saturating_add(super::round_ratio(
+                (beats % 1_000_000) * (period % 1_000_000),
+                1_000_000,
+            ))
+    }
+
+    pub(crate) fn nanos_from_microbeats(&self, beats: i128) -> i128 {
+        let period = self.period_micros();
+        (beats / 1_000)
+            .saturating_mul(period)
+            .saturating_add((beats % 1_000).saturating_mul(period / 1_000))
+            .saturating_add(super::round_ratio(
+                (beats % 1_000) * (period % 1_000),
+                1_000,
+            ))
     }
 }
 
@@ -63,10 +140,7 @@ impl crate::encoding::Encode for Tempo {
         &self,
         out: &mut alloc::vec::Vec<u8>,
     ) -> core::result::Result<(), crate::encoding::EncodeError> {
-        self.micros_per_beat()
-            .num_microseconds()
-            .unwrap()
-            .encode_to(out)?;
+        super::micros(self.micros_per_beat()).encode_to(out)?;
         Ok(())
     }
     fn encoded_size(&self) -> usize {
@@ -86,6 +160,80 @@ impl crate::encoding::Decode for Tempo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duration_boundary_wide_scaling_divides_before_narrowing() {
+        for (bpm, nanos, expected) in [
+            (0.0, i128::MAX, 1_000),
+            (0.0, i128::MIN, -1_000),
+            (-0.0, i128::MIN, 1_000),
+            (-0.0, i128::MAX, -1_000),
+            (0.0, i128::MAX / 2, 500),
+            (60_000_000.0, i128::MAX, i128::MAX),
+            (60_000_000.0, i128::MIN, i128::MIN),
+            (-60_000_000.0, i128::MIN, i128::MAX),
+            (-60_000_000.0, i128::MAX, i128::MIN),
+            (f64::INFINITY, i128::MAX, i128::MAX),
+            (f64::INFINITY, i128::MIN, i128::MIN),
+            (f64::INFINITY, 0, 0),
+        ] {
+            assert_eq!(Tempo::new(bpm).microbeats_from_nanos(nanos), expected);
+        }
+    }
+
+    #[test]
+    fn review_round_tempo_preserves_wide_periods() {
+        let period = Duration::microseconds(1_i64 << 62) * 4;
+        for period in [period, -period] {
+            let tempo = Tempo::from(period);
+            assert_eq!(tempo.micros_per_beat(), period);
+            assert_eq!(tempo.micros_to_beats(period), Beats::new(1.0));
+            assert_eq!(tempo.beats_to_micros(Beats::new(1.0)), period);
+            assert_eq!(tempo.beats_to_micros(Beats::new(0.5)), period / 2);
+            let bytes = crate::encoding::encode_to_vec(&tempo).unwrap();
+            assert_eq!(
+                i64::from_be_bytes(bytes.try_into().unwrap()),
+                if period < Duration::zero() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }
+            );
+        }
+        let period = Duration::microseconds(i64::MAX) * 2;
+        assert_eq!(Tempo::from(period).micros_to_beats(period), Beats::new(1.0));
+        for bpm in [-1e-20, 1e-20] {
+            let tempo = Tempo::new(bpm);
+            let beat = Beats::from_microbeats(1);
+            let time = tempo.beats_to_micros(beat);
+            assert!(time > Duration::MIN && time < Duration::MAX);
+            assert_eq!(tempo.micros_to_beats(time), beat);
+        }
+    }
+
+    #[test]
+    fn wide_boundary_tempo_preserves_large_elapsed_values() {
+        let tempo = Tempo::new(20.0);
+        let elapsed = Duration::microseconds(i64::MAX) - Duration::microseconds(i64::MIN);
+        assert_eq!(
+            tempo.micros_to_beats(elapsed).value,
+            6_148_914_691_236_517_205
+        );
+        assert_eq!(
+            tempo.micros_to_beats(-elapsed).value,
+            -6_148_914_691_236_517_205
+        );
+        assert_eq!(
+            tempo.beats_to_micros(Beats::from_microbeats(i64::MAX)),
+            Duration::microseconds(i64::MAX) * 3
+        );
+        assert_eq!(
+            tempo.beats_to_micros(Beats::from_microbeats(i64::MIN)),
+            Duration::microseconds(i64::MIN) * 3
+        );
+        assert_eq!(tempo.micros_to_beats(Duration::MAX).value, i64::MAX);
+        assert_eq!(tempo.micros_to_beats(Duration::MIN).value, i64::MIN);
+    }
 
     #[test]
     fn construct_from_bpm() {

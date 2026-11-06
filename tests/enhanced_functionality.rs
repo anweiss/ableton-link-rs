@@ -181,7 +181,7 @@ async fn test_enhanced_basic_link() {
     );
 
     // Test real-time session state access
-    let session_state = link.capture_audio_session_state();
+    let session_state = link.capture_audio_session_state().unwrap();
     assert_eq!(session_state.tempo(), 120.0, "Should capture correct tempo");
     assert!(
         !session_state.is_playing(),
@@ -197,7 +197,7 @@ async fn test_realtime_session_state() {
     let link = BasicLink::new(140.0).await.unwrap();
 
     // Capture initial state
-    let mut session_state = link.capture_audio_session_state();
+    let mut session_state = link.capture_audio_session_state().unwrap();
     assert_eq!(session_state.tempo(), 140.0);
 
     // Modify state
@@ -206,17 +206,23 @@ async fn test_realtime_session_state() {
     session_state.set_is_playing(true, current_time);
 
     // Commit changes
-    link.commit_audio_session_state(session_state);
+    let ticket = link.commit_audio_session_state(session_state).unwrap();
+    assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 140.0);
+    assert_eq!(
+        link.process_audio_session_state_updates().await,
+        Some((ticket, Ok(())))
+    );
+    assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
 
     // Verify changes
-    let updated_state = link.capture_audio_session_state();
+    let updated_state = link.capture_audio_session_state().unwrap();
     assert_eq!(updated_state.tempo(), 160.0, "Tempo should be updated");
     assert!(updated_state.is_playing(), "Should be playing after commit");
 
     info!("Real-time session state test passed");
 }
 
-/// Performance test for real-time operations
+/// Audio-side throughput; non-RT processing and acknowledgment are untimed.
 #[tokio::test]
 async fn test_realtime_performance() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -225,36 +231,52 @@ async fn test_realtime_performance() {
 
     let link = BasicLink::new(120.0).await.unwrap();
 
-    let start_time = std::time::Instant::now();
-    let iterations = 10000;
+    let batches = 10;
+    let iterations_per_batch = 1000;
+    let iterations = batches * iterations_per_batch;
+    let mut elapsed = Duration::ZERO;
+    let mut accepted_edits = 0;
 
-    // Test audio thread performance
-    for i in 0..iterations {
-        let session_state = link.capture_audio_session_state();
+    for batch in 0..batches {
+        let expected_tempo = 130.0 + f64::from(batch) * 10.0;
+        let mut pending = None;
+        let start_time = std::time::Instant::now();
+        for i in 0..iterations_per_batch {
+            let session_state = link.capture_audio_session_state().unwrap();
+            let current_time = link.clock().micros();
+            let beat = session_state.beat_at_time(current_time, 4.0);
+            let phase = session_state.phase_at_time(current_time, 4.0);
 
-        // Simulate some audio processing
-        let current_time = link.clock().micros();
-        let beat = session_state.beat_at_time(current_time, 4.0);
-        let phase = session_state.phase_at_time(current_time, 4.0);
+            if i + 1 == iterations_per_batch {
+                let mut modified_state = session_state;
+                modified_state.set_tempo(expected_tempo, current_time);
+                pending = Some(link.commit_audio_session_state(modified_state).unwrap());
+            }
 
-        // Occasionally modify state
-        if i % 1000 == 0 {
-            let mut modified_state = session_state;
-            modified_state.set_tempo(120.0 + (i as f64 * 0.01), current_time);
-            link.commit_audio_session_state(modified_state);
+            assert!(beat >= 0.0);
+            assert!((0.0..4.0).contains(&phase));
         }
+        elapsed += start_time.elapsed();
 
-        // Verify calculations are reasonable
-        assert!(beat >= 0.0);
-        assert!((0.0..4.0).contains(&phase));
+        let ticket = pending.unwrap();
+        assert_eq!(
+            link.process_audio_session_state_updates().await,
+            Some((ticket, Ok(())))
+        );
+        assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
+        assert_eq!(
+            link.capture_audio_session_state().unwrap().tempo(),
+            expected_tempo,
+        );
+        accepted_edits += 1;
     }
 
-    let elapsed = start_time.elapsed();
-    let operations_per_second = iterations as f64 / elapsed.as_secs_f64();
+    assert_eq!(accepted_edits, batches);
+    let operations_per_second = f64::from(iterations) / elapsed.as_secs_f64();
 
     info!(
-        "Real-time performance: {} operations in {:?} ({:.0} ops/sec)",
-        iterations, elapsed, operations_per_second
+        "Audio-side throughput: {} operations and {} successful admissions in {:?} ({:.0} ops/sec); non-RT processing and acknowledgment excluded",
+        iterations, accepted_edits, elapsed, operations_per_second
     );
 
     // Should be able to handle way more than audio rate operations
