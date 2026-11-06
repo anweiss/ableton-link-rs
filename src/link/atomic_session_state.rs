@@ -13,8 +13,11 @@ use super::{
 use super::{sessions::SessionId, state::ClientStartStopState, timeline::Timeline};
 use crate::link::IncomingClientState;
 
-/// Non-blocking accepted-state capture and a bounded proposal queue.
+/// Try-only audio capture and a bounded proposal queue.
 /// A non-RT consumer must validate each request and acknowledge its ticket.
+/// Only audio capture, queue admission and result acknowledgment use try-only
+/// acquisition. Non-RT peek, publication, completion and app capture may block
+/// on synchronous locks; calling them from async code does not make them yield.
 ///
 /// The legacy consuming helper is removed. Use [`Self::pending_update`],
 /// publish only accepted state, complete the ticket, then read its result.
@@ -48,6 +51,7 @@ impl AtomicSessionState {
 
     /// Capture with one reader-pin attempt, try-only locks, and no allocation.
     /// On error, skip this capture or reuse a caller-owned accepted value.
+    /// A pending accepted publication may already have been flushed before error.
     pub fn capture_audio_session_state(&self) -> Result<ClientState, AudioCaptureError> {
         self.rt_handler.get_rt_client_state()
     }
@@ -96,14 +100,17 @@ impl AtomicSessionState {
     /// Peek at a ticketed proposal without consuming it.
     /// Validate, publish accepted state, and complete the ticket before advancing.
     /// Read its result with `take_commit_result` before reusing the queue slot.
+    /// This non-RT operation may block on a synchronous mutex.
     pub fn pending_update(&self) -> Option<(AudioCommitTicket, IncomingClientState)> {
         self.rt_handler.pending_update()
     }
 
+    /// Install accepted state; this non-RT operation may block on publication.
     pub fn publish_client_state(&self, accepted: ClientState) {
         self.rt_handler.publish_client_state(accepted);
     }
 
+    /// Record completion; this non-RT operation may block on the queue mutex.
     pub fn complete_pending_update(
         &self,
         ticket: AudioCommitTicket,
@@ -112,6 +119,8 @@ impl AtomicSessionState {
         self.rt_handler.complete_pending_update(ticket, result)
     }
 
+    /// Try to acknowledge a result. `Busy` consumes nothing and does not
+    /// establish that this ticket is valid or has a result; retry later.
     pub fn take_commit_result(
         &self,
         ticket: AudioCommitTicket,
