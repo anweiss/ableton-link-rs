@@ -9,6 +9,8 @@ use super::{
 };
 use crate::link::IncomingClientState;
 
+/// Copyable request identity, recoverable from its owning handler if lost.
+/// Dropping copies does not cancel a request or acknowledge its result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioCommitTicket {
     queue: core::num::NonZeroU64,
@@ -17,8 +19,8 @@ pub struct AudioCommitTicket {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AudioQueueError {
-    /// Admission found an occupied slot or could not acquire its try-only lock.
-    /// Acknowledgment can also return this when its lock is unavailable,
+    /// Admission found an occupied slot or an unavailable try-only lock.
+    /// Acknowledgment and ticket lookup also return this for an unavailable lock,
     /// including contention or poisoning. This does not
     /// establish that a request or result exists, or validate an existing ticket.
     /// Retry later without spinning in the audio callback; drain or acknowledge
@@ -170,7 +172,7 @@ impl AcceptedState {
 }
 
 /// Try-only audio snapshots and a bounded acknowledged proposal queue.
-/// Audio capture, proposal admission and result acknowledgment use try-only
+/// Audio capture, admission, ticket lookup and acknowledgment use try-only
 /// acquisition. Non-RT peeking, accepted publication, completion and app capture
 /// use synchronous locks and may block, including when called by an async task.
 ///
@@ -334,6 +336,24 @@ impl SafeRtSessionStateHandler {
             .ok_or(AudioQueueError::UnknownTicket)
     }
 
+    /// Recover a copy of the pending or completed request's ticket.
+    /// Uses one try-only lock without allocation, processing, or acknowledgment.
+    /// `None` means the slot was empty; `Busy` means its lock was unavailable.
+    /// Retain the returned ticket and use `take_commit_result` to acknowledge
+    /// completion. Another consumer may acknowledge it first, making it stale.
+    pub fn outstanding_commit_ticket(&self) -> Result<Option<AudioCommitTicket>, AudioQueueError> {
+        let Some(queue) = self.queue_id else {
+            return Ok(None);
+        };
+        let pending = self.pending.try_lock().map_err(|_| AudioQueueError::Busy)?;
+        Ok(
+            (pending.incoming.is_some() || pending.result.is_some()).then_some(AudioCommitTicket {
+                queue,
+                sequence: pending.sequence,
+            }),
+        )
+    }
+
     /// Check if there are pending updates waiting to be processed
     pub fn has_pending_updates(&self) -> bool {
         self.has_pending_updates.load(Ordering::Acquire)
@@ -475,6 +495,7 @@ mod tests {
             handler.update_rt_client_state(incoming),
             Err(AudioQueueError::TicketExhausted)
         );
+        assert_eq!(handler.outstanding_commit_ticket(), Ok(None));
         handler.pending.lock().unwrap().sequence = 0;
         handler.queue_id = None;
         assert_eq!(
@@ -482,6 +503,81 @@ mod tests {
             Err(AudioQueueError::TicketExhausted)
         );
         assert!(!handler.has_pending_updates());
+        assert_eq!(handler.outstanding_commit_ticket(), Ok(None));
+    }
+
+    #[test]
+    fn ordering_lost_ticket_recovery_preserves_result_and_queue_capacity() {
+        for result in [Ok(()), Err(CommitError::TimelineOriginExhausted)] {
+            let initial = create_test_client_state();
+            let handler = SafeRtSessionStateHandler::new(initial);
+            let mut accepted = initial;
+            accepted.timeline.tempo = Tempo::new(140.0);
+            let incoming = IncomingClientState {
+                timeline: Some(accepted.timeline),
+                start_stop_state: None,
+                timeline_timestamp: Duration::zero(),
+            };
+            assert_eq!(handler.outstanding_commit_ticket(), Ok(None));
+            handler.update_rt_client_state(incoming).unwrap();
+            {
+                let (ticket, proposal) = handler.pending_update().unwrap();
+                assert_eq!(proposal, incoming);
+                assert_eq!(handler.outstanding_commit_ticket(), Ok(Some(ticket)));
+                assert_eq!(handler.pending_update(), Some((ticket, incoming)));
+                assert_eq!(handler.take_commit_result(ticket), Ok(None));
+                if result.is_ok() {
+                    handler.publish_client_state(accepted);
+                }
+                assert!(handler.complete_pending_update(ticket, result));
+            }
+            assert!(!handler.has_pending_updates());
+            assert_eq!(handler.pending_update(), None);
+            assert_eq!(
+                handler.update_rt_client_state(incoming),
+                Err(AudioQueueError::Busy)
+            );
+            let recovered = handler.outstanding_commit_ticket().unwrap().unwrap();
+            assert_eq!(handler.outstanding_commit_ticket(), Ok(Some(recovered)));
+            assert_eq!(
+                handler.update_rt_client_state(incoming),
+                Err(AudioQueueError::Busy)
+            );
+            assert_eq!(
+                handler.get_rt_client_state(),
+                Ok(if result.is_ok() { accepted } else { initial })
+            );
+            assert_eq!(handler.take_commit_result(recovered), Ok(Some(result)));
+            assert_eq!(handler.outstanding_commit_ticket(), Ok(None));
+            let next = handler.update_rt_client_state(incoming).unwrap();
+            assert_ne!(next, recovered);
+            assert_eq!(
+                handler.take_commit_result(recovered),
+                Err(AudioQueueError::UnknownTicket)
+            );
+            assert_eq!(handler.pending_update(), Some((next, incoming)));
+        }
+    }
+
+    #[test]
+    fn ordering_ticket_lookup_contention_does_not_consume_the_request() {
+        let handler = SafeRtSessionStateHandler::new(create_test_client_state());
+        let incoming = IncomingClientState {
+            timeline: None,
+            start_stop_state: None,
+            timeline_timestamp: Duration::zero(),
+        };
+        let ticket = handler.update_rt_client_state(incoming).unwrap();
+        let guard = handler.pending.lock().unwrap();
+        assert_eq!(
+            handler.outstanding_commit_ticket(),
+            Err(AudioQueueError::Busy)
+        );
+        drop(guard);
+        assert_eq!(handler.outstanding_commit_ticket(), Ok(Some(ticket)));
+        assert_eq!(handler.pending_update(), Some((ticket, incoming)));
+        assert!(handler.complete_pending_update(ticket, Ok(())));
+        assert_eq!(handler.take_commit_result(ticket), Ok(Some(Ok(()))));
     }
 
     #[test]

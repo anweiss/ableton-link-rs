@@ -373,11 +373,25 @@ impl BasicLink {
         completed
     }
 
+    /// Acknowledge a completed result. `Busy` consumes nothing; a stale ticket
+    /// returns `UnknownTicket`. Recover a lost copy through
+    /// [`Self::outstanding_audio_commit_ticket`].
     pub fn take_audio_commit_result(
         &self,
         ticket: AudioCommitTicket,
     ) -> result::Result<Option<result::Result<(), CommitError>>, AudioQueueError> {
         self.atomic_session_state.take_commit_result(ticket)
+    }
+
+    /// Recover a lost ticket for the pending request or unacknowledged result.
+    /// Uses one try-only lock without allocation or consuming anything. Drain
+    /// pending work normally, then acknowledge with [`Self::take_audio_commit_result`].
+    /// `Busy` means the lock is unavailable, not proof of an occupied slot.
+    /// Another consumer can acknowledge first, making the returned copy stale.
+    pub fn outstanding_audio_commit_ticket(
+        &self,
+    ) -> result::Result<Option<AudioCommitTicket>, AudioQueueError> {
+        self.atomic_session_state.outstanding_commit_ticket()
     }
 
     /// Capture accepted state, possibly blocking on its publication cache.
@@ -849,6 +863,26 @@ mod tests {
         );
         assert_eq!(first.take_audio_commit_result(a), Ok(Some(Ok(()))));
         assert_eq!(second.take_audio_commit_result(b), Ok(Some(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn ordering_audio_commit_ticket_is_recoverable_after_discarded_drain() {
+        let link = BasicLink::new(120.0).await.unwrap();
+        let mut state = link.capture_app_session_state();
+        state.set_tempo(140.0, link.clock.micros());
+        link.commit_audio_session_state(state).unwrap();
+        let _ = link.process_audio_session_state_updates().await;
+        let ticket = link.outstanding_audio_commit_ticket().unwrap().unwrap();
+        assert_eq!(link.outstanding_audio_commit_ticket(), Ok(Some(ticket)));
+        assert_eq!(link.capture_audio_session_state().unwrap().tempo(), 140.0);
+        assert_eq!(link.take_audio_commit_result(ticket), Ok(Some(Ok(()))));
+        assert_eq!(link.outstanding_audio_commit_ticket(), Ok(None));
+        link.commit_audio_session_state(link.capture_audio_session_state().unwrap())
+            .unwrap();
+        let _ = link.process_audio_session_state_updates().await;
+        let next = link.outstanding_audio_commit_ticket().unwrap().unwrap();
+        assert_ne!(next, ticket);
+        assert_eq!(link.take_audio_commit_result(next), Ok(Some(Ok(()))));
     }
 
     #[tokio::test]
