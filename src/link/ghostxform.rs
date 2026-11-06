@@ -18,6 +18,7 @@ impl Default for GhostXForm {
 }
 
 impl GhostXForm {
+    #[cfg(any(feature = "std", test))]
     pub(crate) fn host_to_ghost_nanos(&self, host_time: Duration) -> Duration {
         super::duration_from_nanos(self.host_to_ghost_wide_nanos(host_time))
     }
@@ -85,10 +86,12 @@ impl GhostXForm {
         }
     }
 
+    #[cfg(any(feature = "std", test))]
     pub(crate) fn ghost_to_host_nanos(&self, ghost_time: Duration) -> Duration {
         self.ghost_nanos_to_host(super::duration_nanos(ghost_time))
     }
 
+    #[cfg(any(feature = "std", test))]
     pub(crate) fn ghost_nanos_to_host(&self, ghost_nanos: i128) -> Duration {
         self.ghost_nanos_to_host_units(ghost_nanos, 1)
             .unwrap_or_else(core::convert::identity)
