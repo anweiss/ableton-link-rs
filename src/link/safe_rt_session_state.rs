@@ -160,6 +160,17 @@ impl AcceptedState {
 }
 
 /// Non-blocking accepted snapshots and a bounded acknowledged proposal queue.
+///
+/// The legacy consuming helper is removed. Use [`Self::pending_update`],
+/// publish only accepted state, complete the ticket, then read its result.
+///
+/// ```compile_fail,E0599
+/// use ableton_link_rs::link::safe_rt_session_state::SafeRtSessionStateHandler;
+///
+/// fn legacy_drain(state: &SafeRtSessionStateHandler) {
+///     while state.process_pending_updates().is_some() {}
+/// }
+/// ```
 pub struct SafeRtSessionStateHandler {
     queue_id: Option<core::num::NonZeroU64>,
     accepted: AcceptedState,
@@ -221,14 +232,9 @@ impl SafeRtSessionStateHandler {
         })
     }
 
-    /// Peek at the pending request, preserving its changed-field mask.
-    /// The non-RT consumer must validate, publish accepted state, and complete
-    /// its ticket. Repeated reads do not consume or acknowledge the request.
-    pub fn process_pending_updates(&self) -> Option<IncomingClientState> {
-        self.pending_update().map(|(_, incoming)| incoming)
-    }
-
     /// Peek without consuming: cancellation of a non-RT drain leaves the request queued.
+    /// Validate, publish accepted state, and complete its ticket before advancing.
+    /// Read its result with `take_commit_result` before reusing the queue slot.
     pub fn pending_update(&self) -> Option<(AudioCommitTicket, IncomingClientState)> {
         let queue = self.queue_id?;
         let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -510,20 +516,21 @@ mod tests {
         // Should have pending updates
         assert!(handler.has_pending_updates());
 
-        // Process pending updates
-        let processed = handler.process_pending_updates();
+        let processed = handler.pending_update();
         assert!(processed.is_some());
 
-        let processed_state = processed.unwrap();
+        let (processed_ticket, processed_state) = processed.unwrap();
+        assert_eq!(processed_ticket, ticket);
         assert!(processed_state.timeline.is_some());
         assert_eq!(processed_state.timeline.unwrap().tempo.bpm(), 140.0);
         assert_eq!(processed_state, incoming_state);
-        assert_eq!(handler.process_pending_updates(), Some(incoming_state));
+        assert_eq!(handler.pending_update(), Some((ticket, incoming_state)));
         assert_eq!(
             handler.update_rt_client_state(incoming_state),
             Err(AudioQueueError::Busy)
         );
         assert!(handler.complete_pending_update(ticket, Err(CommitError::TimelineOriginExhausted)));
+        assert_eq!(handler.pending_update(), None);
         assert_eq!(handler.get_rt_client_state(), Ok(client_state));
         assert_eq!(
             handler.update_rt_client_state(incoming_state),
@@ -628,7 +635,7 @@ mod tests {
             };
 
             let ticket = handler.update_rt_client_state(incoming_state).unwrap();
-            assert_eq!(handler.process_pending_updates(), Some(incoming_state));
+            assert_eq!(handler.pending_update(), Some((ticket, incoming_state)));
             handler.publish_client_state(ClientState {
                 timeline: new_timeline,
                 ..client_state
