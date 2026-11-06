@@ -41,6 +41,10 @@ ableton-link-rs = { version = "0.3.0", default-features = false }
 
 This gives you access to core types like `Beats`, `Tempo`, `Timeline`, `GhostXForm`, `StartStopState`, and `NodeId` without pulling in networking dependencies, along with the wire encoding layer in `src/encoding.rs` (`Encode`/`Decode`, `encode_to_vec`, `decode_from_slice`). Requires `alloc`.
 
+The three private nanosecond clock adapters used only by the controller compile
+with `std` or unit tests. Public `GhostXForm` methods and the core timeline
+composition helpers remain available without `std`.
+
 ### LinkAudio Usage
 
 Audio sharing is opt-in via the `audio` feature, which implies `std`:
