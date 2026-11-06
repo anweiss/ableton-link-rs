@@ -288,6 +288,9 @@ impl SafeRtSessionStateHandler {
 
     /// Publish only a controller-accepted snapshot, never an unvalidated proposal.
     /// This non-RT operation may block on the accepted-publication mutex.
+    /// The caller owns snapshot ordering: no version comparison prevents an older
+    /// snapshot published later from replacing newer cache contents. Serialize
+    /// sampling and publication across publishers, or reject superseded snapshots.
     pub fn publish_client_state(&self, accepted: ClientState) {
         self.accepted.publish(accepted);
     }

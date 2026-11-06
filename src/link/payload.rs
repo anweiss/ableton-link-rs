@@ -527,6 +527,113 @@ mod tests {
     }
 
     #[test]
+    fn packet_compatibility_rejects_noncanonical_entry_lengths() {
+        use crate::link::error::Error;
+
+        for (key, expected) in [
+            (HOST_TIME_HEADER_KEY, HOST_TIME_SIZE),
+            (GHOST_TIME_HEADER_KEY, GHOST_TIME_SIZE),
+            (PREV_GHOST_TIME_HEADER_KEY, PREV_GHOST_TIME_SIZE),
+            (TIMELINE_HEADER_KEY, TIMELINE_SIZE),
+            (SESSION_MEMBERSHIP_HEADER_KEY, SESSION_MEMBERSHIP_SIZE),
+            (START_STOP_STATE_HEADER_KEY, START_STOP_STATE_SIZE),
+            (
+                MEASUREMENT_ENDPOINT_V4_HEADER_KEY,
+                MEASUREMENT_ENDPOINT_V4_SIZE,
+            ),
+            (AUDIO_ENDPOINT_V4_HEADER_KEY, AUDIO_ENDPOINT_V4_SIZE),
+        ] {
+            for (size, available, reason) in [
+                (expected - 1, expected - 1, "payload entry size mismatch"),
+                (expected + 1, expected + 1, "payload entry size mismatch"),
+                (expected, expected - 1, "truncated payload entry"),
+            ] {
+                let mut bytes = PayloadEntryHeader { key, size }.encode().unwrap();
+                bytes.resize(bytes.len() + available as usize, 0);
+                assert!(matches!(
+                    crate::discovery::messages::parse_payload(&bytes),
+                    Err(Error::Protocol(actual)) if actual == reason
+                ));
+            }
+        }
+        for key in [u32::from_be_bytes(*b"new!"), AUDIO_ENDPOINT_V6_HEADER_KEY] {
+            let bytes = PayloadEntryHeader {
+                key,
+                size: u32::MAX,
+            }
+            .encode()
+            .unwrap();
+            assert!(matches!(
+                crate::discovery::messages::parse_payload(&bytes),
+                Err(Error::Protocol("truncated payload entry"))
+            ));
+        }
+
+        let mut bytes = HostTime::new(Duration::microseconds(123)).encode().unwrap();
+        bytes.extend(
+            PayloadEntryHeader {
+                key: HOST_TIME_HEADER_KEY,
+                size: HOST_TIME_SIZE + 1,
+            }
+            .encode()
+            .unwrap(),
+        );
+        bytes.resize(bytes.len() + HOST_TIME_SIZE as usize + 1, 0);
+        let mut partial = Payload::default();
+        assert!(decode(&mut partial, &bytes).is_err());
+        assert!(matches!(
+            partial.entries.as_slice(),
+            [PayloadEntry::HostTime(HostTime { time })]
+                if *time == Duration::microseconds(123)
+        ));
+        assert!(crate::discovery::messages::parse_payload(&bytes).is_err());
+    }
+
+    #[test]
+    fn packet_compatibility_preserves_bounded_extensions_and_trailing_fragments() {
+        let node = NodeId::from_array([7; 8]);
+        let mut payload = Payload::from(NodeState {
+            node_id: node,
+            session_id: SessionId(node),
+            timeline: Timeline {
+                tempo: Tempo::new(120.0),
+                beat_origin: Beats::new(3.0),
+                time_origin: Duration::microseconds(123),
+            },
+            start_stop_state: StartStopState::default(),
+        });
+        payload.entries.extend([
+            PayloadEntry::HostTime(HostTime::new(Duration::microseconds(123))),
+            PayloadEntry::GhostTime(GhostTime::new(Duration::microseconds(-456))),
+            PayloadEntry::PrevGhostTime(PrevGhostTime::new(Duration::microseconds(789))),
+            PayloadEntry::MeasurementEndpointV4(MeasurementEndpointV4 {
+                endpoint: Some("127.0.0.1:3000".parse().unwrap()),
+            }),
+            PayloadEntry::AudioEndpointV4(AudioEndpointV4 {
+                endpoint: Some("127.0.0.1:3001".parse().unwrap()),
+            }),
+        ]);
+        let canonical = payload.encode().unwrap();
+        for (key, size) in [
+            (u32::from_be_bytes(*b"new!"), 0),
+            (u32::from_be_bytes(*b"new!"), 3),
+            (AUDIO_ENDPOINT_V6_HEADER_KEY, AUDIO_ENDPOINT_V6_SIZE),
+            (AUDIO_ENDPOINT_V6_HEADER_KEY, 3),
+        ] {
+            let mut extension = PayloadEntryHeader { key, size }.encode().unwrap();
+            extension.resize(extension.len() + size as usize, 0);
+            for trailing in 0..PAYLOAD_ENTRY_HEADER_SIZE {
+                let mut bytes = extension.clone();
+                bytes.extend_from_slice(&canonical);
+                bytes.extend_from_slice(&extension);
+                bytes.resize(bytes.len() + trailing, 0);
+                let decoded = crate::discovery::messages::parse_payload(&bytes).unwrap();
+                assert_eq!(decoded.encode().unwrap(), canonical);
+            }
+        }
+    }
+
+    #[test]
     fn decode_classifies_entry_rejections() {
         use crate::link::error::Error;
 
