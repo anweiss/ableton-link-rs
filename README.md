@@ -320,6 +320,11 @@ Audio commits now explicitly mean **queued**, not accepted.
 It never changes captured state optimistically. There is one outstanding slot:
 handle `Busy` (including lock contention) without assuming submission, and
 `TicketExhausted` rather than expecting identifiers to wrap.
+`Busy` does not prove that there is an outstanding request: admission may only
+have encountered a contended lock and returns no ticket. During result
+acknowledgment, `Busy` consumes nothing and does not validate the supplied
+ticket or prove that a result is ready. Retain the ticket and retry later,
+without spinning in the audio callback; drain or acknowledge only actual tickets.
 Tickets also carry a non-reused queue identity. A ticket from another instance
 returns `UnknownTicket` without acknowledging the local result; low-level
 completion rejects it too.
@@ -353,6 +358,12 @@ use `publish_client_state` only for an accepted snapshot, and record the result
 with `complete_pending_update` before advancing a drain loop. Read the result
 with `take_commit_result` before reusing the slot. Neither peeking nor successful
 queue admission is acceptance.
+The non-RT peek, publication and completion helpers acquire synchronous mutexes
+and may block. App commits and audio-drain futures call these and other cache
+or notification helpers, so their `async` signatures do not make every lock wait
+cooperative or offload it to another thread. Run them in a non-RT application
+context where synchronous waits are acceptable. The one-request drain limit is
+not a wall-clock bound.
 
 Accepted RT snapshots use pinned, preallocated value slots. A preempted publisher
 does not force readers to block or substitute default values for accepted state.
@@ -480,7 +491,12 @@ remains active, with a 100 ms backoff for every commit error. Stopping clears
 that backoff; successful alignment is not repeated on each display refresh.
 `triple_buffer` is now a dev-dependency for the retained comparison tests, not
 part of the normal `std` dependency graph. Its obsolete implicit Cargo feature
-is removed; downstream feature lists must stop requesting `triple_buffer`.
+is removed. Removing the unused optional `async-trait` dependency also removes
+its implicit Cargo feature. Both are source-breaking feature-resolution changes:
+remove `async-trait` and `triple_buffer` from downstream dependency
+`features = [...]` lists and forwarded features such as
+`ableton-link-rs/async-trait` or `ableton-link-rs/triple_buffer`. There is no
+replacement crate feature to enable.
 Link Classic and LinkAudio tempo encoders saturate signed wire periods without
 changing the sign of a negative out-of-range value.
 PONG ghost timestamps saturate at the final signed-microsecond wire boundary.
@@ -1012,6 +1028,10 @@ Linux and macOS networking enable both the `net` and `time` features of `rustix`
 including the time types used by its socket timeout helpers. This dependency
 remains optional under `std`; `no_std` builds do not enable it.
 Unused direct `async-trait`, `winapi`, and `mach2` dependencies have been removed.
+The removed implicit `async-trait` and `triple_buffer` features require downstream
+changes; see [source migration](#source-migration-and-managed-lifecycle).
+`winapi` and `mach2` were non-optional
+target dependencies and did not expose corresponding implicit crate features.
 Platform implementations retain their used safe wrappers and Windows SDK
 bindings; transitive dependencies of those wrappers are managed separately.
 

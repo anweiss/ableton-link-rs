@@ -17,7 +17,13 @@ pub struct AudioCommitTicket {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AudioQueueError {
-    #[error("audio commit queue is busy; drain and acknowledge the outstanding request")]
+    /// Admission found an occupied slot or could not acquire its try-only lock.
+    /// Acknowledgment can also return this when its lock is unavailable,
+    /// including contention or poisoning. This does not
+    /// establish that a request or result exists, or validate an existing ticket.
+    /// Retry later without spinning in the audio callback; drain or acknowledge
+    /// only an actual ticket. Failed admission creates no ticket.
+    #[error("audio commit queue is unavailable or occupied")]
     Busy,
     #[error("audio commit ticket counter exhausted")]
     TicketExhausted,
@@ -25,8 +31,12 @@ pub enum AudioQueueError {
     UnknownTicket,
 }
 
+/// A failed capture returns no snapshot, but may already have flushed a pending
+/// accepted publication before attempting to pin a reader. It is not a rollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AudioCaptureError {
+    /// The single reader-pin attempt lost a compare-exchange race.
+    /// Skip capture or reuse a caller-owned accepted value; do not retry here.
     #[error("accepted-state reader count changed; skip capture until a later callback")]
     Busy,
     #[error("accepted-state reader counter exhausted")]
@@ -159,7 +169,10 @@ impl AcceptedState {
     }
 }
 
-/// Non-blocking accepted snapshots and a bounded acknowledged proposal queue.
+/// Try-only audio snapshots and a bounded acknowledged proposal queue.
+/// Audio capture, proposal admission and result acknowledgment use try-only
+/// acquisition. Non-RT peeking, accepted publication, completion and app capture
+/// use synchronous locks and may block, including when called by an async task.
 ///
 /// The legacy consuming helper is removed. Use [`Self::pending_update`],
 /// publish only accepted state, complete the ticket, then read its result.
@@ -235,6 +248,7 @@ impl SafeRtSessionStateHandler {
     /// Peek without consuming: cancellation of a non-RT drain leaves the request queued.
     /// Validate, publish accepted state, and complete its ticket before advancing.
     /// Read its result with `take_commit_result` before reusing the queue slot.
+    /// This non-RT operation may block on a synchronous mutex.
     pub fn pending_update(&self) -> Option<(AudioCommitTicket, IncomingClientState)> {
         let queue = self.queue_id?;
         let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -271,10 +285,12 @@ impl SafeRtSessionStateHandler {
     }
 
     /// Publish only a controller-accepted snapshot, never an unvalidated proposal.
+    /// This non-RT operation may block on the accepted-publication mutex.
     pub fn publish_client_state(&self, accepted: ClientState) {
         self.accepted.publish(accepted);
     }
 
+    /// Record a terminal result. This non-RT operation may block on the queue mutex.
     pub fn complete_pending_update(
         &self,
         ticket: AudioCommitTicket,
@@ -295,6 +311,8 @@ impl SafeRtSessionStateHandler {
     }
 
     /// Non-blocking acknowledgment; a completed result occupies the slot until read.
+    /// `Busy` means the lock is unavailable, not confirmation that this ticket is valid
+    /// or has a result. Nothing was consumed; retain the ticket and retry later.
     pub fn take_commit_result(
         &self,
         ticket: AudioCommitTicket,

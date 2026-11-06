@@ -214,6 +214,7 @@ impl LinkAudio {
     }
 
     /// Forwards to [`BasicLink::commit_app_session_state`].
+    /// Its non-RT synchronous mutex waits may block this async task.
     pub async fn commit_app_session_state(
         &mut self,
         state: SessionState,
@@ -221,7 +222,9 @@ impl LinkAudio {
         self.link.commit_app_session_state(state).await
     }
 
-    /// Forwards the bounded, non-RT audio commit drain.
+    /// Forwards the at-most-one-request, non-RT audio commit drain.
+    /// Synchronous mutex waits may block this async task; see
+    /// [`BasicLink::process_audio_session_state_updates`].
     pub async fn process_audio_session_state_updates(
         &self,
     ) -> Option<(

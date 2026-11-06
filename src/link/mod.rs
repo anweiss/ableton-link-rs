@@ -312,6 +312,8 @@ impl BasicLink {
     /// Attempt accepted capture without retrying reader-pin contention.
     /// Skip work or reuse a caller-owned accepted value on error; never retry
     /// inside the callback. Uses try-only locks, not a lock-free protocol.
+    /// An error may follow a flushed accepted publication; it does not mean
+    /// that the accepted cache stayed unchanged.
     pub fn capture_audio_session_state(&self) -> result::Result<SessionState, AudioCaptureError> {
         let client_state = self.atomic_session_state.capture_audio_session_state()?;
         let mut captured = to_session_state(&client_state, self.num_peers() > 0);
@@ -326,6 +328,8 @@ impl BasicLink {
     /// Queue one request without changing captured state. Drain it on a non-RT
     /// thread with [`Self::process_audio_session_state_updates`], then acknowledge
     /// the returned ticket with [`Self::take_audio_commit_result`].
+    /// `Busy` creates no ticket and may mean only lock contention, not that
+    /// there is an outstanding request to drain.
     pub fn commit_audio_session_state(
         &self,
         state: SessionState,
@@ -342,6 +346,9 @@ impl BasicLink {
     /// Cancellation leaves an unprocessed request queued. Call periodically from
     /// the application thread, including when there are no audio requests.
     /// Concurrent or reentrant consumers return None without consuming a request.
+    /// Non-RT queue, cache and notification helpers use synchronous mutexes and
+    /// may block this async task. Run it where synchronous waits are acceptable;
+    /// neither `async` nor the one-request limit bounds lock-wait time.
     pub async fn process_audio_session_state_updates(
         &self,
     ) -> Option<(AudioCommitTicket, result::Result<(), CommitError>)> {
@@ -389,6 +396,9 @@ impl BasicLink {
         }
     }
 
+    /// Commit from a non-RT application context. Accepted-cache publication and
+    /// notification helpers may acquire blocking synchronous mutexes inside this
+    /// async task; awaiting it does not offload those waits to another thread.
     pub async fn commit_app_session_state(
         &mut self,
         state: SessionState,
