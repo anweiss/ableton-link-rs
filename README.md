@@ -62,7 +62,8 @@ cargo run --example platform_demo
 ```
 
 See the [examples guide](docs/examples.md) for controls, playback configuration,
-Docker and ESP32 setup.
+Docker and ESP32 setup. LinkAudio speaker playback uses bounded, nonblocking
+buffering with startup/recovery prefill and smoothed discontinuities.
 
 ## Documentation
 

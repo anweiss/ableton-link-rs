@@ -114,6 +114,7 @@ esp-idf-svc = { version = "0.53", default-features = false, features = ["alloc"]
 [dev-dependencies]
 console-subscriber = "0.5.0"
 triple_buffer = "8.1.1"
+rtrb = "0.4.1"
 
 [target.'cfg(windows)'.dev-dependencies]
 crossterm = { version = "0.29", default-features = false, features = ["windows"] }
@@ -133,6 +134,7 @@ path = "examples/platform_demo.rs"
 name = "link_audio"
 path = "examples/link_audio.rs"
 required-features = ["audio"]
+test = true
 
 # Enforced package-wide rather than as an inner attribute in `src/lib.rs`,
 # because `--all-targets` builds examples and integration tests as their own

@@ -167,10 +167,62 @@ track (plus `Main`), so pick the channel you actually want — most tracks strea
 audible in the mix. The `link_audio` example plays the subscribed channel through the default output device
 and prints a peak level meter; set `LINK_AUDIO_PLAYBACK=0` to receive without opening an output device.
 
-The example buffers 50 ms of received audio by default (`LINK_AUDIO_LATENCY_MS`). It performs no
-clock-drift compensation between the sending peer and the local output device, so that buffer has to
-absorb raw network jitter, which was measured at roughly 30 ms peak to peak on an ordinary LAN. Lower
-values underrun audibly.
+The example waits for 50 ms of received audio before starting or recovering from starvation.
+Input received while the output device is opening is metered but discarded.
+Prefill begins with fresh input after the source is first rendered, rather than
+replaying a stale queue accumulated during device startup.
+Queued audio expires after the larger of one second or twice the ring's frame
+capacity expressed as a duration. Expired frames are discarded and counted, so a
+partial refill cannot replay arbitrarily old audio after a long outage.
+Expiry discards at most eight queued frames per rendered frame, keeping playback
+in recovery until the stale prefix is gone and fresh prefill is available.
+`LINK_AUDIO_LATENCY_MS` requests this prefill target, clamped to 1-1000 ms, not total
+end-to-end latency. `LINK_AUDIO_OUTPUT_BURST_MS` reserves a burst budget for the
+output device (default 50 ms, also clamped to 1-1000 ms). The effective prefill
+is the larger of those two settings, rounded up to whole received frames, and
+is printed at startup and in status. This avoids sizing the ring only for tiny
+network chunks when the OS pulls larger output blocks. The budget is explicit,
+not detected from the device: lower it only after verifying the output callback
+duration, or raise it if callbacks consume more than 50 ms at once.
+
+The preallocated SPSC ring holds
+`effective target + max(effective target, fade-out frames) + maximum wire-chunk frames`
+(all sizes rounded to whole frames).
+This reserves room for a complete receive chunk even if a partial prefill is
+already queued, consumption is paused for the recovery fade, or a full output
+burst arrives at fade completion, including at the
+1 ms setting. Maximum chunk size derives from
+`AudioBuffer::MAX_AUDIO_BYTES` and the received channel count. Its audio-side
+operations do not allocate or take a shared blocking mutex. The example uses the dev-only `rtrb` dependency for this
+safe handoff; library consumers do not acquire that dependency.
+
+On starvation it fades the last output frame to silence over 5 ms, waits until
+both that fade and the prefill target are complete, then fades back in. When full, it drops incoming whole
+frames and crossfades at the resulting gap when it reaches playback. This
+concealment smooths discontinuities; it cannot reconstruct missing audio.
+The example does not compensate sender/output clock drift or schedule speaker
+playback against Link's beat grid. Persistent drift can still cause rebuffering
+or overflow, and speakers on different devices are not sample-aligned.
+
+Status distinguishes underrun **events** from missing output **frames**, counts
+startup waiting frames separately, and reports dropped frames (including input
+discarded while output is opening or expired after an outage), rejected buffers
+and incoming peak level, including valid frames dropped during overflow.
+Buffered milliseconds use the received sample rate. Missing
+frames include the fade-out/rebuffer interval after starvation, not just
+zero-valued samples. The receiver accepts 1-32 channels and sample rates through
+192 kHz; later format changes or malformed sample counts are rejected and counted,
+not played with the wrong format. Restart the example to accept a changed format.
+Queue occupancy is accounted on admission and consumption, so buffered duration
+also updates before the first render or while output is idle. Rejections before
+the first supported format are reported while playback is inactive and retained
+in the same counter after startup.
+Accepted channel formats do not guarantee speaker routing: the default output
+device and Rodio's channel conversion determine which channels are audible.
+Surplus channels can be dropped rather than downmixed; use mono or stereo for a
+two-speaker monitor. Rejection counts cover decoded buffers considered for this
+example's playback, not malformed datagrams or codec data discarded before the
+callback. Receive-only mode does not perform playback validation.
 
 ## Core Types (available in `no_std`)
 

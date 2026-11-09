@@ -8,128 +8,36 @@
 //! ```
 
 use std::{
-    collections::VecDeque,
     f64::consts::TAU,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        mpsc, Arc,
     },
     time::Duration,
 };
 
 use ableton_link_rs::link_audio::LinkAudio;
-use rodio::{ChannelCount, Player, Sample, SampleRate, Source};
+use rodio::{Player, Source};
 
 #[path = "common/audio_sink.rs"]
 mod audio_sink;
+#[path = "common/link_audio_playback.rs"]
+mod link_audio_playback;
+
+use link_audio_playback::{Format, LivePlayback, PlaybackInput, PlaybackStats};
 
 const SAMPLE_RATE: u32 = 44100;
 const NUM_CHANNELS: usize = 2;
 const NUM_FRAMES: usize = 256;
 const QUANTUM: f64 = 4.0;
 
-/// Default jitter buffer depth, in milliseconds, overridable with
-/// `LINK_AUDIO_LATENCY_MS`.
-///
-/// This example does no clock-drift compensation between the sender and the
-/// local output device, so the buffer has to absorb raw network jitter. On a
-/// normal LAN that jitter was measured at roughly 30 ms peak to peak, so much
-/// below this the stream underruns audibly.
+/// Startup and recovery prefill target, overridable with `LINK_AUDIO_LATENCY_MS`.
+/// Storage also reserves full-wire-chunk headroom; clock drift is not compensated.
 const DEFAULT_LATENCY_MS: usize = 50;
+const DEFAULT_OUTPUT_BURST_MS: usize = 50;
 
-/// Shared jitter buffer between the LinkAudio source callback (producer) and
-/// the rodio output stream (consumer).
-#[derive(Default)]
-struct PlaybackQueue {
-    samples: VecDeque<i16>,
-    underruns: u64,
-    /// Largest sample magnitude seen since the last status line, used as a
-    /// simple input level meter.
-    peak: i32,
-    /// Wire format of the subscribed channel, learned from the first buffer.
-    format: Option<(ChannelCount, SampleRate)>,
-}
-
-/// A rodio [`Source`] that plays whatever the LinkAudio source callback has
-/// delivered, substituting silence on underrun so the stream never ends.
-///
-/// Samples are pulled a whole frame at a time. Popping individual samples would
-/// let an underrun (or a trim) that is not a multiple of the channel count shift
-/// every later sample by one channel, permanently swapping left and right.
-struct LivePlayback {
-    queue: Arc<Mutex<PlaybackQueue>>,
-    channels: ChannelCount,
-    sample_rate: SampleRate,
-    frame: VecDeque<Sample>,
-}
-
-impl LivePlayback {
-    fn new(
-        queue: Arc<Mutex<PlaybackQueue>>,
-        channels: ChannelCount,
-        sample_rate: SampleRate,
-    ) -> Self {
-        Self {
-            queue,
-            channels,
-            sample_rate,
-            frame: VecDeque::with_capacity(channels.get() as usize),
-        }
-    }
-}
-
-impl Iterator for LivePlayback {
-    type Item = Sample;
-
-    fn next(&mut self) -> Option<Sample> {
-        if let Some(sample) = self.frame.pop_front() {
-            return Some(sample);
-        }
-
-        let channels = self.channels.get() as usize;
-        let mut queue = self.queue.lock().unwrap();
-
-        if queue.samples.len() >= channels {
-            for _ in 0..channels {
-                let sample = queue.samples.pop_front().unwrap_or(0);
-                self.frame.push_back(sample as f32 / -(i16::MIN as f32));
-            }
-        } else {
-            queue.underruns += 1;
-            for _ in 0..channels {
-                self.frame.push_back(0.0);
-            }
-        }
-
-        self.frame.pop_front()
-    }
-}
-
-impl Source for LivePlayback {
-    fn current_span_len(&self) -> Option<usize> {
-        None
-    }
-
-    fn channels(&self) -> ChannelCount {
-        self.channels
-    }
-
-    fn sample_rate(&self) -> SampleRate {
-        self.sample_rate
-    }
-
-    fn total_duration(&self) -> Option<Duration> {
-        None
-    }
-}
-
-/// Opens the default output device and streams `queue` to the speakers until
-/// the process exits.
-fn start_playback(
-    queue: Arc<Mutex<PlaybackQueue>>,
-    channels: ChannelCount,
-    sample_rate: SampleRate,
-) {
+/// Opens the default output device and keeps the playback source alive.
+fn start_playback(playback: LivePlayback) {
     std::thread::spawn(move || {
         let stream = match audio_sink::open_default_sink() {
             Ok(stream) => stream,
@@ -140,7 +48,7 @@ fn start_playback(
         };
 
         let sink = Player::connect_new(stream.mixer());
-        sink.append(LivePlayback::new(queue, channels, sample_rate));
+        sink.append(playback);
         sink.sleep_until_end();
     });
 }
@@ -175,7 +83,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_LATENCY_MS)
-        .max(1);
+        .clamp(1, 1000);
+    let output_burst_ms = std::env::var("LINK_AUDIO_OUTPUT_BURST_MS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_OUTPUT_BURST_MS)
+        .clamp(1, 1000);
 
     let mut link = LinkAudio::new(120.0, name.clone()).await?;
     if std::env::var("LINK_IO_REALTIME").as_deref() == Ok("1") {
@@ -197,10 +110,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     link.set_channels_changed_callback(|| println!("-- channels changed --"));
 
     // Subscribe to the first channel published by another peer.
-    let subscribed = Arc::new(Mutex::new(None));
+    let mut subscribed = None;
     let frames_received = Arc::new(AtomicU64::new(0));
-    let queue = Arc::new(Mutex::new(PlaybackQueue::default()));
-    let mut playback_started = false;
+    let rejected_buffers = Arc::new(AtomicU64::new(0));
+    let (playback_tx, playback_rx) = mpsc::sync_channel(1);
+    let mut playback_stats: Option<Arc<PlaybackStats>> = None;
     let mut listed = false;
     let mut last_status = std::time::Instant::now();
 
@@ -214,8 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
         // Discover and subscribe.
-        let mut subscription = subscribed.lock().unwrap();
-        if subscription.is_none() {
+        if subscribed.is_none() {
             let candidates: Vec<_> = link
                 .channels()
                 .into_iter()
@@ -243,49 +156,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     channel.name, channel.peer_name
                 );
                 let counter = frames_received.clone();
-                let playback = playback_enabled.then(|| queue.clone());
-                *subscription = Some(link.add_source(channel.id, move |handle| {
+                let playback_tx = playback_tx.clone();
+                let rejected = rejected_buffers.clone();
+                let mut input: Option<PlaybackInput> = None;
+                let mut warned_format = false;
+                subscribed = Some(link.add_source(channel.id, move |handle| {
                     counter.fetch_add(handle.info.num_frames as u64, Ordering::Relaxed);
 
-                    if let Some(queue) = &playback {
-                        let mut queue = queue.lock().unwrap();
-                        if queue.format.is_none() {
-                            // The stream header is network data, so a zero
-                            // sample rate or an out-of-range channel count is
-                            // skipped rather than trusted.
-                            let channels = u16::try_from(handle.info.num_channels.max(1))
-                                .ok()
-                                .and_then(ChannelCount::new);
-                            let rate = SampleRate::new(handle.info.sample_rate);
-                            if let (Some(channels), Some(rate)) = (channels, rate) {
-                                queue.format = Some((channels, rate));
+                    if playback_enabled {
+                        if input.is_none() {
+                            let format = Format::from_initial_buffer(
+                                handle.info.num_channels,
+                                handle.info.sample_rate,
+                                handle.info.num_frames,
+                                handle.samples,
+                                &rejected,
+                            );
+                            if let Some(format) = format {
+                                let (writer, playback) = LivePlayback::new(
+                                    format,
+                                    latency_ms,
+                                    output_burst_ms,
+                                    rejected.clone(),
+                                );
+                                playback.wait_for_output();
+                                input = Some(writer);
+                                let _ = playback_tx.try_send(playback);
+                            } else if !warned_format {
+                                eprintln!("skipping unsupported or malformed playback format");
+                                warned_format = true;
                             }
                         }
-                        let max_frames = handle.info.sample_rate as usize * latency_ms / 1000;
-                        let channels = handle.info.num_channels.max(1);
-                        let capacity = (max_frames * channels).max(handle.samples.len());
-                        let queued = queue.samples.len();
-                        if queued + handle.samples.len() > capacity {
-                            // Always drop whole frames so that the remaining
-                            // samples stay aligned to channel boundaries.
-                            let overflow = queued + handle.samples.len() - capacity;
-                            let overflow = overflow.div_ceil(channels) * channels;
-                            queue.samples.drain(..overflow.min(queued));
+                        if let Some(input) = &mut input {
+                            input.push(
+                                handle.info.num_channels,
+                                handle.info.sample_rate,
+                                handle.info.num_frames,
+                                handle.samples,
+                            );
                         }
-                        queue.samples.extend(handle.samples.iter().copied());
-
-                        let peak = handle
-                            .samples
-                            .iter()
-                            .map(|s| (*s as i32).abs())
-                            .max()
-                            .unwrap_or(0);
-                        queue.peak = queue.peak.max(peak);
                     }
                 }));
             }
         }
-        drop(subscription);
 
         // Render and publish a sine tone aligned to the Link beat grid.
         let session_state = link.capture_app_session_state();
@@ -324,30 +237,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // The wire format is discovered from the first buffer that arrives, so
         // the output device can only be opened once audio is actually flowing.
-        if playback_enabled && !playback_started {
-            if let Some((channels, rate)) = queue.lock().unwrap().format {
-                println!("playing back {channels} channel(s) at {rate} Hz");
-                start_playback(queue.clone(), channels, rate);
-                playback_started = true;
-            }
+        if let Ok(playback) = playback_rx.try_recv() {
+            println!(
+                "playing back {} channel(s) at {} Hz; requested prefill: {latency_ms} ms; effective prefill: {:.1} ms",
+                playback.channels(),
+                playback.sample_rate(),
+                playback.stats.prefill_ms(),
+            );
+            playback_stats = Some(playback.stats.clone());
+            start_playback(playback);
         }
 
         if last_status.elapsed() >= Duration::from_secs(2) {
             last_status = std::time::Instant::now();
-            let (underruns, peak, queued) = {
-                let mut queue = queue.lock().unwrap();
-                let peak = std::mem::take(&mut queue.peak);
-                (queue.underruns, peak, queue.samples.len())
-            };
+            let status = playback_stats
+                .as_ref()
+                .map(|stats| stats.status())
+                .unwrap_or_else(|| {
+                    format!(
+                        "playback inactive | rejected buffers: {}",
+                        rejected_buffers.load(Ordering::Relaxed)
+                    )
+                });
             println!(
-                "peers: {} | tempo: {:.1} | channels: {} | frames: {} | buffered: {:.1} ms | underruns: {} | peak: {:.1}%",
+                "peers: {} | tempo: {:.1} | channels: {} | frames: {} | {status}",
                 link.num_peers(),
                 session_state.tempo(),
                 link.channels().len(),
                 received,
-                queued as f32 * 1000.0 / (SAMPLE_RATE as f32 * NUM_CHANNELS as f32),
-                underruns,
-                peak as f32 * 100.0 / -(i16::MIN as f32)
             );
         }
     }
