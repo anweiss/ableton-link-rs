@@ -34,6 +34,7 @@ const QUANTUM: f64 = 4.0;
 /// Startup and recovery prefill target, overridable with `LINK_AUDIO_LATENCY_MS`.
 /// Storage also reserves full-wire-chunk headroom; clock drift is not compensated.
 const DEFAULT_LATENCY_MS: usize = 50;
+const DEFAULT_OUTPUT_BURST_MS: usize = 50;
 
 /// Opens the default output device and keeps the playback source alive.
 fn start_playback(playback: LivePlayback) {
@@ -82,6 +83,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_LATENCY_MS)
+        .clamp(1, 1000);
+    let output_burst_ms = std::env::var("LINK_AUDIO_OUTPUT_BURST_MS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_OUTPUT_BURST_MS)
         .clamp(1, 1000);
 
     let mut link = LinkAudio::new(120.0, name.clone()).await?;
@@ -167,8 +173,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &rejected,
                             );
                             if let Some(format) = format {
-                                let (writer, playback) =
-                                    LivePlayback::new(format, latency_ms, rejected.clone());
+                                let (writer, playback) = LivePlayback::new(
+                                    format,
+                                    latency_ms,
+                                    output_burst_ms,
+                                    rejected.clone(),
+                                );
                                 input = Some(writer);
                                 let _ = playback_tx.try_send(playback);
                             } else if !warned_format {
@@ -228,9 +238,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the output device can only be opened once audio is actually flowing.
         if let Ok(playback) = playback_rx.try_recv() {
             println!(
-                "playing back {} channel(s) at {} Hz; prefill target: {latency_ms} ms",
+                "playing back {} channel(s) at {} Hz; requested prefill: {latency_ms} ms; effective prefill: {:.1} ms",
                 playback.channels(),
                 playback.sample_rate(),
+                playback.stats.prefill_ms(),
             );
             playback_stats = Some(playback.stats.clone());
             start_playback(playback);

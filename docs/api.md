@@ -168,8 +168,16 @@ audible in the mix. The `link_audio` example plays the subscribed channel throug
 and prints a peak level meter; set `LINK_AUDIO_PLAYBACK=0` to receive without opening an output device.
 
 The example waits for 50 ms of received audio before starting or recovering from starvation.
-`LINK_AUDIO_LATENCY_MS` sets this prefill target, clamped to 1-1000 ms, not total
-end-to-end latency. The preallocated SPSC ring holds the larger of twice the target
+`LINK_AUDIO_LATENCY_MS` requests this prefill target, clamped to 1-1000 ms, not total
+end-to-end latency. `LINK_AUDIO_OUTPUT_BURST_MS` reserves a burst budget for the
+output device (default 50 ms, also clamped to 1-1000 ms). The effective prefill
+is the larger of those two settings, rounded up to whole received frames, and
+is printed at startup and in status. This avoids sizing the ring only for tiny
+network chunks when the OS pulls larger output blocks. The budget is explicit,
+not detected from the device: lower it only after verifying the output callback
+duration, or raise it if callbacks consume more than 50 ms at once.
+
+The preallocated SPSC ring holds the larger of twice the effective target
 or `target - 1 + maximum wire-chunk frames` (all sizes rounded to whole frames).
 This reserves room for a complete receive chunk even if a partial prefill is
 already queued, including at the 1 ms setting. Maximum chunk size derives from

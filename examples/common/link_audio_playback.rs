@@ -65,6 +65,7 @@ struct Frame {
 
 pub struct PlaybackStats {
     format: Format,
+    prefill_frames: usize,
     buffered_frames: AtomicUsize,
     underrun_events: AtomicU64,
     missing_frames: AtomicU64,
@@ -75,11 +76,16 @@ pub struct PlaybackStats {
 }
 
 impl PlaybackStats {
+    pub fn prefill_ms(&self) -> f64 {
+        self.prefill_frames as f64 * 1000.0 / self.format.rate.get() as f64
+    }
+
     pub fn status(&self) -> String {
         let buffered_ms = self.buffered_frames.load(Ordering::Relaxed) as f64 * 1000.0
             / self.format.rate.get() as f64;
         format!(
-            "buffered: {buffered_ms:.1} ms | underrun events: {} | missing frames: {} | startup frames: {} | dropped frames: {} | rejected buffers: {} | peak: {:.1}%",
+            "buffered: {buffered_ms:.1} ms | effective prefill: {:.1} ms | underrun events: {} | missing frames: {} | startup frames: {} | dropped frames: {} | rejected buffers: {} | peak: {:.1}%",
+            self.prefill_ms(),
             self.underrun_events.load(Ordering::Relaxed),
             self.missing_frames.load(Ordering::Relaxed),
             self.startup_frames.load(Ordering::Relaxed),
@@ -157,9 +163,12 @@ impl LivePlayback {
     pub fn new(
         format: Format,
         latency_ms: usize,
+        output_burst_ms: usize,
         rejected_buffers: Arc<AtomicU64>,
     ) -> (PlaybackInput, Self) {
-        let target_frames = format.frames_for_ms(latency_ms.clamp(1, 1000));
+        let target_frames = format
+            .frames_for_ms(latency_ms.clamp(1, 1000))
+            .max(format.frames_for_ms(output_burst_ms.min(1000)));
         let max_chunk_frames = AudioBuffer::MAX_AUDIO_BYTES / size_of::<i16>() / format.channels();
         // A waiting renderer may already hold target - 1 frames when a full
         // wire chunk arrives. Keep that chunk without forcing a partial drop.
@@ -167,6 +176,7 @@ impl LivePlayback {
         let (producer, consumer) = RingBuffer::new(capacity);
         let stats = Arc::new(PlaybackStats {
             format,
+            prefill_frames: target_frames,
             buffered_frames: AtomicUsize::new(0),
             underrun_events: AtomicU64::new(0),
             missing_frames: AtomicU64::new(0),
@@ -289,7 +299,7 @@ mod tests {
     use super::*;
 
     fn new_playback(format: Format, latency_ms: usize) -> (PlaybackInput, LivePlayback) {
-        LivePlayback::new(format, latency_ms, Arc::default())
+        LivePlayback::new(format, latency_ms, 0, Arc::default())
     }
 
     fn advance(playback: &mut LivePlayback, frames: usize) -> Vec<f32> {
@@ -486,10 +496,30 @@ mod tests {
         assert_eq!(rejected.load(Ordering::Relaxed), 3);
 
         let format = Format::from_initial_buffer(2, 44100, 1, &[0; 2], &rejected).unwrap();
-        let (mut input, playback) = LivePlayback::new(format, 10, rejected.clone());
+        let (mut input, playback) = LivePlayback::new(format, 10, 0, rejected.clone());
         assert!(playback.stats.status().contains("rejected buffers: 3"));
         input.push(1, 44100, 1, &[0]);
         assert_eq!(rejected.load(Ordering::Relaxed), 4);
         assert!(playback.stats.status().contains("rejected buffers: 4"));
+    }
+
+    #[test]
+    fn output_burst_budget_prevents_loss_with_512_frame_receive_and_render_blocks() {
+        let format = Format::new(2, 44100).unwrap();
+        let (mut input, mut playback) = LivePlayback::new(format, 1, 50, Arc::default());
+        for _ in 0..20 {
+            for frames in [125, 125, 125, 125, 12] {
+                input.push(2, 44100, frames, &vec![12000; frames * 2]);
+            }
+            advance(&mut playback, 512);
+        }
+        assert!(playback.started);
+        assert_eq!(playback.stats.underrun_events.load(Ordering::Relaxed), 0);
+        assert_eq!(playback.stats.missing_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(playback.stats.dropped_frames.load(Ordering::Relaxed), 0);
+        assert!(playback
+            .stats
+            .status()
+            .contains("effective prefill: 50.0 ms"));
     }
 }
