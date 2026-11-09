@@ -169,10 +169,13 @@ impl LivePlayback {
         let target_frames = format
             .frames_for_ms(latency_ms.clamp(1, 1000))
             .max(format.frames_for_ms(output_burst_ms.min(1000)));
+        let fade_frames = format.frames_for_ms(FADE_MS);
         let max_chunk_frames = AudioBuffer::MAX_AUDIO_BYTES / size_of::<i16>() / format.channels();
         // A waiting renderer may already hold target - 1 frames when a full
         // wire chunk arrives. Keep that chunk without forcing a partial drop.
-        let capacity = (target_frames * 2).max(target_frames - 1 + max_chunk_frames);
+        let capacity = (target_frames * 2)
+            .max(target_frames - 1 + max_chunk_frames)
+            .max(fade_frames + max_chunk_frames);
         let (producer, consumer) = RingBuffer::new(capacity);
         let stats = Arc::new(PlaybackStats {
             format,
@@ -196,7 +199,7 @@ impl LivePlayback {
                 consumer,
                 format,
                 target_frames,
-                fade_frames: format.frames_for_ms(FADE_MS),
+                fade_frames,
                 fade_remaining: 0,
                 fade_from: [0.0; MAX_CHANNELS],
                 output: [0.0; MAX_CHANNELS],
@@ -521,5 +524,26 @@ mod tests {
             .stats
             .status()
             .contains("effective prefill: 50.0 ms"));
+    }
+
+    #[test]
+    fn high_rate_recovery_has_room_for_chunks_received_throughout_fade_out() {
+        let format = Format::new(2, 192000).unwrap();
+        let (mut input, mut playback) = LivePlayback::new(format, 1, 1, Arc::default());
+        let target = playback.target_frames;
+        input.push(2, 192000, target, &vec![16000; target * 2]);
+        advance(&mut playback, target + 1);
+        assert!(playback.waiting);
+        for _ in 0..20 {
+            input.push(2, 192000, 125, &[16000; 250]);
+            advance(&mut playback, 125);
+        }
+        assert!(!playback.waiting);
+        assert_eq!(playback.stats.underrun_events.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            playback.stats.missing_frames.load(Ordering::Relaxed),
+            playback.fade_frames as u64
+        );
+        assert_eq!(playback.stats.dropped_frames.load(Ordering::Relaxed), 0);
     }
 }
