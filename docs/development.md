@@ -131,6 +131,9 @@ cargo check --lib --no-default-features --locked
 # Verify the default build (audio off) still compiles
 cargo check --all-targets --locked
 
+# Deterministic LinkAudio playback tests (no audio device or network needed)
+cargo test --example link_audio --features audio --locked
+
 # Validate the upstream porting backlog (stdlib only; watermark checks need the submodule)
 python3 .github/scripts/validate-upstream-backlog.py
 ```

@@ -167,10 +167,28 @@ track (plus `Main`), so pick the channel you actually want — most tracks strea
 audible in the mix. The `link_audio` example plays the subscribed channel through the default output device
 and prints a peak level meter; set `LINK_AUDIO_PLAYBACK=0` to receive without opening an output device.
 
-The example buffers 50 ms of received audio by default (`LINK_AUDIO_LATENCY_MS`). It performs no
-clock-drift compensation between the sending peer and the local output device, so that buffer has to
-absorb raw network jitter, which was measured at roughly 30 ms peak to peak on an ordinary LAN. Lower
-values underrun audibly.
+The example waits for 50 ms of received audio before starting or recovering from starvation.
+`LINK_AUDIO_LATENCY_MS` sets this prefill target, clamped to 1-1000 ms, not total
+end-to-end latency. The preallocated SPSC ring holds at most twice that target
+(rounded to whole frames), and its audio-side operations do not allocate or take
+a shared blocking mutex. The example uses the dev-only `rtrb` dependency for this
+safe handoff; library consumers do not acquire that dependency.
+
+On starvation it fades the last output frame to silence over 5 ms, waits for the
+prefill target again, then fades back in. When full, it drops incoming whole
+frames and crossfades at the resulting gap when it reaches playback. This
+concealment smooths discontinuities; it cannot reconstruct missing audio.
+The example does not compensate sender/output clock drift or schedule speaker
+playback against Link's beat grid. Persistent drift can still cause rebuffering
+or overflow, and speakers on different devices are not sample-aligned.
+
+Status distinguishes underrun **events** from missing output **frames**, counts
+startup waiting frames separately, and reports dropped frames, rejected buffers
+and peak level. Buffered milliseconds use the received sample rate. Missing
+frames include the fade-out/rebuffer interval after starvation, not just
+zero-valued samples. Playback supports 1-32 channels and sample rates through
+192 kHz; later format changes or malformed sample counts are rejected and counted,
+not played with the wrong format. Restart the example to accept a changed format.
 
 ## Core Types (available in `no_std`)
 

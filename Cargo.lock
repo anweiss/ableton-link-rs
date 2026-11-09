@@ -20,6 +20,7 @@ dependencies = [
  "num-traits",
  "rand",
  "rodio",
+ "rtrb 0.4.1",
  "rustix 1.1.6",
  "socket-pktinfo",
  "socket2",
@@ -2221,7 +2222,7 @@ dependencies = [
  "num-rational",
  "rand",
  "rand_distr",
- "rtrb",
+ "rtrb 0.3.5",
  "symphonia",
  "thiserror 2.0.21",
 ]
@@ -2231,6 +2232,12 @@ name = "rtrb"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fae8ee26b0371a29a77d2b2d6b3ae13aa81def6f9bf1b1b92a32d279a5e709b7"
+
+[[package]]
+name = "rtrb"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5974e397833d890f2f74963408e0d4a6cd8eda2f6a445ae06750291b5d7a997e"
 
 [[package]]
 name = "rustc-hash"
