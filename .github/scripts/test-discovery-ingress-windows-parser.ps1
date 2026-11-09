@@ -9,7 +9,8 @@ $componentListJson = @'
 {
   "Components": [
     { "ComponentId": 101, "InterfaceIndex": 11, "Name": "vEthernet (link154-a)" },
-    { "ComponentId": 2, "SecondaryId": [102], "InterfaceIndex": 12, "Name": "vEthernet (link154-b)" }
+    { "ComponentId": 2, "SecondaryId": [102], "InterfaceIndex": 12, "Name": "vEthernet (link154-b)" },
+    { "ComponentId": 103, "InterfaceIndex": 13, "Name": "Ethernet" }
   ]
 }
 '@
@@ -18,6 +19,8 @@ $componentsA = @(Get-PktmonComponentIds $componentList 11 'vEthernet (link154-a)
 $componentsB = @(Get-PktmonComponentIds $componentList 12 'vEthernet (link154-b)')
 Assert-ParserTest ($componentsA -contains 101) 'component list failed to associate adapter A'
 Assert-ParserTest ($componentsB -contains 102) 'component list failed to associate adapter B'
+$knownComponents = @(Get-PktmonComponentIds -Document $componentList -AllComponents)
+Assert-ParserTest ($knownComponents -contains 103 -and $knownComponents -contains 101 -and $knownComponents -contains 102) 'component list failed to retain known non-fixture NIC identities'
 
 $testOutput = @(
     'test output',
@@ -66,6 +69,13 @@ Assert-ParserTest $leaked.Supported 'a wrong-NIC transmission should remain a re
 Assert-ParserTest ($leaked.Missing.Count -eq 0) 'leakage control must also include both correct transmissions'
 Assert-ParserTest ($leaked.Misrouted.Count -eq 1) 'an additional wrong-NIC transmission was silently accepted'
 
+$foreignOnly = ConvertFrom-Link154PktmonText @(($headerA -replace 'Component 101', 'Component 103'), $packetA, ($headerB -replace 'Component 102', 'Component 103'), $packetB) $expectedResult.Expected $componentsA $componentsB 11 12 $knownComponents
+Assert-ParserTest $foreignOnly.Supported 'known foreign-NIC traffic was treated as unavailable tooling'
+Assert-ParserTest ($foreignOnly.Missing.Count -eq 2 -and $foreignOnly.Misrouted.Count -eq 2) 'foreign-NIC-only traffic failed to report both missing and misrouted transmissions'
+
+$foreignLeak = ConvertFrom-Link154PktmonText @($headerA, $packetA, $headerB, $packetB, ($headerA -replace 'Component 101', 'Component 103'), $packetA) $expectedResult.Expected $componentsA $componentsB 11 12 $knownComponents
+Assert-ParserTest ($foreignLeak.Supported -and $foreignLeak.Missing.Count -eq 0 -and $foreignLeak.Misrouted.Count -eq 1) 'an additional known foreign-NIC transmission was silently accepted'
+
 $ambiguous = ConvertFrom-Link154PktmonText @($headerA, $packetA, $headerB, $packetB) $expectedResult.Expected @(101, 102) @(102) 11 12
 Assert-ParserTest (!$ambiguous.Supported) 'overlapping NIC component mappings were accepted as evidence'
 
@@ -83,4 +93,4 @@ Assert-ParserTest ($stale.Missing.Count -eq 1) 'an unrecognized packet header in
 $unsupported = ConvertFrom-Link154PktmonText @('Packet Group=1 Direction=TX Component=101', 'UDP 10.42.0.9:53001 -> 224.76.78.75:20808') $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest (!$unsupported.Supported) 'unrecognized capture format was treated as valid evidence'
 
-Write-Host 'Windows pktmon parser tests passed: positive, invalid endpoint markers, no UDP, wrong source port, cross-adapter, additional wrong-NIC Tx, ambiguous mapping, unmapped NIC, stale header, unsupported format.'
+Write-Host 'Windows pktmon parser tests passed: positive, invalid endpoint markers, no UDP, wrong source port, cross-adapter, additional wrong-NIC Tx, foreign-NIC-only Tx, foreign-NIC leakage, ambiguous mapping, unmapped NIC, stale header, unsupported format.'

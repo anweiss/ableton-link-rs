@@ -243,7 +243,7 @@ the distinct registered source endpoints and the Link multicast destination.
 The fixture consumes the test's endpoint/interface markers rather than accepting
 an arbitrary source port at the duplicate address. Its isolated parser tests
 cover matching, invalid endpoint markers, no-UDP captures, wrong-port,
-cross-adapter, additional wrong-NIC transmissions,
+cross-adapter, additional wrong-NIC transmissions, known foreign-NIC-only traffic,
 ambiguous/unmapped NIC identities, stale headers and unsupported-format captures; the
 Windows CI job runs them before provisioning adapters. Unsupported capture
 tooling is reported as missing evidence, separately from a valid capture that
@@ -251,7 +251,10 @@ fails to show a required transmission. Missing prerequisites skip only the
 duplicate-capture evidence: the existing overlap/restart/churn assertions must
 still pass, and a green Windows job is not a duplicate-network pass. A valid
 capture missing a required endpoint's NIC Tx, or also transmitting that endpoint
-on the wrong fixture NIC, fails the fixture. Recognized packet metadata with no
+on any known wrong NIC, fails the fixture. The parser retains the full Pktmon
+component inventory, so known non-fixture NICs are routing failures rather than
+unavailable evidence; only genuinely unresolved component identities take that
+fallback. Recognized packet metadata with no
 UDP records reports both transmissions as missing; a changed packet decoder
 cannot turn that absence into a tooling skip. Missing or invalid endpoint markers
 fail after every successful duplicate-enabled test run, even without capture

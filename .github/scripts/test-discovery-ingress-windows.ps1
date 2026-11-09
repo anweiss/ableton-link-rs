@@ -158,6 +158,7 @@ try {
             $adapterBName = (Get-NetAdapter -InterfaceIndex $b).Name
             $componentsA = @(Get-PktmonComponentIds $componentsJson $a $adapterAName)
             $componentsB = @(Get-PktmonComponentIds $componentsJson $b $adapterBName)
+            $knownComponents = @(Get-PktmonComponentIds -Document $componentsJson -AllComponents)
             if (!$componentsA.Count -or !$componentsB.Count) {
                 throw "pktmon list JSON did not map both fixture adapters to components (A=$a/$adapterAName, B=$b/$adapterBName)"
             }
@@ -181,13 +182,13 @@ try {
             Invoke-Pktmon @('stop') | Out-Null
             $captureStarted = $false
             Invoke-Pktmon @('etl2txt', $captureEtl, '--out', $captureText, '--verbose', '3') | Out-Null
-            $captureResult = ConvertFrom-Link154PktmonText (Get-Content $captureText) $expectedResult.Expected $componentsA $componentsB $a $b
+            $captureResult = ConvertFrom-Link154PktmonText (Get-Content $captureText) $expectedResult.Expected $componentsA $componentsB $a $b $knownComponents
             if (!$captureResult.Supported) { throw $captureResult.Reason }
             if ($captureResult.Missing.Count) {
                 throw "VALID_CAPTURE_MISSING_EXPECTED_NIC_TX: no NIC-level Tx matched endpoint(s) $($captureResult.Missing -join ', ')"
             }
             if ($captureResult.Misrouted.Count) {
-                throw "VALID_CAPTURE_WRONG_NIC_TX: multicast source observed on the wrong fixture NIC: $($captureResult.Misrouted -join ', ')"
+                throw "VALID_CAPTURE_WRONG_NIC_TX: multicast source observed on a wrong NIC: $($captureResult.Misrouted -join ', ')"
             }
             $evidenceVerified = $true
             Write-Host "Pktmon correlated exact source endpoints with NIC-level multicast Tx on both adapters: $($expectedResult.Expected.Endpoint -join ', ')."

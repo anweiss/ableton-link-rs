@@ -1,5 +1,5 @@
 function Get-PktmonComponentIds {
-    param($Document, [int]$InterfaceIndex, [string]$AdapterName)
+    param($Document, [int]$InterfaceIndex, [string]$AdapterName, [switch]$AllComponents)
     $ids = [System.Collections.Generic.HashSet[int]]::new()
     $visit = {
         param($item)
@@ -24,7 +24,7 @@ function Get-PktmonComponentIds {
             }
             $matchesInterface = $null -ne $itemIndex -and [int]$itemIndex -eq $InterfaceIndex
             $matchesName = $itemName -is [string] -and $itemName -like "*$AdapterName*"
-            if ($matchesInterface -or $matchesName) {
+            if ($AllComponents -or $matchesInterface -or $matchesName) {
                 foreach ($itemId in $itemIds) {
                     $parsedId = 0
                     if ([int]::TryParse([string]$itemId, [ref]$parsedId)) { [void]$ids.Add($parsedId) }
@@ -78,7 +78,8 @@ function ConvertFrom-Link154PktmonText {
         [int[]]$ComponentsA,
         [int[]]$ComponentsB,
         [int]$InterfaceA,
-        [int]$InterfaceB
+        [int]$InterfaceB,
+        [int[]]$KnownComponents = @()
     )
     if (!$ComponentsA.Count -or !$ComponentsB.Count -or $InterfaceA -eq $InterfaceB -or
         @($ComponentsA | Where-Object { $ComponentsB -contains $_ }).Count) {
@@ -124,7 +125,9 @@ function ConvertFrom-Link154PktmonText {
                 }
                 if ($components -contains $snapshot.Component) {
                     [void]$matched.Add("$($endpoint.Endpoint)|$($endpoint.InterfaceIndex)")
-                } elseif ($ComponentsA -contains $snapshot.Component -or $ComponentsB -contains $snapshot.Component) {
+                } elseif ($ComponentsA -contains $snapshot.Component -or
+                    $ComponentsB -contains $snapshot.Component -or
+                    $KnownComponents -contains $snapshot.Component) {
                     [void]$misrouted.Add("$source|expected=$($endpoint.InterfaceIndex)|component=$($snapshot.Component)")
                 } else {
                     [void]$unmapped.Add($snapshot.Component)
