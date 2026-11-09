@@ -173,13 +173,14 @@ try {
     $testExitCode = $LASTEXITCODE
     $testOutput | ForEach-Object { Write-Output $_ }
     if ($testExitCode -ne 0) { throw "Multihomed fixture failed: $testExitCode" }
+    if ($env:LINK_154_DUPLICATE_REJECTED -ne '5010') {
+        $expectedResult = Get-Link154ExpectedEgress $testOutput $a $b
+    }
     if ($captureStarted) {
         try {
             Invoke-Pktmon @('stop') | Out-Null
             $captureStarted = $false
             Invoke-Pktmon @('etl2txt', $captureEtl, '--out', $captureText, '--verbose', '3') | Out-Null
-            $expectedResult = Get-Link154ExpectedEgress $testOutput $a $b
-            if (!$expectedResult.Supported) { throw $expectedResult.Reason }
             $captureResult = ConvertFrom-Link154PktmonText (Get-Content $captureText) $expectedResult.Expected $componentsA $componentsB $a $b
             if (!$captureResult.Supported) { throw $captureResult.Reason }
             if ($captureResult.Missing.Count) {

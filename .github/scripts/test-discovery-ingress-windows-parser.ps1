@@ -27,6 +27,18 @@ $testOutput = @(
 $expectedResult = Get-Link154ExpectedEgress $testOutput 11 12
 Assert-ParserTest $expectedResult.Supported 'valid expected-endpoint markers were rejected'
 
+foreach ($invalidMarkers in @(
+    @{ Lines = @(); Name = 'missing markers' },
+    @{ Lines = @($testOutput[1]); Name = 'one missing marker' },
+    @{ Lines = @($testOutput[1], ($testOutput[2] -replace 'ifIndex=12', 'ifIndex=11')); Name = 'duplicate interface' },
+    @{ Lines = @($testOutput[1], ($testOutput[2] -replace '53002', '53001')); Name = 'duplicate endpoint' },
+    @{ Lines = @($testOutput[1], ($testOutput[2] -replace '53002', '65536')); Name = 'invalid port' }
+)) {
+    $rejected = $false
+    try { Get-Link154ExpectedEgress $invalidMarkers.Lines 11 12 | Out-Null } catch { $rejected = $true }
+    Assert-ParserTest $rejected "$($invalidMarkers.Name) did not fail endpoint validation"
+}
+
 $headerA = '[00]0000.0000::2026-11-09 10:00:00.000000000 [Microsoft-Windows-PktMon] PktGroupId 100, PktNumber 1, Appearance 1, Direction Tx , Type Ethernet , Component 101, Filter 1, OriginalSize 80, LoggedSize 80'
 $headerB = '[00]0000.0000::2026-11-09 10:00:00.000000001 [Microsoft-Windows-PktMon] PktGroupId 101, PktNumber 1, Appearance 1, Direction Tx , Type Ethernet , Component 102, Filter 1, OriginalSize 80, LoggedSize 80'
 $packetA = '       ip: 10.42.0.9.53001 > 224.76.78.75.20808: UDP, length 52'
@@ -35,6 +47,10 @@ $packetB = '       ip: 10.42.0.9.53002 > 224.76.78.75.20808: UDP, length 52'
 $positive = ConvertFrom-Link154PktmonText @($headerA, $packetA, $headerB, $packetB) $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest $positive.Supported 'documented Pktmon text format was not recognized'
 Assert-ParserTest ($positive.Missing.Count -eq 0) 'positive capture did not correlate both endpoints to their NICs'
+
+$noUdp = ConvertFrom-Link154PktmonText @($headerA, '       arp: who-has 10.42.0.129 tell 10.42.0.1', $headerB, '       ip: 10.42.0.1.53000 > 10.42.0.129.80: Flags [S], seq 1, win 65535, length 0') $expectedResult.Expected $componentsA $componentsB 11 12
+Assert-ParserTest $noUdp.Supported 'valid NIC packet metadata with no UDP was treated as unavailable tooling'
+Assert-ParserTest ($noUdp.Missing.Count -eq 2) 'capture without UDP failed to report both missing transmissions'
 
 $wrongPort = ConvertFrom-Link154PktmonText @($headerA, ($packetA -replace '53001', '53099'), $headerB, $packetB) $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest $wrongPort.Supported 'wrong-port capture should still be recognized as valid format'
@@ -67,4 +83,4 @@ Assert-ParserTest ($stale.Missing.Count -eq 1) 'an unrecognized packet header in
 $unsupported = ConvertFrom-Link154PktmonText @('Packet Group=1 Direction=TX Component=101', 'UDP 10.42.0.9:53001 -> 224.76.78.75:20808') $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest (!$unsupported.Supported) 'unrecognized capture format was treated as valid evidence'
 
-Write-Host 'Windows pktmon parser tests passed: positive, wrong source port, cross-adapter, additional wrong-NIC Tx, ambiguous mapping, unmapped NIC, stale header, unsupported format.'
+Write-Host 'Windows pktmon parser tests passed: positive, invalid endpoint markers, no UDP, wrong source port, cross-adapter, additional wrong-NIC Tx, ambiguous mapping, unmapped NIC, stale header, unsupported format.'

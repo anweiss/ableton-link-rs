@@ -51,7 +51,7 @@ function Get-Link154ExpectedEgress {
                 ![int]::TryParse($Matches[2], [ref]$port) -or
                 ![int]::TryParse($Matches[3], [ref]$interfaceIndex) -or
                 $port -lt 1 -or $port -gt 65535) {
-                return [pscustomobject]@{ Supported = $false; Reason = "Malformed multicast expectation marker: $line"; Expected = @() }
+                throw "Malformed multicast expectation marker: $line"
             }
             $expected += [pscustomobject]@{
                 Address = $address
@@ -66,11 +66,7 @@ function Get-Link154ExpectedEgress {
         @($expected | Select-Object -ExpandProperty InterfaceIndex -Unique).Count -ne 2 -or
         @($expected | Select-Object -ExpandProperty Endpoint -Unique).Count -ne 2 -or
         @($expected | Where-Object { $_.InterfaceIndex -notin @($InterfaceA, $InterfaceB) }).Count -ne 0) {
-        return [pscustomobject]@{
-            Supported = $false
-            Reason = "Expected exactly one distinct 10.42.0.9 endpoint marker per fixture adapter; found $($expected.Count)"
-            Expected = $expected
-        }
+        throw "Expected exactly one distinct 10.42.0.9 endpoint marker per fixture adapter; found $($expected.Count)"
     }
     [pscustomobject]@{ Supported = $true; Reason = $null; Expected = $expected }
 }
@@ -142,10 +138,10 @@ function ConvertFrom-Link154PktmonText {
             Reason = "Expected multicast source appeared on unmapped NIC component(s): $(@($unmapped | Sort-Object) -join ', ')"
         }
     }
-    if ($snapshots -eq 0 -or $udpPackets -eq 0) {
+    if ($snapshots -eq 0) {
         return [pscustomobject]@{
             Supported = $false
-            Reason = 'Pktmon text did not contain the documented metadata and tcpdump-style UDP record format'
+            Reason = 'Pktmon text did not contain the documented packet metadata'
             Snapshots = $snapshots
             UdpPackets = $udpPackets
             Matched = @($matched)
