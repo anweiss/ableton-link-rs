@@ -15,6 +15,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 const MAX_CHANNELS: usize = 32;
 const MAX_SAMPLE_RATE: u32 = 192_000;
 const FADE_MS: usize = 5;
+const MAX_EXPIRED_FRAMES_PER_RENDER: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Format {
@@ -260,9 +261,8 @@ impl LivePlayback {
             self.output_ready.store(true, Ordering::Release);
             self.output_ready_announced = true;
         }
-        let queued = self.consumer.slots();
         let mut expired = 0;
-        for _ in 0..queued {
+        for _ in 0..MAX_EXPIRED_FRAMES_PER_RENDER {
             let stale = self.consumer.peek().is_ok_and(|frame| {
                 now.saturating_duration_since(frame.received_at) > self.stale_after
             });
@@ -282,14 +282,21 @@ impl LivePlayback {
                 self.start_fade();
             }
         }
+        let fresh_front = self.consumer.peek().is_ok_and(|frame| {
+            now.saturating_duration_since(frame.received_at) <= self.stale_after
+        });
         let available = self.consumer.slots();
-        if self.waiting && self.fade_remaining == 0 && available >= self.target_frames {
+        if self.waiting
+            && fresh_front
+            && self.fade_remaining == 0
+            && available >= self.target_frames
+        {
             self.waiting = false;
             self.started = true;
             self.start_fade();
         }
 
-        let frame = if self.waiting {
+        let frame = if self.waiting || !fresh_front {
             None
         } else {
             self.consumer.pop().ok()
@@ -678,6 +685,61 @@ mod tests {
         for _ in 0..10 {
             playback.render_frame_at(resumed);
         }
+        assert_eq!(playback.output[0], 16000.0 / 32768.0);
+        assert_eq!(playback.stats.underrun_events.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn paused_output_expires_a_large_backlog_in_bounded_steps_before_fresh_prefill() {
+        let (mut input, mut playback) = new_playback(Format::new(2, 192000).unwrap(), 1000);
+        let before_pause = playback.test_now;
+        let target = playback.target_frames;
+        let fade_frames = playback.fade_frames;
+        input.push_at(2, 192000, target, &vec![4000; target * 2], before_pause);
+        advance(&mut playback, fade_frames);
+        let room = input.producer.slots();
+        input.push_at(2, 192000, room, &vec![4000; room * 2], before_pause);
+        let backlog = playback.consumer.slots();
+        assert!(backlog > 384000);
+
+        let resumed = before_pause + playback.stale_after + Duration::from_millis(1);
+        playback.render_frame_at(resumed);
+        assert_eq!(
+            playback.consumer.slots(),
+            backlog - MAX_EXPIRED_FRAMES_PER_RENDER
+        );
+        assert!(playback.waiting);
+        input.push_at(2, 192000, 8, &[16000; 16], resumed);
+
+        let mut remaining = backlog - MAX_EXPIRED_FRAMES_PER_RENDER;
+        while remaining > 0 {
+            let before = playback.consumer.slots();
+            playback.render_frame_at(resumed);
+            let discarded = remaining.min(MAX_EXPIRED_FRAMES_PER_RENDER);
+            assert_eq!(before - playback.consumer.slots(), discarded);
+            remaining -= discarded;
+            assert!(playback.waiting);
+            if playback.fade_remaining == 0 {
+                assert_eq!(playback.output[0], 0.0);
+            }
+        }
+        assert_eq!(playback.consumer.slots(), 8);
+        assert_eq!(playback.stats.buffered_frames.load(Ordering::Relaxed), 8);
+        assert_eq!(
+            playback.stats.dropped_frames.load(Ordering::Relaxed),
+            backlog as u64
+        );
+        input.push_at(
+            2,
+            192000,
+            target - 8,
+            &vec![16000; (target - 8) * 2],
+            resumed,
+        );
+        for _ in 0..playback.fade_frames {
+            playback.render_frame_at(resumed);
+        }
+        assert!(!playback.waiting);
         assert_eq!(playback.output[0], 16000.0 / 32768.0);
         assert_eq!(playback.stats.underrun_events.load(Ordering::Relaxed), 1);
     }

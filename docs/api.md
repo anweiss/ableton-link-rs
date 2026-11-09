@@ -174,6 +174,8 @@ replaying a stale queue accumulated during device startup.
 Queued audio expires after the larger of one second or twice the ring's frame
 capacity expressed as a duration. Expired frames are discarded and counted, so a
 partial refill cannot replay arbitrarily old audio after a long outage.
+Expiry discards at most eight queued frames per rendered frame, keeping playback
+in recovery until the stale prefix is gone and fresh prefill is available.
 `LINK_AUDIO_LATENCY_MS` requests this prefill target, clamped to 1-1000 ms, not total
 end-to-end latency. `LINK_AUDIO_OUTPUT_BURST_MS` reserves a burst budget for the
 output device (default 50 ms, also clamped to 1-1000 ms). The effective prefill
