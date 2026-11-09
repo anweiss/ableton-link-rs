@@ -33,6 +33,21 @@ impl Format {
         })
     }
 
+    pub fn from_initial_buffer(
+        channels: usize,
+        rate: u32,
+        frames: usize,
+        samples: &[i16],
+        rejected: &AtomicU64,
+    ) -> Option<Format> {
+        let format = Format::new(channels, rate)
+            .filter(|_| frames > 0 && frames.checked_mul(channels) == Some(samples.len()));
+        if format.is_none() {
+            rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        format
+    }
+
     fn channels(self) -> usize {
         self.channels.get() as usize
     }
@@ -55,7 +70,7 @@ pub struct PlaybackStats {
     missing_frames: AtomicU64,
     startup_frames: AtomicU64,
     dropped_frames: AtomicU64,
-    rejected_buffers: AtomicU64,
+    rejected_buffers: Arc<AtomicU64>,
     peak: AtomicI32,
 }
 
@@ -105,7 +120,10 @@ impl PlaybackInput {
                 generation: self.generation,
             };
             frame.samples[..channels].copy_from_slice(samples);
+            // Account before publishing so a concurrent pop cannot underflow.
+            self.stats.buffered_frames.fetch_add(1, Ordering::Relaxed);
             if self.producer.push(frame).is_err() {
+                self.stats.buffered_frames.fetch_sub(1, Ordering::Relaxed);
                 break;
             }
             written += 1;
@@ -136,7 +154,11 @@ pub struct LivePlayback {
 }
 
 impl LivePlayback {
-    pub fn new(format: Format, latency_ms: usize) -> (PlaybackInput, Self) {
+    pub fn new(
+        format: Format,
+        latency_ms: usize,
+        rejected_buffers: Arc<AtomicU64>,
+    ) -> (PlaybackInput, Self) {
         let target_frames = format.frames_for_ms(latency_ms.clamp(1, 1000));
         let max_chunk_frames = AudioBuffer::MAX_AUDIO_BYTES / size_of::<i16>() / format.channels();
         // A waiting renderer may already hold target - 1 frames when a full
@@ -150,7 +172,7 @@ impl LivePlayback {
             missing_frames: AtomicU64::new(0),
             startup_frames: AtomicU64::new(0),
             dropped_frames: AtomicU64::new(0),
-            rejected_buffers: AtomicU64::new(0),
+            rejected_buffers,
             peak: AtomicI32::new(0),
         });
         (
@@ -184,7 +206,7 @@ impl LivePlayback {
 
     fn render_frame(&mut self) {
         let available = self.consumer.slots();
-        if self.waiting && available >= self.target_frames {
+        if self.waiting && self.fade_remaining == 0 && available >= self.target_frames {
             self.waiting = false;
             self.started = true;
             self.start_fade();
@@ -201,6 +223,7 @@ impl LivePlayback {
             self.start_fade();
         }
         if let Some(frame) = frame {
+            self.stats.buffered_frames.fetch_sub(1, Ordering::Relaxed);
             if self.generation.is_some_and(|g| g != frame.generation) {
                 self.start_fade();
             }
@@ -227,10 +250,6 @@ impl LivePlayback {
                 *output = from * mix + *output * (1.0 - mix);
             }
         }
-        self.stats.buffered_frames.store(
-            available.saturating_sub(usize::from(frame.is_some())),
-            Ordering::Relaxed,
-        );
     }
 }
 
@@ -269,6 +288,10 @@ impl Source for LivePlayback {
 mod tests {
     use super::*;
 
+    fn new_playback(format: Format, latency_ms: usize) -> (PlaybackInput, LivePlayback) {
+        LivePlayback::new(format, latency_ms, Arc::default())
+    }
+
     fn advance(playback: &mut LivePlayback, frames: usize) -> Vec<f32> {
         let samples = frames * playback.format.channels();
         playback.take(samples).collect()
@@ -276,7 +299,7 @@ mod tests {
 
     #[test]
     fn prefill_and_recovery_wait_for_the_target_and_count_events_not_frames() {
-        let (mut input, mut playback) = LivePlayback::new(Format::new(1, 1000).unwrap(), 10);
+        let (mut input, mut playback) = new_playback(Format::new(1, 1000).unwrap(), 10);
         input.push(1, 1000, 9, &[16000; 9]);
         assert_eq!(advance(&mut playback, 20), vec![0.0; 20]);
         assert_eq!(playback.consumer.slots(), 9);
@@ -299,7 +322,7 @@ mod tests {
 
     #[test]
     fn overflow_is_bounded_aligned_and_crossfaded_at_the_actual_gap() {
-        let (mut input, mut playback) = LivePlayback::new(Format::new(2, 1000).unwrap(), 10);
+        let (mut input, mut playback) = new_playback(Format::new(2, 1000).unwrap(), 10);
         let capacity = input.producer.slots();
         let positive: Vec<_> = (0..capacity + 5).flat_map(|_| [16000, -16000]).collect();
         input.push(2, 1000, capacity + 5, &positive);
@@ -324,8 +347,7 @@ mod tests {
     #[test]
     fn diagnostics_use_the_received_rate_and_format_changes_are_rejected() {
         for (channels, rate) in [(1, 48000), (2, 96000)] {
-            let (mut input, mut playback) =
-                LivePlayback::new(Format::new(channels, rate).unwrap(), 10);
+            let (mut input, mut playback) = new_playback(Format::new(channels, rate).unwrap(), 10);
             let frames = rate as usize / 100;
             input.push(channels, rate, frames, &vec![1; frames * channels]);
             advance(&mut playback, 1);
@@ -344,7 +366,7 @@ mod tests {
 
     #[test]
     fn concurrent_handoff_keeps_stereo_frames_intact_without_waiting_for_a_producer() {
-        let (mut input, mut playback) = LivePlayback::new(Format::new(2, 1000).unwrap(), 10);
+        let (mut input, mut playback) = new_playback(Format::new(2, 1000).unwrap(), 10);
         let producer = std::thread::spawn(move || {
             for _ in 0..1000 {
                 input.push(2, 1000, 2, &[12000, -12000, 12000, -12000]);
@@ -362,11 +384,15 @@ mod tests {
         }
         assert!(playback.waiting);
         assert!(playback.consumer.slots() < playback.target_frames);
+        assert_eq!(
+            playback.stats.buffered_frames.load(Ordering::Relaxed),
+            playback.consumer.slots()
+        );
     }
 
     #[test]
     fn starvation_retains_a_partial_refill_until_the_target_is_reached() {
-        let (mut input, mut playback) = LivePlayback::new(Format::new(2, 1000).unwrap(), 10);
+        let (mut input, mut playback) = new_playback(Format::new(2, 1000).unwrap(), 10);
         input.push(2, 1000, 10, &[12000; 20]);
         advance(&mut playback, 15);
         assert!(playback.waiting);
@@ -387,8 +413,7 @@ mod tests {
     #[test]
     fn minimum_latency_holds_a_full_wire_chunk_even_with_a_partial_prefill() {
         for channels in [1, 2] {
-            let (mut input, mut playback) =
-                LivePlayback::new(Format::new(channels, 44100).unwrap(), 1);
+            let (mut input, mut playback) = new_playback(Format::new(channels, 44100).unwrap(), 1);
             let partial = playback.target_frames - 1;
             input.push(channels, 44100, partial, &vec![0; partial * channels]);
             advance(&mut playback, 100);
@@ -410,7 +435,7 @@ mod tests {
     #[test]
     fn peak_meter_measures_input_even_when_loud_frames_are_dropped() {
         for free in [0, 1] {
-            let (mut input, playback) = LivePlayback::new(Format::new(1, 44100).unwrap(), 1);
+            let (mut input, playback) = new_playback(Format::new(1, 44100).unwrap(), 1);
             let filled = input.producer.slots() - free;
             input.push(1, 44100, filled, &vec![0; filled]);
             assert!(playback.stats.status().ends_with("peak: 0.0%"));
@@ -422,5 +447,49 @@ mod tests {
                 (2 - free) as u64
             );
         }
+    }
+
+    #[test]
+    fn recovery_finishes_fading_to_silence_even_if_the_refill_arrives_early() {
+        let (mut input, mut playback) = new_playback(Format::new(1, 1000).unwrap(), 10);
+        input.push(1, 1000, 10, &[16000; 10]);
+        advance(&mut playback, 10);
+        let first = advance(&mut playback, 1)[0];
+        input.push(1, 1000, 10, &[16000; 10]);
+        let tail = advance(&mut playback, 4);
+        assert!(first > tail[0]);
+        assert!(tail.windows(2).all(|s| s[0] >= s[1]));
+        assert_eq!(tail[3], 0.0);
+        assert_eq!(playback.consumer.slots(), 10);
+        assert_eq!(playback.stats.underrun_events.load(Ordering::Relaxed), 1);
+        let resumed = advance(&mut playback, 5);
+        assert!(resumed[0] > 0.0 && resumed[0] < resumed[4]);
+    }
+
+    #[test]
+    fn buffer_duration_tracks_admitted_frames_while_the_renderer_is_idle() {
+        let (mut input, mut playback) = new_playback(Format::new(2, 48000).unwrap(), 10);
+        input.push(2, 48000, 480, &[0; 960]);
+        assert!(playback.stats.status().starts_with("buffered: 10.0 ms"));
+        advance(&mut playback, 120);
+        assert!(playback.stats.status().starts_with("buffered: 7.5 ms"));
+        input.push(2, 48000, 120, &[0; 240]);
+        assert!(playback.stats.status().starts_with("buffered: 10.0 ms"));
+    }
+
+    #[test]
+    fn format_rejections_before_and_after_startup_share_one_counter() {
+        let rejected = Arc::new(AtomicU64::new(0));
+        assert!(Format::from_initial_buffer(2, 192001, 1, &[0; 2], &rejected).is_none());
+        assert!(Format::from_initial_buffer(2, 44100, 2, &[0; 2], &rejected).is_none());
+        assert!(Format::from_initial_buffer(2, 44100, 0, &[], &rejected).is_none());
+        assert_eq!(rejected.load(Ordering::Relaxed), 3);
+
+        let format = Format::from_initial_buffer(2, 44100, 1, &[0; 2], &rejected).unwrap();
+        let (mut input, playback) = LivePlayback::new(format, 10, rejected.clone());
+        assert!(playback.stats.status().contains("rejected buffers: 3"));
+        input.push(1, 44100, 1, &[0]);
+        assert_eq!(rejected.load(Ordering::Relaxed), 4);
+        assert!(playback.stats.status().contains("rejected buffers: 4"));
     }
 }

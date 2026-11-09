@@ -177,8 +177,8 @@ already queued, including at the 1 ms setting. Maximum chunk size derives from
 operations do not allocate or take a shared blocking mutex. The example uses the dev-only `rtrb` dependency for this
 safe handoff; library consumers do not acquire that dependency.
 
-On starvation it fades the last output frame to silence over 5 ms, waits for the
-prefill target again, then fades back in. When full, it drops incoming whole
+On starvation it fades the last output frame to silence over 5 ms, waits until
+both that fade and the prefill target are complete, then fades back in. When full, it drops incoming whole
 frames and crossfades at the resulting gap when it reaches playback. This
 concealment smooths discontinuities; it cannot reconstruct missing audio.
 The example does not compensate sender/output clock drift or schedule speaker
@@ -193,6 +193,10 @@ frames include the fade-out/rebuffer interval after starvation, not just
 zero-valued samples. Playback supports 1-32 channels and sample rates through
 192 kHz; later format changes or malformed sample counts are rejected and counted,
 not played with the wrong format. Restart the example to accept a changed format.
+Queue occupancy is accounted on admission and consumption, so buffered duration
+also updates before the first render or while output is idle. Rejections before
+the first supported format are reported while playback is inactive and retained
+in the same counter after startup.
 
 ## Core Types (available in `no_std`)
 

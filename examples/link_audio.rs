@@ -106,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Subscribe to the first channel published by another peer.
     let mut subscribed = None;
     let frames_received = Arc::new(AtomicU64::new(0));
+    let rejected_buffers = Arc::new(AtomicU64::new(0));
     let (playback_tx, playback_rx) = mpsc::sync_channel(1);
     let mut playback_stats: Option<Arc<PlaybackStats>> = None;
     let mut listed = false;
@@ -150,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let counter = frames_received.clone();
                 let playback_tx = playback_tx.clone();
+                let rejected = rejected_buffers.clone();
                 let mut input: Option<PlaybackInput> = None;
                 let mut warned_format = false;
                 subscribed = Some(link.add_source(channel.id, move |handle| {
@@ -157,13 +159,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     if playback_enabled {
                         if input.is_none() {
-                            let format =
-                                Format::new(handle.info.num_channels, handle.info.sample_rate);
-                            let valid_length = handle.info.num_frames > 0
-                                && handle.info.num_frames.checked_mul(handle.info.num_channels)
-                                    == Some(handle.samples.len());
-                            if let Some(format) = format.filter(|_| valid_length) {
-                                let (writer, playback) = LivePlayback::new(format, latency_ms);
+                            let format = Format::from_initial_buffer(
+                                handle.info.num_channels,
+                                handle.info.sample_rate,
+                                handle.info.num_frames,
+                                handle.samples,
+                                &rejected,
+                            );
+                            if let Some(format) = format {
+                                let (writer, playback) =
+                                    LivePlayback::new(format, latency_ms, rejected.clone());
                                 input = Some(writer);
                                 let _ = playback_tx.try_send(playback);
                             } else if !warned_format {
@@ -236,7 +241,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let status = playback_stats
                 .as_ref()
                 .map(|stats| stats.status())
-                .unwrap_or_else(|| "playback inactive".to_string());
+                .unwrap_or_else(|| {
+                    format!(
+                        "playback inactive | rejected buffers: {}",
+                        rejected_buffers.load(Ordering::Relaxed)
+                    )
+                });
             println!(
                 "peers: {} | tempo: {:.1} | channels: {} | frames: {} | {status}",
                 link.num_peers(),
