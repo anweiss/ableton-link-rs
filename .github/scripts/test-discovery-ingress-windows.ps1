@@ -55,6 +55,15 @@ function Wait-FixtureAddresses {
     $addresses | Format-Table IPAddress, InterfaceIndex, AddressState, ValidLifetime
     if (@($addresses | Where-Object AddressState -ne Preferred).Count) { throw 'Fixture addresses did not become usable after DAD' }
 }
+function Invoke-Pktmon {
+    param([string[]]$Arguments)
+    $output = & pktmon @Arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "pktmon $($Arguments -join ' ') failed: $($output -join "`n")"
+    }
+    $output
+}
+. (Join-Path $PSScriptRoot 'discovery-ingress-pktmon.ps1')
 if ($Churn) {
     if ($env:LINK_154_ADAPTER_FIXTURE -ne '1') { throw 'Fixture not active' }
     $index = [int]$env:LINK_154_ADAPTER_A
@@ -70,7 +79,14 @@ if (@(Get-NetIPAddress -AddressFamily IPv4 | Where-Object IPAddress -like '10.42
 $created = @()
 $switches = @()
 $networks = @()
+$captureStarted = $false
+$captureArtifactsOwned = $false
+$captureEtl = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path '.link154-pktmon.etl'))
+$captureText = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path '.link154-pktmon.txt'))
 $rule = 'ableton-link-154-fixture'
+$env:LINK_154_DUPLICATE_REJECTED = ''
+$evidenceMissing = $null
+$evidenceVerified = $false
 try {
     Get-NetAdapter | Format-Table Name, ifIndex, Status
     Get-NetIPInterface -AddressFamily IPv4 | Format-Table InterfaceAlias, InterfaceIndex, ConnectionState
@@ -126,14 +142,84 @@ try {
     }
     Wait-FixtureAddresses
     $env:LINK_154_ADAPTER_A = "$a"
+    $env:LINK_154_ADAPTER_B = "$b"
     $env:LINK_154_ADAPTER_FIXTURE = '1'
-    & $TestBinary --ignored --exact discovery::messenger::tests::multihomed_adapter_ingress_and_churn --nocapture
-    if ($LASTEXITCODE -ne 0) { throw "Multihomed fixture failed: $LASTEXITCODE" }
+    if ($env:LINK_154_DUPLICATE_REJECTED -eq '5010') {
+        $evidenceMissing = 'Windows rejected the duplicate address with ERROR_OBJECT_ALREADY_EXISTS/5010; duplicate-address response endpoints and multicast egress were not exercised.'
+    } else {
+        foreach ($path in @($captureEtl, $captureText)) {
+            if (Test-Path $path) { throw "Refusing to overwrite existing capture artifact $path" }
+        }
+        $captureArtifactsOwned = $true
+        try {
+            if (!(Get-Command pktmon -ErrorAction SilentlyContinue)) { throw 'pktmon is unavailable' }
+            $componentsJson = (Invoke-Pktmon @('list', '--json') | Out-String) | ConvertFrom-Json -AsHashtable
+            $adapterAName = (Get-NetAdapter -InterfaceIndex $a).Name
+            $adapterBName = (Get-NetAdapter -InterfaceIndex $b).Name
+            $componentsA = @(Get-PktmonComponentIds $componentsJson $a $adapterAName)
+            $componentsB = @(Get-PktmonComponentIds $componentsJson $b $adapterBName)
+            if (!$componentsA.Count -or !$componentsB.Count) {
+                throw "pktmon list JSON did not map both fixture adapters to components (A=$a/$adapterAName, B=$b/$adapterBName)"
+            }
+            # NIC-only capture avoids treating Winsock multicast loopback as adapter egress.
+            Invoke-Pktmon @('start', '--capture', '--comp', 'nics', '--type', 'flow', '--pkt-size', '0', '--file-name', $captureEtl) | Out-Null
+            $captureStarted = $true
+        } catch {
+            if (Test-Path $captureEtl) { $captureStarted = $true }
+            $evidenceMissing = "Pktmon capture setup unsupported: $($_.Exception.Message)"
+        }
+    }
+    $testOutput = @(& $TestBinary --ignored --exact discovery::messenger::tests::multihomed_adapter_ingress_and_churn --nocapture 2>&1)
+    $testExitCode = $LASTEXITCODE
+    $testOutput | ForEach-Object { Write-Output $_ }
+    if ($testExitCode -ne 0) { throw "Multihomed fixture failed: $testExitCode" }
+    if ($captureStarted) {
+        try {
+            Invoke-Pktmon @('stop') | Out-Null
+            $captureStarted = $false
+            Invoke-Pktmon @('etl2txt', $captureEtl, '--out', $captureText, '--verbose', '3') | Out-Null
+            $expectedResult = Get-Link154ExpectedEgress $testOutput $a $b
+            if (!$expectedResult.Supported) { throw $expectedResult.Reason }
+            $captureResult = ConvertFrom-Link154PktmonText (Get-Content $captureText) $expectedResult.Expected $componentsA $componentsB $a $b
+            if (!$captureResult.Supported) { throw $captureResult.Reason }
+            if ($captureResult.Missing.Count) {
+                throw "VALID_CAPTURE_MISSING_EXPECTED_NIC_TX: no NIC-level Tx matched endpoint(s) $($captureResult.Missing -join ', ')"
+            }
+            $evidenceVerified = $true
+            Write-Host "Pktmon correlated exact source endpoints with NIC-level multicast Tx on both adapters: $($expectedResult.Expected.Endpoint -join ', ')."
+        } catch {
+            if ($_.Exception.Message -like 'VALID_CAPTURE_MISSING_EXPECTED_NIC_TX:*') { throw }
+            $evidenceMissing = "Pktmon egress evidence unavailable: $($_.Exception.Message)"
+        }
+    }
 } finally {
+    if ($captureStarted) {
+        try {
+            Invoke-Pktmon @('stop') | Out-Null
+        } catch {
+            if (!$evidenceMissing) { $evidenceMissing = "Pktmon stop failed: $($_.Exception.Message)" }
+        }
+    }
+    if ($captureArtifactsOwned) {
+        Remove-Item $captureEtl, $captureText -Force -ErrorAction SilentlyContinue
+    }
     foreach ($entry in $created) {
         [FixtureAddress]::Set($entry[0], $entry[1], $false)
     }
     if (Get-NetFirewallRule -Name $rule -ErrorAction SilentlyContinue) { Remove-NetFirewallRule -Name $rule }
     foreach ($name in $switches) { Remove-VMSwitch -Name $name -Force }
     foreach ($network in $networks) { $network | Remove-HnsNetwork }
+}
+if ($evidenceMissing) {
+    Write-Output "::warning::LINK-154 MISSING EVIDENCE: $evidenceMissing"
+    if ($env:GITHUB_STEP_SUMMARY) {
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### LINK-154 Windows adapter fixture: SKIPPED — MISSING EVIDENCE`n`n$evidenceMissing`n`nAvailable ingress/churn fixture assertions completed where topology allowed. Duplicate-address evidence was not established; this is not a pass."
+    }
+    # Preserve prerequisite-skip behavior: other fixture assertions may have
+    # passed, but unavailable duplicate-address evidence is never a full pass.
+    # A parsed capture missing expected NIC Tx throws above and remains a failure.
+    exit 0
+}
+if ($evidenceVerified -and $env:GITHUB_STEP_SUMMARY) {
+    Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '### LINK-154 Windows adapter fixture: verified distinct duplicate-address response endpoints and exact NIC-level multicast Tx correlation on both adapters.'
 }

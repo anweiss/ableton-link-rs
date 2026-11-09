@@ -140,6 +140,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          & .github/scripts/test-discovery-ingress-windows-parser.ps1
           $artifacts = cargo test --lib --all-features --locked --no-run --message-format=json
           if ($LASTEXITCODE -ne 0) { throw 'Test compilation failed' }
           $binary = $artifacts | ConvertFrom-Json | Where-Object { $_.profile.test -and $_.executable } | Select-Object -ExpandProperty executable
