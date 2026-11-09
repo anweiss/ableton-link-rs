@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use ableton_link_rs::link_audio::AudioBuffer;
 use rodio::{ChannelCount, Sample, SampleRate, Source};
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -90,9 +91,14 @@ impl PlaybackInput {
             self.generation = self.generation.wrapping_add(1);
             return;
         }
+        let peak = samples
+            .iter()
+            .map(|sample| (*sample as i32).abs())
+            .max()
+            .unwrap_or(0);
+        self.stats.peak.fetch_max(peak, Ordering::Relaxed);
         let accepted = frames.min(self.producer.slots());
         let mut written = 0;
-        let mut peak = 0;
         for samples in samples.chunks_exact(channels).take(accepted) {
             let mut frame = Frame {
                 samples: [0; MAX_CHANNELS],
@@ -103,11 +109,7 @@ impl PlaybackInput {
                 break;
             }
             written += 1;
-            for sample in samples {
-                peak = peak.max((*sample as i32).abs());
-            }
         }
-        self.stats.peak.fetch_max(peak, Ordering::Relaxed);
         if written < frames {
             self.stats
                 .dropped_frames
@@ -136,7 +138,11 @@ pub struct LivePlayback {
 impl LivePlayback {
     pub fn new(format: Format, latency_ms: usize) -> (PlaybackInput, Self) {
         let target_frames = format.frames_for_ms(latency_ms.clamp(1, 1000));
-        let (producer, consumer) = RingBuffer::new(target_frames * 2);
+        let max_chunk_frames = AudioBuffer::MAX_AUDIO_BYTES / size_of::<i16>() / format.channels();
+        // A waiting renderer may already hold target - 1 frames when a full
+        // wire chunk arrives. Keep that chunk without forcing a partial drop.
+        let capacity = (target_frames * 2).max(target_frames - 1 + max_chunk_frames);
+        let (producer, consumer) = RingBuffer::new(capacity);
         let stats = Arc::new(PlaybackStats {
             format,
             buffered_frames: AtomicUsize::new(0),
@@ -294,11 +300,12 @@ mod tests {
     #[test]
     fn overflow_is_bounded_aligned_and_crossfaded_at_the_actual_gap() {
         let (mut input, mut playback) = LivePlayback::new(Format::new(2, 1000).unwrap(), 10);
-        let positive: Vec<_> = (0..25).flat_map(|_| [16000, -16000]).collect();
-        input.push(2, 1000, 25, &positive);
-        assert_eq!(playback.consumer.slots(), 20);
+        let capacity = input.producer.slots();
+        let positive: Vec<_> = (0..capacity + 5).flat_map(|_| [16000, -16000]).collect();
+        input.push(2, 1000, capacity + 5, &positive);
+        assert_eq!(playback.consumer.slots(), capacity);
         assert_eq!(playback.stats.dropped_frames.load(Ordering::Relaxed), 5);
-        advance(&mut playback, 10);
+        advance(&mut playback, capacity - 10);
         let negative: Vec<_> = (0..10).flat_map(|_| [-16000, 16000]).collect();
         input.push(2, 1000, 10, &negative);
         let before_gap = advance(&mut playback, 10);
@@ -375,5 +382,45 @@ mod tests {
             .all(|sample| *sample > 0.0));
         assert_eq!(playback.consumer.slots(), 0);
         assert!(!playback.waiting);
+    }
+
+    #[test]
+    fn minimum_latency_holds_a_full_wire_chunk_even_with_a_partial_prefill() {
+        for channels in [1, 2] {
+            let (mut input, mut playback) =
+                LivePlayback::new(Format::new(channels, 44100).unwrap(), 1);
+            let partial = playback.target_frames - 1;
+            input.push(channels, 44100, partial, &vec![0; partial * channels]);
+            advance(&mut playback, 100);
+            assert_eq!(playback.consumer.slots(), partial);
+
+            let chunk_frames = AudioBuffer::MAX_AUDIO_BYTES / size_of::<i16>() / channels;
+            let chunk = vec![12000; chunk_frames * channels];
+            input.push(channels, 44100, chunk_frames, &chunk);
+            assert_eq!(playback.consumer.slots(), partial + chunk_frames);
+            advance(&mut playback, partial + chunk_frames);
+            for _ in 0..5 {
+                input.push(channels, 44100, chunk_frames, &chunk);
+                advance(&mut playback, chunk_frames);
+            }
+            assert_eq!(playback.stats.dropped_frames.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn peak_meter_measures_input_even_when_loud_frames_are_dropped() {
+        for free in [0, 1] {
+            let (mut input, playback) = LivePlayback::new(Format::new(1, 44100).unwrap(), 1);
+            let filled = input.producer.slots() - free;
+            input.push(1, 44100, filled, &vec![0; filled]);
+            assert!(playback.stats.status().ends_with("peak: 0.0%"));
+
+            input.push(1, 44100, 2, &[0, i16::MIN]);
+            assert!(playback.stats.status().ends_with("peak: 100.0%"));
+            assert_eq!(
+                playback.stats.dropped_frames.load(Ordering::Relaxed),
+                (2 - free) as u64
+            );
+        }
     }
 }

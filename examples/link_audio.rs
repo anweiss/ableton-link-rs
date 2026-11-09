@@ -32,7 +32,7 @@ const NUM_FRAMES: usize = 256;
 const QUANTUM: f64 = 4.0;
 
 /// Startup and recovery prefill target, overridable with `LINK_AUDIO_LATENCY_MS`.
-/// Storage is bounded to twice this target; clock drift is not compensated.
+/// Storage also reserves full-wire-chunk headroom; clock drift is not compensated.
 const DEFAULT_LATENCY_MS: usize = 50;
 
 /// Opens the default output device and keeps the playback source alive.

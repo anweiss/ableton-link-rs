@@ -169,9 +169,12 @@ and prints a peak level meter; set `LINK_AUDIO_PLAYBACK=0` to receive without op
 
 The example waits for 50 ms of received audio before starting or recovering from starvation.
 `LINK_AUDIO_LATENCY_MS` sets this prefill target, clamped to 1-1000 ms, not total
-end-to-end latency. The preallocated SPSC ring holds at most twice that target
-(rounded to whole frames), and its audio-side operations do not allocate or take
-a shared blocking mutex. The example uses the dev-only `rtrb` dependency for this
+end-to-end latency. The preallocated SPSC ring holds the larger of twice the target
+or `target - 1 + maximum wire-chunk frames` (all sizes rounded to whole frames).
+This reserves room for a complete receive chunk even if a partial prefill is
+already queued, including at the 1 ms setting. Maximum chunk size derives from
+`AudioBuffer::MAX_AUDIO_BYTES` and the received channel count. Its audio-side
+operations do not allocate or take a shared blocking mutex. The example uses the dev-only `rtrb` dependency for this
 safe handoff; library consumers do not acquire that dependency.
 
 On starvation it fades the last output frame to silence over 5 ms, waits for the
@@ -184,7 +187,8 @@ or overflow, and speakers on different devices are not sample-aligned.
 
 Status distinguishes underrun **events** from missing output **frames**, counts
 startup waiting frames separately, and reports dropped frames, rejected buffers
-and peak level. Buffered milliseconds use the received sample rate. Missing
+and incoming peak level, including valid frames dropped during overflow.
+Buffered milliseconds use the received sample rate. Missing
 frames include the fade-out/rebuffer interval after starvation, not just
 zero-valued samples. Playback supports 1-32 channels and sample rates through
 192 kHz; later format changes or malformed sample counts are rejected and counted,
