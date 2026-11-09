@@ -102,6 +102,15 @@ Assert-ParserTest (!$ambiguous.Supported) 'overlapping NIC component mappings we
 $unmapped = ConvertFrom-Link154PktmonText @($headerA, $packetA, $headerB, $packetB, ($headerA -replace 'Component 101', 'Component 999'), $packetA) $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest (!$unmapped.Supported) 'target-source traffic on an unmapped NIC was accepted as verified evidence'
 
+$unknownAndAbsent = ConvertFrom-Link154PktmonText @(($headerA -replace 'Component 101', 'Component 999'), $packetA) $expectedResult.Expected $componentsA $componentsB 11 12 $knownComponents
+Assert-ParserTest ($unknownAndAbsent.Supported -and $unknownAndAbsent.Missing -contains '10.42.0.9:53002|12') 'unknown-NIC traffic for endpoint A masked an entirely absent endpoint B'
+
+$unknownAndMissing = ConvertFrom-Link154PktmonText @($headerA, $packetA, ($headerA -replace 'Component 101', 'Component 999'), $packetA) $expectedResult.Expected $componentsA $componentsB 11 12 $knownComponents
+Assert-ParserTest ($unknownAndMissing.Supported -and $unknownAndMissing.Missing.Count -eq 1) 'an unknown extra copy masked the other endpoint missing from a valid capture'
+
+$unknownOnly = ConvertFrom-Link154PktmonText @(($headerA -replace 'Component 101', 'Component 999'), $packetA, $headerB, $packetB) $expectedResult.Expected $componentsA $componentsB 11 12 $knownComponents
+Assert-ParserTest (!$unknownOnly.Supported) 'uncertainty limited to the only unmatched endpoint was treated as verified evidence'
+
 $mixed = ConvertFrom-Link154PktmonText @($headerA, $packetA, $headerB, $packetB, ($headerA -replace 'Component 101', 'Component 102'), $packetA, ($headerA -replace 'Component 101', 'Component 999'), $packetA) $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest ($mixed.Supported -and $mixed.Misrouted.Count -eq 1) 'an unmapped NIC obscured a proven wrong-fixture-NIC transmission'
 
@@ -113,4 +122,4 @@ Assert-ParserTest ($stale.Missing.Count -eq 1) 'an unrecognized packet header in
 $unsupported = ConvertFrom-Link154PktmonText @('Packet Group=1 Direction=TX Component=101', 'UDP 10.42.0.9:53001 -> 224.76.78.75:20808') $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest (!$unsupported.Supported) 'unrecognized capture format was treated as valid evidence'
 
-Write-Host 'Windows pktmon parser tests passed: direct/nested component mapping, IP/Ethernet endpoints, checksum annotations, invalid endpoint markers, no UDP, wrong source port, cross-adapter, additional wrong-NIC Tx, foreign-NIC-only Tx, foreign-NIC leakage, ambiguous mapping, unmapped NIC, stale header, unsupported format.'
+Write-Host 'Windows pktmon parser tests passed: direct/nested component mapping, IP/Ethernet endpoints, checksum annotations, invalid endpoint markers, no UDP, wrong source port, cross-adapter, additional wrong-NIC Tx, foreign-NIC-only Tx, foreign-NIC leakage, ambiguous mapping, per-endpoint unknown-NIC uncertainty, stale header, unsupported format.'

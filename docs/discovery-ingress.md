@@ -256,7 +256,9 @@ capture missing a required endpoint's NIC Tx, or also transmitting that endpoint
 on any known wrong NIC, fails the fixture. The parser retains the full Pktmon
 component inventory, so known non-fixture NICs are routing failures rather than
 unavailable evidence; only genuinely unresolved component identities take that
-fallback. Recognized packet metadata with no
+fallback. Unknown-NIC uncertainty is tracked per endpoint: it cannot suppress a
+failure for another endpoint absent from the capture, or a proven wrong-NIC send.
+Recognized packet metadata with no
 UDP records reports both transmissions as missing; a changed packet decoder
 cannot turn that absence into a tooling skip. Missing or invalid endpoint markers
 fail after every successful duplicate-enabled test run, even without capture

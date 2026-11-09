@@ -101,6 +101,7 @@ function ConvertFrom-Link154PktmonText {
     $matched = [System.Collections.Generic.HashSet[string]]::new()
     $misrouted = [System.Collections.Generic.HashSet[string]]::new()
     $unmapped = [System.Collections.Generic.HashSet[int]]::new()
+    $unverified = [System.Collections.Generic.HashSet[string]]::new()
     $packet = $null
     foreach ($line in $Lines) {
         if ("$line" -match '\bPktGroupId\b') {
@@ -139,11 +140,14 @@ function ConvertFrom-Link154PktmonText {
                     [void]$misrouted.Add("$source|expected=$($endpoint.InterfaceIndex)|component=$($snapshot.Component)")
                 } else {
                     [void]$unmapped.Add($snapshot.Component)
+                    [void]$unverified.Add("$($endpoint.Endpoint)|$($endpoint.InterfaceIndex)")
                 }
             }
         }
     }
-    if ($unmapped.Count -and !$misrouted.Count) {
+    $required = @($Expected | ForEach-Object { "$($_.Endpoint)|$($_.InterfaceIndex)" })
+    $unobserved = @($required | Where-Object { !$matched.Contains($_) -and !$unverified.Contains($_) })
+    if ($unmapped.Count -and !$misrouted.Count -and !$unobserved.Count) {
         return [pscustomobject]@{
             Supported = $false
             Reason = "Expected multicast source appeared on unmapped NIC component(s): $(@($unmapped | Sort-Object) -join ', ')"
@@ -158,7 +162,6 @@ function ConvertFrom-Link154PktmonText {
             Matched = @($matched)
         }
     }
-    $required = @($Expected | ForEach-Object { "$($_.Endpoint)|$($_.InterfaceIndex)" })
     [pscustomobject]@{
         Supported = $true
         Reason = $null
@@ -167,5 +170,6 @@ function ConvertFrom-Link154PktmonText {
         Matched = @($matched | Sort-Object)
         Missing = @($required | Where-Object { !$matched.Contains($_) })
         Misrouted = @($misrouted | Sort-Object)
+        Unverified = @($unverified | Sort-Object)
     }
 }
