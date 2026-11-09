@@ -80,7 +80,8 @@ network-interface = { version = "2.0.3", optional = true }
 audio_thread_priority = { version = "0.38.0", default-features = false, optional = true }
 
 [dependencies.libc]
-version = "0.2"
+# Darwin's native RFC 3678 group_req and membership constants.
+version = "0.2.191"
 optional = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]

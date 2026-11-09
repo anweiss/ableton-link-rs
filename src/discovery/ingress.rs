@@ -103,27 +103,18 @@ pub(super) fn set_membership(socket: &UdpSocket, index: u32, join: bool) -> io::
 #[allow(unsafe_code)]
 pub(super) fn set_membership(socket: &UdpSocket, index: u32, join: bool) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    // Darwin SDK netinet/in.h defines these under #pragma pack(4).
-    // libc does not currently publish the Darwin group_req or constants.
-    #[repr(C, packed(4))]
-    struct GroupRequest {
-        interface: u32,
-        group: libc::sockaddr_storage,
-    }
-    const MCAST_JOIN_GROUP: libc::c_int = 80;
-    const MCAST_LEAVE_GROUP: libc::c_int = 81;
     let mut address =
         socket2::SockAddr::from(SocketAddrV4::new(super::MULTICAST_ADDR, 0)).as_storage();
     // SAFETY: SockAddr constructed the fully initialized native sockaddr storage;
     // view_as uses that same native type, not a reinterpretation of another ABI.
-    let request = GroupRequest {
-        interface: index,
-        group: unsafe { *address.view_as::<libc::sockaddr_storage>() },
+    let request = libc::group_req {
+        gr_interface: index,
+        gr_group: unsafe { *address.view_as::<libc::sockaddr_storage>() },
     };
     let option = if join {
-        MCAST_JOIN_GROUP
+        libc::MCAST_JOIN_GROUP
     } else {
-        MCAST_LEAVE_GROUP
+        libc::MCAST_LEAVE_GROUP
     };
     // SAFETY: synchronous option call borrows a live socket and initialized
     // group_req of the platform's own layout. No pointer escapes.
@@ -151,7 +142,8 @@ fn pin_egress(socket: &std::net::UdpSocket, index: u32) -> io::Result<()> {
 }
 
 // socket2 exposes IP_BOUND_IF on macOS but no IP_UNICAST_IF on Linux/Windows.
-// Its Linux SO_BINDTOIFINDEX alternative needs CAP_NET_RAW and a recent kernel.
+// Linux SO_BINDTOIFINDEX also scopes reception (unlike IP_UNICAST_IF) and needs
+// a recent kernel; changing an existing device binding needs CAP_NET_RAW.
 // socket-pktinfo only wraps reception; nix has no typed IP_UNICAST_IF option.
 // Keep the two missing setsockopt wrappers here, not a custom recvmsg/WSARecvMsg.
 #[cfg(target_os = "linux")]
@@ -272,5 +264,22 @@ mod tests {
         assert!(options.reuse_address().unwrap());
         #[cfg(unix)]
         assert!(options.reuse_port().unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn darwin_native_indexed_membership_can_join_and_leave() {
+        let index = nix::net::if_::if_nametoindex("lo0").unwrap();
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        set_membership(&socket, index, true).unwrap();
+        assert!(
+            set_membership(&socket, index, true).is_err(),
+            "the indexed membership must actually have been installed"
+        );
+        set_membership(&socket, index, false).unwrap();
+        assert!(
+            set_membership(&socket, index, false).is_err(),
+            "the indexed membership must actually have been removed"
+        );
     }
 }

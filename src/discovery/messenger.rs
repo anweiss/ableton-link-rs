@@ -6294,6 +6294,12 @@ mod tests {
             interface_socket_entries(&context.interface_sockets).len(),
             2
         );
+        let duplicate_entries = interface_socket_entries(&context.interface_sockets);
+        assert_ne!(
+            duplicate_entries[0].socket.local_addr().unwrap(),
+            duplicate_entries[1].socket.local_addr().unwrap(),
+            "duplicate-address registrations need distinct response endpoints"
+        );
         for (local, index) in [
             (Ipv4Addr::new(10, 42, 0, 130), host_a.index),
             (Ipv4Addr::new(10, 42, 0, 2), host_b.index),
@@ -6316,6 +6322,52 @@ mod tests {
             assert_eq!(
                 parse_message_header(&output.stdout).unwrap().0.message_type,
                 ALIVE
+            );
+        }
+        #[cfg(windows)]
+        for entry in &duplicate_entries {
+            let endpoint = entry.socket.local_addr().unwrap();
+            eprintln!(
+                "LINK154_MULTICAST_TX_EXPECT endpoint={} ifIndex={}",
+                endpoint, entry.identity.index
+            );
+            let from = context.peer_state.lock().unwrap().ident();
+            let mut sent = false;
+            let mut last_error = None;
+            for attempt in 1..=3 {
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    send_message_reporting(
+                        entry.socket.clone(),
+                        from,
+                        1,
+                        ALIVE,
+                        &Payload::default(),
+                        SocketAddrV4::new(MULTICAST_ADDR, LINK_PORT),
+                        0,
+                        Some((entry, &context.interface_sockets)),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(true)) => {
+                        sent = true;
+                        break;
+                    }
+                    Ok(Ok(false)) => {
+                        last_error = Some("message encoding produced no datagram".to_owned())
+                    }
+                    Ok(Err(error)) => last_error = Some(error.to_string()),
+                    Err(_) => last_error = Some("registered multicast send timed out".to_owned()),
+                }
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            assert!(
+                sent,
+                "registered multicast send failed three bounded attempts for {endpoint}: {}",
+                last_error.unwrap_or_else(|| "no send attempt succeeded".to_owned())
             );
         }
         context.gate.stop().await;

@@ -114,6 +114,7 @@ safe-outputs:
       exclude:
         - ".github/"
         - "README.md"
+        - "docs/README.md"
     # Exclusive allowlist, scoped to what a port pull request can legitimately
     # contain. Anything outside it is refused.
     allowed-files:
@@ -127,6 +128,7 @@ safe-outputs:
       # the README in the same pull request - it did exactly that on PR #124.
       # Without this the agent can never satisfy that class of comment.
       - "README.md"
+      - "docs/**"
   add-comment:
     target: "*"
     max: 1
@@ -234,6 +236,10 @@ and the record stayed wrong — spending the last of two rounds and leaving a
 maintainer to correct it by hand.
 
 ## Keep the record matching the code
+
+Read `docs/README.md` and update any affected topic document alongside code.
+`docs/**` is writable, including its index. Keep the root README concise, with a
+short summary or link rather than detailed migration or implementation notes.
 
 When your fix changes the *approach* rather than just a line, the pull request's own
 description of itself goes stale — and on a port pull request the description is load

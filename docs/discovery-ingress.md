@@ -1,5 +1,7 @@
 # Discovery ingress identity
 
+[Documentation index](README.md) | [Project README](../README.md)
+
 The managed `Messenger` used by `BasicLink` retains the receiving OS interface
 index for both multicast announcements and unicast replies. It no longer guesses
 the response interface from the sender's IP address. The wildcard listener still
@@ -33,7 +35,11 @@ duplicate the unbound socket and assume a later bind updates the clone.
 Binding only a source IP is insufficient on weak-host systems. Linux/Windows
 therefore have narrowly scoped `setsockopt` wrappers for `IP_UNICAST_IF`, in
 network byte order. socket2 lacks that option; its Linux `SO_BINDTOIFINDEX`
-alternative needs privileges and a newer kernel. `nix` has no typed
+alternative needs a newer kernel and also restricts reception, unlike
+`IP_UNICAST_IF`. The evaluated Linux kernel permits the initial device binding
+without `CAP_NET_RAW`, but requires that capability to change an existing device
+binding. It is not a drop-in replacement for the existing local-delivery path
+and does not add an incarnation token. `nix` has no typed
 `IP_UNICAST_IF` option, and socket-pktinfo wraps reception, not egress options.
 The socket remains owned during each synchronous call and each argument points
 to an initialized, correctly sized integer. Packet decoding does not use local
@@ -51,6 +57,11 @@ its `IP_ADD_MEMBERSHIP` consumes only `ip_mreq`, ignoring the index appended by
 socket2's `join_multicast_v4_n`. The real two-adapter fixture exposed this as an
 incorrect first membership and `EADDRINUSE` on the second. Neither socket2 nor
 nix provides the needed RFC 3678 wrapper, so it is a narrow local exception.
+The request layout and option constants come from libc 0.2.191 rather than a
+local `group_req` definition or hard-coded numbers. Its Rust 1.65 MSRV remains
+below this library's Rust 1.87 floor. A native macOS test installs and removes an
+indexed loopback membership, checking duplicate join and leave failures too;
+this validates the actual syscall contract without modifying host interfaces.
 Memberships are joined once per adapter even with multiple local aliases.
 Outgoing multicast uses rustix's safe indexed `IP_MULTICAST_IF` wrapper on
 Linux/macOS and Winsock's indexed `0.x.x.x` form through socket2 on Windows.
@@ -227,9 +238,39 @@ The fixture also tries the independent NetTCPIP `New-NetIPAddress` provider
 when the native IP Helper call returns 5010. This is confined to the adapters
 it created, never the runner's transport adapter. Provider success must pass
 the existing duplicate-address unicast-response assertions. Managed outgoing
-multicast capture in this adapter fixture is macOS-only, so Windows provider
-success alone would still not prove duplicate-address multicast egress; a matching 5010 is still missing
-evidence, and any other failure fails setup. This tests a second provisioning
+multicast capture on macOS observes the opposite peer port. The Windows fixture
+now also sends an ALIVE from each duplicate-address registration and checks
+Pktmon NIC-only Tx records on both fixture adapters. Those records must identify
+the distinct registered source endpoints and the Link multicast destination.
+The fixture consumes the test's endpoint/interface markers rather than accepting
+an arbitrary source port at the duplicate address. Its isolated parser tests
+cover matching, invalid endpoint markers, no-UDP captures, wrong-port,
+cross-adapter, additional wrong-NIC transmissions, known foreign-NIC-only traffic,
+ambiguous/unmapped NIC identities, nested component `Properties`/`ifIndex`,
+IP/Ethernet endpoint lines with checksum annotations, stale headers and
+unsupported-format captures; the
+Windows CI job runs them before provisioning adapters. Unsupported capture
+tooling is reported as missing evidence, separately from a valid capture that
+fails to show a required transmission. Fixture output streams live while its
+endpoint markers are retained, so hangs or job cancellation do not withhold
+diagnostics until process completion. Missing prerequisites skip only the
+duplicate-capture evidence: the existing overlap/restart/churn assertions must
+still pass, and a green Windows job is not a duplicate-network pass. A valid
+capture missing a required endpoint's NIC Tx, or also transmitting that endpoint
+on any known wrong NIC, fails the fixture. The parser retains the full Pktmon
+component inventory, so known non-fixture NICs are routing failures rather than
+unavailable evidence; only genuinely unresolved component identities take that
+fallback. Unknown-NIC uncertainty is tracked per endpoint: it cannot suppress a
+failure for another endpoint absent from the capture, or a proven wrong-NIC send.
+Recognized packet metadata with no
+UDP records reports both transmissions as missing; a changed packet decoder
+cannot turn that absence into a tooling skip. Missing or invalid endpoint markers
+fail after every successful duplicate-enabled test run, even without capture
+tooling, outside the capture-error fallback.
+This is local virtual-NIC transmission evidence, not independent peer receipt:
+provider success plus these records would still not prove the full Windows
+criterion. A matching 5010 remains missing evidence and is explicitly reported
+as skipped in the job summary; any other failure fails setup. This tests a second provisioning
 API, not a different Windows network stack or an independent physical topology.
 These same-host tests are distinct from Linux's independent peer namespaces;
 they do not establish behavior across external physical networks.
@@ -268,13 +309,12 @@ reference with `dev_put`, then stores the integer in `inet->uc_index`.
 handle. Retaining a userspace socket or registration Arc therefore does not
 establish the required kernel identity lifetime on those paths.
 
-Darwin is different: `inp_bindif` resolves an interface pointer and
-`inp_bindif_common` stores `inp_boundifp`. This is not evidence that Darwin has
-the same integer-only storage as Linux; nor does that snippet establish the
-complete receive-to-egress lifetime guarantee. It has not been promoted into a
-cross-platform closure claim. More user-space checks, or replacing the listener
-while retaining the same indexed send options, would not prove atomic exclusion
-on the Linux/Windows paths.
+Darwin's `inp_bindif` resolves an interface pointer and `inp_bindif_common`
+stores `inp_boundifp`, but output subsequently derives
+`ifscope = inp->inp_boundifp->if_index`. Pointer storage alone therefore does not
+establish a receive-to-egress incarnation contract. More user-space checks, or
+replacing the listener while retaining the same indexed send options, would not
+prove atomic exclusion.
 
 Complete repository-owned unsafe removal is also unfinished. `rustix` replaced
 Unix multicast egress and `crossterm` replaced the Windows example console calls.
@@ -289,6 +329,42 @@ flag, then its public stream emits an address-set difference, so it loses that
 case just as the rejected snapshot watcher does. No local FFI was moved into a
 shim dependency or replaced by an unsupported-platform success path.
 
+### November 9, 2026 implementation decision
+
+The issue's September body describes the original routing defect; its September
+10 and November 5 comments describe the stricter remaining acceptance criteria.
+The original routing fix is already implemented. This follow-up does not reopen
+the upstream backlog or replace packet reception.
+
+| Remaining criterion | Supported implementation/evidence | Still required for closure |
+| --- | --- | --- |
+| Receive-to-egress incarnation identity | Captured ingress index, registered socket, observed raw-event invalidation and checked nonblocking send | A documented kernel lifetime primitive and replacement at the final send boundary, for both unicast and managed multicast |
+| Windows duplicate-address networks | Existing overlap/restart/churn fixture; provisioning rejection remains missing evidence | Usable duplicate-address adapters and independent peer-side observation of both response endpoints and multicast egress, or a configuration-specific authoritative limit |
+| Safe platform integration | Safe packet reception and Unix multicast egress; native libc Darwin membership ABI | Suitable safe unicast/membership, raw Windows notification and Unix reactor-registration APIs without losing raw equal-final-state events or owned shutdown |
+
+Established implementations such as Avahi and systemd-resolved pass the interface
+index using `IP_PKTINFO` ancillary data. This is a useful precedent for
+index-scoped routing, not a generation-bearing lifetime primitive. Passing the
+same index per send rather than setting a socket option cannot, by itself,
+distinguish a replacement adapter that has acquired that index.
+Likewise, per-interface multicast listeners, `SO_BINDTOIFINDEX`, additional
+generation checks, and converting Windows indices to LUIDs in userspace do not
+establish atomic identity at the UDP send boundary.
+
+The safe-wrapper inventory was rechecked against socket2 0.6.5, rustix 1.1.6,
+nix 0.31.3 and Tokio 1.54.1. The native Darwin request binding reduces local ABI
+maintenance; it does not turn the remaining `setsockopt` call into a safe crate
+API. The existing reactor-registration and Windows raw-notification exceptions
+remain, rather than adding a second reactor or losing equal-final-state events.
+
+No suitable lifetime primitive was established in this investigation. This is
+not proof that no such primitive can exist. A privileged namespace/service
+redesign or a kernel change would be a different deployment contract, not an
+unconditional fix for the current unprivileged portable library. The retained
+contract is index-scoped delivery plus rejection of **observed** topology
+changes. No issue closure is claimed from a source review, native membership
+test or unexecuted platform fixture.
+
 ## Primary implementation references
 
 * Upstream: `vendor/ableton-link/include/ableton/discovery/IpInterface.hpp`,
@@ -296,6 +372,11 @@ shim dependency or replaced by an unsupported-platform success path.
 * Packet metadata: <https://github.com/pixsper/socket-pktinfo/tree/v0.4.1/src>
 * Linux options/routing: <https://github.com/torvalds/linux/blob/master/net/ipv4/ip_sockglue.c>
   and <https://github.com/torvalds/linux/blob/master/net/ipv4/udp.c>
+* November 9 pinned Linux checks:
+  [`IP_UNICAST_IF` stores an index](https://github.com/torvalds/linux/blob/7475ea8b58616b33c04afb976cf0fbaad9dd63fb/net/ipv4/ip_sockglue.c#L1127-L1156),
+  [bound-device option and capability check](https://github.com/torvalds/linux/blob/7475ea8b58616b33c04afb976cf0fbaad9dd63fb/net/core/sock.c#L636-L662),
+  [unicast/multicast output-index selection](https://github.com/torvalds/linux/blob/7475ea8b58616b33c04afb976cf0fbaad9dd63fb/net/ipv4/udp.c#L1393-L1412),
+  and [route lookup by index](https://github.com/torvalds/linux/blob/7475ea8b58616b33c04afb976cf0fbaad9dd63fb/net/ipv4/route.c#L2814-L2817).
 * Windows option contract:
   <https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-ip-socket-options>
 * socket2 adapter binding:
@@ -304,6 +385,14 @@ shim dependency or replaced by an unsupported-platform success path.
   <https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_mcast.c>
 * Darwin bound-interface storage:
   <https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_pcb.c>
+  and [pinned conversion back to an output scope index](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/netinet/in_pcb.c#L1593-L1596).
+* Native Darwin RFC 3678 bindings:
+  <https://github.com/rust-lang/libc/blob/0.2.191/src/unix/bsd/apple/mod.rs>.
+* Comparable indexed send/receive designs:
+  [Avahi](https://github.com/avahi/avahi/blob/7d8af13d62f12ee046c3bdc95c1b2676c054d2d1/avahi-core/socket.c#L544-L562)
+  and [systemd-resolved](https://github.com/systemd/systemd/blob/6cf990ea2931a901aaba4e0e5ee1d8fda86a4a76/src/resolve/resolved-manager.c#L1176).
+* Windows NIC capture:
+  <https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/pktmon-start>.
 * Evaluated Windows watcher:
   <https://docs.rs/crate/if-watch/3.2.2/source/src/win.rs>
 * Windows notifications and cancellation:
@@ -319,7 +408,7 @@ be forwarded intact to `GatewayObserver`; managed BYEBYE is a zero-TTL peer-stat
 withdrawal. Session construction uses `Session::new`; requests/results and standalone
 measurement/result helpers use the originating `SessionKey` (`session.key()`). The
 new `MeasurePeerEvent::Cancelled(key, attempted_peer)` denotes retryable registration retirement.
-See the [canonical README migration guide](../README.md#source-migration-and-managed-lifecycle)
+See the [source migration guide](migration.md)
 for every affected public signature and enum, session-aware observers, retry ownership,
 cooperative contention and clock publication. These source-breaking changes do not
 change the wire format. Same-adapter alias selection uses
@@ -329,4 +418,4 @@ scan and reused for all registrations in that reconciliation, including leases
 captured before a failed identity snapshot recovered. This does not close #154.
 
 Receive ordering, node supersession and committed departure cleanup are documented
-in the [README receive guarantees](../README.md#basic-usage).
+in the [managed discovery overview](migration.md#managed-discovery-overview).

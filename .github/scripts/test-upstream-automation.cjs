@@ -506,6 +506,26 @@ test('triage fix: safe-output allowlist and workflow wakeups are wired', () => {
   assert.match(port, /required-labels: \[upstream-sync, automation\]/);
 });
 
+test('port agents: relocated topic docs are writable without widening workflow access', () => {
+  for (const [name, output] of [
+    ['link-upstream-port', 'create_pull_request'],
+    ['copilot-review-fix', 'push_to_pull_request_branch'],
+  ]) {
+    const source = workflow(`${name}.md`);
+    const lock = workflow(`${name}.lock.yml`);
+    const encoded = lock.match(/^          GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: (".*")$/m)[1];
+    const policy = JSON.parse(JSON.parse(encoded))[output];
+    assert.deepEqual(policy.allowed_files, [
+      'src/**', 'tests/**', 'examples/**', 'vendor/ableton-link',
+      '.github/upstream-backlog.toml', 'README.md', 'docs/**',
+    ], `${name}: only topic docs broaden the writable set`);
+    assert.match(source, /exclude:\n(?:[^\n]*\n)*?        - "docs\/README\.md"/);
+    assert.match(source, /Read `docs\/README\.md`/);
+    assert.ok(!policy.protected_files.includes('README.md'));
+    assert.ok(!policy.protected_files.includes('docs/README.md'));
+  }
+});
+
 test('triage fix: compiled preflight and safe-output policy match the tested source', () => {
   const lock = workflow('copilot-triage-review-fix.lock.yml');
   const sourceScript = fixSource.split('      script: |\n')[1]
