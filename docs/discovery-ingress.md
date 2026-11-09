@@ -249,7 +249,9 @@ IP/Ethernet endpoint lines with checksum annotations, stale headers and
 unsupported-format captures; the
 Windows CI job runs them before provisioning adapters. Unsupported capture
 tooling is reported as missing evidence, separately from a valid capture that
-fails to show a required transmission. Missing prerequisites skip only the
+fails to show a required transmission. Fixture output streams live while its
+endpoint markers are retained, so hangs or job cancellation do not withhold
+diagnostics until process completion. Missing prerequisites skip only the
 duplicate-capture evidence: the existing overlap/restart/churn assertions must
 still pass, and a green Windows job is not a duplicate-network pass. A valid
 capture missing a required endpoint's NIC Tx, or also transmitting that endpoint

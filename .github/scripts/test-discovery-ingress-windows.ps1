@@ -170,9 +170,8 @@ try {
             $evidenceMissing = "Pktmon capture setup unsupported: $($_.Exception.Message)"
         }
     }
-    $testOutput = @(& $TestBinary --ignored --exact discovery::messenger::tests::multihomed_adapter_ingress_and_churn --nocapture 2>&1)
+    & $TestBinary --ignored --exact discovery::messenger::tests::multihomed_adapter_ingress_and_churn --nocapture 2>&1 | Tee-Object -Variable testOutput
     $testExitCode = $LASTEXITCODE
-    $testOutput | ForEach-Object { Write-Output $_ }
     if ($testExitCode -ne 0) { throw "Multihomed fixture failed: $testExitCode" }
     if ($env:LINK_154_DUPLICATE_REJECTED -ne '5010') {
         $expectedResult = Get-Link154ExpectedEgress $testOutput $a $b

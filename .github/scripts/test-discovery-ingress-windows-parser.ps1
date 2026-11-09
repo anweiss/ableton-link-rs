@@ -122,4 +122,65 @@ Assert-ParserTest ($stale.Missing.Count -eq 1) 'an unrecognized packet header in
 $unsupported = ConvertFrom-Link154PktmonText @('Packet Group=1 Direction=TX Component=101', 'UDP 10.42.0.9:53001 -> 224.76.78.75:20808') $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest (!$unsupported.Supported) 'unrecognized capture format was treated as valid evidence'
 
-Write-Host 'Windows pktmon parser tests passed: direct/nested component mapping, IP/Ethernet endpoints, checksum annotations, invalid endpoint markers, no UDP, wrong source port, cross-adapter, additional wrong-NIC Tx, foreign-NIC-only Tx, foreign-NIC leakage, ambiguous mapping, per-endpoint unknown-NIC uncertainty, stale header, unsupported format.'
+$fixturePath = Join-Path $PSScriptRoot 'test-discovery-ingress-windows.ps1'
+$tokens = $null
+$parseErrors = $null
+$fixtureAst = [System.Management.Automation.Language.Parser]::ParseFile($fixturePath, [ref]$tokens, [ref]$parseErrors)
+Assert-ParserTest (!$parseErrors) 'fixture script contains syntax errors'
+$testStatements = @($fixtureAst.FindAll({
+    param($node)
+    ($node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left.Extent.Text -eq '$testOutput' -and
+        $node.Right.Extent.Text.Contains('--ignored --exact discovery::messenger::tests::multihomed_adapter_ingress_and_churn')) -or
+    ($node -is [System.Management.Automation.Language.PipelineAst] -and
+        $node.Parent.Parent -is [System.Management.Automation.Language.TryStatementAst] -and
+        $node.Extent.Text.StartsWith('& $TestBinary --ignored --exact discovery::messenger::tests::multihomed_adapter_ingress_and_churn'))
+}, $true))
+Assert-ParserTest ($testStatements.Count -eq 1) 'could not identify the fixture output statement'
+$temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "link154-output-$([guid]::NewGuid().ToString('N'))"
+[void][System.IO.Directory]::CreateDirectory($temporaryDirectory)
+$process = $null
+try {
+    $releasePath = Join-Path $temporaryDirectory 'release'
+    $fakeFixture = Join-Path $temporaryDirectory 'fixture.ps1'
+    $wrapper = Join-Path $temporaryDirectory 'wrapper.ps1'
+    $escapedRelease = $releasePath.Replace("'", "''")
+    $escapedFixture = $fakeFixture.Replace("'", "''")
+    @"
+Write-Output 'fixture-started'
+while (!(Test-Path -LiteralPath '$escapedRelease')) { Start-Sleep -Milliseconds 20 }
+Write-Output 'fixture-finished'
+exit 23
+"@ | Set-Content -LiteralPath $fakeFixture
+    @"
+`$ErrorActionPreference = 'Stop'
+`$TestBinary = '$escapedFixture'
+$($testStatements[0].Extent.Text)
+if (`$LASTEXITCODE -ne 23) { throw 'Fixture exit code was lost' }
+if (@(`$testOutput).Count -ne 2 -or `$testOutput[0] -ne 'fixture-started' -or `$testOutput[1] -ne 'fixture-finished') {
+    throw 'Fixture output was not retained for marker validation'
+}
+exit 0
+"@ | Set-Content -LiteralPath $wrapper
+    $start = [System.Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = (Get-Process -Id $PID).Path
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    foreach ($argument in @('-NoLogo', '-NoProfile', '-File', $wrapper)) { $start.ArgumentList.Add($argument) }
+    $process = [System.Diagnostics.Process]::Start($start)
+    $firstLine = $process.StandardOutput.ReadLineAsync()
+    Assert-ParserTest ($firstLine.Wait(10000)) 'fixture diagnostics were buffered until process completion'
+    Assert-ParserTest ($firstLine.Result -eq 'fixture-started') 'fixture start diagnostic was not streamed'
+    [System.IO.File]::WriteAllText($releasePath, '')
+    Assert-ParserTest ($process.WaitForExit(10000)) 'fixture streaming regression did not complete'
+    Assert-ParserTest ($process.ExitCode -eq 0) "fixture output or exit-code retention failed: $($process.StandardError.ReadToEnd())"
+} finally {
+    if ($null -ne $process) {
+        if (!$process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+        $process.Dispose()
+    }
+    Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force
+}
+
+Write-Host 'Windows pktmon parser tests passed: direct/nested component mapping, IP/Ethernet endpoints, checksum annotations, invalid endpoint markers, no UDP, wrong source port, cross-adapter, additional wrong-NIC Tx, foreign-NIC-only Tx, foreign-NIC leakage, ambiguous mapping, per-endpoint unknown-NIC uncertainty, stale header, unsupported format, live fixture diagnostics and exit-code retention.'
