@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ableton_link_rs::link_audio::AudioBuffer;
@@ -61,6 +61,7 @@ impl Format {
 struct Frame {
     samples: [i16; MAX_CHANNELS],
     generation: u64,
+    received_at: Instant,
 }
 
 pub struct PlaybackStats {
@@ -106,6 +107,17 @@ pub struct PlaybackInput {
 
 impl PlaybackInput {
     pub fn push(&mut self, channels: usize, rate: u32, frames: usize, samples: &[i16]) {
+        self.push_at(channels, rate, frames, samples, Instant::now());
+    }
+
+    fn push_at(
+        &mut self,
+        channels: usize,
+        rate: u32,
+        frames: usize,
+        samples: &[i16],
+        received_at: Instant,
+    ) {
         if Format::new(channels, rate) != Some(self.format)
             || frames.checked_mul(channels) != Some(samples.len())
         {
@@ -130,6 +142,7 @@ impl PlaybackInput {
             let mut frame = Frame {
                 samples: [0; MAX_CHANNELS],
                 generation: self.generation,
+                received_at,
             };
             frame.samples[..channels].copy_from_slice(samples);
             // Account before publishing so a concurrent pop cannot underflow.
@@ -164,6 +177,9 @@ pub struct LivePlayback {
     started: bool,
     output_ready: Arc<AtomicBool>,
     output_ready_announced: bool,
+    stale_after: Duration,
+    #[cfg(test)]
+    test_now: Instant,
     pub stats: Arc<PlaybackStats>,
 }
 
@@ -217,6 +233,12 @@ impl LivePlayback {
                 started: false,
                 output_ready,
                 output_ready_announced: false,
+                stale_after: Duration::from_secs_f64(
+                    capacity as f64 * 2.0 / format.rate.get() as f64,
+                )
+                .max(Duration::from_secs(1)),
+                #[cfg(test)]
+                test_now: Instant::now(),
                 stats,
             },
         )
@@ -233,10 +255,32 @@ impl LivePlayback {
         self.fade_remaining = self.fade_frames;
     }
 
-    fn render_frame(&mut self) {
+    fn render_frame_at(&mut self, now: Instant) {
         if !self.output_ready_announced {
             self.output_ready.store(true, Ordering::Release);
             self.output_ready_announced = true;
+        }
+        let queued = self.consumer.slots();
+        let mut expired = 0;
+        for _ in 0..queued {
+            let stale = self.consumer.peek().is_ok_and(|frame| {
+                now.saturating_duration_since(frame.received_at) > self.stale_after
+            });
+            if !stale || self.consumer.pop().is_err() {
+                break;
+            }
+            expired += 1;
+            self.stats.buffered_frames.fetch_sub(1, Ordering::Relaxed);
+        }
+        if expired > 0 {
+            self.stats
+                .dropped_frames
+                .fetch_add(expired, Ordering::Relaxed);
+            if !self.waiting {
+                self.waiting = true;
+                self.stats.underrun_events.fetch_add(1, Ordering::Relaxed);
+                self.start_fade();
+            }
         }
         let available = self.consumer.slots();
         if self.waiting && self.fade_remaining == 0 && available >= self.target_frames {
@@ -291,7 +335,7 @@ impl Iterator for LivePlayback {
 
     fn next(&mut self) -> Option<Sample> {
         if self.channel == 0 {
-            self.render_frame();
+            self.render_frame_at(Instant::now());
         }
         let sample = self.output[self.channel];
         self.channel = (self.channel + 1) % self.format.channels();
@@ -326,8 +370,12 @@ mod tests {
     }
 
     fn advance(playback: &mut LivePlayback, frames: usize) -> Vec<f32> {
-        let samples = frames * playback.format.channels();
-        playback.take(samples).collect()
+        let mut samples = Vec::with_capacity(frames * playback.format.channels());
+        for _ in 0..frames {
+            playback.render_frame_at(playback.test_now);
+            samples.extend_from_slice(&playback.output[..playback.format.channels()]);
+        }
+        samples
     }
 
     #[test]
@@ -607,5 +655,30 @@ mod tests {
         assert_eq!(fresh[9], 16000.0 / 32768.0);
         assert_eq!(playback.stats.underrun_events.load(Ordering::Relaxed), 0);
         assert_eq!(playback.stats.startup_frames.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn partial_refill_expires_after_a_long_outage_and_cannot_start_old_audio() {
+        let (mut input, mut playback) = new_playback(Format::new(1, 1000).unwrap(), 10);
+        input.push(1, 1000, 10, &[16000; 10]);
+        advance(&mut playback, 15);
+        assert!(playback.waiting);
+        let before_outage = playback.test_now;
+        input.push_at(1, 1000, 8, &[4000; 8], before_outage);
+        advance(&mut playback, 1);
+        let resumed = before_outage + playback.stale_after + Duration::from_millis(1);
+        input.push_at(1, 1000, 2, &[16000; 2], resumed);
+        playback.render_frame_at(resumed);
+        assert_eq!(playback.consumer.slots(), 2);
+        assert!(playback.waiting);
+        assert_eq!(playback.output[0], 0.0);
+        assert_eq!(playback.stats.dropped_frames.load(Ordering::Relaxed), 8);
+
+        input.push_at(1, 1000, 8, &[16000; 8], resumed);
+        for _ in 0..10 {
+            playback.render_frame_at(resumed);
+        }
+        assert_eq!(playback.output[0], 16000.0 / 32768.0);
+        assert_eq!(playback.stats.underrun_events.load(Ordering::Relaxed), 1);
     }
 }

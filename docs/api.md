@@ -171,6 +171,9 @@ The example waits for 50 ms of received audio before starting or recovering from
 Input received while the output device is opening is metered but discarded.
 Prefill begins with fresh input after the source is first rendered, rather than
 replaying a stale queue accumulated during device startup.
+Queued audio expires after the larger of one second or twice the ring's frame
+capacity expressed as a duration. Expired frames are discarded and counted, so a
+partial refill cannot replay arbitrarily old audio after a long outage.
 `LINK_AUDIO_LATENCY_MS` requests this prefill target, clamped to 1-1000 ms, not total
 end-to-end latency. `LINK_AUDIO_OUTPUT_BURST_MS` reserves a burst budget for the
 output device (default 50 ms, also clamped to 1-1000 ms). The effective prefill
@@ -201,17 +204,23 @@ or overflow, and speakers on different devices are not sample-aligned.
 
 Status distinguishes underrun **events** from missing output **frames**, counts
 startup waiting frames separately, and reports dropped frames (including input
-discarded while output is opening), rejected buffers
+discarded while output is opening or expired after an outage), rejected buffers
 and incoming peak level, including valid frames dropped during overflow.
 Buffered milliseconds use the received sample rate. Missing
 frames include the fade-out/rebuffer interval after starvation, not just
-zero-valued samples. Playback supports 1-32 channels and sample rates through
+zero-valued samples. The receiver accepts 1-32 channels and sample rates through
 192 kHz; later format changes or malformed sample counts are rejected and counted,
 not played with the wrong format. Restart the example to accept a changed format.
 Queue occupancy is accounted on admission and consumption, so buffered duration
 also updates before the first render or while output is idle. Rejections before
 the first supported format are reported while playback is inactive and retained
 in the same counter after startup.
+Accepted channel formats do not guarantee speaker routing: the default output
+device and Rodio's channel conversion determine which channels are audible.
+Surplus channels can be dropped rather than downmixed; use mono or stereo for a
+two-speaker monitor. Rejection counts cover decoded buffers considered for this
+example's playback, not malformed datagrams or codec data discarded before the
+callback. Receive-only mode does not perform playback validation.
 
 ## Core Types (available in `no_std`)
 
