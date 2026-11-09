@@ -4,7 +4,6 @@
 
 Repository paths and shell commands below are relative to the repository root.
 
-
 ```bash
 # Clone the repository
 git clone https://github.com/anweiss/ableton-link-rs.git
@@ -24,6 +23,10 @@ cargo run --features audio --example link_audio -- my-peer-name main
 # Run the platform optimizations demo
 cargo run --example platform_demo
 ```
+
+For LinkAudio playback, latency settings and receive-only mode, see
+[LinkAudio integration and playback](api.md#linkaudio-feature--audio).
+For platform dependencies, see [build requirements](development.md#build-requirements).
 
 ## Running RustHut in Docker
 

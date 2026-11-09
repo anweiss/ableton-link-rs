@@ -75,7 +75,7 @@ ableton-link-rs
 | `std` | ✅ | Full functionality including networking, async, and peer discovery |
 | `audio` | ❌ | LinkAudio: publish and receive PCM audio channels over the Link session. Implies `std`. |
 
-Without `std`, only core types and math are available (requires `alloc`).
+Without `std`, core timing types, math and wire encoding are available (requires `alloc`).
 
 ## Build Requirements
 
@@ -136,3 +136,16 @@ python3 .github/scripts/validate-upstream-backlog.py
 ```
 
 All CI checks must pass before merging to `main`.
+
+The backlog validator requires Python 3.11+ for the standard-library `tomllib`
+module. When changing Windows fixture scripts or automation, also run the
+corresponding checks:
+
+```bash
+pwsh -NoLogo -NoProfile -File .github/scripts/test-discovery-ingress-windows-parser.ps1
+node --test .github/scripts/test-upstream-automation.cjs
+```
+
+For agentic workflow source changes, use the pinned compiler and
+[lock-file verification procedure](upstream-automation.md); never edit generated
+locks by hand.

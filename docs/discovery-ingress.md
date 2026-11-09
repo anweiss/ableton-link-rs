@@ -1,5 +1,7 @@
 # Discovery ingress identity
 
+[Documentation index](README.md) | [Project README](../README.md)
+
 The managed `Messenger` used by `BasicLink` retains the receiving OS interface
 index for both multicast announcements and unicast replies. It no longer guesses
 the response interface from the sender's IP address. The wildcard listener still

@@ -1,5 +1,7 @@
 # Owned execution and shutdown
 
+[Documentation index](README.md) | [Project README](../README.md)
+
 `Controller::new` creates a named OS thread with a current-thread Tokio runtime,
 then constructs the controller and its network resources on it. Construction
 returns only after the result is received. Failure or cancellation drops the

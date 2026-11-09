@@ -26,14 +26,14 @@ honoured only on `automation`-labelled pull requests, because a body marker can 
 self-applied; agent-authored pull requests rely on it, since `safe-outputs` pins their
 labels and they carry `automation` already.
 
-When updating the README:
+When updating documentation:
 
-1. Update the version number in all code examples and dependency snippets
-2. Update the feature list to reflect current capabilities
-3. Update API examples if method signatures or behavior changed
-4. Update the architecture section if module structure changed
-5. Update build requirements if toolchain or platform requirements changed
-6. Keep the `no_std` section accurate with current core vs std-only types
+1. Keep dependency versions current in the README and `docs/api.md`; retain their release-please markers.
+2. Summarize public capabilities and feature selection in the README; keep detail in the relevant topic.
+3. Update API examples in `docs/api.md` and migration contracts in `docs/migration.md` when signatures or behavior change.
+4. Update the architecture in `docs/development.md` when module structure changes.
+5. Keep build requirements in `docs/development.md` and the README's Rust requirements consistent.
+6. Keep the README's `no_std` summary consistent with the core-type and encoding guidance in `docs/api.md`.
 
 Keep the root README concise: installation, one small example, feature selection,
 and links. Detailed API contracts, migration notes, concurrency invariants,
