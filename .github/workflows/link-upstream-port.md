@@ -110,6 +110,7 @@ safe-outputs:
         # never grants. Listing README.md below without excluding it here would
         # silently turn a README-touching port into a fallback issue.
         - "README.md"
+        - "docs/README.md"
     # Exclusive allowlist. Anything outside it is refused, so a run cannot quietly
     # add a dependency, rewrite CI, or edit its own prompt to widen its reach.
     allowed-files:
@@ -126,6 +127,7 @@ safe-outputs:
       # enforces in review (PR #124). Without this the port opens knowing it will
       # take a review finding it was never able to pre-empt.
       - "README.md"
+      - "docs/**"
   create-issue:
     title-prefix: "[upstream-sync] "
     labels: [upstream-sync, automation, needs-decision]
@@ -867,8 +869,8 @@ explicitly instead of picking an interpretation silently.
 ## What you cannot change
 
 A pull request from this workflow may only touch `src/**`, `tests/**`, `examples/**`,
-the `vendor/ableton-link` submodule pin, `.github/upstream-backlog.toml`, and
-`README.md`. Anything else — `Cargo.toml`, CI configuration, these workflow files —
+the `vendor/ableton-link` submodule pin, `.github/upstream-backlog.toml`,
+`README.md`, and `docs/**`. Anything else — `Cargo.toml`, CI configuration, these workflow files —
 is refused outright, and the whole patch goes with it.
 
 **`README.md` is inside that set, and updating it is not optional.** The repository's
@@ -886,6 +888,10 @@ label yourself, because `safe-outputs` pins your label list to `upstream-sync` a
 precisely *because* your pull requests carry `automation` — the check ignores that
 marker on any pull request that does not, since a body marker can otherwise be
 self-applied by anyone. Do not leave it to review to notice.
+
+Read `docs/README.md` for the relevant API, migration and implementation contracts,
+and update the affected topic document alongside code. Keep the root README
+concise: use a short user-facing summary or link there, not a per-fix narrative.
 
 So if your port needs a new dependency or a CI change, do not try to sneak it in and do
 not work around the restriction. Open an issue instead: describe the upstream change,

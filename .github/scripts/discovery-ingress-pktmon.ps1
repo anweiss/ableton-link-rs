@@ -20,6 +20,14 @@ function Get-PktmonComponentIds {
                             $itemIds += $value
                         }
                     }
+                    '^Properties$' {
+                        foreach ($property in @($item[$key])) {
+                            if ($property -is [System.Collections.IDictionary] -and
+                                $property['Name'] -match '^(InterfaceIndex|IfIndex)$') {
+                                $itemIndex = $property['Value']
+                            }
+                        }
+                    }
                 }
             }
             $matchesInterface = $null -ne $itemIndex -and [int]$itemIndex -eq $InterfaceIndex
@@ -106,7 +114,7 @@ function ConvertFrom-Link154PktmonText {
             }
             continue
         }
-        if ("$line" -match '(?:Drop:\s*)?ip:\s*(\d{1,3}(?:\.\d{1,3}){3})\.(\d+)\s*>\s*(\d{1,3}(?:\.\d{1,3}){3})\.(\d+):\s*UDP(?:,|\s)') {
+        if ("$line" -match '(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})\.(\d+)\s*>\s*(\d{1,3}(?:\.\d{1,3}){3})\.(\d+):\s*(?:\[[^\]\r\n]*\]\s*)*UDP(?:,|\s)') {
             $udpPackets++
             $snapshot = $packet
             $packet = $null

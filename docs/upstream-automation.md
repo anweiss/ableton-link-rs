@@ -43,6 +43,11 @@ The porting rules and the C++ header to Rust module map both live in
 [`.github/workflows/shared/link-upstream-context.md`](../.github/workflows/shared/link-upstream-context.md).
 Edit that file to change how either workflow reasons about a change.
 
+Port and port-review-fix agents can update `docs/**` as well as `README.md`.
+Detailed API and implementation guidance belongs in the relevant topic document;
+the root README stays a concise entry point. Backlog-only triage agents retain
+their single-file allowlist and cannot change documentation.
+
 **The backlog file.** The backlog is
 [`.github/upstream-backlog.toml`](../.github/upstream-backlog.toml), versioned with the
 repository. It replaced an issue whose body was a checkbox list: an issue body can be

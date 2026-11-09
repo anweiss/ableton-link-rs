@@ -22,6 +22,18 @@ Assert-ParserTest ($componentsB -contains 102) 'component list failed to associa
 $knownComponents = @(Get-PktmonComponentIds -Document $componentList -AllComponents)
 Assert-ParserTest ($knownComponents -contains 103 -and $knownComponents -contains 101 -and $knownComponents -contains 102) 'component list failed to retain known non-fixture NIC identities'
 
+$nestedComponents = @'
+{
+  "Components": [
+    { "Id": 201, "Name": "Microsoft Hyper-V Network Adapter #1", "Properties": [{ "Name": "ifIndex", "Value": 11 }] },
+    { "Id": 202, "Name": "Microsoft Hyper-V Network Adapter #2", "Properties": [{ "Name": "ifIndex", "Value": 12 }] }
+  ]
+}
+'@ | ConvertFrom-Json -AsHashtable
+Assert-ParserTest (@(Get-PktmonComponentIds $nestedComponents 11 'vEthernet (link154-a)') -contains 201) 'nested ifIndex did not associate the parent component with adapter A'
+Assert-ParserTest (@(Get-PktmonComponentIds $nestedComponents 12 'vEthernet (link154-b)') -contains 202) 'nested ifIndex did not associate the parent component with adapter B'
+Assert-ParserTest (@(Get-PktmonComponentIds $nestedComponents 99 'unrelated alias').Count -eq 0) 'nested component mapping matched an unrelated adapter'
+
 $testOutput = @(
     'test output',
     'LINK154_MULTICAST_TX_EXPECT endpoint=10.42.0.9:53001 ifIndex=11',
@@ -50,6 +62,14 @@ $packetB = '       ip: 10.42.0.9.53002 > 224.76.78.75.20808: UDP, length 52'
 $positive = ConvertFrom-Link154PktmonText @($headerA, $packetA, $headerB, $packetB) $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest $positive.Supported 'documented Pktmon text format was not recognized'
 Assert-ParserTest ($positive.Missing.Count -eq 0) 'positive capture did not correlate both endpoints to their NICs'
+
+$ethernetA = '       AA-BB-CC-DD-EE-01 > 01-00-5E-4C-4E-4B, ethertype IPv4 (0x0800), length 94: 10.42.0.9.53001 > 224.76.78.75.20808: [udp sum ok] UDP, length 52'
+$ethernetB = @(
+    '       AA-BB-CC-DD-EE-02 > 01-00-5E-4C-4E-4B, ethertype IPv4 (0x0800), length 94:',
+    '           10.42.0.9.53002 > 224.76.78.75.20808: [bad udp cksum 0x1234 -> 0x5678!] UDP, length 52'
+)
+$ethernet = ConvertFrom-Link154PktmonText (@($headerA, $ethernetA, $headerB) + $ethernetB) $expectedResult.Expected $componentsA $componentsB 11 12
+Assert-ParserTest ($ethernet.Supported -and $ethernet.Missing.Count -eq 0 -and $ethernet.Misrouted.Count -eq 0) 'Ethernet inline/continuation endpoints or checksum annotations were not parsed'
 
 $noUdp = ConvertFrom-Link154PktmonText @($headerA, '       arp: who-has 10.42.0.129 tell 10.42.0.1', $headerB, '       ip: 10.42.0.1.53000 > 10.42.0.129.80: Flags [S], seq 1, win 65535, length 0') $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest $noUdp.Supported 'valid NIC packet metadata with no UDP was treated as unavailable tooling'
@@ -93,4 +113,4 @@ Assert-ParserTest ($stale.Missing.Count -eq 1) 'an unrecognized packet header in
 $unsupported = ConvertFrom-Link154PktmonText @('Packet Group=1 Direction=TX Component=101', 'UDP 10.42.0.9:53001 -> 224.76.78.75:20808') $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest (!$unsupported.Supported) 'unrecognized capture format was treated as valid evidence'
 
-Write-Host 'Windows pktmon parser tests passed: positive, invalid endpoint markers, no UDP, wrong source port, cross-adapter, additional wrong-NIC Tx, foreign-NIC-only Tx, foreign-NIC leakage, ambiguous mapping, unmapped NIC, stale header, unsupported format.'
+Write-Host 'Windows pktmon parser tests passed: direct/nested component mapping, IP/Ethernet endpoints, checksum annotations, invalid endpoint markers, no UDP, wrong source port, cross-adapter, additional wrong-NIC Tx, foreign-NIC-only Tx, foreign-NIC leakage, ambiguous mapping, unmapped NIC, stale header, unsupported format.'

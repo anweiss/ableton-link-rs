@@ -244,7 +244,9 @@ The fixture consumes the test's endpoint/interface markers rather than accepting
 an arbitrary source port at the duplicate address. Its isolated parser tests
 cover matching, invalid endpoint markers, no-UDP captures, wrong-port,
 cross-adapter, additional wrong-NIC transmissions, known foreign-NIC-only traffic,
-ambiguous/unmapped NIC identities, stale headers and unsupported-format captures; the
+ambiguous/unmapped NIC identities, nested component `Properties`/`ifIndex`,
+IP/Ethernet endpoint lines with checksum annotations, stale headers and
+unsupported-format captures; the
 Windows CI job runs them before provisioning adapters. Unsupported capture
 tooling is reported as missing evidence, separately from a valid capture that
 fails to show a required transmission. Missing prerequisites skip only the
