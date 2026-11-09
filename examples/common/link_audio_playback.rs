@@ -171,11 +171,9 @@ impl LivePlayback {
             .max(format.frames_for_ms(output_burst_ms.min(1000)));
         let fade_frames = format.frames_for_ms(FADE_MS);
         let max_chunk_frames = AudioBuffer::MAX_AUDIO_BYTES / size_of::<i16>() / format.channels();
-        // A waiting renderer may already hold target - 1 frames when a full
-        // wire chunk arrives. Keep that chunk without forcing a partial drop.
-        let capacity = (target_frames * 2)
-            .max(target_frames - 1 + max_chunk_frames)
-            .max(fade_frames + max_chunk_frames);
+        // Retain a whole output burst beyond the longer of prefill/fade,
+        // plus one receive chunk for packet-boundary overshoot.
+        let capacity = target_frames + target_frames.max(fade_frames) + max_chunk_frames;
         let (producer, consumer) = RingBuffer::new(capacity);
         let stats = Arc::new(PlaybackStats {
             format,
@@ -545,5 +543,31 @@ mod tests {
             playback.fade_frames as u64
         );
         assert_eq!(playback.stats.dropped_frames.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn recovery_headroom_also_holds_a_complete_output_burst_after_fade_completion() {
+        for channels in [1, 2, 8, 32] {
+            let format = Format::new(channels, 192000).unwrap();
+            let (mut input, mut playback) = LivePlayback::new(format, 1, 1, Arc::default());
+            let frames = playback.target_frames;
+            let samples = vec![16000; frames * channels];
+            input.push(channels, 192000, frames, &samples);
+            advance(&mut playback, frames + 1);
+            let max_chunk_frames = AudioBuffer::MAX_AUDIO_BYTES / size_of::<i16>() / channels;
+            for _ in 0..20 {
+                for chunk in samples.chunks(max_chunk_frames * channels) {
+                    input.push(channels, 192000, chunk.len() / channels, chunk);
+                }
+                advance(&mut playback, frames);
+            }
+            assert_eq!(
+                playback.stats.dropped_frames.load(Ordering::Relaxed),
+                0,
+                "{channels}-channel recovery dropped a complete output burst"
+            );
+            assert_eq!(playback.stats.underrun_events.load(Ordering::Relaxed), 1);
+            assert!(!playback.waiting);
+        }
     }
 }

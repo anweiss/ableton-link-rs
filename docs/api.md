@@ -177,11 +177,12 @@ network chunks when the OS pulls larger output blocks. The budget is explicit,
 not detected from the device: lower it only after verifying the output callback
 duration, or raise it if callbacks consume more than 50 ms at once.
 
-The preallocated SPSC ring holds the largest of twice the effective target,
-`target - 1 + maximum wire-chunk frames`, or
-`fade-out frames + maximum wire-chunk frames` (all sizes rounded to whole frames).
+The preallocated SPSC ring holds
+`effective target + max(effective target, fade-out frames) + maximum wire-chunk frames`
+(all sizes rounded to whole frames).
 This reserves room for a complete receive chunk even if a partial prefill is
-already queued or consumption is paused for the recovery fade, including at the
+already queued, consumption is paused for the recovery fade, or a full output
+burst arrives at fade completion, including at the
 1 ms setting. Maximum chunk size derives from
 `AudioBuffer::MAX_AUDIO_BYTES` and the received channel count. Its audio-side
 operations do not allocate or take a shared blocking mutex. The example uses the dev-only `rtrb` dependency for this
