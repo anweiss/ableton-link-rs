@@ -2,7 +2,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -101,6 +101,7 @@ pub struct PlaybackInput {
     format: Format,
     generation: u64,
     stats: Arc<PlaybackStats>,
+    output_ready: Arc<AtomicBool>,
 }
 
 impl PlaybackInput {
@@ -118,9 +119,14 @@ impl PlaybackInput {
             .max()
             .unwrap_or(0);
         self.stats.peak.fetch_max(peak, Ordering::Relaxed);
-        let accepted = frames.min(self.producer.slots());
+        if !self.output_ready.load(Ordering::Acquire) {
+            self.stats
+                .dropped_frames
+                .fetch_add(frames as u64, Ordering::Relaxed);
+            return;
+        }
         let mut written = 0;
-        for samples in samples.chunks_exact(channels).take(accepted) {
+        for samples in samples.chunks_exact(channels) {
             let mut frame = Frame {
                 samples: [0; MAX_CHANNELS],
                 generation: self.generation,
@@ -156,6 +162,8 @@ pub struct LivePlayback {
     generation: Option<u64>,
     waiting: bool,
     started: bool,
+    output_ready: Arc<AtomicBool>,
+    output_ready_announced: bool,
     pub stats: Arc<PlaybackStats>,
 }
 
@@ -175,6 +183,7 @@ impl LivePlayback {
         // plus one receive chunk for packet-boundary overshoot.
         let capacity = target_frames + target_frames.max(fade_frames) + max_chunk_frames;
         let (producer, consumer) = RingBuffer::new(capacity);
+        let output_ready = Arc::new(AtomicBool::new(true));
         let stats = Arc::new(PlaybackStats {
             format,
             prefill_frames: target_frames,
@@ -192,6 +201,7 @@ impl LivePlayback {
                 format,
                 generation: 0,
                 stats: stats.clone(),
+                output_ready: output_ready.clone(),
             },
             Self {
                 consumer,
@@ -205,9 +215,17 @@ impl LivePlayback {
                 generation: None,
                 waiting: true,
                 started: false,
+                output_ready,
+                output_ready_announced: false,
                 stats,
             },
         )
+    }
+
+    /// Call before handing the source to the output thread, so opening the
+    /// device cannot accumulate old audio that will be played on startup.
+    pub fn wait_for_output(&self) {
+        self.output_ready.store(false, Ordering::Release);
     }
 
     fn start_fade(&mut self) {
@@ -216,6 +234,10 @@ impl LivePlayback {
     }
 
     fn render_frame(&mut self) {
+        if !self.output_ready_announced {
+            self.output_ready.store(true, Ordering::Release);
+            self.output_ready_announced = true;
+        }
         let available = self.consumer.slots();
         if self.waiting && self.fade_remaining == 0 && available >= self.target_frames {
             self.waiting = false;
@@ -569,5 +591,21 @@ mod tests {
             assert_eq!(playback.stats.underrun_events.load(Ordering::Relaxed), 1);
             assert!(!playback.waiting);
         }
+    }
+
+    #[test]
+    fn delayed_output_start_discards_old_input_and_prefills_with_fresh_audio() {
+        let (mut input, mut playback) = new_playback(Format::new(1, 1000).unwrap(), 10);
+        playback.wait_for_output();
+        input.push(1, 1000, 100, &[4000; 100]);
+        assert_eq!(playback.consumer.slots(), 0);
+        assert_eq!(playback.stats.dropped_frames.load(Ordering::Relaxed), 100);
+        assert_eq!(advance(&mut playback, 1), vec![0.0]);
+
+        input.push(1, 1000, 10, &[16000; 10]);
+        let fresh = advance(&mut playback, 10);
+        assert_eq!(fresh[9], 16000.0 / 32768.0);
+        assert_eq!(playback.stats.underrun_events.load(Ordering::Relaxed), 0);
+        assert_eq!(playback.stats.startup_frames.load(Ordering::Relaxed), 1);
     }
 }

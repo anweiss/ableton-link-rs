@@ -168,6 +168,9 @@ audible in the mix. The `link_audio` example plays the subscribed channel throug
 and prints a peak level meter; set `LINK_AUDIO_PLAYBACK=0` to receive without opening an output device.
 
 The example waits for 50 ms of received audio before starting or recovering from starvation.
+Input received while the output device is opening is metered but discarded.
+Prefill begins with fresh input after the source is first rendered, rather than
+replaying a stale queue accumulated during device startup.
 `LINK_AUDIO_LATENCY_MS` requests this prefill target, clamped to 1-1000 ms, not total
 end-to-end latency. `LINK_AUDIO_OUTPUT_BURST_MS` reserves a burst budget for the
 output device (default 50 ms, also clamped to 1-1000 ms). The effective prefill
@@ -197,7 +200,8 @@ playback against Link's beat grid. Persistent drift can still cause rebuffering
 or overflow, and speakers on different devices are not sample-aligned.
 
 Status distinguishes underrun **events** from missing output **frames**, counts
-startup waiting frames separately, and reports dropped frames, rejected buffers
+startup waiting frames separately, and reports dropped frames (including input
+discarded while output is opening), rejected buffers
 and incoming peak level, including valid frames dropped during overflow.
 Buffered milliseconds use the received sample rate. Missing
 frames include the fade-out/rebuffer interval after starvation, not just

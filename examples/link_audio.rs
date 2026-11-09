@@ -179,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     output_burst_ms,
                                     rejected.clone(),
                                 );
+                                playback.wait_for_output();
                                 input = Some(writer);
                                 let _ = playback_tx.try_send(playback);
                             } else if !warned_format {
