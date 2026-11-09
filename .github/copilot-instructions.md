@@ -35,6 +35,13 @@ When updating the README:
 5. Update build requirements if toolchain or platform requirements changed
 6. Keep the `no_std` section accurate with current core vs std-only types
 
+Keep the root README concise: installation, one small example, feature selection,
+and links. Detailed API contracts, migration notes, concurrency invariants,
+architecture and automation procedures belong in `docs/`, indexed by
+`docs/README.md`. Read the relevant topic before changing its behavior, update it
+alongside the code, and satisfy the README maintenance rule with a brief
+user-facing summary or link rather than appending implementation narratives.
+
 ## Conventional Commits
 
 All commits must follow the [Conventional Commits](https://www.conventionalcommits.org/) specification. PR titles are used as squash-merge commit messages and must also follow this format:

@@ -397,7 +397,7 @@ be forwarded intact to `GatewayObserver`; managed BYEBYE is a zero-TTL peer-stat
 withdrawal. Session construction uses `Session::new`; requests/results and standalone
 measurement/result helpers use the originating `SessionKey` (`session.key()`). The
 new `MeasurePeerEvent::Cancelled(key, attempted_peer)` denotes retryable registration retirement.
-See the [canonical README migration guide](../README.md#source-migration-and-managed-lifecycle)
+See the [source migration guide](migration.md)
 for every affected public signature and enum, session-aware observers, retry ownership,
 cooperative contention and clock publication. These source-breaking changes do not
 change the wire format. Same-adapter alias selection uses
@@ -407,4 +407,4 @@ scan and reused for all registrations in that reconciliation, including leases
 captured before a failed identity snapshot recovered. This does not close #154.
 
 Receive ordering, node supersession and committed departure cleanup are documented
-in the [README receive guarantees](../README.md#basic-usage).
+in the [managed discovery overview](migration.md#managed-discovery-overview).

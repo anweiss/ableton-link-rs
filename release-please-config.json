@@ -20,7 +20,8 @@
       ],
       "extra-files": [
         "Cargo.lock",
-        "README.md"
+        "README.md",
+        "docs/api.md"
       ]
     }
   }
