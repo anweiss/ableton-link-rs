@@ -354,6 +354,26 @@ mod tests {
             playback.next();
         }
         assert!(playback.waiting);
+        assert!(playback.consumer.slots() < playback.target_frames);
+    }
+
+    #[test]
+    fn starvation_retains_a_partial_refill_until_the_target_is_reached() {
+        let (mut input, mut playback) = LivePlayback::new(Format::new(2, 1000).unwrap(), 10);
+        input.push(2, 1000, 10, &[12000; 20]);
+        advance(&mut playback, 15);
+        assert!(playback.waiting);
+
+        input.push(2, 1000, 8, &[12000; 16]);
+        assert_eq!(advance(&mut playback, 100), vec![0.0; 200]);
+        assert_eq!(playback.consumer.slots(), 8);
+        assert_eq!(playback.stats.underrun_events.load(Ordering::Relaxed), 1);
+
+        input.push(2, 1000, 2, &[12000; 4]);
+        assert!(advance(&mut playback, 10)
+            .iter()
+            .all(|sample| *sample > 0.0));
         assert_eq!(playback.consumer.slots(), 0);
+        assert!(!playback.waiting);
     }
 }
