@@ -84,23 +84,36 @@ function ConvertFrom-Link154PktmonText {
         [int]$InterfaceA,
         [int]$InterfaceB
     )
+    if (!$ComponentsA.Count -or !$ComponentsB.Count -or $InterfaceA -eq $InterfaceB -or
+        @($ComponentsA | Where-Object { $ComponentsB -contains $_ }).Count) {
+        return [pscustomobject]@{
+            Supported = $false
+            Reason = 'Fixture NIC component mappings must be nonempty and disjoint, with distinct interface indexes'
+        }
+    }
     $snapshots = 0
     $udpPackets = 0
     $matched = [System.Collections.Generic.HashSet[string]]::new()
+    $misrouted = [System.Collections.Generic.HashSet[string]]::new()
+    $unmapped = [System.Collections.Generic.HashSet[int]]::new()
     $packet = $null
     foreach ($line in $Lines) {
-        if ("$line" -match 'PktGroupId\s+(\d+),\s*PktNumber\s+(\d+),.*Direction\s+(Tx|Rx)\s*,.*Component\s+(\d+)') {
-            $packet = @{
-                Group = "$($Matches[1]):$($Matches[2])"
-                Direction = $Matches[3]
-                Component = [int]$Matches[4]
+        if ("$line" -match '\bPktGroupId\b') {
+            $packet = $null
+            if ("$line" -match 'PktGroupId\s+(\d+),\s*PktNumber\s+(\d+),.*Direction\s+(Tx|Rx)\s*,.*Component\s+(\d+)') {
+                $packet = @{
+                    Direction = $Matches[3]
+                    Component = [int]$Matches[4]
+                }
+                $snapshots++
             }
-            $snapshots++
             continue
         }
         if ("$line" -match '(?:Drop:\s*)?ip:\s*(\d{1,3}(?:\.\d{1,3}){3})\.(\d+)\s*>\s*(\d{1,3}(?:\.\d{1,3}){3})\.(\d+):\s*UDP(?:,|\s)') {
             $udpPackets++
-            if ($null -eq $packet -or $packet.Direction -ne 'Tx') { continue }
+            $snapshot = $packet
+            $packet = $null
+            if ($null -eq $snapshot -or $snapshot.Direction -ne 'Tx') { continue }
             $source = "$($Matches[1]):$($Matches[2])"
             $destination = "$($Matches[3]):$($Matches[4])"
             if ($destination -ne '224.76.78.75:20808') { continue }
@@ -113,10 +126,20 @@ function ConvertFrom-Link154PktmonText {
                 } else {
                     continue
                 }
-                if ($components -contains $packet.Component) {
+                if ($components -contains $snapshot.Component) {
                     [void]$matched.Add("$($endpoint.Endpoint)|$($endpoint.InterfaceIndex)")
+                } elseif ($ComponentsA -contains $snapshot.Component -or $ComponentsB -contains $snapshot.Component) {
+                    [void]$misrouted.Add("$source|expected=$($endpoint.InterfaceIndex)|component=$($snapshot.Component)")
+                } else {
+                    [void]$unmapped.Add($snapshot.Component)
                 }
             }
+        }
+    }
+    if ($unmapped.Count -and !$misrouted.Count) {
+        return [pscustomobject]@{
+            Supported = $false
+            Reason = "Expected multicast source appeared on unmapped NIC component(s): $(@($unmapped | Sort-Object) -join ', ')"
         }
     }
     if ($snapshots -eq 0 -or $udpPackets -eq 0) {
@@ -136,5 +159,6 @@ function ConvertFrom-Link154PktmonText {
         UdpPackets = $udpPackets
         Matched = @($matched | Sort-Object)
         Missing = @($required | Where-Object { !$matched.Contains($_) })
+        Misrouted = @($misrouted | Sort-Object)
     }
 }

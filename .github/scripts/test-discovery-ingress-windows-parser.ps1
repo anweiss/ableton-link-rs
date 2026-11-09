@@ -43,8 +43,28 @@ Assert-ParserTest ($wrongPort.Missing.Count -eq 1) 'capture with wrong source po
 $misrouted = ConvertFrom-Link154PktmonText @(($headerA -replace 'Component 101', 'Component 102'), $packetA, ($headerB -replace 'Component 102', 'Component 101'), $packetB) $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest $misrouted.Supported 'cross-adapter capture should still be recognized as valid format'
 Assert-ParserTest ($misrouted.Missing.Count -eq 2) 'cross-adapter packets falsely satisfied the expected NIC mappings'
+Assert-ParserTest ($misrouted.Misrouted.Count -eq 2) 'cross-adapter transmissions were not reported as routing failures'
+
+$leaked = ConvertFrom-Link154PktmonText @($headerA, $packetA, $headerB, $packetB, ($headerA -replace 'Component 101', 'Component 102'), $packetA) $expectedResult.Expected $componentsA $componentsB 11 12
+Assert-ParserTest $leaked.Supported 'a wrong-NIC transmission should remain a recognized capture'
+Assert-ParserTest ($leaked.Missing.Count -eq 0) 'leakage control must also include both correct transmissions'
+Assert-ParserTest ($leaked.Misrouted.Count -eq 1) 'an additional wrong-NIC transmission was silently accepted'
+
+$ambiguous = ConvertFrom-Link154PktmonText @($headerA, $packetA, $headerB, $packetB) $expectedResult.Expected @(101, 102) @(102) 11 12
+Assert-ParserTest (!$ambiguous.Supported) 'overlapping NIC component mappings were accepted as evidence'
+
+$unmapped = ConvertFrom-Link154PktmonText @($headerA, $packetA, $headerB, $packetB, ($headerA -replace 'Component 101', 'Component 999'), $packetA) $expectedResult.Expected $componentsA $componentsB 11 12
+Assert-ParserTest (!$unmapped.Supported) 'target-source traffic on an unmapped NIC was accepted as verified evidence'
+
+$mixed = ConvertFrom-Link154PktmonText @($headerA, $packetA, $headerB, $packetB, ($headerA -replace 'Component 101', 'Component 102'), $packetA, ($headerA -replace 'Component 101', 'Component 999'), $packetA) $expectedResult.Expected $componentsA $componentsB 11 12
+Assert-ParserTest ($mixed.Supported -and $mixed.Misrouted.Count -eq 1) 'an unmapped NIC obscured a proven wrong-fixture-NIC transmission'
+
+$unknownHeader = $headerA -replace 'Direction Tx', 'Direction Unknown'
+$stale = ConvertFrom-Link154PktmonText @($headerA, $packetA, $headerB, $unknownHeader, $packetB) $expectedResult.Expected $componentsA $componentsB 11 12
+Assert-ParserTest $stale.Supported 'one unrecognized header must not erase the other valid capture records'
+Assert-ParserTest ($stale.Missing.Count -eq 1) 'an unrecognized packet header inherited the previous NIC identity'
 
 $unsupported = ConvertFrom-Link154PktmonText @('Packet Group=1 Direction=TX Component=101', 'UDP 10.42.0.9:53001 -> 224.76.78.75:20808') $expectedResult.Expected $componentsA $componentsB 11 12
 Assert-ParserTest (!$unsupported.Supported) 'unrecognized capture format was treated as valid evidence'
 
-Write-Host 'Windows pktmon parser tests passed: positive, wrong source port, cross-adapter, unsupported format.'
+Write-Host 'Windows pktmon parser tests passed: positive, wrong source port, cross-adapter, additional wrong-NIC Tx, ambiguous mapping, unmapped NIC, stale header, unsupported format.'

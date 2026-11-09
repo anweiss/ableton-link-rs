@@ -185,10 +185,14 @@ try {
             if ($captureResult.Missing.Count) {
                 throw "VALID_CAPTURE_MISSING_EXPECTED_NIC_TX: no NIC-level Tx matched endpoint(s) $($captureResult.Missing -join ', ')"
             }
+            if ($captureResult.Misrouted.Count) {
+                throw "VALID_CAPTURE_WRONG_NIC_TX: multicast source observed on the wrong fixture NIC: $($captureResult.Misrouted -join ', ')"
+            }
             $evidenceVerified = $true
             Write-Host "Pktmon correlated exact source endpoints with NIC-level multicast Tx on both adapters: $($expectedResult.Expected.Endpoint -join ', ')."
         } catch {
-            if ($_.Exception.Message -like 'VALID_CAPTURE_MISSING_EXPECTED_NIC_TX:*') { throw }
+            if ($_.Exception.Message -like 'VALID_CAPTURE_MISSING_EXPECTED_NIC_TX:*' -or
+                $_.Exception.Message -like 'VALID_CAPTURE_WRONG_NIC_TX:*') { throw }
             $evidenceMissing = "Pktmon egress evidence unavailable: $($_.Exception.Message)"
         }
     }

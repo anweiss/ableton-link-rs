@@ -242,13 +242,15 @@ Pktmon NIC-only Tx records on both fixture adapters. Those records must identify
 the distinct registered source endpoints and the Link multicast destination.
 The fixture consumes the test's endpoint/interface markers rather than accepting
 an arbitrary source port at the duplicate address. Its isolated parser tests
-cover matching, wrong-port, cross-adapter and unsupported-format captures; the
+cover matching, wrong-port, cross-adapter, additional wrong-NIC transmissions,
+ambiguous/unmapped NIC identities, stale headers and unsupported-format captures; the
 Windows CI job runs them before provisioning adapters. Unsupported capture
 tooling is reported as missing evidence, separately from a valid capture that
 fails to show a required transmission. Missing prerequisites skip only the
 duplicate-capture evidence: the existing overlap/restart/churn assertions must
 still pass, and a green Windows job is not a duplicate-network pass. A valid
-capture missing a required endpoint's NIC Tx fails the fixture.
+capture missing a required endpoint's NIC Tx, or also transmitting that endpoint
+on the wrong fixture NIC, fails the fixture.
 This is local virtual-NIC transmission evidence, not independent peer receipt:
 provider success plus these records would still not prove the full Windows
 criterion. A matching 5010 remains missing evidence and is explicitly reported
