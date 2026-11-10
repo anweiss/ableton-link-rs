@@ -4,6 +4,34 @@
 
 Repository paths and shell commands below are relative to the repository root.
 
+## LinkAudio mutability and sharing
+
+`LinkAudio` no longer implements `DerefMut<Target = BasicLink>`. Read-only
+`BasicLink` methods remain available through `Deref`, but a helper taking
+`&mut BasicLink` cannot accept a mutable `LinkAudio` through deref coercion.
+Change that helper to accept `&mut LinkAudio`, or call its explicitly forwarded
+methods for enable/disable, callback registration, start/stop sync and app
+session-state commits. Do not bypass these methods to mutate the wrapped link.
+
+`enable_link_audio(true)` records a sharing request, not permission to share while
+Link is disabled. `LinkAudio::disable` stops sharing and withdraws its advertised
+audio endpoint while retaining the request. A later `LinkAudio::enable` resumes
+sharing if it is still requested; `enable_link_audio(false)` clears the request.
+
+## Session-aware client state and notifications
+
+With `std`, `ClientState` and `RtClientState` struct literals now include
+`timeline_session_id: SessionId`. Preserve the session associated with the
+timeline when capturing, constructing or forwarding these values; do not fill
+the field with an unrelated current/default session ID. Conversions between
+the two state types preserve it. `no_std` `ClientState` has no such field.
+
+`controller::update_session_timing` takes a final `session_id: SessionId`
+argument as well as returning `Result<(), CommitError>`. Supply the session
+that belongs to the provided timeline and clock mapping, and handle rejection.
+`PeerStateChange` also adds `AudioEndpoint(peer_id, endpoint)`; update exhaustive
+matches to handle the notification or explicitly ignore it when unused.
+
 ## Managed discovery overview
 
 Managed discovery advertises each interface's bound reply socket as its measurement
