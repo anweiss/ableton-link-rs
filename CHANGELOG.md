@@ -12,8 +12,8 @@
 ### Upgrading
 
 This release includes source-breaking API changes and requires Rust 1.87+.
-See the [migration guide](https://github.com/anweiss/ableton-link-rs/blob/7c299f35e2702b319d0be762e00b1294de67cf0d/docs/migration.md)
-and [API reference](https://github.com/anweiss/ableton-link-rs/blob/ef0d9672d8eb0ef11fcaa8506166d1dbdae2d358/docs/api.md)
+See the [migration guide](https://github.com/anweiss/ableton-link-rs/blob/d69ea3e562f434e2b800f13270e0df83b436e925/docs/migration.md)
+and [API reference](https://github.com/anweiss/ableton-link-rs/blob/d69ea3e562f434e2b800f13270e0df83b436e925/docs/api.md)
 before upgrading from 0.3.
 
 ## [0.3.0](https://github.com/anweiss/ableton-link-rs/compare/v0.2.0...v0.3.0) (2026-08-10)
