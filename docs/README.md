@@ -9,6 +9,7 @@ contracts and maintenance procedures live here.
 |------------|------|
 | Library integration, `no_std`, LinkAudio, encoding, clocks or scheduling | [API guide](api.md) |
 | Runnable demos, audio playback, Docker or ESP32 | [Examples](examples.md) |
+| Component relationships, feature boundaries or network/audio flow | [Architecture diagrams](architecture.md) |
 | API migration, state publication, RT capture/commit, session identity or ordering | [Migration and managed-state contracts](migration.md) |
 | Discovery routing, interface leases, topology changes or platform evidence | [Discovery interfaces](discovery-ingress.md) |
 | Owned IO runtime, enable/disable, callbacks or destruction | [Execution and shutdown](execution-lifecycle.md) |
