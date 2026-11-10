@@ -19,6 +19,10 @@ Repository paths and shell commands below are relative to the repository root.
 
 ## Architecture
 
+Start with the [component and network diagrams](architecture.md) for how the
+public API, managed discovery, clock measurement and optional audio transport
+fit together. The tree below maps those components to source files.
+
 ```
 ableton-link-rs
 ├── encoding.rs              # Wire encoding traits and primitives (no_std)

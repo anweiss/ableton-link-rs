@@ -53,6 +53,26 @@ Use `default-features = false` for core types without networking, or
 `features = ["audio"]` for LinkAudio.
 [Configuration and API examples](docs/api.md) cover both.
 
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    app["Your application"]
+    link["BasicLink<br/>std"]
+    audio["LinkAudio<br/>optional audio feature"]
+    peers["Link peers<br/>on the local network"]
+    app --> link
+    app -.-> audio
+    audio -.->|wraps| link
+    link <-->|tempo, beat, phase and start/stop| peers
+    audio <-->|separate PCM transport| peers
+```
+
+Link Classic synchronizes musical timing; optional LinkAudio adds audio sharing
+between audio-enabled peers. Core timing types can also be used without either
+network path. See the [component and network diagrams](docs/architecture.md)
+for feature boundaries, discovery and audio flow.
+
 ## Examples
 
 ```bash
