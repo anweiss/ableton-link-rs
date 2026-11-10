@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/anweiss/ableton-link-rs/compare/v0.4.0...v0.4.1) (2026-11-10)
+
+
+### Documentation
+
+* add architecture and network diagrams ([#207](https://github.com/anweiss/ableton-link-rs/issues/207)) ([0c99c98](https://github.com/anweiss/ableton-link-rs/commit/0c99c98547cd12aa0335b2211bcef7cb478e1501))
+
 ## [0.4.0](https://github.com/anweiss/ableton-link-rs/compare/v0.3.0...v0.4.0) (2026-11-10)
 
 ### Highlights

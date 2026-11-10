@@ -14,7 +14,7 @@ Requires Rust **1.87+**. Add the library and Tokio to your application:
 <!-- x-release-please-start-version -->
 ```toml
 [dependencies]
-ableton-link-rs = "0.4.0"
+ableton-link-rs = "0.4.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 <!-- x-release-please-end -->
