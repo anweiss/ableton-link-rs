@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.0](https://github.com/anweiss/ableton-link-rs/compare/v0.3.0...v0.4.0) (2026-11-10)
+
+### Highlights
+
+- More reliable discovery, reconnects and session handoffs on multi-interface networks.
+- Safer state capture and commits, with explicit audio-commit acknowledgments and owned background tasks.
+- Better LinkAudio playback buffering, recovery fades and diagnostics.
+- Fixes for clock, tempo and beat-boundary edge cases.
+
+### Upgrading
+
+This release includes source-breaking API changes and requires Rust 1.87+.
+See the [migration guide](https://github.com/anweiss/ableton-link-rs/blob/d69ea3e562f434e2b800f13270e0df83b436e925/docs/migration.md)
+and [API reference](https://github.com/anweiss/ableton-link-rs/blob/d69ea3e562f434e2b800f13270e0df83b436e925/docs/api.md)
+before upgrading from 0.3.
+
 ## [0.3.0](https://github.com/anweiss/ableton-link-rs/compare/v0.2.0...v0.3.0) (2026-08-10)
 
 

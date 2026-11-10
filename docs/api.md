@@ -11,7 +11,7 @@ For embedded or `no_std` environments, disable the default `std` feature to acce
 <!-- x-release-please-start-version -->
 ```toml
 [dependencies]
-ableton-link-rs = { version = "0.3.0", default-features = false }
+ableton-link-rs = { version = "0.4.0", default-features = false }
 ```
 <!-- x-release-please-end -->
 
@@ -28,7 +28,7 @@ Audio sharing is opt-in via the `audio` feature, which implies `std`:
 <!-- x-release-please-start-version -->
 ```toml
 [dependencies]
-ableton-link-rs = { version = "0.3.0", features = ["audio"] }
+ableton-link-rs = { version = "0.4.0", features = ["audio"] }
 ```
 <!-- x-release-please-end -->
 
