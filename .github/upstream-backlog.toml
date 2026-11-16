@@ -37,8 +37,8 @@ schema_version = 1
 # the submodule pin, and the validator fails if this drifts from it.
 [watermark]
 pinned = "62c7f1f5af183ac3317b418a2bda226d57428097"
-upstream = "5ba907ae027a8c2ec8824463e37296dcefc5e9be"
-commits_behind = 124
+upstream = "4f5be9939bd6d016758f021aa91f44440171ef2d"
+commits_behind = 141
 
 # ---------------------------------------------------------------------------
 # Port items, in upstream ancestry order (oldest first). The port workflow
@@ -347,6 +347,17 @@ retired_at_pin = "62c7f1f5af183ac3317b418a2bda226d57428097"
 why = "Upstream `62c7f1f5af18` adds `link_audio::Channels`, a per-gateway registry of `ChannelInfo` entries filled from `PeerAnnouncement` (a new entry fires the callback; an update fires it only when the first entry for that id changes; closing a gateway drops its entries and fires it), and owns one in the audio `Controller` with a no-op callback. `src/link_audio/channels.rs` already provides this registry (`saw_announcement`, `gateway_closed`, plus later upstream additions such as byes, ttl pruning and send handlers) and the engine owns it, so no Rust change was needed. Rust reports changes through return values rather than a stored callback. Bookkeeping-only retirement."
 impact = "No user-visible effect: this crate already tracks the audio channels announced by other peers. This entry only records that the upstream commit is accounted for."
 
+[[port]]
+id = "arrangement-sync"
+title = "Share an arrangement timeline between peers so arrangement playback can be launched in sync"
+upstream = ["27949bc942ce613128f063903e5f93c692893084", "f32633f192756fe4e2f5747ddd8e6759c0d71794", "f7de5bdb60e20cbe97005a7660c40ddc29f9958a", "ec1196beb1b4d86e7425bd2ce83b7f77faa3c31e", "99c150d87f64beecf2fa83d6a7eb1d472359cd4f", "e5abc269a4ff17475db22aad69863d5cb0850904", "eefad799454b00d457cb94d0f161cd238c3c87e2", "b72fcdaaf020112df9a159f7c84a2d11556461b2", "84320bd63bfac831af4062247c841838cb8f2b16"]
+rust = ["src/link/state.rs", "src/link/payload.rs", "src/link/node.rs", "src/link/controller.rs", "src/discovery/peers.rs", "src/lib.rs", "src/link/mod.rs"]
+risk = "wire-format"
+status = "outstanding"
+retired_at_pin = ""
+why = "Upstream adds arrangement sync as an optional Link feature. 27949bc adds include/ableton/link/ArrangementTimeline.hpp: `ArrangementTimeline` (peer-state payload key `'artl'` = 0x6172746c; wire body is the tuple Beats beatOrigin, Beats launchBeats, microseconds timestamp, encoded as three i64 big-endian like Timeline), plus `ClientArrangementTimeline` (beatOrigin, launchTime, timestamp) and `ApiArrangementTimeline` (beatOrigin, launchTime). f32633f adds an arrangement timeline to `SessionState` and `ClientState` (Controller.hpp, SessionState.hpp). f7de5bd adds `NodeState::arrangementTimeline` (std::optional) and `OptionalArrangementTimelineEntry`, appended as the fourth payload entry after Timeline, SessionMembership, StartStopState; the entry is emitted only when set (size 0 otherwise) and parsed when present, and NodeState equality includes it. ec1196b adds `Controller::enableArrangementSync`. 99c150d handles client-supplied arrangement timelines in Controller; e5abc26 passes the arrangement timeline from `Peers` (PeerState.hpp, Peers.hpp) to the Controller; eefad79 applies timelines received from the network; b72fcda keeps beat times continuous when sync is disabled (SessionState.hpp gains conversion logic, large new tests in tst_Controller.cpp and tst_SessionState.cpp). 84320bd exposes it in the Link API (Link.hpp, Link.ipp, LinkAudio.ipp). Rust: add the arrangement timeline types to the no_std core (src/link/state.rs or a new no_std module), add an optional `artl` payload entry in src/link/payload.rs / src/link/node.rs (encode only when set; unknown/absent must stay interoperable with peers lacking it, and the existing payload ordering must not change), thread it through peers and the controller, and add the public enable/query/commit API on BasicLink (src/lib.rs, src/link/mod.rs) and LinkAudio. Read the full diffs of all nine commits first; they must land together as one concern. Wire-format change: state in the PR which upstream encoder was matched. Keep README and docs/api.md updated since this is new public API. 5907ce3 (tests only), 2701a82 (LinkHut example) and 4beafa4 (C API) are filed as not-applicable."
+impact = "Newer Ableton Link releases let peers share an arrangement timeline so that arrangement-based software can start playback at the same moment. This crate neither sends nor understands that information, so it ignores arrangement launches from such peers and cannot launch one itself. Applications using this crate gain the feature once it is ported."
+
 # ---------------------------------------------------------------------------
 # Commits seen and consciously parked. Kept so that coverage stays provable:
 # a commit nobody mentions is not deferred, it is deleted the moment the pin
@@ -566,3 +577,23 @@ reason = "Sink::retainBuffer/releaseSlot refactor so an undersized slot discarde
 [[not_applicable]]
 upstream = ["5ba907ae027a8c2ec8824463e37296dcefc5e9be"]
 reason = "Add SinkProcessor and SourceProcessor Catch2 tests (CMake and test harness only)"
+
+[[not_applicable]]
+upstream = ["5907ce3d5bb3c113456dbfc6757bdb547ab6a780"]
+reason = "Add missing SessionState tests to tst_Link (Catch2 tests only)"
+
+[[not_applicable]]
+upstream = ["2701a827a0dbca42dc6c202827a4e468ef36d0b9"]
+reason = "Add arrangement sync support to LinkHut (C++ example scaffolding only)"
+
+[[not_applicable]]
+upstream = ["4beafa41892014def8a977c9446d878faedd4cf5"]
+reason = "Add arrangement sync to the abl_link C API extension (C bindings are not ported; the Rust API is covered by the arrangement-sync item)"
+
+[[not_applicable]]
+upstream = ["612967f7dc35e071542db7a42b9c043d7c821eae", "9832673d209fbe2c3611d7163ad0f301a442bd2c", "593e670e2ce01e8c55338c92a0730a0ac641b652"]
+reason = "Upstream README and TEST-PLAN.md documentation edits only"
+
+[[not_applicable]]
+upstream = ["e64b558810f1df34deb0caf9f4454e272649353d", "4f5be9939bd6d016758f021aa91f44440171ef2d"]
+reason = "Upstream CI clang-format tooling changes only"
