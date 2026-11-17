@@ -117,7 +117,7 @@ try {
         @($a, '10.42.0.1'), @($a, '10.42.0.130'), @($a, '10.42.0.9'),
         @($b, '10.42.0.129'), @($b, '10.42.0.2'), @($b, '10.42.0.9')
     )
-    New-NetFirewallRule -Name $rule -DisplayName $rule -Direction Inbound -Action Allow -Protocol UDP -Program $TestBinary | Out-Null
+    New-NetFirewallRule -Name $rule -DisplayName $rule -Direction Inbound -Action Allow -Protocol UDP -LocalPort 20808 | Out-Null
     foreach ($entry in $assignments) {
         Write-Host "Adding $($entry[1]) to interface $($entry[0])"
         try {
