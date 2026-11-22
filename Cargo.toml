@@ -91,7 +91,7 @@ socket-pktinfo = { version = "0.4.1", optional = true }
 termios = "0.3"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["socket", "fs", "net"], optional = true }
+nix = { version = "0.32.0", default-features = false, features = ["socket", "fs", "net"], optional = true }
 # Socket timeout helpers in rustix 1.1.5 need the shared time types.
 rustix = { version = "1.1.4", features = ["net", "time"], optional = true }
 
