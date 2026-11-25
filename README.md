@@ -53,6 +53,10 @@ Use `default-features = false` for core types without networking, or
 `features = ["audio"]` for LinkAudio.
 [Configuration and API examples](docs/api.md) cover both.
 
+Rodio and its native audio-device backend are development dependencies used by
+the examples, not by library consumers (including `audio` builds). The legacy
+`rodio` feature remains accepted as a no-op for compatibility.
+
 ## Architecture at a glance
 
 ```mermaid

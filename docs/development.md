@@ -88,9 +88,16 @@ Without `std`, core timing types, math and wire encoding are available (requires
 | Rust | 1.87+ to use the library (enforced by `rust-version`); 1.88+ to run the test suite, which pulls `console-subscriber` |
 | Tokio | 1.53.3+ with `std`, for `AsyncFd::register` (the replacement for the deprecated `AsyncFd::new`) |
 | macOS | 10.15+ |
-| Linux | glibc 2.28+, `libasound2-dev` (for `rodio`) |
+| Linux | glibc 2.28+; `libasound2-dev` for repository tests and examples that build Rodio |
 | Windows | Windows 10+ |
 | ESP32 | ESP-IDF v5.3+, espup toolchain |
+
+Rodio is a development dependency for the RustHut and LinkAudio examples and
+their shared playback helpers. Normal library builds, including those with the
+`audio` feature, do not pull in Rodio, CPAL or ALSA through this crate. Repository
+tests and example builds still resolve development dependencies, so Linux
+contributors need `libasound2-dev` for those commands. The legacy `rodio` feature
+is retained as an empty compatibility alias; it enables no library API or backend.
 
 The `std` feature requires tokio 1.53.3 or newer. Discovery registers its
 interface-change socket with `AsyncFd::register`, which older tokio releases do
